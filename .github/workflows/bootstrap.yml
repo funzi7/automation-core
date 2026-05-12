@@ -68,9 +68,14 @@ jobs:
             const templateContent = fs.readFileSync('template/sync-automation-core.yml', 'utf8');
 
             // Fetch all repos
+            // Use authenticated user endpoint to include private repos.
+            // listForUser only returns public repos regardless of token scope.
             const allRepos = await github.paginate(
-              github.rest.repos.listForUser,
-              { username: OWNER, per_page: 100 }
+              github.rest.repos.listForAuthenticatedUser,
+              {
+                per_page: 100,
+                affiliation: 'owner',  // only repos owned by the user, not orgs/collaborated
+              }
             );
 
             const eligibleRepos = allRepos.filter(r =>
