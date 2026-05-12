@@ -8,6 +8,29 @@ Central source of truth for CI/CD automation across all of @funzi7's repositorie
 - `codex-auto-fix.yml` — triggers Codex to fix flagged P1/P2 reviews automatically
 - `codex-gate.yml` — blocks PR merge until Codex signals (review with no P1, 👍 reaction, or fix Summary after P1)
 
+## How to onboard repos
+
+Run the **Bootstrap repos** workflow from the Actions tab.
+
+1. Go to Actions → Bootstrap repos → Run workflow
+2. Optional inputs:
+   - `dry_run`: true → only list eligible repos, don't open PRs
+   - `target_repo`: limit to a single repo (leave empty for all)
+3. Workflow opens a PR titled `chore(automation): bootstrap sync from automation-core` in each eligible repo
+4. Merge each PR
+5. From then on, daily sync is active in that repo
+
+### Setup (one-time)
+
+The bootstrap workflow needs a fine-grained PAT with cross-repo access:
+
+1. Go to https://github.com/settings/personal-access-tokens
+2. Create new token (fine-grained)
+3. Resource owner: your user
+4. Repository access: All repositories
+5. Permissions: Contents (write), Pull requests (write), Workflows (write), Metadata (read)
+6. Save the token, then add it as a secret named `CROSS_REPO_PAT` in this repo (Settings → Secrets and variables → Actions)
+
 ## How sync works
 
 Each participating repo has `.github/workflows/sync-automation-core.yml` that:

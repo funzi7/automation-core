@@ -1,0 +1,182 @@
+name: Bootstrap repos
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'List repos without creating PRs'
+        required: false
+        type: boolean
+        default: false
+      target_repo:
+        description: 'Specific repo name to bootstrap (leave empty for all)'
+        required: false
+        type: string
+
+permissions:
+  contents: read  # for reading template
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout automation-core
+        uses: actions/checkout@v4
+
+      - name: Generate app token for cross-repo access
+        id: token
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Use the workflow's GITHUB_TOKEN — it has limited scope to
+            // automation-core itself. For cross-repo access we need a PAT.
+            //
+            // RECOMMENDED: Create a fine-grained PAT with:
+            //   - Resource access: All repos owned by you
+            //   - Permissions: Contents (write), Pull requests (write),
+            //     Workflows (write), Metadata (read)
+            //
+            // Save it as a secret named CROSS_REPO_PAT in this repo.
+
+            if (!process.env.CROSS_REPO_PAT) {
+              core.setFailed(
+                'CROSS_REPO_PAT secret not configured.\n' +
+                'Create a fine-grained PAT and save it as a secret named CROSS_REPO_PAT.\n' +
+                'Required permissions: Contents (write), Pull requests (write), Workflows (write), Metadata (read).\n' +
+                'Resource access: All repositories.'
+              );
+              return;
+            }
+            core.setSecret(process.env.CROSS_REPO_PAT);
+            core.setOutput('token', process.env.CROSS_REPO_PAT);
+        env:
+          CROSS_REPO_PAT: ${{ secrets.CROSS_REPO_PAT }}
+
+      - name: Bootstrap all repos
+        if: steps.token.outputs.token != ''
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.token.outputs.token }}
+          script: |
+            const fs = require('fs');
+
+            const DRY_RUN = ${{ inputs.dry_run }};
+            const TARGET_REPO = '${{ inputs.target_repo }}';
+            const OWNER = context.repo.owner;
+            const SOURCE_REPO = context.repo.repo;
+
+            const templateContent = fs.readFileSync('template/sync-automation-core.yml', 'utf8');
+
+            // Fetch all repos
+            const allRepos = await github.paginate(
+              github.rest.repos.listForUser,
+              { username: OWNER, per_page: 100 }
+            );
+
+            const eligibleRepos = allRepos.filter(r =>
+              !r.archived &&
+              !r.fork &&
+              r.name !== SOURCE_REPO &&
+              (TARGET_REPO === '' || r.name === TARGET_REPO)
+            );
+
+            core.info(`Found ${eligibleRepos.length} eligible repos (dry_run=${DRY_RUN})`);
+
+            const results = [];
+
+            for (const repo of eligibleRepos) {
+              const repoName = repo.name;
+              core.info(`\n--- ${repoName} ---`);
+
+              // Check if sync workflow already exists
+              try {
+                await github.rest.repos.getContent({
+                  owner: OWNER,
+                  repo: repoName,
+                  path: '.github/workflows/sync-automation-core.yml',
+                });
+                results.push(`⏭ ${repoName}: already has sync workflow`);
+                continue;
+              } catch (e) {
+                if (e.status !== 404) throw e;
+              }
+
+              // Check opt-out
+              try {
+                await github.rest.repos.getContent({
+                  owner: OWNER,
+                  repo: repoName,
+                  path: '.automation-core-ignore',
+                });
+                results.push(`⏭ ${repoName}: has opt-out file`);
+                continue;
+              } catch (e) {
+                if (e.status !== 404) throw e;
+              }
+
+              if (DRY_RUN) {
+                results.push(`✨ ${repoName}: would create PR`);
+                continue;
+              }
+
+              // Get default branch SHA
+              const { data: repoData } = await github.rest.repos.get({
+                owner: OWNER,
+                repo: repoName,
+              });
+              const defaultBranch = repoData.default_branch;
+
+              const { data: ref } = await github.rest.git.getRef({
+                owner: OWNER,
+                repo: repoName,
+                ref: `heads/${defaultBranch}`,
+              });
+              const baseSha = ref.object.sha;
+
+              // Create branch
+              const branchName = 'chore/bootstrap-automation-core';
+              try {
+                await github.rest.git.createRef({
+                  owner: OWNER,
+                  repo: repoName,
+                  ref: `refs/heads/${branchName}`,
+                  sha: baseSha,
+                });
+              } catch (e) {
+                if (e.status === 422) {
+                  results.push(`⏭ ${repoName}: branch ${branchName} already exists`);
+                  continue;
+                }
+                throw e;
+              }
+
+              // Create file on branch
+              await github.rest.repos.createOrUpdateFileContents({
+                owner: OWNER,
+                repo: repoName,
+                path: '.github/workflows/sync-automation-core.yml',
+                message: 'chore(automation): bootstrap sync from automation-core',
+                content: Buffer.from(templateContent).toString('base64'),
+                branch: branchName,
+              });
+
+              // Open PR
+              const { data: pr } = await github.rest.pulls.create({
+                owner: OWNER,
+                repo: repoName,
+                title: 'chore(automation): bootstrap sync from automation-core',
+                head: branchName,
+                base: defaultBranch,
+                body: `Adds daily sync workflow that pulls CI automation from [automation-core](https://github.com/${OWNER}/${SOURCE_REPO}).\n\nAfter merge, this repo will receive automatic PRs whenever automation-core updates the synced workflows.\n\nTo opt out, create \`.automation-core-ignore\` at the repo root.`,
+              });
+
+              results.push(`✅ ${repoName}: PR #${pr.number} — ${pr.html_url}`);
+            }
+
+            // Summary
+            core.summary
+              .addHeading('Bootstrap Results')
+              .addList(results)
+              .write();
+
+            results.forEach(r => core.info(r));
