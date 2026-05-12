@@ -1,4 +1,9 @@
 #!/bin/bash
+# Legacy bootstrap script. Prefer the GitHub Actions workflow:
+# Actions → Bootstrap repos → Run workflow
+#
+# This script remains for CLI use when needed.
+
 # bootstrap.sh — Add sync-automation-core.yml to all of funzi7's repos
 #
 # Usage: GITHUB_TOKEN=ghp_xxxxx ./bootstrap.sh
