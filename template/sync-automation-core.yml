@@ -1,0 +1,90 @@
+name: Sync from automation-core
+
+on:
+  schedule:
+    - cron: '0 3 * * *'  # 03:00 UTC daily
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check opt-out
+        id: optout
+        run: |
+          if [ -f ".automation-core-ignore" ]; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout this repo
+        if: steps.optout.outputs.skip == 'false'
+        uses: actions/checkout@v4
+
+      - name: Clone automation-core
+        if: steps.optout.outputs.skip == 'false'
+        run: |
+          git clone --depth 1 https://github.com/funzi7/automation-core.git /tmp/automation-core
+
+      - name: Sync workflows
+        if: steps.optout.outputs.skip == 'false'
+        id: sync
+        run: |
+          set -euo pipefail
+
+          # Read sync-config.json
+          CONFIG=/tmp/automation-core/sync-config.json
+          SYNCED=$(jq -r '.synced_workflows[]' "$CONFIG")
+          REMOVED=$(jq -r '.removed_workflows[]' "$CONFIG")
+
+          mkdir -p .github/workflows
+
+          CHANGES=0
+
+          # Sync (copy from source if different)
+          for wf in $SYNCED; do
+            SRC="/tmp/automation-core/workflows/$wf"
+            DST=".github/workflows/$wf"
+            if [ ! -f "$SRC" ]; then
+              echo "::warning::$wf in config but missing in source"
+              continue
+            fi
+            if [ ! -f "$DST" ] || ! cmp -s "$SRC" "$DST"; then
+              cp "$SRC" "$DST"
+              CHANGES=$((CHANGES + 1))
+              echo "Updated: $wf"
+            fi
+          done
+
+          # Remove (delete if present locally)
+          for wf in $REMOVED; do
+            DST=".github/workflows/$wf"
+            if [ -f "$DST" ]; then
+              rm "$DST"
+              CHANGES=$((CHANGES + 1))
+              echo "Removed: $wf"
+            fi
+          done
+
+          echo "changes=$CHANGES" >> $GITHUB_OUTPUT
+
+      - name: Create PR if changes
+        if: steps.optout.outputs.skip == 'false' && steps.sync.outputs.changes != '0'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: chore/sync-automation-core
+          delete-branch: true
+          title: 'chore(automation): sync from automation-core'
+          body: |
+            Automated sync from [automation-core](https://github.com/funzi7/automation-core).
+
+            Changes: ${{ steps.sync.outputs.changes }} file(s).
+
+            To opt this repo out of future syncs, create `.automation-core-ignore` in the repo root.
+          commit-message: 'chore(automation): sync workflows from automation-core'

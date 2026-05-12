@@ -1,0 +1,471 @@
+name: Codex Auto-Fix
+
+# Auto-respond to Codex bot reviews with `@codex address that
+# feedback` so Codex (which already does automatic reviews on
+# every PR) also drives its own follow-up commit when it flags
+# P1 or P2 issues. Without this workflow, every Codex review
+# requires a human to type the trigger comment manually.
+#
+# Safety rails:
+#   - Only fires on comments from chatgpt-codex-connector[bot].
+#     An external attacker can't impersonate the bot login, so
+#     this is the right authentication surface.
+#   - Capped at 2 auto-trigger comments per PR. If 2 rounds of
+#     auto-fix don't resolve the review, a human takes over —
+#     same circuit-breaker pattern as retry budgets in the
+#     scrapers. Prevents infinite loops if Codex keeps producing
+#     P1/P2 reviews on the same code.
+#   - Substring match on "P1" or "P2" in the review body. Codex
+#     uses badge URLs like `P1-orange?style=flat` so the literal
+#     substring is reliable; "no issues" reviews don't include
+#     those tokens.
+
+on:
+  pull_request_review:
+    types: [submitted]
+  # Inline review comments (single line of code, not wrapped in a
+  # full PR review). Codex usually batches inline notes into a review
+  # event, but occasionally drops one as a standalone comment —
+  # without this, those bypass the auto-fix loop.
+  pull_request_review_comment:
+    types: [created]
+  issue_comment:
+    types: [created]
+  # `issues` is for the site-health auto-trigger (trigger_codex_on_health_issue
+  # job below). Existing jobs filter by event payload shape — for an `issues`
+  # event `github.event.comment` / `github.event.review` are both null, so
+  # their `if:` clauses evaluate false and they stay quiet.
+  issues:
+    types: [opened, labeled]
+
+permissions:
+  # Need write to comment on the PR. issues:write is required
+  # because the GH issues API also services PR-level comments
+  # (PRs are issues with extra fields). pull-requests:write is
+  # for the review-event payload access.
+  issues: write
+  pull-requests: write
+
+jobs:
+  trigger_codex_fix:
+    runs-on: ubuntu-latest
+    # Per-event explicit gate: each clause requires (1) the right
+    # event_name, (2) the bot author on the right payload field, and
+    # (3) a P1 or P2 marker in the body. Pulling P1/P2 into the if:
+    # short-circuits jobs for "Codex says LGTM" reviews entirely
+    # (instead of starting the runner and bailing in JS).
+    #
+    # Three branches mirror the on: events that can carry actionable
+    # bot feedback: PR review, inline review-comment, top-level
+    # issue/PR comment. The `issues` event is intentionally omitted
+    # — that's site-health territory, handled by the dedicated job
+    # below.
+    if: |
+      (github.event_name == 'pull_request_review' &&
+       github.event.review.user.login == 'chatgpt-codex-connector[bot]' &&
+       (contains(github.event.review.body, 'P1') || contains(github.event.review.body, 'P2'))) ||
+      (github.event_name == 'pull_request_review_comment' &&
+       github.event.comment.user.login == 'chatgpt-codex-connector[bot]' &&
+       (contains(github.event.comment.body, 'P1') || contains(github.event.comment.body, 'P2'))) ||
+      (github.event_name == 'issue_comment' &&
+       github.event.comment.user.login == 'chatgpt-codex-connector[bot]' &&
+       (contains(github.event.comment.body, 'P1') || contains(github.event.comment.body, 'P2')))
+
+    steps:
+      - name: Check if review has actionable feedback
+        id: check_review
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Body comes from whichever event fired.
+            const body =
+              context.payload.comment?.body ||
+              context.payload.review?.body ||
+              "";
+
+            // Codex marks actionable items with P1 / P2 badges.
+            // The badge URL contains the literal "P1"/"P2"
+            // substring, so a loose includes() match works.
+            // Codex's "no issues" reviews react with 👍 instead
+            // of leaving a body, so they don't trip this gate.
+            const hasActionableFeedback =
+              body.includes("P1") || body.includes("P2");
+
+            // PR number: pull_request_review payload has
+            // `pull_request`, issue_comment has `issue` (PRs
+            // are issues for the comments API).
+            const prNumber =
+              context.payload.pull_request?.number ||
+              context.payload.issue?.number;
+            if (!prNumber) {
+              core.info("No PR number in payload; skipping");
+              core.setOutput("should_trigger", "false");
+              return;
+            }
+
+            // Count prior auto-trigger comments to enforce the
+            // 2-round cap. The "[auto-triggered]" marker is in
+            // every comment this workflow posts (see the next
+            // step's body); counting them gives an accurate
+            // round counter regardless of how many human
+            // @codex comments have been added.
+            const { data: comments } =
+              await github.rest.issues.listComments({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+              });
+            const autoFixCount = comments.filter(
+              (c) =>
+                c.body?.includes("@codex address that feedback") &&
+                c.body?.includes("[auto-triggered]"),
+            ).length;
+
+            if (autoFixCount >= 2) {
+              core.warning(
+                `Already auto-triggered Codex ${autoFixCount} times on PR #${prNumber}; skipping. A human can take over by commenting @codex manually.`,
+              );
+              core.setOutput("should_trigger", "false");
+              return;
+            }
+
+            core.info(
+              `PR #${prNumber}: actionable=${hasActionableFeedback}, prior auto-fixes=${autoFixCount}`,
+            );
+            core.setOutput(
+              "should_trigger",
+              hasActionableFeedback ? "true" : "false",
+            );
+            core.setOutput("pr_number", prNumber.toString());
+
+      - name: Comment on PR to trigger Codex fix
+        if: steps.check_review.outputs.should_trigger == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = parseInt(
+              "${{ steps.check_review.outputs.pr_number }}",
+              10,
+            );
+            const eventName = context.eventName;
+            const payload = context.payload;
+            const baseBody = "@codex address that feedback\n\n[auto-triggered]";
+
+            // Route the trigger reply to wherever Codex left the
+            // feedback so the bot can correlate the @-mention with
+            // the specific finding it raised:
+            //   - inline review-comment thread → reply in-thread
+            //     via createReplyForReviewComment. Codex previously
+            //     ignored PR-level @-mentions when the P1 was inline
+            //     because there was no thread linkage; the result
+            //     was P1s sitting unaddressed on PR #71 even though
+            //     the auto-fix step thought it had triggered.
+            //   - top-level pull_request_review → PR-level comment
+            //     with the review URL appended, so Codex (and any
+            //     human reading later) can jump straight to the
+            //     review summary that prompted the trigger.
+            //   - issue_comment → PR-level comment, unchanged from
+            //     the legacy behaviour.
+            if (
+              eventName === 'pull_request_review_comment' &&
+              payload.comment
+            ) {
+              await github.rest.pulls.createReplyForReviewComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber,
+                comment_id: payload.comment.id,
+                body: baseBody,
+              });
+              core.info(
+                `Auto-triggered Codex fix as inline reply on PR #${prNumber} (comment ${payload.comment.id})`,
+              );
+            } else if (
+              eventName === 'pull_request_review' &&
+              payload.review
+            ) {
+              const body =
+                `@codex address that feedback from your review (${payload.review.html_url})\n\n[auto-triggered]`;
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body,
+              });
+              core.info(
+                `Auto-triggered Codex fix on PR #${prNumber} (review ${payload.review.id})`,
+              );
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body: baseBody,
+              });
+              core.info(`Auto-triggered Codex fix on PR #${prNumber}`);
+            }
+
+  # Archive Codex post-fix summaries to the agent-memory repo so
+  # Claude conversations can read them directly instead of needing
+  # Dima to copy/paste from the PR. Triggers on every Codex
+  # issue_comment that includes a "Summary" header (the marker for
+  # a fix summary; review comments don't carry that header).
+  #
+  # The archive runs in parallel to trigger_codex_fix above —
+  # different gating, different work — but BOTH may fire on the
+  # same comment if Codex ever combines a summary with a P1/P2
+  # tag. That's harmless: the trigger job posts an @codex comment
+  # (which Codex ignores once it's already in summary mode), and
+  # this job archives the summary regardless.
+  archive_codex_summary:
+    runs-on: ubuntu-latest
+    # Serialize archive runs across the workflow. Two summaries
+    # landing simultaneously would otherwise race the git push to
+    # agent-memory; the second push would fail non-fast-forward.
+    # cancel-in-progress=false queues runs instead of killing them
+    # — every summary gets archived eventually.
+    concurrency:
+      group: codex-summary-archive
+      cancel-in-progress: false
+    if: |
+      (github.event_name == 'issue_comment' &&
+       github.event.comment.user.login == 'chatgpt-codex-connector[bot]' &&
+       contains(github.event.comment.body, 'Summary')) ||
+      (github.event_name == 'pull_request_review' &&
+       github.event.review.user.login == 'chatgpt-codex-connector[bot]' &&
+       contains(github.event.review.body, 'Summary')) ||
+      (github.event_name == 'pull_request_review_comment' &&
+       github.event.comment.user.login == 'chatgpt-codex-connector[bot]' &&
+       contains(github.event.comment.body, 'Summary'))
+
+    steps:
+      - name: Extract Codex summary
+        id: extract
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Codex emits its post-fix summary as one of three event
+            // shapes: a top-level issue_comment, a full
+            // pull_request_review submission, or an inline
+            // pull_request_review_comment on a specific line. All
+            // three carry the body + author + URL but on different
+            // payload keys; normalise here so the rest of the script
+            // doesn't branch.
+            //   - PR review:           review payload, pull_request.number
+            //   - Inline review comm.: comment payload, pull_request.number
+            //   - Issue comment (PR):  comment payload, issue.number
+            //                          (PRs are issues for the comments API)
+            let source;
+            let prNumber;
+            if (context.eventName === 'pull_request_review') {
+              source = context.payload.review;
+              prNumber = context.payload.pull_request.number;
+            } else if (context.eventName === 'pull_request_review_comment') {
+              source = context.payload.comment;
+              prNumber = context.payload.pull_request.number;
+            } else {
+              source = context.payload.comment;
+              prNumber = context.payload.issue.number;
+            }
+            const body = source.body;
+            const commentUrl = source.html_url;
+            // Use the source object's actual submitted_at/created_at
+            // timestamp rather than `new Date()` — keeps the log entry
+            // timestamp accurate even when the workflow runs slightly
+            // later than the comment/review was posted. Reviews use
+            // submitted_at, comments use created_at.
+            const commentDate =
+              source.submitted_at ?? source.created_at ?? new Date().toISOString();
+
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+            });
+
+            // Pull the "Reviewed commit: <sha>" line out of the
+            // summary body when Codex includes it. Falls back to
+            // 'unknown' so the log entry still renders.
+            const commitMatch = body.match(
+              /Reviewed commit:\s*`?([a-f0-9]+)`?/i,
+            );
+            const commit = commitMatch ? commitMatch[1] : "unknown";
+
+            core.setOutput("pr_number", prNumber.toString());
+            core.setOutput("pr_title", pr.title);
+            core.setOutput("commit", commit);
+            core.setOutput("comment_url", commentUrl);
+            core.setOutput("date", commentDate);
+
+            // Save body to a temp file. Multiline-safe and avoids
+            // shell-escaping the body (which could contain
+            // backticks, $, etc.) when it's passed downstream.
+            const fs = require("fs");
+            fs.writeFileSync("/tmp/codex-summary.md", body);
+
+      - name: Clone agent-memory
+        env:
+          PAT: ${{ secrets.AGENT_MEMORY_PAT }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PAT:-}" ]; then
+            echo "::error::AGENT_MEMORY_PAT secret is not set. See PR #57 description for setup steps."
+            exit 1
+          fi
+          git clone "https://x-access-token:${PAT}@github.com/funzi7/agent-memory.git" /tmp/agent-memory
+          cd /tmp/agent-memory
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Append entry to codex-log.md
+        env:
+          PR_NUMBER: ${{ steps.extract.outputs.pr_number }}
+          PR_TITLE: ${{ steps.extract.outputs.pr_title }}
+          COMMIT: ${{ steps.extract.outputs.commit }}
+          COMMENT_URL: ${{ steps.extract.outputs.comment_url }}
+          DATE: ${{ steps.extract.outputs.date }}
+        run: |
+          set -euo pipefail
+
+          LOG_PATH=/tmp/agent-memory/thai-rent-finder/codex-log.md
+          mkdir -p "$(dirname "$LOG_PATH")"
+
+          # Initialize file with the canonical header if missing.
+          # The header is exactly 5 content lines + trailing blank
+          # so the head/tail split below stays predictable.
+          if [ ! -f "$LOG_PATH" ]; then
+            cat > "$LOG_PATH" <<'CODEXLOG_HEADER_EOF'
+          # Codex Activity Log — thai-rent-finder
+
+          History of Codex auto-fix activities. Newest first.
+
+          ---
+
+          CODEXLOG_HEADER_EOF
+          fi
+
+          # Build the new entry. The wrapper heredoc uses unquoted
+          # CODEXLOG_ENTRY_EOF so ${PR_NUMBER} etc. expand from
+          # the env block above. $(cat ...) inlines the comment
+          # body — its contents are NOT re-expanded by bash, so
+          # any literal `$something` in the summary is safe.
+          NEW_ENTRY=$(cat <<CODEXLOG_ENTRY_EOF
+          ## PR #${PR_NUMBER} — ${PR_TITLE}
+          **Date:** ${DATE}
+          **Reviewed commit:** ${COMMIT}
+          **Source:** [PR comment](${COMMENT_URL})
+
+          $(cat /tmp/codex-summary.md)
+
+          ---
+
+          CODEXLOG_ENTRY_EOF
+          )
+
+          # Insert the new entry right after the 5-line header.
+          # Strategy:
+          #   lines 1..5 (header through `---`)
+          #   blank
+          #   new entry
+          #   lines 6..N (everything else — prior entries)
+          # Newest-first ordering preserved. printf is safer than
+          # echo here — it doesn't interpret backslash escapes
+          # regardless of shell options.
+          head -n 5 "$LOG_PATH" > /tmp/log-new.md
+          printf '\n' >> /tmp/log-new.md
+          printf '%s\n' "$NEW_ENTRY" >> /tmp/log-new.md
+          tail -n +6 "$LOG_PATH" >> /tmp/log-new.md
+
+          mv /tmp/log-new.md "$LOG_PATH"
+
+      - name: Commit and push to agent-memory
+        env:
+          PR_NUMBER: ${{ steps.extract.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+          cd /tmp/agent-memory
+          git add thai-rent-finder/codex-log.md
+          if git diff --staged --quiet; then
+            echo "No changes to codex-log.md (entry was likely a duplicate); skipping push."
+            exit 0
+          fi
+          git commit -m "chore(codex-log): archive PR #${PR_NUMBER} Codex summary"
+          # Pull-with-rebase is belt-and-suspenders against the
+          # concurrency group's serial guarantee: if a manual edit
+          # to the file happens between clone and push, rebase
+          # over it instead of failing.
+          git pull --rebase origin main
+          git push origin main
+
+  # Auto-tag @codex on issues opened by the site-health workflow (or
+  # opened manually with the same label) so its own auto-fix flow can
+  # pick them up. Codex doesn't watch raw issues — only PR comments —
+  # so without this nudge the site-health alert sits there until a
+  # human triages it.
+  #
+  # Fires on `opened` AND `labeled` so adding the label after the fact
+  # still triggers (matches how Dima would tag a manually-filed issue
+  # for Codex to pick up). Existing jobs are gated on
+  # comment/review payload shape and stay quiet on `issues` events.
+  trigger_codex_on_health_issue:
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'issues' &&
+      contains(github.event.issue.labels.*.name, 'site-health')
+    permissions:
+      issues: write
+      contents: read
+
+    steps:
+      - name: Comment to trigger Codex
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = context.payload.issue;
+
+            // Dedupe: walk existing comments for the
+            // [health-auto-trigger] marker. If we've already
+            // tagged Codex once on this issue, don't do it again
+            // even when the issue is re-labeled or re-opened.
+            // Keeps the @codex thread tidy and prevents a loop
+            // if a human flips labels during triage.
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issue.number,
+            });
+
+            const alreadyTriggered = comments.some(
+              (c) =>
+                c.body?.includes('@codex') &&
+                c.body?.includes('[health-auto-trigger]'),
+            );
+
+            if (alreadyTriggered) {
+              core.info(
+                `Issue #${issue.number} already triggered Codex, skipping`,
+              );
+              return;
+            }
+
+            // Body built via array.join('\n') to avoid a multiline
+            // template literal whose dedented content might collide
+            // with YAML's block-scalar parsing (same gotcha as
+            // site-health.yml).
+            const body = [
+              '@codex please diagnose this site health issue and propose a fix.',
+              '',
+              'If you can identify the root cause and the fix is contained (selector update, parser tweak, retry logic), open a PR.',
+              '',
+              'If manual investigation is needed (Cloudflare changes, infrastructure issues, schema changes requiring migrations), comment with your diagnosis and recommended action steps.',
+              '',
+              '[health-auto-trigger]',
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issue.number,
+              body,
+            });
+            core.info(`Triggered Codex on health issue #${issue.number}`);
