@@ -1,0 +1,7 @@
+{
+  "synced_workflows": [
+    "codex-auto-fix.yml",
+    "codex-gate.yml"
+  ],
+  "removed_workflows": []
+}
