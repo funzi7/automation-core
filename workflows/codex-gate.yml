@@ -1,0 +1,405 @@
+name: Codex Gate
+
+# Blocks PR merge until Codex provides a signal (review, comment, or
+# 👍 reaction). PRs #66 and #67 were merged within minutes of opening,
+# before Codex finished reviewing — Codex flagged P1 issues 2-5 minutes
+# later but the bugs were already on main, leading to 8 days of silent
+# failures in auto-update-state.yml and daily-checkup.yml. This gate
+# closes that race.
+#
+# How it passes:
+#   - Codex left a 👍 reaction on the PR (= no issues)
+#   - Codex posted a review/comment with no P1 marker
+#   - Codex posted a P1, then later posted a fix Summary commit
+#   - PR has label "codex-p1-acknowledged" (manual override)
+#   - 5 retry attempts (~8min) elapsed without a Codex signal (timeout)
+#
+# Re-runs itself every ~90 seconds while waiting (max 5 attempts =
+# ~8 minutes) — this used to use `schedule: */2 * * * *` but GitHub
+# only fires schedule events on a best-effort basis, often skipping
+# the first few cron ticks under load. The self-rerun loop is
+# deterministic per-PR and stops as soon as Codex posts (the
+# pull_request_review event re-triggers immediately).
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+  pull_request_review_comment:
+    types: [created, edited, deleted]
+  issue_comment:
+    types: [created, edited, deleted]
+  # Self-rerun loop entry point. The Trigger step calls
+  # createWorkflowDispatch with this workflow_id and a pr_number input
+  # — that fires a fresh run instead of attempting reRunWorkflow on
+  # the still-active run (which 403s with "This workflow is already
+  # running"). The PR-resolution step picks up the input below.
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to check (used by self-rerun)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+  # Needed so the gate can dispatch a fresh run of itself via
+  # createWorkflowDispatch when no Codex signal has landed yet.
+  actions: write
+
+jobs:
+  check-codex-status:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve PR number(s) to check
+        id: prs
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // pull_request → the PR being opened/synced
+            // pull_request_review → context.payload.pull_request
+            // pull_request_review_comment → context.payload.pull_request
+            // issue_comment → context.payload.issue (PRs are issues for
+            //   the comments API)
+            // workflow_dispatch (self-rerun loop) → no PR payload at all,
+            //   the PR number comes through as an input; parse it back
+            //   into a JS number so downstream filters compare correctly.
+            let prNumbers = [];
+
+            if (context.payload.pull_request) {
+              prNumbers = [context.payload.pull_request.number];
+            } else if (context.payload.issue?.pull_request) {
+              prNumbers = [context.payload.issue.number];
+            } else if (
+              context.eventName === 'pull_request_review_comment' &&
+              context.payload.pull_request
+            ) {
+              prNumbers = [context.payload.pull_request.number];
+            } else if (
+              context.eventName === 'workflow_dispatch' &&
+              context.payload.inputs?.pr_number
+            ) {
+              prNumbers = [parseInt(context.payload.inputs.pr_number, 10)];
+            }
+
+            core.setOutput('numbers', JSON.stringify(prNumbers));
+
+      - name: Evaluate Codex signal for each PR
+        if: steps.prs.outputs.numbers != '[]'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumbers = JSON.parse('${{ steps.prs.outputs.numbers }}');
+
+            const isCodex = (user) =>
+              user?.login === 'chatgpt-codex-connector[bot]' ||
+              user?.login === 'codex' ||
+              (user?.type === 'Bot' && user?.login?.toLowerCase().includes('codex'));
+
+            // Codex uses several P1 marker formats:
+            //   **P1** Title           (bold, top-level review)
+            //   [P1] Title             (bracketed, inline review comment)
+            //   P1: Title              (colon variant)
+            //   P1-orange?style=flat   (badge image alt-text URL fragment)
+            // Match any of these as a standalone marker (word-boundary on
+            // left via punctuation/whitespace set; non-letter on right via
+            // [:\s] or "-orange") to avoid false matches like "P10" or
+            // "P1A".
+            const p1Pattern = /(?:^|[\s>(\[*_`])(?:\*\*)?\s*\[?P1\]?\s*(?:\*\*)?(?:[:\s]|-orange)/i;
+            const fixSummaryPattern = /###\s+Summary[\s\S]+commit/i;
+            const MAX_ATTEMPTS = 5;
+
+            // Codex's own post-fix Summary blocks frequently quote
+            // earlier P1 markers verbatim (e.g. "Hardened the P1
+            // regex so P1-orange badge fragments..."). Without
+            // stripping those sections, the gate reads the Summary
+            // as a fresh P1 finding and keeps blocking the PR even
+            // after the fix landed. Strip "## Summary" and
+            // "## Testing" headings (## or ###) up to the next
+            // same-level heading or a horizontal rule, then run
+            // p1Pattern against the cleaned body. fixSummaryPattern
+            // still uses the original body — that pattern is
+            // looking *for* the Summary, not at it.
+            function stripSummarySections(body) {
+              if (!body) return '';
+              return body
+                .replace(/(?:^|\n)#{2,3}\s+Summary[\s\S]*?(?=\n#{2,3}\s|\n---|$)/gi, '')
+                .replace(/(?:^|\n)#{2,3}\s+Testing[\s\S]*?(?=\n#{2,3}\s|\n---|$)/gi, '');
+            }
+
+            // Track overall job result — fail if ANY PR is blocked
+            let anyBlocked = false;
+            const results = [];
+
+            for (const prNumber of prNumbers) {
+              const { data: pr } = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber,
+              });
+
+              // Manual override — admin can force-merge
+              if (pr.labels.some(l => l.name === 'codex-p1-acknowledged')) {
+                results.push(`PR #${prNumber}: ✅ override label present`);
+                continue;
+              }
+
+              const ageMinutes = (Date.now() - new Date(pr.created_at).getTime()) / 60000;
+
+              // Fetch reviews
+              const { data: reviews } = await github.rest.pulls.listReviews({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber,
+              });
+
+              // Fetch comments
+              const { data: comments } = await github.rest.issues.listComments({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+              });
+
+              // Fetch inline review comments — Codex frequently lands
+              // P1 findings here (line-level annotations) instead of in
+              // a top-level review body. Without this fetch, an inline-
+              // only Codex review would look like "no signal" to the
+              // gate even though the bot has already weighed in.
+              const { data: reviewComments } = await github.rest.pulls.listReviewComments({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber,
+                per_page: 100,
+              });
+
+              // Fetch PR-level reactions (👍 from Codex when no issues)
+              const { data: prReactions } = await github.rest.reactions.listForIssue({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+              });
+
+              const codexReviews = reviews.filter(r => isCodex(r.user));
+              const codexComments = comments.filter(c => isCodex(c.user));
+              const codexReviewComments = reviewComments.filter(c => isCodex(c.user));
+              const codexThumbsUp = prReactions.some(
+                r => isCodex(r.user) && r.content === '+1'
+              );
+
+              const hasAnyCodexSignal =
+                codexReviews.length > 0 ||
+                codexComments.length > 0 ||
+                codexReviewComments.length > 0 ||
+                codexThumbsUp;
+
+              // Case 1: No signal yet — count prior gate runs against
+              // this same head_sha. Each run (initial + rerun) increments
+              // the count; once we hit MAX_ATTEMPTS we time out and
+              // allow merge instead of blocking forever.
+              if (!hasAnyCodexSignal) {
+                const { data: ourRuns } = await github.rest.actions.listWorkflowRunsForRepo({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  workflow_id: 'codex-gate.yml',
+                  head_sha: pr.head.sha,
+                  per_page: 20,
+                });
+
+                const attemptsForThisPr = ourRuns.workflow_runs.filter(
+                  r => r.head_sha === pr.head.sha
+                ).length;
+
+                if (attemptsForThisPr < MAX_ATTEMPTS) {
+                  results.push(
+                    `PR #${prNumber}: ⏳ waiting for Codex (attempt ${attemptsForThisPr}/${MAX_ATTEMPTS}, ${ageMinutes.toFixed(1)}min)`
+                  );
+
+                  // Tell the follow-up steps to sleep and self-rerun.
+                  // Sleep + rerun live in separate steps because mixing
+                  // a 90s sleep into github-script burns the runner's
+                  // node process for no reason and obscures the log.
+                  //
+                  // Write directly to $GITHUB_ENV via fs.appendFileSync
+                  // instead of core.exportVariable. Functionally
+                  // equivalent (core.exportVariable does this internally)
+                  // but explicit so a future reader doesn't assume the
+                  // value is somehow buffered until step exit — every
+                  // line below is committed to disk before the next
+                  // statement runs, which matters because anyBlocked +
+                  // the eventual core.setFailed() at the end of the
+                  // step would otherwise look like they could lose the
+                  // writes.
+                  core.info('Scheduling self-rerun in 90 seconds...');
+                  const fsCore = require('fs');
+                  const envFile = process.env.GITHUB_ENV;
+                  if (envFile) {
+                    fsCore.appendFileSync(envFile, `NEEDS_RERUN=true\n`);
+                    fsCore.appendFileSync(envFile, `RERUN_PR=${prNumber}\n`);
+                    fsCore.appendFileSync(envFile, `RERUN_SHA=${pr.head.sha}\n`);
+                  }
+
+                  anyBlocked = true;
+                } else {
+                  results.push(
+                    `PR #${prNumber}: ⚠️ timeout — Codex didn't signal after ${MAX_ATTEMPTS} attempts, allowing merge`
+                  );
+                }
+                continue;
+              }
+
+              // Case 2: 👍 reaction = no issues found
+              if (
+                codexThumbsUp &&
+                codexReviews.length === 0 &&
+                codexComments.length === 0 &&
+                codexReviewComments.length === 0
+              ) {
+                results.push(`PR #${prNumber}: ✅ Codex reacted 👍 — no issues`);
+                continue;
+              }
+
+              // Case 3: Review/comment exists — check for P1
+              // bodyForP1 is the body with Summary/Testing sections
+              // stripped, used for p1Pattern matching only. body stays
+              // intact for fixSummaryPattern (which looks *for* the
+              // Summary heading) and for log lines.
+              const allBodies = [
+                ...codexReviews.map(r => ({
+                  body: r.body || '',
+                  bodyForP1: stripSummarySections(r.body || ''),
+                  date: r.submitted_at,
+                })),
+                ...codexComments.map(c => ({
+                  body: c.body || '',
+                  bodyForP1: stripSummarySections(c.body || ''),
+                  date: c.created_at,
+                })),
+                ...codexReviewComments.map(c => ({
+                  body: c.body || '',
+                  bodyForP1: stripSummarySections(c.body || ''),
+                  date: c.created_at,
+                })),
+              ].sort((a, b) => new Date(a.date) - new Date(b.date));
+
+              // Look up the latest commit on the PR head. Any P1 posted
+              // before this timestamp is treated as stale — the new
+              // commit is presumed to address it (Codex marks them
+              // "outdated" in its UI but the API still returns the
+              // body, so we have to filter by date ourselves).
+              // Without this, fix commits never clear earlier P1s
+              // unless Codex also posts a follow-up Summary, which
+              // doesn't always happen.
+              const { data: prCommits } = await github.rest.pulls.listCommits({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber,
+                per_page: 100,
+              });
+              const latestCommitDate = prCommits.length > 0
+                ? new Date(prCommits[prCommits.length - 1].commit.committer.date)
+                : new Date(pr.created_at);
+
+              const activeP1Items = allBodies.filter(
+                item => p1Pattern.test(item.bodyForP1) && new Date(item.date) > latestCommitDate
+              );
+              const hasActiveP1 = activeP1Items.length > 0;
+
+              if (!hasActiveP1) {
+                // Either no P1 ever, or all P1s predate the latest commit.
+                const totalP1Count = allBodies.filter(
+                  item => p1Pattern.test(item.bodyForP1)
+                ).length;
+                if (totalP1Count > 0) {
+                  results.push(
+                    `PR #${prNumber}: ✅ Codex P1s found but all stale (before latest commit at ${latestCommitDate.toISOString()})`
+                  );
+                } else {
+                  results.push(`PR #${prNumber}: ✅ Codex reviewed — no P1`);
+                }
+                continue;
+              }
+
+              // Case 4: Active P1 found — was it followed by a fix
+              // Summary from Codex? Both must be after latestCommitDate
+              // for the fix to count against this iteration.
+              let lastActiveP1Date = null;
+              let lastFixDate = null;
+              for (const item of allBodies) {
+                const itemDate = new Date(item.date);
+                if (itemDate <= latestCommitDate) continue;
+                if (p1Pattern.test(item.bodyForP1)) lastActiveP1Date = item.date;
+                // fixSummaryPattern uses the original body — we *want*
+                // the Summary heading here.
+                if (fixSummaryPattern.test(item.body)) lastFixDate = item.date;
+              }
+
+              if (lastFixDate && new Date(lastFixDate) > new Date(lastActiveP1Date)) {
+                results.push(`PR #${prNumber}: ✅ Codex P1 followed by fix Summary`);
+                continue;
+              }
+
+              // Active P1 unresolved
+              results.push(
+                `PR #${prNumber}: ❌ Codex P1 unresolved (last active P1: ${lastActiveP1Date}, last fix: ${lastFixDate || 'none'}, latest commit: ${latestCommitDate.toISOString()})`
+              );
+              anyBlocked = true;
+            }
+
+            core.summary.addHeading('Codex Gate Results').addList(results).write();
+            results.forEach(r => core.info(r));
+
+            if (anyBlocked) {
+              core.setFailed(
+                'One or more PRs blocked by Codex Gate.\n' +
+                'Resolve by:\n' +
+                '  1. Wait for Codex to signal (auto-reruns every 90s, max 5 attempts)\n' +
+                '  2. Comment "@codex address that feedback" if P1 found\n' +
+                '  3. Add label "codex-p1-acknowledged" to override'
+              );
+            }
+
+      # always() is required: the previous step calls core.setFailed()
+      # whenever it blocks the gate, which sets the step outcome to
+      # failure. Without always(), GitHub implicitly wraps the if as
+      # `success() && <expr>` and skips this step — exactly the no-op
+      # we observed where Sleep + Trigger always reported "skipped".
+      - name: Sleep before rerun
+        if: always() && env.NEEDS_RERUN == 'true'
+        run: |
+          echo "Waiting 90 seconds before triggering rerun..."
+          sleep 90
+
+      # createWorkflowDispatch instead of reRunWorkflow: reRun returns
+      # 403 "This workflow is already running" because the active run
+      # hasn't terminated yet. Dispatching a fresh run sidesteps the
+      # rule entirely and shows up in the Actions tab as a new entry
+      # tagged "Triggered via workflow_dispatch", which makes the loop
+      # easier to follow than a "Re-run #N" indicator on the same row.
+      #
+      # ref defaults to the PR head SHA (so the dispatched run sees the
+      # same commit Codex was reviewing) but falls back to 'main' when
+      # the env var is unset (e.g. early-iteration safety net). The
+      # workflow file itself always loads from the ref, so a PR that
+      # modifies codex-gate.yml self-tests its own changes.
+      - name: Trigger self-rerun via workflow_dispatch
+        if: always() && env.NEEDS_RERUN == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = process.env.RERUN_PR;
+            const ref = process.env.RERUN_SHA || 'main';
+            core.info(
+              `Dispatching new gate run for PR #${prNumber} at ref ${ref}`,
+            );
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'codex-gate.yml',
+              ref,
+              inputs: {
+                pr_number: prNumber,
+              },
+            });
