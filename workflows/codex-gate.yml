@@ -238,7 +238,12 @@ jobs:
                   if (envFile) {
                     fsCore.appendFileSync(envFile, `NEEDS_RERUN=true\n`);
                     fsCore.appendFileSync(envFile, `RERUN_PR=${prNumber}\n`);
-                    fsCore.appendFileSync(envFile, `RERUN_SHA=${pr.head.sha}\n`);
+                    // Store the head BRANCH NAME, not the SHA — workflow_dispatch
+                    // requires `ref` to be a branch or tag name and rejects a raw
+                    // SHA with 422 ("No ref found"). For same-repo PRs pr.head.ref
+                    // is a real branch in this repo, so dispatching against it
+                    // reaches the same commit Codex was reviewing.
+                    fsCore.appendFileSync(envFile, `RERUN_BRANCH=${pr.head.ref}\n`);
                   }
 
                   anyBlocked = true;
@@ -379,18 +384,21 @@ jobs:
       # tagged "Triggered via workflow_dispatch", which makes the loop
       # easier to follow than a "Re-run #N" indicator on the same row.
       #
-      # ref defaults to the PR head SHA (so the dispatched run sees the
-      # same commit Codex was reviewing) but falls back to 'main' when
-      # the env var is unset (e.g. early-iteration safety net). The
-      # workflow file itself always loads from the ref, so a PR that
-      # modifies codex-gate.yml self-tests its own changes.
+      # ref MUST be a branch or tag name — workflow_dispatch rejects a
+      # raw SHA with 422 ("No ref found"), which used to leave the gate
+      # red instead of self-rerunning. We dispatch against the PR head
+      # branch (RERUN_BRANCH from the evaluator step) so the dispatched
+      # run sees the same commit Codex was reviewing. Falls back to
+      # 'main' when the env var is unset (e.g. early-iteration safety
+      # net). The workflow file itself always loads from the ref, so a
+      # PR that modifies codex-gate.yml self-tests its own changes.
       - name: Trigger self-rerun via workflow_dispatch
         if: always() && env.NEEDS_RERUN == 'true'
         uses: actions/github-script@v7
         with:
           script: |
             const prNumber = process.env.RERUN_PR;
-            const ref = process.env.RERUN_SHA || 'main';
+            const ref = process.env.RERUN_BRANCH || 'main';
             core.info(
               `Dispatching new gate run for PR #${prNumber} at ref ${ref}`,
             );
