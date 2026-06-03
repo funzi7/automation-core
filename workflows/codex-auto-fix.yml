@@ -324,18 +324,24 @@ jobs:
           COMMIT: ${{ steps.extract.outputs.commit }}
           COMMENT_URL: ${{ steps.extract.outputs.comment_url }}
           DATE: ${{ steps.extract.outputs.date }}
+          # Derived per-repo so the log lives under the running repo's
+          # name in agent-memory instead of a hard-coded directory.
+          REPO_NAME: ${{ github.event.repository.name }}
         run: |
           set -euo pipefail
 
-          LOG_PATH=/tmp/agent-memory/thai-rent-finder/codex-log.md
+          LOG_PATH=/tmp/agent-memory/${REPO_NAME}/codex-log.md
           mkdir -p "$(dirname "$LOG_PATH")"
 
           # Initialize file with the canonical header if missing.
           # The header is exactly 5 content lines + trailing blank
           # so the head/tail split below stays predictable.
+          # Heredoc delimiter is intentionally unquoted so ${REPO_NAME}
+          # expands in the header. No other $… tokens appear here, so
+          # there's nothing else to escape.
           if [ ! -f "$LOG_PATH" ]; then
-            cat > "$LOG_PATH" <<'CODEXLOG_HEADER_EOF'
-          # Codex Activity Log — thai-rent-finder
+            cat > "$LOG_PATH" <<CODEXLOG_HEADER_EOF
+          # Codex Activity Log — ${REPO_NAME}
 
           History of Codex auto-fix activities. Newest first.
 
@@ -381,10 +387,11 @@ jobs:
       - name: Commit and push to agent-memory
         env:
           PR_NUMBER: ${{ steps.extract.outputs.pr_number }}
+          REPO_NAME: ${{ github.event.repository.name }}
         run: |
           set -euo pipefail
           cd /tmp/agent-memory
-          git add thai-rent-finder/codex-log.md
+          git add "${REPO_NAME}/codex-log.md"
           if git diff --staged --quiet; then
             echo "No changes to codex-log.md (entry was likely a duplicate); skipping push."
             exit 0
