@@ -1,10 +1,15 @@
 name: Codex Auto-Fix
 
-# Auto-respond to Codex bot reviews with `@codex address that
-# feedback` so Codex (which already does automatic reviews on
-# every PR) also drives its own follow-up commit when it flags
-# P1 or P2 issues. Without this workflow, every Codex review
-# requires a human to type the trigger comment manually.
+# Auto-respond to Codex bot reviews with `@codex fix` so Codex
+# (which already does automatic reviews on every PR) also drives
+# its own follow-up commit when it flags P1 or P2 issues. Without
+# this workflow, every Codex review requires a human to type the
+# trigger comment manually.
+#
+# The trigger phrase MUST be the literal "@codex fix" on its own
+# first line — empirically that's the only phrase that produces
+# a fix commit. "@codex address that feedback" was a no-op;
+# "@codex review" only re-reviews.
 #
 # Safety rails:
 #   - Only fires on comments from chatgpt-codex-connector[bot].
@@ -109,16 +114,27 @@ jobs:
             // step's body); counting them gives an accurate
             // round counter regardless of how many human
             // @codex comments have been added.
-            const { data: comments } =
-              await github.rest.issues.listComments({
+            //
+            // Paginate: the default page size is 30, so on
+            // chatty PRs the older auto-trigger comments would
+            // silently drop off and the circuit breaker would
+            // think we were on round 0 forever.
+            const comments = await github.paginate(
+              github.rest.issues.listComments,
+              {
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: prNumber,
-              });
+                per_page: 100,
+              }
+            );
+            // Match purely on the "[auto-triggered]" marker so
+            // the circuit breaker stays correct if the trigger
+            // phrase ever rotates (it just did: "@codex address
+            // that feedback" → "@codex fix"). Old comments still
+            // carry the marker and still count.
             const autoFixCount = comments.filter(
-              (c) =>
-                c.body?.includes("@codex address that feedback") &&
-                c.body?.includes("[auto-triggered]"),
+              (c) => c.body?.includes("[auto-triggered]"),
             ).length;
 
             if (autoFixCount >= 2) {
@@ -149,7 +165,17 @@ jobs:
             );
             const eventName = context.eventName;
             const payload = context.payload;
-            const baseBody = "@codex address that feedback\n\n[auto-triggered]";
+            // First line is the bare phrase "@codex fix" — that is
+            // the trigger Codex actually responds to with a fix
+            // commit. The earlier phrase "@codex address that
+            // feedback" was a no-op: empirically it did not produce
+            // any push. "@codex review" only re-reviews. Keep this
+            // first line literal and unembellished so Codex's
+            // parser sees the trigger cleanly.
+            //
+            // "[auto-triggered]" stays on a later line as the
+            // marker the circuit-breaker (previous step) counts.
+            const baseBody = "@codex fix\n\n[auto-triggered]";
 
             // Route the trigger reply to wherever Codex left the
             // feedback so the bot can correlate the @-mention with
@@ -161,9 +187,10 @@ jobs:
             //     was P1s sitting unaddressed on PR #71 even though
             //     the auto-fix step thought it had triggered.
             //   - top-level pull_request_review → PR-level comment
-            //     with the review URL appended, so Codex (and any
-            //     human reading later) can jump straight to the
-            //     review summary that prompted the trigger.
+            //     with the review URL appended AFTER the
+            //     [auto-triggered] marker (so the trigger phrase
+            //     stays on the first line); Codex (and any human
+            //     reading later) can still jump to the review.
             //   - issue_comment → PR-level comment, unchanged from
             //     the legacy behaviour.
             if (
@@ -185,7 +212,7 @@ jobs:
               payload.review
             ) {
               const body =
-                `@codex address that feedback from your review (${payload.review.html_url})\n\n[auto-triggered]`;
+                `@codex fix\n\n[auto-triggered]\n\n(review: ${payload.review.html_url})`;
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
