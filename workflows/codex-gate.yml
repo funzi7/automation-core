@@ -99,16 +99,23 @@ jobs:
               user?.login === 'codex' ||
               (user?.type === 'Bot' && user?.login?.toLowerCase().includes('codex'));
 
-            // Codex uses several P1 marker formats:
-            //   **P1** Title           (bold, top-level review)
-            //   [P1] Title             (bracketed, inline review comment)
-            //   P1: Title              (colon variant)
-            //   P1-orange?style=flat   (badge image alt-text URL fragment)
-            // Match any of these as a standalone marker (word-boundary on
-            // left via punctuation/whitespace set; non-letter on right via
-            // [:\s] or "-orange") to avoid false matches like "P10" or
-            // "P1A".
-            const p1Pattern = /(?:^|[\s>(\[*_`])(?:\*\*)?\s*\[?P1\]?\s*(?:\*\*)?(?:[:\s]|-orange)/i;
+            // Codex marks P1 findings exactly two ways:
+            //   - "P1-orange" image-badge URL fragment (appears
+            //     anywhere in the body — the badge can be inline)
+            //   - A line-leading severity label after optional
+            //     markdown line-prefixes (whitespace, blockquote >,
+            //     list markers, _ * ` # ): **P1**, [P1], or P1:
+            // The regex has two top-level alternatives matching
+            // exactly those. Prose that merely contains the
+            // literal token "P1" (e.g. "the P1 issue is fixed"
+            // mid-sentence, or quoted P1 references inside a
+            // stripped Summary block that survived stripping)
+            // MUST NOT match — only a real badge or a real
+            // line-leading severity label. This is tighter than
+            // the earlier `(?:^|[\s>(\[*_`])...` form which fired
+            // on any whitespace-prefixed P1 token regardless of
+            // line position.
+            const p1Pattern = /(?:P1-orange|(?:^|\n)[\s>*\-_#`]*(?:\*\*\s*P1\s*\*\*|\[P1\]|P1:))/i;
             const fixSummaryPattern = /###\s+Summary[\s\S]+commit/i;
             const MAX_ATTEMPTS = 5;
 
@@ -149,19 +156,36 @@ jobs:
 
               const ageMinutes = (Date.now() - new Date(pr.created_at).getTime()) / 60000;
 
-              // Fetch reviews
-              const { data: reviews } = await github.rest.pulls.listReviews({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                pull_number: prNumber,
-              });
+              // Fetch reviews — paginate. The default page size is 30,
+              // and on long-running PRs (or repos with chatty bots)
+              // there can easily be more than 30 reviews. A single
+              // listReviews call would silently drop older pages,
+              // including the very first Codex review where a P1 was
+              // raised, and the gate would conclude "no P1 ever".
+              const reviews = await github.paginate(
+                github.rest.pulls.listReviews,
+                {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: prNumber,
+                  per_page: 100,
+                }
+              );
 
-              // Fetch comments
-              const { data: comments } = await github.rest.issues.listComments({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: prNumber,
-              });
+              // Fetch comments — paginate for the same reason as
+              // reviews above. The 30-per-page default silently
+              // truncated older pages, so a Codex P1 that landed in
+              // a comment early in the PR's life would disappear
+              // from view once the PR accrued 30+ comments.
+              const comments = await github.paginate(
+                github.rest.issues.listComments,
+                {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: prNumber,
+                  per_page: 100,
+                }
+              );
 
               // Fetch inline review comments — Codex frequently lands
               // P1 findings here (line-level annotations) instead of in
@@ -313,7 +337,64 @@ jobs:
               const hasActiveP1 = activeP1Items.length > 0;
 
               if (!hasActiveP1) {
-                // Either no P1 ever, or all P1s predate the latest commit.
+                // Synchronize-race guard: even with no active P1, we
+                // must NOT pass unless Codex has actually re-reviewed
+                // the latest head. After a `synchronize` push, the
+                // prior Codex review is stale (it reviewed the old
+                // code). Without this guard the gate would pass on a
+                // pre-commit "no P1" signal — and a fresh P1 in the
+                // new code would land on a green PR.
+                //
+                // Require at least one Codex signal (review body,
+                // top-level comment, or inline review comment) dated
+                // AFTER latestCommitDate. If none exists, fall into
+                // the same wait/self-rerun/timeout path Case 1 uses,
+                // so the gate keeps waiting (up to MAX_ATTEMPTS) for
+                // Codex to re-review the new head.
+                const hasPostCommitCodexSignal = allBodies.some(
+                  item => new Date(item.date) > latestCommitDate
+                );
+
+                if (!hasPostCommitCodexSignal) {
+                  const { data: ourRuns } = await github.rest.actions.listWorkflowRunsForRepo({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    workflow_id: 'codex-gate.yml',
+                    head_sha: pr.head.sha,
+                    per_page: 20,
+                  });
+
+                  const attemptsForThisPr = ourRuns.workflow_runs.filter(
+                    r => r.head_sha === pr.head.sha
+                  ).length;
+
+                  if (attemptsForThisPr < MAX_ATTEMPTS) {
+                    results.push(
+                      `PR #${prNumber}: ⏳ Codex signal is pre-commit, waiting for re-review (attempt ${attemptsForThisPr}/${MAX_ATTEMPTS}, ${ageMinutes.toFixed(1)}min)`
+                    );
+
+                    core.info('Scheduling self-rerun in 90 seconds...');
+                    const fsCore = require('fs');
+                    const envFile = process.env.GITHUB_ENV;
+                    if (envFile) {
+                      fsCore.appendFileSync(envFile, `NEEDS_RERUN=true\n`);
+                      fsCore.appendFileSync(envFile, `RERUN_PR=${prNumber}\n`);
+                      fsCore.appendFileSync(envFile, `RERUN_BRANCH=${pr.head.ref}\n`);
+                    }
+
+                    anyBlocked = true;
+                  } else {
+                    // Preserve the existing fail-open behavior at
+                    // MAX_ATTEMPTS so a wedged Codex doesn't block
+                    // PRs forever.
+                    results.push(
+                      `PR #${prNumber}: ⚠️ timeout — Codex didn't re-review after ${MAX_ATTEMPTS} attempts, allowing merge`
+                    );
+                  }
+                  continue;
+                }
+
+                // Real pass: have a post-commit Codex signal AND no active P1.
                 const totalP1Count = allBodies.filter(
                   item => p1Pattern.test(item.bodyForP1)
                 ).length;
@@ -361,7 +442,7 @@ jobs:
                 'One or more PRs blocked by Codex Gate.\n' +
                 'Resolve by:\n' +
                 '  1. Wait for Codex to signal (auto-reruns every 90s, max 5 attempts)\n' +
-                '  2. Comment "@codex address that feedback" if P1 found\n' +
+                '  2. Comment "@codex fix" if P1 found\n' +
                 '  3. Add label "codex-p1-acknowledged" to override'
               );
             }
