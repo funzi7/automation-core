@@ -31,6 +31,21 @@ name: Minutes Guard
 #     state/minutes-guard.json so re-enable only restores what the
 #     guard itself disabled — workflows you disabled manually
 #     stay disabled.
+#   - H1: only refs/heads/main may write. Any other ref is forced
+#     into effective dry-run (no disable/enable, no state commit),
+#     so branch-dispatch previews can never mutate remote state.
+#   - H2: a cooldown after re-enable, plus ignoring runs older than
+#     state.last_enable_at when counting billing-kills, prevents
+#     re-pausing right after a billing reset on stale pre-reset
+#     failures.
+#   - H3: re-enable removes an entry from state only on actual
+#     success (2xx) or a CONFIRMED 404 (i.e. the workflow truly no
+#     longer exists — verified by a follow-up getWorkflow read).
+#     A bare 404 from enableWorkflow is ambiguous (could be
+#     auth/permission/transient) so it's treated as 'failed' unless
+#     confirmed by the second read. Transient / 5xx / rate-limit
+#     errors keep the entry around for the next attempt instead of
+#     being lost to a wholesale map-clear.
 
 on:
   schedule:
@@ -71,6 +86,11 @@ env:
   BILLING_KILL_MAX_DURATION_SEC: '15'
   RUNS_PER_REPO: '15'
   MONTHLY_REENABLE_CRON: '5 0 1 * *'
+  # H2: after a re-enable, skip detection entirely for this many
+  # minutes so we don't immediately re-pause on pre-reset stale
+  # failures that are still inside the runs window. 90min covers
+  # the 5-attempt codex-gate self-rerun loop with margin.
+  COOLDOWN_MINUTES: '90'
 
 jobs:
   guard:
@@ -89,20 +109,14 @@ jobs:
       - name: Run guard
         id: guard
         uses: actions/github-script@v7
-        env:
-          CROSS_REPO_PAT: ${{ secrets.CROSS_REPO_PAT }}
-          INPUT_FORCE_ENABLE: ${{ inputs.force_enable }}
-          INPUT_DRY_RUN: ${{ inputs.dry_run }}
-          TRIGGERED_BY_SCHEDULE: ${{ github.event.schedule }}
-          THIS_REPO: ${{ github.repository }}
-          TARGET_REPOS: ${{ env.TARGET_REPOS }}
-          STATE_FILE: ${{ env.STATE_FILE }}
-          PAUSE_THRESHOLD_FAILURES: ${{ env.PAUSE_THRESHOLD_FAILURES }}
-          PAUSE_LOOKBACK_HOURS: ${{ env.PAUSE_LOOKBACK_HOURS }}
-          BILLING_KILL_MAX_DURATION_SEC: ${{ env.BILLING_KILL_MAX_DURATION_SEC }}
-          RUNS_PER_REPO: ${{ env.RUNS_PER_REPO }}
-          MONTHLY_REENABLE_CRON: ${{ env.MONTHLY_REENABLE_CRON }}
         with:
+          # Every octokit call in this script is cross-repo (the targets
+          # are private repos owned by funzi7). The repo's own
+          # GITHUB_TOKEN only has scope on automation-core itself and
+          # cannot disable workflows elsewhere, so we authenticate the
+          # built-in Octokit as CROSS_REPO_PAT for the whole script.
+          # State-file commit is a separate step that uses the same PAT.
+          github-token: ${{ secrets.CROSS_REPO_PAT }}
           script: |
             const fs = require('fs');
             const path = require('path');
@@ -113,6 +127,7 @@ jobs:
             const PAUSE_LOOKBACK_HOURS = parseInt(process.env.PAUSE_LOOKBACK_HOURS, 10);
             const BILLING_KILL_MAX_DURATION_SEC = parseInt(process.env.BILLING_KILL_MAX_DURATION_SEC, 10);
             const RUNS_PER_REPO = parseInt(process.env.RUNS_PER_REPO, 10);
+            const COOLDOWN_MINUTES = parseInt(process.env.COOLDOWN_MINUTES, 10);
             const MONTHLY_REENABLE_CRON = process.env.MONTHLY_REENABLE_CRON;
             const THIS_REPO = process.env.THIS_REPO;
 
@@ -141,22 +156,44 @@ jobs:
             }
             core.info(`Targets: ${targets.join(', ')}`);
 
-            // ---- Cross-repo client (CROSS_REPO_PAT) ----
-            const pat = process.env.CROSS_REPO_PAT;
-            if (!pat) {
+            // ---- CROSS_REPO_PAT presence check ----
+            // We don't construct a separate Octokit from the PAT (the
+            // step's github-token: input already auths the built-in
+            // `github` client with it). But if the secret is empty,
+            // `github` would silently fall back to GITHUB_TOKEN and
+            // every cross-repo write would 404/403. Fail fast with the
+            // README pointer.
+            if (!process.env.CROSS_REPO_PAT) {
               core.setFailed(
                 'CROSS_REPO_PAT secret is not set on this repo. See ' +
                 'README → "Setup (one-time)" for the fine-grained PAT instructions.'
               );
               return;
             }
-            const xgh = require('@actions/github').getOctokit(pat);
+            const xgh = github;
 
             // ---- Mode selection ----
             const inputs = {
               force_enable: process.env.INPUT_FORCE_ENABLE === 'true',
               dry_run: process.env.INPUT_DRY_RUN === 'true',
             };
+
+            // H1: non-main = read-only. Only refs/heads/main may write.
+            // Any other ref (workflow_dispatch on a feature branch / PR
+            // preview / fix branch) is forced into effective dry-run so
+            // it can never disable or enable a workflow or commit state.
+            // The downstream code respects inputs.dry_run for both the
+            // API writes (safeDisable/safeEnable) AND the state commit
+            // (stateChanged stays false → commit step skipped).
+            const refIsMain = process.env.GITHUB_REF === 'refs/heads/main';
+            if (!refIsMain) {
+              core.info(
+                `Non-main ref (${process.env.GITHUB_REF || 'unset'}) — forcing effective ` +
+                `dry-run: will not disable, enable, or commit state. Only refs/heads/main may write.`
+              );
+              inputs.dry_run = true;
+            }
+
             const triggeredSchedule = process.env.TRIGGERED_BY_SCHEDULE || '';
             let mode;
             if (inputs.force_enable) mode = 're-enable';
@@ -277,30 +314,88 @@ jobs:
               }
             }
 
+            // H3: return a structured outcome so the re-enable loop can
+            // decide per-workflow whether to clear the state entry or
+            // keep it for retry. We classify:
+            //   'ok'      → 2xx success, remove entry
+            //   'gone'    → CONFIRMED 404: the enableWorkflow call
+            //               returned 404 AND a follow-up getWorkflow
+            //               also returned 404, so the workflow truly
+            //               no longer exists. Remove entry.
+            //   'failed'  → any other error, including a bare 404
+            //               from enableWorkflow where the confirming
+            //               getWorkflow read says the workflow still
+            //               exists (auth/permission/transient). KEEP
+            //               the entry so the next run / next month
+            //               retries it. P1 fix from PR #8 review.
+            //   'dry-run' → no API call made; keep state untouched
             async function safeEnable(owner, repo, wf) {
               if (inputs.dry_run) {
                 core.info(`[DRY-RUN] would re-enable ${owner}/${repo} ${wf.path} (id=${wf.id})`);
-                return { acted: true };
+                return { outcome: 'dry-run' };
               }
               try {
                 await xgh.rest.actions.enableWorkflow({ owner, repo, workflow_id: wf.id });
-                core.info(`Re-enabled ${owner}/${repo} ${wf.path} (id=${wf.id})`);
-                return { acted: true };
+                core.info(`Re-enabled ${owner}/${repo} ${wf.path} (id=${wf.id}) — enabled`);
+                return { outcome: 'ok' };
               } catch (e) {
                 if (e.status === 404) {
-                  core.info(`Workflow gone (404): ${owner}/${repo} id=${wf.id}; skipping`);
-                  return { acted: false };
+                  // 404 from enableWorkflow is AMBIGUOUS:
+                  //   (a) the workflow file was deleted from the repo,
+                  //   (b) the PAT lost access / lacks Actions:write,
+                  //   (c) a transient API blip surfaced as 404.
+                  // Naively treating every 404 as 'gone' would drop
+                  // the retry record from state while the workflow
+                  // stays disabled in the repo — it would then never
+                  // get re-enabled and the cron would stay down
+                  // forever. Confirm with a follow-up getWorkflow
+                  // read; only if THAT also 404s do we believe the
+                  // workflow is truly gone.
+                  try {
+                    await xgh.rest.actions.getWorkflow({
+                      owner, repo, workflow_id: wf.id,
+                    });
+                    // Confirming read succeeded → the workflow still
+                    // exists; the original 404 was auth/permission/
+                    // transient. Keep the entry for retry.
+                    core.warning(
+                      `Enable returned 404 but workflow still exists ` +
+                      `(auth/permission/transient): ` +
+                      `${owner}/${repo} ${wf.path} (id=${wf.id}) — kept-for-retry`
+                    );
+                    return { outcome: 'failed', status: 404 };
+                  } catch (e2) {
+                    if (e2.status === 404) {
+                      core.info(
+                        `Workflow gone-confirmed (404 on getWorkflow too): ` +
+                        `${owner}/${repo} ${wf.path} (id=${wf.id}) — removing from state`
+                      );
+                      return { outcome: 'gone', status: 404 };
+                    }
+                    // Confirming read errored with something other
+                    // than 404 (network, 5xx, rate limit). Be
+                    // conservative: KEEP the entry — better to retry
+                    // next cycle than strand a disabled workflow.
+                    core.warning(
+                      `Enable returned 404 and confirming getWorkflow errored ` +
+                      `(status=${e2.status}, msg=${e2.message}): ` +
+                      `${owner}/${repo} ${wf.path} (id=${wf.id}) — kept-for-retry (conservative)`
+                    );
+                    return { outcome: 'failed', status: e2.status };
+                  }
                 }
                 core.warning(
-                  `Enable failed for ${owner}/${repo} ${wf.path}: status=${e.status} msg=${e.message}`
+                  `Enable failed for ${owner}/${repo} ${wf.path}: ` +
+                  `status=${e.status} msg=${e.message} — kept-for-retry`
                 );
-                return { acted: false };
+                return { outcome: 'failed', status: e.status };
               }
             }
 
             // ---- Run summary helper ----
             const summary = core.summary.addHeading('Minutes Guard run');
             summary.addRaw(`**Mode:** ${mode}${inputs.dry_run ? ' (DRY-RUN — no writes)' : ''}\n\n`);
+            summary.addRaw(`**Ref:** ${process.env.GITHUB_REF || 'unset'}\n\n`);
             summary.addRaw(`**Targets:** ${targets.join(', ')}\n\n`);
 
             // ---- RE-ENABLE MODE ----
@@ -316,16 +411,46 @@ jobs:
                   lines.push(`${target}: nothing recorded as disabled-by-guard`);
                   continue;
                 }
-                let n = 0;
+                // H3: per-workflow outcome tracking. `keep` collects
+                // entries we did NOT successfully retire (failed
+                // attempts + dry-run no-ops), so they survive into the
+                // next state.
+                const keep = [];
+                let ok = 0, gone = 0, failed = 0, dryRun = 0;
                 for (const wf of recorded) {
                   const r = await safeEnable(owner, repo, wf);
-                  if (r.acted) n += 1;
+                  if (r.outcome === 'ok') {
+                    ok += 1;
+                  } else if (r.outcome === 'gone') {
+                    gone += 1;
+                  } else if (r.outcome === 'failed') {
+                    failed += 1;
+                    keep.push(wf);
+                  } else { // 'dry-run'
+                    dryRun += 1;
+                    keep.push(wf);
+                  }
                 }
-                lines.push(`${target}: re-enabled ${n} of ${recorded.length} recorded workflow(s)`);
-                if (n > 0) anyEnabled = true;
+                if (!inputs.dry_run) {
+                  state.disabled_by_guard[target] = keep;
+                  if (keep.length !== recorded.length) stateChanged = true;
+                  if (keep.length === 0) {
+                    // tidy: don't leave empty arrays in the map
+                    delete state.disabled_by_guard[target];
+                  }
+                }
+                const dryNote = inputs.dry_run ? ' (dry-run; state unchanged)' : '';
+                lines.push(
+                  `${target}: ok=${ok}, gone=${gone}, failed=${failed}, ` +
+                  `kept=${keep.length}/${recorded.length}${dryNote}`
+                );
+                if (ok > 0) anyEnabled = true;
               }
+              // H3: only set last_enable_at when at least one workflow
+              // actually got re-enabled. Don't wipe disabled_by_guard
+              // wholesale — per-target `keep` arrays above retain the
+              // transient-failure entries for retry.
               if (anyEnabled && !inputs.dry_run) {
-                state.disabled_by_guard = {};
                 state.last_enable_at = new Date().toISOString();
                 stateChanged = true;
               }
@@ -333,7 +458,33 @@ jobs:
             }
             // ---- DETECT MODE (and DETECT-DRY-RUN) ----
             else {
+              // H2: cooldown short-circuit. If we just re-enabled, any
+              // billing-kills in the runs window are by definition
+              // pre-reset (the new commit hasn't had time to fail yet),
+              // so don't even bother counting them.
+              if (state.last_enable_at) {
+                const sinceMin = (Date.now() - new Date(state.last_enable_at).getTime()) / 60000;
+                if (sinceMin < COOLDOWN_MINUTES) {
+                  summary.addRaw(
+                    `**Cooldown:** ${sinceMin.toFixed(1)}min since last re-enable ` +
+                    `(${state.last_enable_at}) is under COOLDOWN_MINUTES=${COOLDOWN_MINUTES} — ` +
+                    `skipping detection.\n`
+                  );
+                  await summary.write();
+                  core.setOutput('state_changed', 'false');
+                  return;
+                }
+              }
+
+              // H2: also clamp the runs-window cutoff to last_enable_at,
+              // so even outside the cooldown we never count pre-reset
+              // failures that happen to fall inside PAUSE_LOOKBACK_HOURS.
               const cutoffMs = Date.now() - PAUSE_LOOKBACK_HOURS * 60 * 60 * 1000;
+              const lastEnableMs = state.last_enable_at
+                ? new Date(state.last_enable_at).getTime()
+                : 0;
+              const effectiveCutoffMs = Math.max(cutoffMs, lastEnableMs);
+
               let accountQuotaExhausted = false;
               const detectLines = [];
 
@@ -351,7 +502,7 @@ jobs:
                 let billingKilledCount = 0;
                 for (const run of runs) {
                   const ranAt = new Date(run.run_started_at || run.created_at).getTime();
-                  if (ranAt < cutoffMs) continue;
+                  if (ranAt < effectiveCutoffMs) continue;
                   if (await runIsBillingKilled(owner, repo, run)) billingKilledCount += 1;
                 }
                 detectLines.push(
@@ -362,9 +513,13 @@ jobs:
                   accountQuotaExhausted = true;
                 }
               }
+              const enableNote = state.last_enable_at
+                ? `, after-re-enable=${state.last_enable_at}`
+                : '';
               summary.addRaw(
                 `**Detection** (lookback=${PAUSE_LOOKBACK_HOURS}h, ` +
-                `threshold=${PAUSE_THRESHOLD_FAILURES}, dur<${BILLING_KILL_MAX_DURATION_SEC}s):\n\n`
+                `threshold=${PAUSE_THRESHOLD_FAILURES}, dur<${BILLING_KILL_MAX_DURATION_SEC}s` +
+                `${enableNote}):\n\n`
               );
               summary.addList(detectLines);
 
@@ -440,6 +595,20 @@ jobs:
             } else {
               core.setOutput('state_changed', 'false');
             }
+        env:
+          CROSS_REPO_PAT: ${{ secrets.CROSS_REPO_PAT }}
+          INPUT_FORCE_ENABLE: ${{ inputs.force_enable }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+          TRIGGERED_BY_SCHEDULE: ${{ github.event.schedule }}
+          THIS_REPO: ${{ github.repository }}
+          TARGET_REPOS: ${{ env.TARGET_REPOS }}
+          STATE_FILE: ${{ env.STATE_FILE }}
+          PAUSE_THRESHOLD_FAILURES: ${{ env.PAUSE_THRESHOLD_FAILURES }}
+          PAUSE_LOOKBACK_HOURS: ${{ env.PAUSE_LOOKBACK_HOURS }}
+          BILLING_KILL_MAX_DURATION_SEC: ${{ env.BILLING_KILL_MAX_DURATION_SEC }}
+          RUNS_PER_REPO: ${{ env.RUNS_PER_REPO }}
+          MONTHLY_REENABLE_CRON: ${{ env.MONTHLY_REENABLE_CRON }}
+          COOLDOWN_MINUTES: ${{ env.COOLDOWN_MINUTES }}
 
       - name: Commit state changes
         if: steps.guard.outputs.state_changed == 'true'
@@ -449,7 +618,9 @@ jobs:
           set -euo pipefail
           # Only push state back when we're running on the canonical
           # branch — branch-dispatch runs (e.g. PR previews) should not
-          # mutate main's state file.
+          # mutate main's state file. This is the bash-side belt to H1's
+          # JS-side suspenders; together they make non-main writes
+          # impossible.
           if [ "$GITHUB_REF" != "refs/heads/main" ]; then
             echo "::notice::Not on main (ref=$GITHUB_REF) — skipping state commit"
             exit 0
