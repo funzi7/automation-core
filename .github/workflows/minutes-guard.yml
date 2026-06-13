@@ -82,9 +82,22 @@ env:
     funzi7/thai-rent-finder
   STATE_FILE: state/minutes-guard.json
   PAUSE_THRESHOLD_FAILURES: '3'
-  PAUSE_LOOKBACK_HOURS: '2'
+  # 24h window. The poll fires every 2h and scrapers run once a day,
+  # so a 2h window rarely holds 3 kills even on an exhausted account
+  # (a 2026-06-13 dry-run reported 2/0 over 2h, "no exhaustion",
+  # while the account was actually out of minutes). 24h reliably
+  # crosses the threshold because the every-2h poll alone produces
+  # ~12 billing-killed runs/day. Widening is safe: detection only
+  # needs to fire ONCE — disabling is sticky until the monthly
+  # 00:05 re-enable — and the H2 effectiveCutoffMs clamp to
+  # last_enable_at + the 90min cooldown already prevent re-counting
+  # pre-reset failures after a re-enable.
+  PAUSE_LOOKBACK_HOURS: '24'
   BILLING_KILL_MAX_DURATION_SEC: '15'
-  RUNS_PER_REPO: '15'
+  # Bumped from 15 → 30 to match PAUSE_LOOKBACK_HOURS=24. A busy
+  # repo can exceed 15 runs in a day; fetch 30 so the window isn't
+  # silently truncated before 3 billing-kills are counted.
+  RUNS_PER_REPO: '30'
   MONTHLY_REENABLE_CRON: '5 0 1 * *'
   # H2: after a re-enable, skip detection entirely for this many
   # minutes so we don't immediately re-pause on pre-reset stale
