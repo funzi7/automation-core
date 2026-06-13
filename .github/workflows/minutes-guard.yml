@@ -39,9 +39,13 @@ name: Minutes Guard
 #     re-pausing right after a billing reset on stale pre-reset
 #     failures.
 #   - H3: re-enable removes an entry from state only on actual
-#     success (2xx) or 404-gone; transient failures (5xx, rate
-#     limits, network) keep the entry around for the next attempt
-#     instead of being lost to a wholesale map-clear.
+#     success (2xx) or a CONFIRMED 404 (i.e. the workflow truly no
+#     longer exists — verified by a follow-up getWorkflow read).
+#     A bare 404 from enableWorkflow is ambiguous (could be
+#     auth/permission/transient) so it's treated as 'failed' unless
+#     confirmed by the second read. Transient / 5xx / rate-limit
+#     errors keep the entry around for the next attempt instead of
+#     being lost to a wholesale map-clear.
 
 on:
   schedule:
@@ -314,10 +318,16 @@ jobs:
             // decide per-workflow whether to clear the state entry or
             // keep it for retry. We classify:
             //   'ok'      → 2xx success, remove entry
-            //   'gone'    → 404, the workflow was deleted; remove entry
-            //   'failed'  → other error (5xx, network, rate limit);
-            //               KEEP the entry so next run / next month
-            //               retries it
+            //   'gone'    → CONFIRMED 404: the enableWorkflow call
+            //               returned 404 AND a follow-up getWorkflow
+            //               also returned 404, so the workflow truly
+            //               no longer exists. Remove entry.
+            //   'failed'  → any other error, including a bare 404
+            //               from enableWorkflow where the confirming
+            //               getWorkflow read says the workflow still
+            //               exists (auth/permission/transient). KEEP
+            //               the entry so the next run / next month
+            //               retries it. P1 fix from PR #8 review.
             //   'dry-run' → no API call made; keep state untouched
             async function safeEnable(owner, repo, wf) {
               if (inputs.dry_run) {
@@ -326,18 +336,57 @@ jobs:
               }
               try {
                 await xgh.rest.actions.enableWorkflow({ owner, repo, workflow_id: wf.id });
-                core.info(`Re-enabled ${owner}/${repo} ${wf.path} (id=${wf.id}) — ok`);
+                core.info(`Re-enabled ${owner}/${repo} ${wf.path} (id=${wf.id}) — enabled`);
                 return { outcome: 'ok' };
               } catch (e) {
                 if (e.status === 404) {
-                  core.info(
-                    `Workflow gone (404): ${owner}/${repo} ${wf.path} (id=${wf.id}) — removing from state`
-                  );
-                  return { outcome: 'gone', status: 404 };
+                  // 404 from enableWorkflow is AMBIGUOUS:
+                  //   (a) the workflow file was deleted from the repo,
+                  //   (b) the PAT lost access / lacks Actions:write,
+                  //   (c) a transient API blip surfaced as 404.
+                  // Naively treating every 404 as 'gone' would drop
+                  // the retry record from state while the workflow
+                  // stays disabled in the repo — it would then never
+                  // get re-enabled and the cron would stay down
+                  // forever. Confirm with a follow-up getWorkflow
+                  // read; only if THAT also 404s do we believe the
+                  // workflow is truly gone.
+                  try {
+                    await xgh.rest.actions.getWorkflow({
+                      owner, repo, workflow_id: wf.id,
+                    });
+                    // Confirming read succeeded → the workflow still
+                    // exists; the original 404 was auth/permission/
+                    // transient. Keep the entry for retry.
+                    core.warning(
+                      `Enable returned 404 but workflow still exists ` +
+                      `(auth/permission/transient): ` +
+                      `${owner}/${repo} ${wf.path} (id=${wf.id}) — kept-for-retry`
+                    );
+                    return { outcome: 'failed', status: 404 };
+                  } catch (e2) {
+                    if (e2.status === 404) {
+                      core.info(
+                        `Workflow gone-confirmed (404 on getWorkflow too): ` +
+                        `${owner}/${repo} ${wf.path} (id=${wf.id}) — removing from state`
+                      );
+                      return { outcome: 'gone', status: 404 };
+                    }
+                    // Confirming read errored with something other
+                    // than 404 (network, 5xx, rate limit). Be
+                    // conservative: KEEP the entry — better to retry
+                    // next cycle than strand a disabled workflow.
+                    core.warning(
+                      `Enable returned 404 and confirming getWorkflow errored ` +
+                      `(status=${e2.status}, msg=${e2.message}): ` +
+                      `${owner}/${repo} ${wf.path} (id=${wf.id}) — kept-for-retry (conservative)`
+                    );
+                    return { outcome: 'failed', status: e2.status };
+                  }
                 }
                 core.warning(
                   `Enable failed for ${owner}/${repo} ${wf.path}: ` +
-                  `status=${e.status} msg=${e.message} — keeping in state for retry`
+                  `status=${e.status} msg=${e.message} — kept-for-retry`
                 );
                 return { outcome: 'failed', status: e.status };
               }
