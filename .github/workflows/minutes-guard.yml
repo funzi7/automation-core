@@ -97,7 +97,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout (need state file)
-        uses: actions/checkout@v4
+        # v5 runs on Node 24. Bumped from @v4 because GitHub forces all
+        # JavaScript actions to Node 24 starting 2026-06-16; running @v4
+        # past that date triggers the deprecation auto-upgrade and
+        # eventually fails. v5 is the Node-24 GA major (no behavior
+        # changes vs v4 that affect this checkout — persist-credentials
+        # still works the same way).
+        uses: actions/checkout@v5
         with:
           # We auth manually with CROSS_REPO_PAT when pushing back, so
           # don't leave GITHUB_TOKEN baked into the remote URL.
@@ -108,7 +114,15 @@ jobs:
 
       - name: Run guard
         id: guard
-        uses: actions/github-script@v7
+        # v8 runs on Node 24. Bumped from @v7 for the same 2026-06-16
+        # forced-upgrade deadline. The script-context surface we depend
+        # on is unchanged in v8: `github` is still the pre-authenticated
+        # octokit/rest.js client with the pagination plugin, `context`
+        # and `core` are still exposed, and `github-token:` still
+        # constructs `github` from whatever token is passed (we pass
+        # CROSS_REPO_PAT). The only v7→v8 breaking change is the Node
+        # runtime bump itself (Node 20 → Node 24).
+        uses: actions/github-script@v8
         with:
           # Every octokit call in this script is cross-repo (the targets
           # are private repos owned by funzi7). The repo's own
