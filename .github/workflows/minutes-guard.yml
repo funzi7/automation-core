@@ -1,0 +1,474 @@
+name: Minutes Guard
+
+# Self-healing guard for shared GitHub Actions monthly minutes.
+#
+# automation-core is PUBLIC → unlimited free Actions minutes → this
+# guard always runs even when the private repos are billing-blocked.
+#
+# Detection is heuristic, not API-based: GitHub's
+# /users/{user}/settings/billing/actions endpoint was sunset
+# 2025-09-26 (Enhanced Billing Platform migration), and the new
+# spend-based endpoints don't expose minutes for personal accounts.
+# A billing-killed run has a tight signature: conclusion=failure,
+# duration < ~15s (the runner never actually started), and zero job
+# logs. ≥3 such runs within the last 2h on ANY target → treat the
+# whole account quota as exhausted (minutes are shared across all
+# of funzi7's repos) and pause cron workflows in EVERY target.
+#
+# Re-enable: a separate cron at 00:05 UTC on the 1st of every month
+# (just after the typical billing reset), and force_enable=true via
+# workflow_dispatch as the manual escape hatch.
+#
+# Safety:
+#   - Only workflows whose source file declares an `on.schedule`
+#     trigger are eligible to pause. Event-only workflows
+#     (codex-gate.yml, codex-auto-fix.yml, ci.yml etc.) are NEVER
+#     touched.
+#   - automation-core (THIS_REPO) is explicitly excluded from the
+#     target list at runtime; it cannot be paused even if added by
+#     accident.
+#   - The guard records every workflow it disables in
+#     state/minutes-guard.json so re-enable only restores what the
+#     guard itself disabled — workflows you disabled manually
+#     stay disabled.
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'   # detection sweep
+    - cron: '5 0 1 * *'      # monthly re-enable: 00:05 UTC on the 1st
+  workflow_dispatch:
+    inputs:
+      force_enable:
+        description: 'Re-enable everything currently recorded as disabled-by-guard, then exit'
+        required: false
+        type: boolean
+        default: false
+      dry_run:
+        description: 'Detect + report only; do not disable or enable anything'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read   # checkout only; the state-file commit step uses CROSS_REPO_PAT
+
+concurrency:
+  # Serialize so two cron ticks (or a cron + a manual dispatch) cannot
+  # race on the state file or double-disable. cancel-in-progress=false
+  # because we never want to discard a half-completed pause.
+  group: minutes-guard
+  cancel-in-progress: false
+
+env:
+  # Edit this list to add or remove targets. THIS_REPO (automation-core)
+  # is excluded by the script — never put it here.
+  TARGET_REPOS: |
+    funzi7/paywall-bot
+    funzi7/thai-rent-finder
+  STATE_FILE: state/minutes-guard.json
+  PAUSE_THRESHOLD_FAILURES: '3'
+  PAUSE_LOOKBACK_HOURS: '2'
+  BILLING_KILL_MAX_DURATION_SEC: '15'
+  RUNS_PER_REPO: '15'
+  MONTHLY_REENABLE_CRON: '5 0 1 * *'
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (need state file)
+        uses: actions/checkout@v4
+        with:
+          # We auth manually with CROSS_REPO_PAT when pushing back, so
+          # don't leave GITHUB_TOKEN baked into the remote URL.
+          persist-credentials: false
+
+      - name: Install js-yaml for workflow-file parsing
+        run: npm install --no-save --prefix . js-yaml@4
+
+      - name: Run guard
+        id: guard
+        uses: actions/github-script@v7
+        env:
+          CROSS_REPO_PAT: ${{ secrets.CROSS_REPO_PAT }}
+          INPUT_FORCE_ENABLE: ${{ inputs.force_enable }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+          TRIGGERED_BY_SCHEDULE: ${{ github.event.schedule }}
+          THIS_REPO: ${{ github.repository }}
+          TARGET_REPOS: ${{ env.TARGET_REPOS }}
+          STATE_FILE: ${{ env.STATE_FILE }}
+          PAUSE_THRESHOLD_FAILURES: ${{ env.PAUSE_THRESHOLD_FAILURES }}
+          PAUSE_LOOKBACK_HOURS: ${{ env.PAUSE_LOOKBACK_HOURS }}
+          BILLING_KILL_MAX_DURATION_SEC: ${{ env.BILLING_KILL_MAX_DURATION_SEC }}
+          RUNS_PER_REPO: ${{ env.RUNS_PER_REPO }}
+          MONTHLY_REENABLE_CRON: ${{ env.MONTHLY_REENABLE_CRON }}
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const yaml = require('js-yaml');
+
+            const STATE_FILE = process.env.STATE_FILE;
+            const PAUSE_THRESHOLD_FAILURES = parseInt(process.env.PAUSE_THRESHOLD_FAILURES, 10);
+            const PAUSE_LOOKBACK_HOURS = parseInt(process.env.PAUSE_LOOKBACK_HOURS, 10);
+            const BILLING_KILL_MAX_DURATION_SEC = parseInt(process.env.BILLING_KILL_MAX_DURATION_SEC, 10);
+            const RUNS_PER_REPO = parseInt(process.env.RUNS_PER_REPO, 10);
+            const MONTHLY_REENABLE_CRON = process.env.MONTHLY_REENABLE_CRON;
+            const THIS_REPO = process.env.THIS_REPO;
+
+            // ---- Target repo list (with hardcoded self-exclusion) ----
+            const targets = (process.env.TARGET_REPOS || '')
+              .split('\n')
+              .map(s => s.trim())
+              .filter(Boolean)
+              .filter(r => {
+                if (r === THIS_REPO) {
+                  core.warning(
+                    `Refusing to target THIS_REPO (${THIS_REPO}) — ` +
+                    `automation-core is public/free and is the host of the guard itself.`
+                  );
+                  return false;
+                }
+                if (!/^[^/]+\/[^/]+$/.test(r)) {
+                  core.warning(`Skipping malformed target "${r}" (expected owner/repo)`);
+                  return false;
+                }
+                return true;
+              });
+            if (targets.length === 0) {
+              core.setFailed('No valid target repos to guard.');
+              return;
+            }
+            core.info(`Targets: ${targets.join(', ')}`);
+
+            // ---- Cross-repo client (CROSS_REPO_PAT) ----
+            const pat = process.env.CROSS_REPO_PAT;
+            if (!pat) {
+              core.setFailed(
+                'CROSS_REPO_PAT secret is not set on this repo. See ' +
+                'README → "Setup (one-time)" for the fine-grained PAT instructions.'
+              );
+              return;
+            }
+            const xgh = require('@actions/github').getOctokit(pat);
+
+            // ---- Mode selection ----
+            const inputs = {
+              force_enable: process.env.INPUT_FORCE_ENABLE === 'true',
+              dry_run: process.env.INPUT_DRY_RUN === 'true',
+            };
+            const triggeredSchedule = process.env.TRIGGERED_BY_SCHEDULE || '';
+            let mode;
+            if (inputs.force_enable) mode = 're-enable';
+            else if (triggeredSchedule === MONTHLY_REENABLE_CRON) mode = 're-enable';
+            else mode = 'detect';
+            core.info(`Mode: ${mode}${inputs.dry_run ? ' (DRY-RUN)' : ''}`);
+
+            // ---- State file load / save ----
+            function loadState() {
+              try {
+                return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+              } catch (e) {
+                if (e.code === 'ENOENT') {
+                  return {
+                    schema: 1,
+                    disabled_by_guard: {},
+                    last_pause_at: null,
+                    last_enable_at: null,
+                  };
+                }
+                throw e;
+              }
+            }
+            function saveState(state) {
+              fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
+              fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2) + '\n');
+            }
+            const state = loadState();
+            let stateChanged = false;
+
+            // ---- Helpers ----
+            async function listRecentRuns(owner, repo) {
+              const { data } = await xgh.rest.actions.listWorkflowRunsForRepo({
+                owner, repo, per_page: RUNS_PER_REPO,
+              });
+              return data.workflow_runs || [];
+            }
+
+            // A billing-killed run has a tight signature:
+            //   conclusion=failure, duration < ~15s, no job actually
+            //   ran any steps. The jobs endpoint either returns 0
+            //   jobs or all-jobs-with-no-completed-steps. Real
+            //   failures take longer and have step-level logs.
+            async function runIsBillingKilled(owner, repo, run) {
+              if (run.conclusion !== 'failure') return false;
+              const startedISO = run.run_started_at || run.created_at;
+              const startedMs = new Date(startedISO).getTime();
+              const endedMs = new Date(run.updated_at).getTime();
+              const durationSec = (endedMs - startedMs) / 1000;
+              if (durationSec >= BILLING_KILL_MAX_DURATION_SEC) return false;
+              try {
+                const { data: jobsResp } = await xgh.rest.actions.listJobsForWorkflowRun({
+                  owner, repo, run_id: run.id, per_page: 100,
+                });
+                const jobs = jobsResp.jobs || [];
+                if (jobs.length === 0) return true;
+                const anyJobRanSteps = jobs.some(j =>
+                  (j.steps || []).some(
+                    s => s.status === 'completed' && s.conclusion !== 'skipped'
+                  )
+                );
+                return !anyJobRanSteps;
+              } catch (e) {
+                // 404 on jobs = strong billing-kill signal (no jobs exist)
+                if (e.status === 404) return true;
+                throw e;
+              }
+            }
+
+            async function listAllWorkflows(owner, repo) {
+              return await xgh.paginate(xgh.rest.actions.listRepoWorkflows, {
+                owner, repo, per_page: 100,
+              });
+            }
+
+            async function getWorkflowFileText(owner, repo, filePath) {
+              const { data } = await xgh.rest.repos.getContent({
+                owner, repo, path: filePath,
+                mediaType: { format: 'raw' },
+              });
+              if (typeof data === 'string') return data;
+              if (data && data.content) {
+                return Buffer.from(data.content, 'base64').toString('utf8');
+              }
+              throw new Error(`Empty contents response for ${owner}/${repo}:${filePath}`);
+            }
+
+            function workflowHasScheduleTrigger(text) {
+              let doc;
+              try { doc = yaml.load(text); }
+              catch (e) {
+                core.warning(`Failed to parse workflow YAML: ${e.message}`);
+                return false;
+              }
+              if (!doc || typeof doc.on === 'undefined') return false;
+              if (typeof doc.on === 'string') return doc.on === 'schedule';
+              if (Array.isArray(doc.on)) return doc.on.includes('schedule');
+              if (typeof doc.on === 'object') {
+                return Object.prototype.hasOwnProperty.call(doc.on, 'schedule');
+              }
+              return false;
+            }
+
+            async function safeDisable(owner, repo, wf) {
+              if (inputs.dry_run) {
+                core.info(`[DRY-RUN] would disable ${owner}/${repo} ${wf.path} (id=${wf.id})`);
+                return { acted: true };
+              }
+              try {
+                await xgh.rest.actions.disableWorkflow({ owner, repo, workflow_id: wf.id });
+                core.info(`Disabled ${owner}/${repo} ${wf.path} (id=${wf.id})`);
+                return { acted: true };
+              } catch (e) {
+                core.warning(
+                  `Disable failed for ${owner}/${repo} ${wf.path}: status=${e.status} msg=${e.message}`
+                );
+                return { acted: false };
+              }
+            }
+
+            async function safeEnable(owner, repo, wf) {
+              if (inputs.dry_run) {
+                core.info(`[DRY-RUN] would re-enable ${owner}/${repo} ${wf.path} (id=${wf.id})`);
+                return { acted: true };
+              }
+              try {
+                await xgh.rest.actions.enableWorkflow({ owner, repo, workflow_id: wf.id });
+                core.info(`Re-enabled ${owner}/${repo} ${wf.path} (id=${wf.id})`);
+                return { acted: true };
+              } catch (e) {
+                if (e.status === 404) {
+                  core.info(`Workflow gone (404): ${owner}/${repo} id=${wf.id}; skipping`);
+                  return { acted: false };
+                }
+                core.warning(
+                  `Enable failed for ${owner}/${repo} ${wf.path}: status=${e.status} msg=${e.message}`
+                );
+                return { acted: false };
+              }
+            }
+
+            // ---- Run summary helper ----
+            const summary = core.summary.addHeading('Minutes Guard run');
+            summary.addRaw(`**Mode:** ${mode}${inputs.dry_run ? ' (DRY-RUN — no writes)' : ''}\n\n`);
+            summary.addRaw(`**Targets:** ${targets.join(', ')}\n\n`);
+
+            // ---- RE-ENABLE MODE ----
+            if (mode === 're-enable') {
+              const trigger = inputs.force_enable ? 'force_enable=true' : `cron ${triggeredSchedule}`;
+              summary.addRaw(`**Trigger:** ${trigger}\n\n`);
+              const lines = [];
+              let anyEnabled = false;
+              for (const target of targets) {
+                const [owner, repo] = target.split('/');
+                const recorded = state.disabled_by_guard[target] || [];
+                if (recorded.length === 0) {
+                  lines.push(`${target}: nothing recorded as disabled-by-guard`);
+                  continue;
+                }
+                let n = 0;
+                for (const wf of recorded) {
+                  const r = await safeEnable(owner, repo, wf);
+                  if (r.acted) n += 1;
+                }
+                lines.push(`${target}: re-enabled ${n} of ${recorded.length} recorded workflow(s)`);
+                if (n > 0) anyEnabled = true;
+              }
+              if (anyEnabled && !inputs.dry_run) {
+                state.disabled_by_guard = {};
+                state.last_enable_at = new Date().toISOString();
+                stateChanged = true;
+              }
+              summary.addList(lines);
+            }
+            // ---- DETECT MODE (and DETECT-DRY-RUN) ----
+            else {
+              const cutoffMs = Date.now() - PAUSE_LOOKBACK_HOURS * 60 * 60 * 1000;
+              let accountQuotaExhausted = false;
+              const detectLines = [];
+
+              for (const target of targets) {
+                const [owner, repo] = target.split('/');
+                let runs;
+                try {
+                  runs = await listRecentRuns(owner, repo);
+                } catch (e) {
+                  detectLines.push(
+                    `${target}: ❌ could not list runs (status=${e.status}, msg=${e.message})`
+                  );
+                  continue;
+                }
+                let billingKilledCount = 0;
+                for (const run of runs) {
+                  const ranAt = new Date(run.run_started_at || run.created_at).getTime();
+                  if (ranAt < cutoffMs) continue;
+                  if (await runIsBillingKilled(owner, repo, run)) billingKilledCount += 1;
+                }
+                detectLines.push(
+                  `${target}: ${billingKilledCount} billing-killed run(s) in last ` +
+                  `${PAUSE_LOOKBACK_HOURS}h (threshold ${PAUSE_THRESHOLD_FAILURES})`
+                );
+                if (billingKilledCount >= PAUSE_THRESHOLD_FAILURES) {
+                  accountQuotaExhausted = true;
+                }
+              }
+              summary.addRaw(
+                `**Detection** (lookback=${PAUSE_LOOKBACK_HOURS}h, ` +
+                `threshold=${PAUSE_THRESHOLD_FAILURES}, dur<${BILLING_KILL_MAX_DURATION_SEC}s):\n\n`
+              );
+              summary.addList(detectLines);
+
+              if (!accountQuotaExhausted) {
+                summary.addRaw(
+                  `\n**Result:** ✅ no account-wide quota exhaustion detected — nothing to do.\n`
+                );
+                await summary.write();
+                core.setOutput('state_changed', 'false');
+                return;
+              }
+
+              summary.addRaw(
+                `\n**Result:** ⚠️ quota exhausted — pausing cron workflows in every target.\n\n`
+              );
+              const pauseLines = [];
+              for (const target of targets) {
+                const [owner, repo] = target.split('/');
+                if (!state.disabled_by_guard[target]) state.disabled_by_guard[target] = [];
+                const alreadyTracked = new Set(state.disabled_by_guard[target].map(x => x.id));
+
+                let workflows;
+                try {
+                  workflows = await listAllWorkflows(owner, repo);
+                } catch (e) {
+                  pauseLines.push(
+                    `${target}: ❌ could not list workflows (status=${e.status})`
+                  );
+                  continue;
+                }
+
+                const pausedHere = [];
+                for (const wf of workflows) {
+                  if (wf.state !== 'active') continue;     // already disabled by us or by user
+                  if (alreadyTracked.has(wf.id)) continue; // double-safety
+                  let text;
+                  try { text = await getWorkflowFileText(owner, repo, wf.path); }
+                  catch (e) {
+                    core.warning(`Could not fetch ${target}:${wf.path} — ${e.message}`);
+                    continue;
+                  }
+                  if (!workflowHasScheduleTrigger(text)) continue;
+                  const r = await safeDisable(owner, repo, wf);
+                  if (r.acted) {
+                    pausedHere.push(wf.path);
+                    if (!inputs.dry_run) {
+                      state.disabled_by_guard[target].push({
+                        id: wf.id,
+                        name: wf.name,
+                        path: wf.path,
+                        disabled_at: new Date().toISOString(),
+                      });
+                      stateChanged = true;
+                    }
+                  }
+                }
+                pauseLines.push(
+                  `${target}: paused ${pausedHere.length} cron workflow(s)` +
+                  (pausedHere.length ? ` — ${pausedHere.join(', ')}` : '')
+                );
+              }
+              if (!inputs.dry_run && stateChanged) {
+                state.last_pause_at = new Date().toISOString();
+              }
+              summary.addList(pauseLines);
+            }
+
+            await summary.write();
+
+            if (stateChanged && !inputs.dry_run) {
+              saveState(state);
+              core.setOutput('state_changed', 'true');
+            } else {
+              core.setOutput('state_changed', 'false');
+            }
+
+      - name: Commit state changes
+        if: steps.guard.outputs.state_changed == 'true'
+        env:
+          PAT: ${{ secrets.CROSS_REPO_PAT }}
+        run: |
+          set -euo pipefail
+          # Only push state back when we're running on the canonical
+          # branch — branch-dispatch runs (e.g. PR previews) should not
+          # mutate main's state file.
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::notice::Not on main (ref=$GITHUB_REF) — skipping state commit"
+            exit 0
+          fi
+          if [ -z "${PAT:-}" ]; then
+            echo "::error::CROSS_REPO_PAT not available for state push"
+            exit 1
+          fi
+          git config user.name 'minutes-guard'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add state/minutes-guard.json
+          if git diff --staged --quiet; then
+            echo 'No staged change after guard step (no-op).'
+            exit 0
+          fi
+          git commit -m 'chore(minutes-guard): update state'
+          # Auth the push via CROSS_REPO_PAT (Contents:write) so it
+          # works even when branch protection blocks the workflow's
+          # default GITHUB_TOKEN.
+          git remote set-url origin "https://x-access-token:${PAT}@github.com/${GITHUB_REPOSITORY}.git"
+          git pull --rebase origin main
+          git push origin HEAD:main
