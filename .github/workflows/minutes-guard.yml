@@ -247,11 +247,13 @@ jobs:
               core.info(`Discovered ${targets.length} private non-archived repo(s).`);
             }
 
-            if (targets.length === 0) {
-              core.setFailed('No valid target repos to guard.');
-              return;
-            }
-            core.info(`Targets (${targets.length}): ${targets.join(', ')}`);
+            // NOTE: zero-target validation is deferred. In detect mode
+            // it's checked right below (nothing to scan = fail). In
+            // re-enable mode it's checked AFTER the state-union block
+            // (which may add repos recorded in state.disabled_by_guard
+            // that are no longer in the discovery set). Failing here
+            // would skip that merge — the bug from the previous fix.
+            core.info(`Initial targets (${targets.length}): ${targets.join(', ') || '(none)'}`);
 
             // ---- Mode selection ----
             const inputs = {
@@ -507,6 +509,12 @@ jobs:
                 }
               }
               core.info(`Re-enable targets (${targets.length}): ${targets.join(', ')}`);
+              if (targets.length === 0) {
+                core.info('Re-enable: no targets and nothing recorded in state — nothing to do.');
+                await summary.write();
+                core.setOutput('state_changed', 'false');
+                return;
+              }
               const trigger = inputs.force_enable ? 'force_enable=true' : `cron ${triggeredSchedule}`;
               summary.addRaw(`**Trigger:** ${trigger}\n\n`);
               const lines = [];
@@ -565,6 +573,10 @@ jobs:
             }
             // ---- DETECT MODE (and DETECT-DRY-RUN) ----
             else {
+              if (targets.length === 0) {
+                core.setFailed('No valid target repos to guard (detect mode).');
+                return;
+              }
               // H2: cooldown short-circuit. If we just re-enabled, any
               // billing-kills in the runs window are by definition
               // pre-reset (the new commit hasn't had time to fail yet),
