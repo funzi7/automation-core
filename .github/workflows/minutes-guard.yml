@@ -484,6 +484,29 @@ jobs:
 
             // ---- RE-ENABLE MODE ----
             if (mode === 're-enable') {
+              // P2 fix (PR #10 review): in re-enable mode, also include
+              // any repo that has entries recorded in
+              // state.disabled_by_guard, even if it's no longer in the
+              // discovery/manual target set (e.g. it was made public or
+              // archived after being paused while private). Otherwise its
+              // recorded workflows would stay disabled forever, because
+              // re-enable only iterates `targets`.
+              const recordedRepos = Object.keys(state.disabled_by_guard || {})
+                .filter(r => (state.disabled_by_guard[r] || []).length > 0);
+              const targetSet = new Set(targets);
+              for (const r of recordedRepos) {
+                if (!targetSet.has(r)) {
+                  // Validate shape and self-exclusion before adding.
+                  if (r === THIS_REPO) continue;
+                  if (!/^[^/]+\/[^/]+$/.test(r)) {
+                    core.warning(`Skipping malformed recorded repo "${r}" in state`);
+                    continue;
+                  }
+                  targets.push(r);
+                  core.info(`Re-enable: including ${r} from state (not in current discovery set).`);
+                }
+              }
+              core.info(`Re-enable targets (${targets.length}): ${targets.join(', ')}`);
               const trigger = inputs.force_enable ? 'force_enable=true' : `cron ${triggeredSchedule}`;
               summary.addRaw(`**Trigger:** ${trigger}\n\n`);
               const lines = [];
