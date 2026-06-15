@@ -75,11 +75,16 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # Edit this list to add or remove targets. THIS_REPO (automation-core)
-  # is excluded by the script — never put it here.
-  TARGET_REPOS: |
-    funzi7/paywall-bot
-    funzi7/thai-rent-finder
+  # When 'true' (default): auto-discover targets = all PRIVATE,
+  # non-archived repos owned by funzi7, minus THIS_REPO.
+  # Precedence: if AUTO_DISCOVER_TARGETS != 'true' OR TARGET_REPOS
+  # is non-empty, the explicit TARGET_REPOS list is used as a
+  # manual override instead of discovery.
+  AUTO_DISCOVER_TARGETS: 'true'
+  # Manual override. Leave EMPTY to use auto-discovery. If you put
+  # repos here (or set AUTO_DISCOVER_TARGETS=false), this explicit
+  # list is used instead of discovery. THIS_REPO is always excluded.
+  TARGET_REPOS: ''
   STATE_FILE: state/minutes-guard.json
   PAUSE_THRESHOLD_FAILURES: '3'
   # 24h window. The poll fires every 2h and scrapers run once a day,
@@ -158,31 +163,6 @@ jobs:
             const MONTHLY_REENABLE_CRON = process.env.MONTHLY_REENABLE_CRON;
             const THIS_REPO = process.env.THIS_REPO;
 
-            // ---- Target repo list (with hardcoded self-exclusion) ----
-            const targets = (process.env.TARGET_REPOS || '')
-              .split('\n')
-              .map(s => s.trim())
-              .filter(Boolean)
-              .filter(r => {
-                if (r === THIS_REPO) {
-                  core.warning(
-                    `Refusing to target THIS_REPO (${THIS_REPO}) — ` +
-                    `automation-core is public/free and is the host of the guard itself.`
-                  );
-                  return false;
-                }
-                if (!/^[^/]+\/[^/]+$/.test(r)) {
-                  core.warning(`Skipping malformed target "${r}" (expected owner/repo)`);
-                  return false;
-                }
-                return true;
-              });
-            if (targets.length === 0) {
-              core.setFailed('No valid target repos to guard.');
-              return;
-            }
-            core.info(`Targets: ${targets.join(', ')}`);
-
             // ---- CROSS_REPO_PAT presence check ----
             // We don't construct a separate Octokit from the PAT (the
             // step's github-token: input already auths the built-in
@@ -190,6 +170,9 @@ jobs:
             // `github` would silently fall back to GITHUB_TOKEN and
             // every cross-repo write would 404/403. Fail fast with the
             // README pointer.
+            //
+            // This block runs BEFORE building the target list because
+            // auto-discovery needs `xgh` to list the owner's repos.
             if (!process.env.CROSS_REPO_PAT) {
               core.setFailed(
                 'CROSS_REPO_PAT secret is not set on this repo. See ' +
@@ -198,6 +181,79 @@ jobs:
               return;
             }
             const xgh = github;
+
+            // ---- Target repo list ----
+            // Precedence (documented in env block):
+            //   1. If TARGET_REPOS is non-empty → manual override.
+            //   2. Else if AUTO_DISCOVER_TARGETS !== 'true' → also
+            //      treat as manual (but TARGET_REPOS is empty, so
+            //      this errors out — protects against a misconfig
+            //      where discovery is off AND no list is given).
+            //   3. Else → auto-discover all private, non-archived
+            //      repos owned by funzi7.
+            // THIS_REPO (automation-core) is ALWAYS excluded.
+
+            function sanitizeTargets(list) {
+              return list
+                .filter(r => {
+                  if (r === THIS_REPO) {
+                    core.warning(
+                      `Refusing to target THIS_REPO (${THIS_REPO}) — ` +
+                      `automation-core is public/free and is the host of the guard itself.`
+                    );
+                    return false;
+                  }
+                  if (!/^[^/]+\/[^/]+$/.test(r)) {
+                    core.warning(`Skipping malformed target "${r}" (expected owner/repo)`);
+                    return false;
+                  }
+                  return true;
+                });
+            }
+
+            const manualList = (process.env.TARGET_REPOS || '')
+              .split('\n')
+              .map(s => s.trim())
+              .filter(Boolean);
+
+            const autoDiscover = (process.env.AUTO_DISCOVER_TARGETS || 'true') === 'true';
+
+            let targets;
+            if (manualList.length > 0) {
+              core.info(`Manual override: TARGET_REPOS has ${manualList.length} entr(ies) — using explicit list, skipping discovery.`);
+              targets = sanitizeTargets(manualList);
+            } else if (!autoDiscover) {
+              core.setFailed(
+                'AUTO_DISCOVER_TARGETS is false and TARGET_REPOS is empty — ' +
+                'no targets to guard. Either set AUTO_DISCOVER_TARGETS=true ' +
+                'or populate TARGET_REPOS.'
+              );
+              return;
+            } else {
+              // Auto-discover: enumerate all repos owned by the authenticated
+              // user (CROSS_REPO_PAT), keep only PRIVATE + non-archived,
+              // exclude THIS_REPO.
+              core.info('Auto-discovering targets: all private, non-archived repos owned by funzi7...');
+              const allRepos = await xgh.paginate(
+                xgh.rest.repos.listForAuthenticatedUser,
+                { per_page: 100, affiliation: 'owner' }
+              );
+              const ownerLogin = THIS_REPO.split('/')[0];
+              const discovered = allRepos
+                .filter(r => r.private && !r.archived)
+                .map(r => r.full_name)
+                .filter(fn => fn.split('/')[0] === ownerLogin);
+              targets = sanitizeTargets(discovered);
+              core.info(`Discovered ${targets.length} private non-archived repo(s).`);
+            }
+
+            // NOTE: zero-target validation is deferred. In detect mode
+            // it's checked right below (nothing to scan = fail). In
+            // re-enable mode it's checked AFTER the state-union block
+            // (which may add repos recorded in state.disabled_by_guard
+            // that are no longer in the discovery set). Failing here
+            // would skip that merge — the bug from the previous fix.
+            core.info(`Initial targets (${targets.length}): ${targets.join(', ') || '(none)'}`);
 
             // ---- Mode selection ----
             const inputs = {
@@ -423,10 +479,42 @@ jobs:
             const summary = core.summary.addHeading('Minutes Guard run');
             summary.addRaw(`**Mode:** ${mode}${inputs.dry_run ? ' (DRY-RUN — no writes)' : ''}\n\n`);
             summary.addRaw(`**Ref:** ${process.env.GITHUB_REF || 'unset'}\n\n`);
-            summary.addRaw(`**Targets:** ${targets.join(', ')}\n\n`);
+            const discoveryMode = manualList.length > 0
+              ? 'manual override'
+              : (autoDiscover ? 'auto-discovered' : 'manual');
+            summary.addRaw(`**Targets (${targets.length}, ${discoveryMode}):** ${targets.join(', ')}\n\n`);
 
             // ---- RE-ENABLE MODE ----
             if (mode === 're-enable') {
+              // P2 fix (PR #10 review): in re-enable mode, also include
+              // any repo that has entries recorded in
+              // state.disabled_by_guard, even if it's no longer in the
+              // discovery/manual target set (e.g. it was made public or
+              // archived after being paused while private). Otherwise its
+              // recorded workflows would stay disabled forever, because
+              // re-enable only iterates `targets`.
+              const recordedRepos = Object.keys(state.disabled_by_guard || {})
+                .filter(r => (state.disabled_by_guard[r] || []).length > 0);
+              const targetSet = new Set(targets);
+              for (const r of recordedRepos) {
+                if (!targetSet.has(r)) {
+                  // Validate shape and self-exclusion before adding.
+                  if (r === THIS_REPO) continue;
+                  if (!/^[^/]+\/[^/]+$/.test(r)) {
+                    core.warning(`Skipping malformed recorded repo "${r}" in state`);
+                    continue;
+                  }
+                  targets.push(r);
+                  core.info(`Re-enable: including ${r} from state (not in current discovery set).`);
+                }
+              }
+              core.info(`Re-enable targets (${targets.length}): ${targets.join(', ')}`);
+              if (targets.length === 0) {
+                core.info('Re-enable: no targets and nothing recorded in state — nothing to do.');
+                await summary.write();
+                core.setOutput('state_changed', 'false');
+                return;
+              }
               const trigger = inputs.force_enable ? 'force_enable=true' : `cron ${triggeredSchedule}`;
               summary.addRaw(`**Trigger:** ${trigger}\n\n`);
               const lines = [];
@@ -485,6 +573,10 @@ jobs:
             }
             // ---- DETECT MODE (and DETECT-DRY-RUN) ----
             else {
+              if (targets.length === 0) {
+                core.setFailed('No valid target repos to guard (detect mode).');
+                return;
+              }
               // H2: cooldown short-circuit. If we just re-enabled, any
               // billing-kills in the runs window are by definition
               // pre-reset (the new commit hasn't had time to fail yet),
@@ -628,6 +720,7 @@ jobs:
           INPUT_DRY_RUN: ${{ inputs.dry_run }}
           TRIGGERED_BY_SCHEDULE: ${{ github.event.schedule }}
           THIS_REPO: ${{ github.repository }}
+          AUTO_DISCOVER_TARGETS: ${{ env.AUTO_DISCOVER_TARGETS }}
           TARGET_REPOS: ${{ env.TARGET_REPOS }}
           STATE_FILE: ${{ env.STATE_FILE }}
           PAUSE_THRESHOLD_FAILURES: ${{ env.PAUSE_THRESHOLD_FAILURES }}
