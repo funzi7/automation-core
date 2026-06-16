@@ -2,14 +2,22 @@ name: Merge Bot
 
 # Generic workflow — synced from automation-core. Closes the self-healing
 # loop: squash-merges PRs that are fully green once codex-gate passes.
-# Triggered ONLY when a check suite completes (plus a once-daily safety-net
-# cron) — not on every label/workflow_run, which made it run 22x in 5min.
-# The job early-exits unless the check suite finished success/neutral. The
+# Woken by: a check_suite that completes (covers most repos' CI), the Codex
+# Gate workflow_run completing (check_suite does NOT fire for Actions-created
+# suites like the gate's), a once-daily safety-net cron, or manual dispatch.
+# The job early-exits unless that signal is a success/neutral check_suite or a
+# SUCCESSFUL Codex Gate run — so it never storms (22x/5min) on red/in-flight. The
 # merge uses AUTOMATION_PAT so the push to the base branch triggers
 # downstream workflows (health-check, etc.). fail-soft: missing PAT → GREEN.
 
 on:
   check_suite:
+    types: [completed]
+  # check_suite does NOT fire for workflow runs created by GitHub Actions
+  # (Codex Gate runs under GITHUB_TOKEN), so without this a green gate would
+  # not wake merge-bot until the daily cron. Filtered to success in the job if:.
+  workflow_run:
+    workflows: ["Codex Gate"]
     types: [completed]
   schedule:
     - cron: '30 7 * * *'   # safety-net once daily (07:30 UTC)
@@ -29,15 +37,22 @@ concurrency:
 jobs:
   merge:
     runs-on: ubuntu-latest
-    # Early-exit: only proceed when a check SUITE actually finished
-    # success/neutral. On schedule/workflow_dispatch there is no check_suite
-    # payload, so those always proceed (safety net + manual). This stops
-    # merge-bot waking on every check_suite that completed red or is still
-    # churning — the cause of 22 runs in 5 minutes.
+    # Early-exit: proceed ONLY on a signal that a fresh set of checks finished
+    # GREEN — otherwise skip immediately (no scan). Waking conditions:
+    #   (a) check_suite completed success/neutral,
+    #   (b) Codex Gate workflow_run completed success,
+    #   (c) the daily safety-net cron,
+    #   (d) manual dispatch.
+    # workflow_run is filtered to success here so the gate's self-rerun loop
+    # (which fails each iteration) never wakes merge-bot — only its final pass.
     if: |
-      github.event_name != 'check_suite' ||
-      github.event.check_suite.conclusion == 'success' ||
-      github.event.check_suite.conclusion == 'neutral'
+      (github.event_name == 'check_suite' &&
+        (github.event.check_suite.conclusion == 'success' ||
+         github.event.check_suite.conclusion == 'neutral')) ||
+      (github.event_name == 'workflow_run' &&
+        github.event.workflow_run.conclusion == 'success') ||
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch'
     steps:
       - name: Fail-soft check for AUTOMATION_PAT
         id: patcheck
