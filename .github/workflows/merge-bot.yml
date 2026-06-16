@@ -139,6 +139,11 @@ jobs:
               // PR ever becomes a candidate.
               if ((pr.labels || []).some((l) => l.name === LABEL_ESCALATE)) return false;
               const byBot = isClaudeBot(pr.user && pr.user.login);
+              // The `automerge` label is the PRIMARY signal for Claude's fix
+              // PRs: claude.yml passes AUTOMATION_PAT as github_token, so PRs
+              // Claude opens are authored by the OWNER (funzi7), not a bot
+              // login — isClaudeBot misses them. claude.yml labels them
+              // `automerge`, so they still become merge candidates here.
               const hasAutomerge = (pr.labels || []).some((l) => l.name === LABEL_AUTOMERGE);
               // A sync PR is trusted ONLY if the title matches AND it is
               // provably ours — a same-repo branch named like the one the
@@ -204,10 +209,13 @@ jobs:
               if (anyFailed) { core.info(`#${prNumber}: a check failed, skip`); continue; }
               if (anyRunning) { core.info(`#${prNumber}: checks still running, skip`); continue; }
 
-              // Codex gate is mandatory when present — never bypass it.
+              // Codex gate is MANDATORY and must FAIL CLOSED: the check must
+              // EXIST on the head SHA and be success. If check-codex-status is
+              // absent (a repo that hasn't received codex-gate, or the gate
+              // hasn't run yet), do NOT merge — never merge an ungated PR.
               const codex = checkRuns.find((c) => c.name === CODEX_CHECK);
-              if (codex && !(codex.status === 'completed' && codex.conclusion === 'success')) {
-                core.info(`#${prNumber}: ${CODEX_CHECK} not success, skip`);
+              if (!codex || codex.status !== 'completed' || codex.conclusion !== 'success') {
+                core.info(`#${prNumber}: ${CODEX_CHECK} missing or not success, skip`);
                 continue;
               }
 
@@ -232,6 +240,12 @@ jobs:
                   try {
                     await github.rest.issues.removeLabel({ owner, repo, issue_number: prNumber, name: LABEL_AUTOMERGE });
                   } catch (e) { /* maybe not present */ }
+                  // Upsert the escalation label first — addLabels only attaches
+                  // labels that already EXIST, so on a fresh repo needs-dima
+                  // must be created before it can be applied.
+                  try {
+                    await github.rest.issues.createLabel({ owner, repo, name: LABEL_ESCALATE, color: 'd93f0b', description: 'Escalation — automation stopped, human needed' });
+                  } catch (e) { if (e.status !== 422) core.info(`createLabel ${LABEL_ESCALATE} failed (ignored): ${e.message}`); }
                   await github.rest.issues.addLabels({ owner, repo, issue_number: prNumber, labels: [LABEL_ESCALATE] });
                   await github.rest.issues.createComment({
                     owner, repo, issue_number: prNumber,
