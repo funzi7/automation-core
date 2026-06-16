@@ -14,11 +14,11 @@ name: Codex Auto-Fix
 #   - Only fires on comments from chatgpt-codex-connector[bot].
 #     An external attacker can't impersonate the bot login, so
 #     this is the right authentication surface.
-#   - Capped at 2 auto-trigger comments per PR. If 2 rounds of
-#     auto-fix don't resolve the review, a human takes over —
-#     same circuit-breaker pattern as retry budgets in the
-#     scrapers. Prevents infinite loops if Codex keeps producing
-#     P1/P2 reviews on the same code.
+#   - Circuit breaker: capped at 3 @claude fix rounds per PR. After
+#     3 rounds that haven't converged, stop auto-triggering, add the
+#     needs-dima label (merge-bot then ignores the PR), and ping
+#     Telegram if configured. Prevents the near-infinite review/fix
+#     loop (each round costs real money).
 #   - Substring match on "P1" or "P2" in the review body. Codex
 #     uses badge URLs like `P1-orange?style=flat` so the literal
 #     substring is reliable; "no issues" reviews don't include
@@ -81,6 +81,8 @@ jobs:
         uses: actions/github-script@v7
         env:
           AUTOMATION_PAT: ${{ secrets.AUTOMATION_PAT }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         with:
           script: |
             // fail-soft: the @claude auto-trigger comment must be posted
@@ -119,7 +121,7 @@ jobs:
             }
 
             // Count prior auto-trigger comments to enforce the
-            // 2-round cap. The "[auto-triggered]" marker is in
+            // 3-round cap. The "[auto-triggered]" marker is in
             // every comment this workflow posts (see the next
             // step's body); counting them gives an accurate
             // round counter regardless of how many human
@@ -147,10 +149,42 @@ jobs:
               (c) => c.body?.includes("[auto-triggered]"),
             ).length;
 
-            if (autoFixCount >= 2) {
+            const MAX_FIX_ROUNDS = 3;
+            if (autoFixCount >= MAX_FIX_ROUNDS) {
+              // Circuit breaker tripped: the review/fix loop isn't converging.
+              // Stop auto-triggering, escalate to a human.
               core.warning(
-                `Already auto-triggered Codex ${autoFixCount} times on PR #${prNumber}; skipping. A human can take over by commenting @claude manually.`,
+                `Circuit breaker: ${autoFixCount} @claude fix rounds on PR #${prNumber} without converging; stopping and escalating to needs-dima.`,
               );
+              try {
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: prNumber,
+                  labels: ['needs-dima'],
+                });
+              } catch (e) {
+                core.info(`addLabel needs-dima failed (ignored): ${e.message}`);
+              }
+              // Telegram escalation (HTML; skip silently if unset).
+              const tgToken = process.env.TELEGRAM_BOT_TOKEN;
+              const tgChat = process.env.TELEGRAM_CHAT_ID;
+              if (tgToken && tgChat) {
+                try {
+                  await fetch(`https://api.telegram.org/bot${tgToken}/sendMessage`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      chat_id: tgChat,
+                      text: `🚨 <b>${context.repo.repo}</b> PR #${prNumber}: ${autoFixCount} @claude fix rounds didn't converge — escalated to <b>needs-dima</b>.`,
+                      parse_mode: 'HTML',
+                      disable_web_page_preview: true,
+                    }),
+                  });
+                } catch (e) {
+                  core.info(`Telegram failed (ignored): ${e.message}`);
+                }
+              }
               core.setOutput("should_trigger", "false");
               return;
             }
