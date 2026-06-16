@@ -1,7 +1,10 @@
 {
   "synced_workflows": [
     "codex-auto-fix.yml",
-    "codex-gate.yml"
+    "codex-gate.yml",
+    "claude.yml",
+    "ci-doctor.yml",
+    "merge-bot.yml"
   ],
   "removed_workflows": []
 }

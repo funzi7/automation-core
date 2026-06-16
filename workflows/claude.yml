@@ -1,0 +1,104 @@
+name: Claude Fixer
+
+# Generic workflow — synced from automation-core to every participating
+# repo. Part of the Self-Healing Loop:
+#   ci-doctor (opens claude-fix Issue) → THIS (fixes, opens PR) →
+#   codex-gate (reviews) → merge-bot (merges when green).
+#
+# fail-soft: the first step checks whether ANTHROPIC_API_KEY is set. If
+# it is empty (repo intentionally has no key, to restrain cost), the job
+# exits GREEN with a log notice instead of failing red. So syncing this
+# file to a key-less repo never produces failures and burns ~0 minutes.
+#
+# Loop-trigger trap: a PR opened with the default GITHUB_TOKEN does NOT
+# trigger other workflows (GitHub loop protection), so codex-gate would
+# never run on Claude's PR. We therefore hand the action AUTOMATION_PAT
+# as github_token (falling back to the default token when the PAT is
+# absent, so the action still works in fail-soft repos).
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  issues:
+    types: [labeled, assigned]
+
+# Never run two fixes on the same Issue/PR at once; never cancel an
+# in-flight fix (a half-applied fix is worse than a queued one).
+concurrency:
+  group: claude-fixer-${{ github.repository }}-${{ github.event.issue.number || github.event.pull_request.number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: read        # Claude reads CI run logs on PRs/Issues
+  id-token: write      # OIDC for the action (harmless if unused)
+
+jobs:
+  claude:
+    # Trigger on: @claude mention in a comment, an assigned Issue, or an
+    # Issue labeled `claude-fix` (the label_trigger path ci-doctor uses).
+    if: |
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'issues' && github.event.action == 'assigned') ||
+      (github.event_name == 'issues' && github.event.action == 'labeled' && github.event.label.name == 'claude-fix')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail-soft check for ANTHROPIC_API_KEY
+        id: keycheck
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "${ANTHROPIC_API_KEY}" ]; then
+            echo "::notice::ANTHROPIC_API_KEY is not set in this repo — skipping Claude Fixer (fail-soft, no error)."
+            echo "has_key=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_key=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout repository
+        if: steps.keycheck.outputs.has_key == 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Claude Code
+        if: steps.keycheck.outputs.has_key == 'true'
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # PAT so Claude's PR triggers codex-gate; default token fallback.
+          github_token: ${{ secrets.AUTOMATION_PAT || github.token }}
+          trigger_phrase: "@claude"
+          label_trigger: "claude-fix"
+          # Cap turns to restrain cost.
+          claude_args: |
+            --max-turns 50
+          additional_permissions: |
+            actions: read
+          prompt: |
+            You are the autonomous fixer in a self-healing CI loop. You were
+            invoked on a GitHub Issue or PR in this repository.
+
+            If triggered by a `claude-fix` Issue (opened by ci-doctor):
+              1. Read the Issue body: it has the failed workflow name, the
+                 failed job names, a link to the failing run, and a tail of the
+                 failing job logs. Diagnose the ROOT CAUSE from those logs — do
+                 not guess.
+              2. Create a NEW branch (e.g. `claude/fix-<short-desc>`). NEVER
+                 commit or push directly to `main`.
+              3. Apply the minimal fix. If the repo has a CLAUDE.md with a
+                 build/test/gate command, OBEY it and run that gate locally;
+                 it must be green before you open the PR.
+              4. Open a PR from your branch that links the Issue with
+                 `Fixes #<N>` (the Issue number you were invoked on) and briefly
+                 explains the root cause and the fix.
+              5. Do NOT merge the PR yourself — codex-gate reviews it and
+                 merge-bot merges once everything is green.
+
+            If triggered by an @claude mention, follow the request in the
+            comment, working on a branch and opening a PR the same way.
