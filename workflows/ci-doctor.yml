@@ -10,7 +10,7 @@ name: CI Doctor
 
 on:
   schedule:
-    - cron: '17 */2 * * *'   # every 2 hours (offset :17 to dodge the cron rush)
+    - cron: '0 6,18 * * *'   # twice daily (06:00 & 18:00 UTC)
   workflow_dispatch:
 
 permissions:
@@ -50,7 +50,7 @@ jobs:
             const owner = context.repo.owner;
             const repo = context.repo.repo;
 
-            const LOOKBACK_HOURS = 3;            // overlap with the 2h cron on purpose
+            const LOOKBACK_HOURS = 13;           // covers the 12h gap between the twice-daily runs + overlap
             const MAX_ATTEMPTS = 3;
             const LABEL_FIX = 'claude-fix';
             const LABEL_DOCTOR = 'ci-doctor';

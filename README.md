@@ -40,6 +40,16 @@ Every cross-workflow write (Issue create, re-label, merge) uses
 `AUTOMATION_PAT` — events made with the default `GITHUB_TOKEN` do not trigger
 other workflows (GitHub loop protection), which would silently kill the loop.
 
+**Scheduling (kept light to restrain Actions-minute cost):** CI Doctor runs on
+a cron **twice a day** (06:00 & 18:00 UTC) to sweep the default branch for
+failed runs — its lookback window (13h) overlaps the two runs so nothing slips
+through. Merge Bot keeps only a **once-daily** safety-net cron (07:30 UTC). The
+loop's real responsiveness does **not** come from these schedules but from
+**events**: Merge Bot fires immediately on `check_suite` completion, PR
+`labeled`, and the Codex Gate `workflow_run`; Claude Fixer fires the moment the
+`claude-fix` label is applied or `@claude` is mentioned. So fixes and merges
+still happen within minutes — the crons are just the backstop.
+
 ### Label dictionary (uniform across all repos)
 
 | Label | Meaning |

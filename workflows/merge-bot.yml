@@ -3,7 +3,7 @@ name: Merge Bot
 # Generic workflow — synced from automation-core. Closes the self-healing
 # loop: squash-merges PRs that are fully green once codex-gate passes.
 # Event-driven (check_suite / pull_request labeled / codex-gate finished),
-# with a 2-hourly safety net. The merge uses AUTOMATION_PAT so the push to
+# with a once-daily safety net. The merge uses AUTOMATION_PAT so the push to
 # the base branch triggers downstream workflows (health-check, etc.).
 # fail-soft: if AUTOMATION_PAT is missing, exit GREEN.
 
@@ -16,7 +16,7 @@ on:
     workflows: ["Codex Gate"]
     types: [completed]
   schedule:
-    - cron: '37 */2 * * *'   # safety net every 2h (offset :37)
+    - cron: '30 7 * * *'   # safety net once daily (07:30 UTC) — real-time merges come from the events above
   workflow_dispatch:
 
 permissions:
