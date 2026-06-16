@@ -75,9 +75,13 @@ jobs:
           github_token: ${{ secrets.AUTOMATION_PAT || github.token }}
           trigger_phrase: "@claude"
           label_trigger: "claude-fix"
-          # Cap turns to restrain cost.
+          # Cap turns to restrain cost; allow the tools Claude needs to
+          # diagnose (Read/Glob/Grep), edit (Edit/Write), and run the gate +
+          # git/gh to open the PR. Without these the agent is sandboxed and
+          # cannot push or open a PR (it hit permission_denials_count: 21).
           claude_args: |
             --max-turns 50
+            --allowedTools "Bash,Edit,Write,Read,Glob,Grep,Bash(git:*),Bash(gh:*)"
           additional_permissions: |
             actions: read
           prompt: |
