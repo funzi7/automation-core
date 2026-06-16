@@ -24,11 +24,14 @@ on:
   issues:
     types: [labeled, assigned]
 
-# Never run two fixes on the same Issue/PR at once; never cancel an
-# in-flight fix (a half-applied fix is worse than a queued one).
+# One fix at a time per Issue/PR — and CANCEL any in-flight run when a new
+# @claude fix arrives. With cancel-in-progress: false, multiple fixes on the
+# same PR ran in PARALLEL and overwrote each other (a ~6-min run "finished"
+# with no commit), burning minutes + money. cancel-in-progress: true kills
+# the stale run immediately so only the newest fix proceeds.
 concurrency:
-  group: claude-fixer-${{ github.repository }}-${{ github.event.issue.number || github.event.pull_request.number }}
-  cancel-in-progress: false
+  group: claude-fix-${{ github.event.issue.number || github.event.pull_request.number }}
+  cancel-in-progress: true
 
 permissions:
   contents: write
@@ -75,25 +78,20 @@ jobs:
           github_token: ${{ secrets.AUTOMATION_PAT || github.token }}
           trigger_phrase: "@claude"
           label_trigger: "claude-fix"
-          # Cap turns to restrain cost; allow only the tools Claude needs.
-          # This job holds contents/PR write + a GitHub token, so a
-          # prompt-injection in an issue/log/comment is the threat. Do NOT
-          # grant bare `Bash`, broad interpreter/package wildcards, or
-          # `Bash(git:*)`: a trailing `:*` is a wildcard, so `Bash(git:*)`
-          # would authorize `git push` to a protected ref, and
-          # `Bash(python:*)`/`Bash(node:*)` would authorize `python -c` /
-          # `node -e` arbitrary code; `Bash(npm:*)` would authorize
-          # `npm exec`/publish and `Bash(gh:*)` would authorize
-          # `gh auth token` exfiltration. Instead allow the file tools
-          # (Read/Glob/Grep/Edit/Write); git scoped to read/branch/commit
-          # subcommands ONLY (no `push` — the v1 action's tag mode injects a
-          # safe-push wrapper + its own scoped git tools); gh scoped to
-          # pr/issue/run/api; and gate runners as specific non-code-exec
-          # subcommands (no raw interpreters, no `npm exec`/`npx`, no
-          # `go run`/`cargo run`).
+          # --max-turns 20 caps cost (most fixes need far fewer than 35).
+          # FINAL, minimal allowlist — this is intentionally the smallest set
+          # that still lets the fixer diagnose, edit, run actionlint, and push
+          # its branch / open a PR. Deliberately EXCLUDED to stop the
+          # shrink-the-allowlist loop and close prompt-injection vectors: bare
+          # `Bash`, broad `Bash(git:*)`, arbitrary interpreters / script
+          # runners (python/node/npm/pnpm/yarn/pip/make/go/cargo), and
+          # `gh api`. git scoped per-subcommand; `git push` is kept because the
+          # fixer must push its own branch. gh limited to pr/issue. If the
+          # fixer needs something not listed it will fail and land on
+          # needs-dima — preferable to an endless allowlist loop.
           claude_args: |
-            --max-turns 50
-            --allowedTools "Read,Glob,Grep,Edit,Write,Bash(gh pr:*),Bash(gh issue:*),Bash(gh run:*),Bash(gh api:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git branch:*),Bash(git checkout:*),Bash(git switch:*),Bash(git add:*),Bash(git commit:*),Bash(git fetch:*),Bash(git rev-parse:*),Bash(git restore:*),Bash(git stash:*),Bash(npm ci:*),Bash(npm install:*),Bash(npm test:*),Bash(npm run:*),Bash(pnpm install:*),Bash(pnpm test:*),Bash(pnpm run:*),Bash(yarn install:*),Bash(yarn test:*),Bash(yarn run:*),Bash(pip install:*),Bash(pytest:*),Bash(ruff:*),Bash(mypy:*),Bash(flake8:*),Bash(black:*),Bash(tox:*),Bash(make:*),Bash(go build:*),Bash(go test:*),Bash(go vet:*),Bash(cargo build:*),Bash(cargo test:*),Bash(cargo clippy:*),Bash(actionlint:*)"
+            --max-turns 20
+            --allowedTools "Read,Glob,Grep,Edit,Write,Bash(git status),Bash(git diff),Bash(git log),Bash(git add:*),Bash(git commit:*),Bash(git checkout:*),Bash(git branch:*),Bash(git fetch:*),Bash(git push:*),Bash(gh pr:*),Bash(gh issue:*),Bash(actionlint)"
           additional_permissions: |
             actions: read
           prompt: |
