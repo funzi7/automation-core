@@ -2,9 +2,15 @@ name: Codex Auto-Fix
 
 # Auto-respond to Codex bot reviews with `@claude fix` so Claude
 # (the trusted fixer, via claude.yml) drives the follow-up commit
-# when Codex flags P1 or P2 issues. Direction is deliberate: Codex
-# reviews, Claude fixes — we never hand the fix back to Codex.
-# Without this workflow a human would have to type the trigger.
+# when Codex flags a P1 issue (a real bug or security hole).
+# Direction is deliberate: Codex reviews, Claude fixes — we never
+# hand the fix back to Codex. Without this workflow a human would
+# have to type the trigger.
+#
+# P1 ONLY: P2 findings (style / nice-to-have) never auto-trigger a
+# paid Claude run — Codex always finds another P2, which created a
+# near-infinite review/fix loop. P2 notes stay on the PR for
+# reference; Dima can post `@claude fix` by hand for a specific one.
 #
 # The comment is posted with AUTOMATION_PAT (not GITHUB_TOKEN): a
 # comment made with the default token does NOT start other workflows
@@ -19,10 +25,16 @@ name: Codex Auto-Fix
 #     needs-dima label (merge-bot then ignores the PR), and ping
 #     Telegram if configured. Prevents the near-infinite review/fix
 #     loop (each round costs real money).
-#   - Substring match on "P1" or "P2" in the review body. Codex
-#     uses badge URLs like `P1-orange?style=flat` so the literal
-#     substring is reliable; "no issues" reviews don't include
-#     those tokens.
+#   - Substring match on "P1" in the review body. Codex uses badge
+#     URLs like `P1-orange?style=flat` so the literal substring is
+#     reliable; "no issues" reviews don't include that token. (Same
+#     existing detection — P2 is intentionally NOT matched, so P2-
+#     only reviews never start a run.)
+#   - Cross-channel debounce: a Codex review with N inline comments
+#     fires N events across TWO channels (issue comments AND review
+#     comments). We dedupe the "[auto-triggered]" marker across BOTH
+#     channels (+ reviews), so a whole review wave yields exactly
+#     ONE @claude fix no matter how many inline notes it carries.
 
 on:
   pull_request_review:
@@ -47,18 +59,21 @@ permissions:
 jobs:
   trigger_codex_fix:
     runs-on: ubuntu-latest
-    # Debounce: serialize bridge runs per PR so the per-commit dedupe in the
-    # Check step reliably sees a prior @claude fix comment. A Codex review with
-    # N inline comments fires N events; this + the dedupe = ONE @claude fix per
-    # review wave (Claude reads the whole PR and fixes all P1/P2 in one run).
+    # Debounce: serialize bridge runs per PR so the cross-channel dedupe in
+    # the Check step reliably sees a prior @claude fix comment BEFORE the next
+    # event is processed. A Codex review with N inline comments fires N events
+    # (in two channels); this serialization + the dedupe = ONE @claude fix per
+    # review wave (Claude reads the whole PR and fixes every P1 in one run).
     concurrency:
       group: codex-claude-bridge-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number }}
       cancel-in-progress: false
     # Per-event explicit gate: each clause requires (1) the right
     # event_name, (2) the bot author on the right payload field, and
-    # (3) a P1 or P2 marker in the body. Pulling P1/P2 into the if:
-    # short-circuits jobs for "Codex says LGTM" reviews entirely
-    # (instead of starting the runner and bailing in JS).
+    # (3) a P1 marker in the body. Pulling P1 into the if: short-
+    # circuits the runner for both "Codex says LGTM" AND P2-only
+    # reviews entirely — P2 must never start a paid fix run — instead
+    # of starting the runner and bailing in JS. (The check step still
+    # confirms an ACTIVE P1 across the whole review wave.)
     #
     # Three branches mirror the on: events that can carry actionable
     # bot feedback: PR review, inline review-comment, top-level
@@ -67,13 +82,13 @@ jobs:
     if: |
       (github.event_name == 'pull_request_review' &&
        github.event.review.user.login == 'chatgpt-codex-connector[bot]' &&
-       (contains(github.event.review.body, 'P1') || contains(github.event.review.body, 'P2'))) ||
+       contains(github.event.review.body, 'P1')) ||
       (github.event_name == 'pull_request_review_comment' &&
        github.event.comment.user.login == 'chatgpt-codex-connector[bot]' &&
-       (contains(github.event.comment.body, 'P1') || contains(github.event.comment.body, 'P2'))) ||
+       contains(github.event.comment.body, 'P1')) ||
       (github.event_name == 'issue_comment' &&
        github.event.comment.user.login == 'chatgpt-codex-connector[bot]' &&
-       (contains(github.event.comment.body, 'P1') || contains(github.event.comment.body, 'P2')))
+       contains(github.event.comment.body, 'P1'))
 
     steps:
       - name: Check if review has actionable feedback
@@ -94,23 +109,12 @@ jobs:
               core.setOutput("should_trigger", "false");
               return;
             }
-            // Body comes from whichever event fired.
-            const body =
-              context.payload.comment?.body ||
-              context.payload.review?.body ||
-              "";
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
 
-            // Codex marks actionable items with P1 / P2 badges.
-            // The badge URL contains the literal "P1"/"P2"
-            // substring, so a loose includes() match works.
-            // Codex's "no issues" reviews react with 👍 instead
-            // of leaving a body, so they don't trip this gate.
-            const hasActionableFeedback =
-              body.includes("P1") || body.includes("P2");
-
-            // PR number: pull_request_review payload has
-            // `pull_request`, issue_comment has `issue` (PRs
-            // are issues for the comments API).
+            // PR number: pull_request_review / pull_request_review_comment
+            // payloads carry `pull_request`; issue_comment carries `issue`
+            // (PRs are issues for the comments API).
             const prNumber =
               context.payload.pull_request?.number ||
               context.payload.issue?.number;
@@ -120,34 +124,42 @@ jobs:
               return;
             }
 
-            // Count prior auto-trigger comments to enforce the
-            // 3-round cap. The "[auto-triggered]" marker is in
-            // every comment this workflow posts (see the next
-            // step's body); counting them gives an accurate
-            // round counter regardless of how many human
-            // @codex comments have been added.
-            //
-            // Paginate: the default page size is 30, so on
-            // chatty PRs the older auto-trigger comments would
-            // silently drop off and the circuit breaker would
-            // think we were on round 0 forever.
-            const comments = await github.paginate(
-              github.rest.issues.listComments,
-              {
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: prNumber,
-                per_page: 100,
-              }
-            );
-            // Match purely on the "[auto-triggered]" marker so
-            // the circuit breaker stays correct if the trigger
-            // phrase ever rotates (it has rotated before, and again
-            // now that we post "@claude fix" instead). Old comments
-            // still carry the marker and still count.
-            const autoFixCount = comments.filter(
-              (c) => c.body?.includes("[auto-triggered]"),
-            ).length;
+            const MARKER = "[auto-triggered]";
+            const CODEX = "chatgpt-codex-connector[bot]";
+
+            // Pull EVERY feedback channel, fully paginated. Codex inline notes
+            // (pull_request_review_comment) live in a DIFFERENT channel from
+            // top-level PR comments (issue_comment), and the bridge posts its
+            // own inline @claude fix as a review-comment REPLY. The old code
+            // counted only issues.listComments, so it never saw those inline
+            // auto-triggers — that's why a single Codex review with several
+            // inline notes fired several runs (PR #19: 3 notes → 2 triggers).
+            const [issueComments, reviewComments, reviews] = await Promise.all([
+              github.paginate(github.rest.issues.listComments, {
+                owner, repo, issue_number: prNumber, per_page: 100,
+              }),
+              github.paginate(github.rest.pulls.listReviewComments, {
+                owner, repo, pull_number: prNumber, per_page: 100,
+              }),
+              github.paginate(github.rest.pulls.listReviews, {
+                owner, repo, pull_number: prNumber, per_page: 100,
+              }),
+            ]);
+
+            // Normalise all three channels to { body, login, date } so the
+            // marker dedupe AND the P1 scan span every channel at once.
+            // Reviews use submitted_at; comments use created_at.
+            const norm = [
+              ...issueComments.map((c) => ({ body: c.body, login: c.user?.login, date: c.created_at })),
+              ...reviewComments.map((c) => ({ body: c.body, login: c.user?.login, date: c.created_at })),
+              ...reviews.map((r) => ({ body: r.body, login: r.user?.login, date: r.submitted_at })),
+            ];
+
+            // Circuit breaker: count auto-trigger markers across ALL channels
+            // (now including the inline replies the old code missed). The
+            // marker — not the trigger phrase — is the round counter, so it
+            // stays correct even if the phrase rotates.
+            const autoFixCount = norm.filter((e) => e.body?.includes(MARKER)).length;
 
             const MAX_FIX_ROUNDS = 3;
             if (autoFixCount >= MAX_FIX_ROUNDS) {
@@ -158,10 +170,7 @@ jobs:
               );
               try {
                 await github.rest.issues.addLabels({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  issue_number: prNumber,
-                  labels: ['needs-dima'],
+                  owner, repo, issue_number: prNumber, labels: ['needs-dima'],
                 });
               } catch (e) {
                 core.info(`addLabel needs-dima failed (ignored): ${e.message}`);
@@ -176,7 +185,7 @@ jobs:
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                       chat_id: tgChat,
-                      text: `🚨 <b>${context.repo.repo}</b> PR #${prNumber}: ${autoFixCount} @claude fix rounds didn't converge — escalated to <b>needs-dima</b>.`,
+                      text: `🚨 <b>${repo}</b> PR #${prNumber}: ${autoFixCount} @claude fix rounds didn't converge — escalated to <b>needs-dima</b>.`,
                       parse_mode: 'HTML',
                       disable_web_page_preview: true,
                     }),
@@ -189,38 +198,60 @@ jobs:
               return;
             }
 
-            // Per-review-wave debounce: if we already posted @claude fix for
-            // the CURRENT head commit, don't post again — Claude fixes every
-            // P1/P2 in one run, so one trigger per wave is enough.
+            // Head-commit timestamp: anything Codex left AFTER this is feedback
+            // on the current head (Codex re-reviews each push); anything the
+            // bridge posted after this is THIS wave's trigger.
             const prCommits = await github.paginate(github.rest.pulls.listCommits, {
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: prNumber,
-              per_page: 100,
+              owner, repo, pull_number: prNumber, per_page: 100,
             });
             const latestCommitDate = prCommits.length
               ? new Date(prCommits[prCommits.length - 1].commit.committer.date)
               : new Date(0);
-            const alreadyThisWave = comments.some(
-              (c) =>
-                c.body?.includes("[auto-triggered]") &&
-                new Date(c.created_at) > latestCommitDate,
+
+            // P1-ONLY gate. Auto-trigger a (paid) Claude run only when at least
+            // one ACTIVE P1 exists for the current head. P2 findings never
+            // auto-trigger — Codex finds new P2s endlessly, which is the
+            // infinite loop we are stopping. P2 notes stay on the PR for
+            // reference; Dima can @claude fix a specific one by hand.
+            // Detection reuses the EXISTING badge check (body.includes("P1")):
+            // a Codex P1 badge contains the literal "P1" substring; a P2 badge
+            // never does. We scan the triggering body PLUS every Codex note
+            // left after the latest commit, so the wave's P1 is seen no matter
+            // which event (review body or a sibling inline note) we run on.
+            const currentBody =
+              context.payload.comment?.body || context.payload.review?.body || "";
+            const codexBodiesThisWave = norm
+              .filter((e) => e.login === CODEX && e.date && new Date(e.date) > latestCommitDate)
+              .map((e) => e.body || "");
+            codexBodiesThisWave.push(currentBody);
+            const hasP1 = codexBodiesThisWave.some((b) => b.includes("P1"));
+            if (!hasP1) {
+              core.info(
+                `PR #${prNumber}: only P2 (no active P1) on the current head — P2 is advisory, not auto-triggering.`,
+              );
+              core.setOutput("should_trigger", "false");
+              return;
+            }
+
+            // Cross-channel debounce: if a @claude fix marker already exists for
+            // the current head in ANY channel, don't post again — Claude fixes
+            // every P1 on the PR in a single run, so one trigger per wave is
+            // enough. This is what collapses N inline events into ONE trigger.
+            const alreadyThisWave = norm.some(
+              (e) => e.body?.includes(MARKER) && e.date && new Date(e.date) > latestCommitDate,
             );
             if (alreadyThisWave) {
               core.info(
-                `PR #${prNumber}: already triggered @claude fix for the current head; debouncing.`,
+                `PR #${prNumber}: already triggered @claude fix for the current head (any channel); debouncing.`,
               );
               core.setOutput("should_trigger", "false");
               return;
             }
 
             core.info(
-              `PR #${prNumber}: actionable=${hasActionableFeedback}, prior auto-fixes=${autoFixCount}`,
+              `PR #${prNumber}: active P1 found; prior auto-fixes=${autoFixCount} — triggering one @claude fix.`,
             );
-            core.setOutput(
-              "should_trigger",
-              hasActionableFeedback ? "true" : "false",
-            );
+            core.setOutput("should_trigger", "true");
             core.setOutput("pr_number", prNumber.toString());
 
       - name: Comment on PR to trigger Claude fix
@@ -239,7 +270,7 @@ jobs:
             const payload = context.payload;
             // First line is the bare phrase "@claude fix" — the
             // trigger claude.yml matches on (a "@claude" mention).
-            // Codex reviews, Claude fixes: when Codex flags a P1/P2 we
+            // Codex reviews, Claude fixes: when Codex flags a P1 we
             // route the fix to Claude, never back to Codex. Keep this
             // first line literal so the mention parser sees it cleanly.
             //
