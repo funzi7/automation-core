@@ -70,6 +70,7 @@ jobs:
           fetch-depth: 0
 
       - name: Run Claude Code
+        id: claude
         if: steps.keycheck.outputs.has_key == 'true'
         uses: anthropics/claude-code-action@v1
         with:
@@ -118,7 +119,13 @@ jobs:
             comment, working on a branch and opening a PR the same way.
 
       - name: Label Claude's PR for auto-merge
-        if: always() && steps.keycheck.outputs.has_key == 'true'
+        # P1 fix: only label when Claude Code actually RAN AND SUCCEEDED. With
+        # always() this labeled PRs even on a failed/cancelled run, so a PR
+        # Claude did NOT fix could pick up `automerge` and auto-merge.
+        # steps.claude.outcome is 'success' only on a real success; it is
+        # 'failure'/'cancelled' on a bad run and 'skipped' in the
+        # fail-soft (no ANTHROPIC_API_KEY) path — none of which should label.
+        if: steps.claude.outcome == 'success'
         uses: actions/github-script@v7
         with:
           # AUTOMATION_PAT (default-token fallback) so merge-bot can pick up the
