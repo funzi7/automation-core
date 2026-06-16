@@ -24,14 +24,16 @@ on:
   issues:
     types: [labeled, assigned]
 
-# One fix at a time per Issue/PR — and CANCEL any in-flight run when a new
-# @claude fix arrives. With cancel-in-progress: false, multiple fixes on the
-# same PR ran in PARALLEL and overwrote each other (a ~6-min run "finished"
-# with no commit), burning minutes + money. cancel-in-progress: true kills
-# the stale run immediately so only the newest fix proceeds.
+# One fix at a time per Issue/PR. cancel-in-progress: FALSE — a Claude run
+# costs money by the minute, so we must NEVER cancel one that is already
+# burning time. A second event for the same Issue/PR queues BEHIND the
+# running one (serialized, not parallel, not cancelled). The real defense
+# against duplicate runs is upstream: each event maps to exactly one clause
+# in the job `if:` below (no single action fires two runs), and
+# codex-auto-fix no longer wakes on Issue events at all.
 concurrency:
   group: claude-fix-${{ github.event.issue.number || github.event.pull_request.number }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: write
