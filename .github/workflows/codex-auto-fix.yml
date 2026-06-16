@@ -35,12 +35,6 @@ on:
     types: [created]
   issue_comment:
     types: [created]
-  # `issues` is for the site-health auto-trigger (trigger_codex_on_health_issue
-  # job below). Existing jobs filter by event payload shape — for an `issues`
-  # event `github.event.comment` / `github.event.review` are both null, so
-  # their `if:` clauses evaluate false and they stay quiet.
-  issues:
-    types: [opened, labeled]
 
 permissions:
   # Need write to comment on the PR. issues:write is required
@@ -68,9 +62,8 @@ jobs:
     #
     # Three branches mirror the on: events that can carry actionable
     # bot feedback: PR review, inline review-comment, top-level
-    # issue/PR comment. The `issues` event is intentionally omitted
-    # — that's site-health territory, handled by the dedicated job
-    # below.
+    # issue/PR comment. This workflow does NOT listen to `issues`
+    # events — it only responds to Codex reviews/comments on PRs.
     if: |
       (github.event_name == 'pull_request_review' &&
        github.event.review.user.login == 'chatgpt-codex-connector[bot]' &&
@@ -519,76 +512,3 @@ jobs:
           # over it instead of failing.
           git pull --rebase origin main
           git push origin main
-
-  # Auto-tag @codex on issues opened by the site-health workflow (or
-  # opened manually with the same label) so its own auto-fix flow can
-  # pick them up. Codex doesn't watch raw issues — only PR comments —
-  # so without this nudge the site-health alert sits there until a
-  # human triages it.
-  #
-  # Fires on `opened` AND `labeled` so adding the label after the fact
-  # still triggers (matches how Dima would tag a manually-filed issue
-  # for Codex to pick up). Existing jobs are gated on
-  # comment/review payload shape and stay quiet on `issues` events.
-  trigger_codex_on_health_issue:
-    runs-on: ubuntu-latest
-    if: |
-      github.event_name == 'issues' &&
-      contains(github.event.issue.labels.*.name, 'site-health')
-    permissions:
-      issues: write
-      contents: read
-
-    steps:
-      - name: Comment to trigger Codex
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const issue = context.payload.issue;
-
-            // Dedupe: walk existing comments for the
-            // [health-auto-trigger] marker. If we've already
-            // tagged Codex once on this issue, don't do it again
-            // even when the issue is re-labeled or re-opened.
-            // Keeps the @codex thread tidy and prevents a loop
-            // if a human flips labels during triage.
-            const { data: comments } = await github.rest.issues.listComments({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: issue.number,
-            });
-
-            const alreadyTriggered = comments.some(
-              (c) =>
-                c.body?.includes('@codex') &&
-                c.body?.includes('[health-auto-trigger]'),
-            );
-
-            if (alreadyTriggered) {
-              core.info(
-                `Issue #${issue.number} already triggered Codex, skipping`,
-              );
-              return;
-            }
-
-            // Body built via array.join('\n') to avoid a multiline
-            // template literal whose dedented content might collide
-            // with YAML's block-scalar parsing (same gotcha as
-            // site-health.yml).
-            const body = [
-              '@codex please diagnose this site health issue and propose a fix.',
-              '',
-              'If you can identify the root cause and the fix is contained (selector update, parser tweak, retry logic), open a PR.',
-              '',
-              'If manual investigation is needed (Cloudflare changes, infrastructure issues, schema changes requiring migrations), comment with your diagnosis and recommended action steps.',
-              '',
-              '[health-auto-trigger]',
-            ].join('\n');
-
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: issue.number,
-              body,
-            });
-            core.info(`Triggered Codex on health issue #${issue.number}`);
