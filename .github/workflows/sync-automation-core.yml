@@ -24,7 +24,7 @@ jobs:
 
       - name: Checkout this repo
         if: steps.optout.outputs.skip == 'false'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           # AUTOMATION_PAT carries the `workflows` RW scope that the
           # default GITHUB_TOKEN lacks. Required so the create-pull-request

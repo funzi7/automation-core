@@ -24,7 +24,7 @@ jobs:
 
       - name: Checkout this repo
         if: steps.optout.outputs.skip == 'false'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Clone automation-core
         if: steps.optout.outputs.skip == 'false'
