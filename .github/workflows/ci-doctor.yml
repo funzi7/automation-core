@@ -193,6 +193,16 @@ jobs:
                 continue;
               }
 
+              // Already escalated to a human on a prior scan — leave it
+              // completely alone. Without this, every later scan re-finds the
+              // issue (it still carries the ci-doctor label), re-enters the
+              // escalation branch, and re-posts the needs-dima comment +
+              // Telegram daily. Skip the moment needs-dima is present.
+              if ((existing.labels || []).some((l) => (l.name || l) === LABEL_ESCALATE)) {
+                core.info(`Issue #${existing.number}: already escalated (needs-dima); skipping.`);
+                continue;
+              }
+
               // Existing Issue → count our attempt comments.
               const comments = await github.paginate(github.rest.issues.listComments, {
                 owner, repo, issue_number: existing.number, per_page: 100,

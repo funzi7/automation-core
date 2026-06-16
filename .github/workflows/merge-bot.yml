@@ -61,6 +61,8 @@ jobs:
             const LABEL_AUTOMERGE = 'automerge';
             const LABEL_ESCALATE = 'needs-dima';
             const SYNC_TITLE_PREFIX = 'chore(automation): sync from automation-core';
+            const SYNC_BRANCH = 'chore/sync-automation-core';   // branch the sync workflow opens
+            const OWNER_LOGIN = 'funzi7';
 
             // minimatch-style glob -> RegExp (supports **, *, ?). Inlined to
             // avoid depending on a package not bundled with github-script.
@@ -118,8 +120,21 @@ jobs:
               if ((pr.labels || []).some((l) => l.name === LABEL_ESCALATE)) return false;
               const byBot = isClaudeBot(pr.user && pr.user.login);
               const hasAutomerge = (pr.labels || []).some((l) => l.name === LABEL_AUTOMERGE);
-              const isSync = (pr.title || '').startsWith(SYNC_TITLE_PREFIX);
-              return byBot || hasAutomerge || isSync;
+              // A sync PR is trusted ONLY if the title matches AND it is
+              // provably ours — a same-repo branch named like the one the
+              // sync workflow opens, or authored by the owner. The title
+              // alone is forgeable: an outside contributor could open a PR
+              // titled "chore(automation): sync from automation-core" from a
+              // fork and ride straight into auto-merge. The same-repo /
+              // owner check closes that hole (fork PRs carry a head.repo
+              // distinct from base, and can't author as the owner).
+              const titleIsSync = (pr.title || '').startsWith(SYNC_TITLE_PREFIX);
+              const sameRepo = !!(pr.head && pr.head.repo && pr.head.repo.full_name === `${owner}/${repo}`);
+              const isTrustedSync = titleIsSync && (
+                (pr.user && pr.user.login === OWNER_LOGIN) ||
+                ((pr.head && pr.head.ref === SYNC_BRANCH) && sameRepo)
+              );
+              return byBot || hasAutomerge || isTrustedSync;
             });
 
             if (!candidates.length) {
