@@ -75,13 +75,16 @@ jobs:
           github_token: ${{ secrets.AUTOMATION_PAT || github.token }}
           trigger_phrase: "@claude"
           label_trigger: "claude-fix"
-          # Cap turns to restrain cost; allow the tools Claude needs to
-          # diagnose (Read/Glob/Grep), edit (Edit/Write), and run the gate +
-          # git/gh to open the PR. Without these the agent is sandboxed and
-          # cannot push or open a PR (it hit permission_denials_count: 21).
+          # Cap turns to restrain cost; allow only the tools Claude needs.
+          # Do NOT grant bare `Bash`: this job holds contents/PR write + a
+          # GitHub token, so unscoped shell would let a prompt-injection in
+          # an issue/log/comment run ANY command (direct pushes, token-bearing
+          # curl). Instead allow the file tools (Read/Glob/Grep/Edit/Write),
+          # scoped git/gh for PR ops, and common gate runners. The v1 action's
+          # tag mode also injects its own scoped git tools + safe-push wrapper.
           claude_args: |
             --max-turns 50
-            --allowedTools "Bash,Edit,Write,Read,Glob,Grep,Bash(git:*),Bash(gh:*)"
+            --allowedTools "Read,Glob,Grep,Edit,Write,Bash(git:*),Bash(gh:*),Bash(npm:*),Bash(npx:*),Bash(pnpm:*),Bash(yarn:*),Bash(node:*),Bash(python:*),Bash(python3:*),Bash(pip:*),Bash(pytest:*),Bash(ruff:*),Bash(make:*),Bash(go:*),Bash(cargo:*),Bash(actionlint:*)"
           additional_permissions: |
             actions: read
           prompt: |
