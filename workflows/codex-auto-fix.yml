@@ -1,15 +1,14 @@
 name: Codex Auto-Fix
 
-# Auto-respond to Codex bot reviews with `@codex fix` so Codex
-# (which already does automatic reviews on every PR) also drives
-# its own follow-up commit when it flags P1 or P2 issues. Without
-# this workflow, every Codex review requires a human to type the
-# trigger comment manually.
+# Auto-respond to Codex bot reviews with `@claude fix` so Claude
+# (the trusted fixer, via claude.yml) drives the follow-up commit
+# when Codex flags P1 or P2 issues. Direction is deliberate: Codex
+# reviews, Claude fixes — we never hand the fix back to Codex.
+# Without this workflow a human would have to type the trigger.
 #
-# The trigger phrase MUST be the literal "@codex fix" on its own
-# first line — empirically that's the only phrase that produces
-# a fix commit. "@codex address that feedback" was a no-op;
-# "@codex review" only re-reviews.
+# The comment is posted with AUTOMATION_PAT (not GITHUB_TOKEN): a
+# comment made with the default token does NOT start other workflows
+# (GitHub loop protection), so claude.yml would never see the mention.
 #
 # Safety rails:
 #   - Only fires on comments from chatgpt-codex-connector[bot].
@@ -80,8 +79,19 @@ jobs:
       - name: Check if review has actionable feedback
         id: check_review
         uses: actions/github-script@v7
+        env:
+          AUTOMATION_PAT: ${{ secrets.AUTOMATION_PAT }}
         with:
           script: |
+            // fail-soft: the @claude auto-trigger comment must be posted
+            // with AUTOMATION_PAT (a GITHUB_TOKEN comment won't trigger
+            // claude.yml). If the PAT isn't set in this repo, skip quietly
+            // rather than post a comment that would go nowhere.
+            if (!process.env.AUTOMATION_PAT) {
+              core.info("AUTOMATION_PAT not set — skipping @claude auto-trigger (fail-soft).");
+              core.setOutput("should_trigger", "false");
+              return;
+            }
             // Body comes from whichever event fired.
             const body =
               context.payload.comment?.body ||
@@ -130,16 +140,16 @@ jobs:
             );
             // Match purely on the "[auto-triggered]" marker so
             // the circuit breaker stays correct if the trigger
-            // phrase ever rotates (it just did: "@codex address
-            // that feedback" → "@codex fix"). Old comments still
-            // carry the marker and still count.
+            // phrase ever rotates (it has rotated before, and again
+            // now that we post "@claude fix" instead). Old comments
+            // still carry the marker and still count.
             const autoFixCount = comments.filter(
               (c) => c.body?.includes("[auto-triggered]"),
             ).length;
 
             if (autoFixCount >= 2) {
               core.warning(
-                `Already auto-triggered Codex ${autoFixCount} times on PR #${prNumber}; skipping. A human can take over by commenting @codex manually.`,
+                `Already auto-triggered Codex ${autoFixCount} times on PR #${prNumber}; skipping. A human can take over by commenting @claude manually.`,
               );
               core.setOutput("should_trigger", "false");
               return;
@@ -154,10 +164,13 @@ jobs:
             );
             core.setOutput("pr_number", prNumber.toString());
 
-      - name: Comment on PR to trigger Codex fix
+      - name: Comment on PR to trigger Claude fix
         if: steps.check_review.outputs.should_trigger == 'true'
         uses: actions/github-script@v7
         with:
+          # AUTOMATION_PAT so the posted @claude comment actually triggers
+          # claude.yml (GITHUB_TOKEN-authored comments don't start workflows).
+          github-token: ${{ secrets.AUTOMATION_PAT }}
           script: |
             const prNumber = parseInt(
               "${{ steps.check_review.outputs.pr_number }}",
@@ -165,17 +178,15 @@ jobs:
             );
             const eventName = context.eventName;
             const payload = context.payload;
-            // First line is the bare phrase "@codex fix" — that is
-            // the trigger Codex actually responds to with a fix
-            // commit. The earlier phrase "@codex address that
-            // feedback" was a no-op: empirically it did not produce
-            // any push. "@codex review" only re-reviews. Keep this
-            // first line literal and unembellished so Codex's
-            // parser sees the trigger cleanly.
+            // First line is the bare phrase "@claude fix" — the
+            // trigger claude.yml matches on (a "@claude" mention).
+            // Codex reviews, Claude fixes: when Codex flags a P1/P2 we
+            // route the fix to Claude, never back to Codex. Keep this
+            // first line literal so the mention parser sees it cleanly.
             //
             // "[auto-triggered]" stays on a later line as the
             // marker the circuit-breaker (previous step) counts.
-            const baseBody = "@codex fix\n\n[auto-triggered]";
+            const baseBody = "@claude fix\n\n[auto-triggered]";
 
             // Route the trigger reply to wherever Codex left the
             // feedback so the bot can correlate the @-mention with
@@ -205,14 +216,14 @@ jobs:
                 body: baseBody,
               });
               core.info(
-                `Auto-triggered Codex fix as inline reply on PR #${prNumber} (comment ${payload.comment.id})`,
+                `Auto-triggered Claude fix as inline reply on PR #${prNumber} (comment ${payload.comment.id})`,
               );
             } else if (
               eventName === 'pull_request_review' &&
               payload.review
             ) {
               const body =
-                `@codex fix\n\n[auto-triggered]\n\n(review: ${payload.review.html_url})`;
+                `@claude fix\n\n[auto-triggered]\n\n(review: ${payload.review.html_url})`;
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
@@ -220,7 +231,7 @@ jobs:
                 body,
               });
               core.info(
-                `Auto-triggered Codex fix on PR #${prNumber} (review ${payload.review.id})`,
+                `Auto-triggered Claude fix on PR #${prNumber} (review ${payload.review.id})`,
               );
             } else {
               await github.rest.issues.createComment({
@@ -229,7 +240,7 @@ jobs:
                 issue_number: prNumber,
                 body: baseBody,
               });
-              core.info(`Auto-triggered Codex fix on PR #${prNumber}`);
+              core.info(`Auto-triggered Claude fix on PR #${prNumber}`);
             }
 
   # Archive Codex post-fix summaries to the agent-memory repo so
@@ -266,8 +277,21 @@ jobs:
        contains(github.event.comment.body, 'Summary'))
 
     steps:
+      - name: Fail-soft check for AGENT_MEMORY_PAT
+        id: patcheck
+        env:
+          AGENT_MEMORY_PAT: ${{ secrets.AGENT_MEMORY_PAT }}
+        run: |
+          if [ -z "${AGENT_MEMORY_PAT}" ]; then
+            echo "::notice::AGENT_MEMORY_PAT is not set — skipping Codex summary archive (fail-soft)."
+            echo "has_pat=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_pat=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Extract Codex summary
         id: extract
+        if: steps.patcheck.outputs.has_pat == 'true'
         uses: actions/github-script@v7
         with:
           script: |
@@ -331,20 +355,18 @@ jobs:
             fs.writeFileSync("/tmp/codex-summary.md", body);
 
       - name: Clone agent-memory
+        if: steps.patcheck.outputs.has_pat == 'true'
         env:
           PAT: ${{ secrets.AGENT_MEMORY_PAT }}
         run: |
           set -euo pipefail
-          if [ -z "${PAT:-}" ]; then
-            echo "::error::AGENT_MEMORY_PAT secret is not set. See PR #57 description for setup steps."
-            exit 1
-          fi
           git clone "https://x-access-token:${PAT}@github.com/funzi7/agent-memory.git" /tmp/agent-memory
           cd /tmp/agent-memory
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
       - name: Append entry to codex-log.md
+        if: steps.patcheck.outputs.has_pat == 'true'
         env:
           PR_NUMBER: ${{ steps.extract.outputs.pr_number }}
           PR_TITLE: ${{ steps.extract.outputs.pr_title }}
@@ -412,6 +434,7 @@ jobs:
           mv /tmp/log-new.md "$LOG_PATH"
 
       - name: Commit and push to agent-memory
+        if: steps.patcheck.outputs.has_pat == 'true'
         env:
           PR_NUMBER: ${{ steps.extract.outputs.pr_number }}
           REPO_NAME: ${{ github.event.repository.name }}
