@@ -53,6 +53,13 @@ permissions:
 jobs:
   trigger_codex_fix:
     runs-on: ubuntu-latest
+    # Debounce: serialize bridge runs per PR so the per-commit dedupe in the
+    # Check step reliably sees a prior @claude fix comment. A Codex review with
+    # N inline comments fires N events; this + the dedupe = ONE @claude fix per
+    # review wave (Claude reads the whole PR and fixes all P1/P2 in one run).
+    concurrency:
+      group: codex-claude-bridge-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number }}
+      cancel-in-progress: false
     # Per-event explicit gate: each clause requires (1) the right
     # event_name, (2) the bot author on the right payload field, and
     # (3) a P1 or P2 marker in the body. Pulling P1/P2 into the if:
@@ -185,6 +192,31 @@ jobs:
                   core.info(`Telegram failed (ignored): ${e.message}`);
                 }
               }
+              core.setOutput("should_trigger", "false");
+              return;
+            }
+
+            // Per-review-wave debounce: if we already posted @claude fix for
+            // the CURRENT head commit, don't post again — Claude fixes every
+            // P1/P2 in one run, so one trigger per wave is enough.
+            const prCommits = await github.paginate(github.rest.pulls.listCommits, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+              per_page: 100,
+            });
+            const latestCommitDate = prCommits.length
+              ? new Date(prCommits[prCommits.length - 1].commit.committer.date)
+              : new Date(0);
+            const alreadyThisWave = comments.some(
+              (c) =>
+                c.body?.includes("[auto-triggered]") &&
+                new Date(c.created_at) > latestCommitDate,
+            );
+            if (alreadyThisWave) {
+              core.info(
+                `PR #${prNumber}: already triggered @claude fix for the current head; debouncing.`,
+              );
               core.setOutput("should_trigger", "false");
               return;
             }
