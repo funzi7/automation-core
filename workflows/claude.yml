@@ -76,15 +76,24 @@ jobs:
           trigger_phrase: "@claude"
           label_trigger: "claude-fix"
           # Cap turns to restrain cost; allow only the tools Claude needs.
-          # Do NOT grant bare `Bash`: this job holds contents/PR write + a
-          # GitHub token, so unscoped shell would let a prompt-injection in
-          # an issue/log/comment run ANY command (direct pushes, token-bearing
-          # curl). Instead allow the file tools (Read/Glob/Grep/Edit/Write),
-          # scoped git/gh for PR ops, and common gate runners. The v1 action's
-          # tag mode also injects its own scoped git tools + safe-push wrapper.
+          # This job holds contents/PR write + a GitHub token, so a
+          # prompt-injection in an issue/log/comment is the threat. Do NOT
+          # grant bare `Bash`, broad interpreter/package wildcards, or
+          # `Bash(git:*)`: a trailing `:*` is a wildcard, so `Bash(git:*)`
+          # would authorize `git push` to a protected ref, and
+          # `Bash(python:*)`/`Bash(node:*)` would authorize `python -c` /
+          # `node -e` arbitrary code; `Bash(npm:*)` would authorize
+          # `npm exec`/publish and `Bash(gh:*)` would authorize
+          # `gh auth token` exfiltration. Instead allow the file tools
+          # (Read/Glob/Grep/Edit/Write); git scoped to read/branch/commit
+          # subcommands ONLY (no `push` — the v1 action's tag mode injects a
+          # safe-push wrapper + its own scoped git tools); gh scoped to
+          # pr/issue/run/api; and gate runners as specific non-code-exec
+          # subcommands (no raw interpreters, no `npm exec`/`npx`, no
+          # `go run`/`cargo run`).
           claude_args: |
             --max-turns 50
-            --allowedTools "Read,Glob,Grep,Edit,Write,Bash(git:*),Bash(gh:*),Bash(npm:*),Bash(npx:*),Bash(pnpm:*),Bash(yarn:*),Bash(node:*),Bash(python:*),Bash(python3:*),Bash(pip:*),Bash(pytest:*),Bash(ruff:*),Bash(make:*),Bash(go:*),Bash(cargo:*),Bash(actionlint:*)"
+            --allowedTools "Read,Glob,Grep,Edit,Write,Bash(gh pr:*),Bash(gh issue:*),Bash(gh run:*),Bash(gh api:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git branch:*),Bash(git checkout:*),Bash(git switch:*),Bash(git add:*),Bash(git commit:*),Bash(git fetch:*),Bash(git rev-parse:*),Bash(git restore:*),Bash(git stash:*),Bash(npm ci:*),Bash(npm install:*),Bash(npm test:*),Bash(npm run:*),Bash(pnpm install:*),Bash(pnpm test:*),Bash(pnpm run:*),Bash(yarn install:*),Bash(yarn test:*),Bash(yarn run:*),Bash(pip install:*),Bash(pytest:*),Bash(ruff:*),Bash(mypy:*),Bash(flake8:*),Bash(black:*),Bash(tox:*),Bash(make:*),Bash(go build:*),Bash(go test:*),Bash(go vet:*),Bash(cargo build:*),Bash(cargo test:*),Bash(cargo clippy:*),Bash(actionlint:*)"
           additional_permissions: |
             actions: read
           prompt: |
