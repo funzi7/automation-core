@@ -1,0 +1,9 @@
+{
+  "protected": [
+    "workflows/**",
+    ".github/workflows/**",
+    "template/**",
+    "scripts/**",
+    "sync-config.json"
+  ]
+}

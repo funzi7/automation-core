@@ -1,0 +1,265 @@
+name: CI Doctor
+
+# Generic workflow — synced from automation-core. Detects failed workflow
+# runs on the default branch and opens a `claude-fix` Issue so Claude Fixer
+# repairs them. Every write (Issue create, comment, label) uses
+# AUTOMATION_PAT, because events created with the default GITHUB_TOKEN do
+# NOT trigger other workflows (GitHub loop protection) — without the PAT,
+# Claude Fixer would never wake. fail-soft: if AUTOMATION_PAT is missing,
+# exit GREEN (the loop is simply inert in that repo).
+
+on:
+  schedule:
+    - cron: '0 6,18 * * *'   # twice daily (06:00 & 18:00 UTC)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  issues: write
+
+concurrency:
+  group: ci-doctor-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail-soft check for AUTOMATION_PAT
+        id: patcheck
+        env:
+          AUTOMATION_PAT: ${{ secrets.AUTOMATION_PAT }}
+        run: |
+          if [ -z "${AUTOMATION_PAT}" ]; then
+            echo "::notice::AUTOMATION_PAT is not set — skipping CI Doctor (fail-soft). Continuation workflows can't be triggered without it."
+            echo "has_pat=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_pat=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Detect failures and manage claude-fix Issues
+        if: steps.patcheck.outputs.has_pat == 'true'
+        uses: actions/github-script@v7
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        with:
+          github-token: ${{ secrets.AUTOMATION_PAT }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            const LOOKBACK_HOURS = 13;           // covers the 12h gap between the twice-daily runs + overlap
+            const MAX_ATTEMPTS = 3;
+            const LABEL_FIX = 'claude-fix';
+            const LABEL_DOCTOR = 'ci-doctor';
+            const LABEL_ESCALATE = 'needs-dima';
+            const ATTEMPT_MARKER = '<!-- ci-doctor-attempt -->';
+
+            // Workflows whose own failures must never spawn fix Issues
+            // (they ARE the automation, or are noise).
+            const IGNORE_WORKFLOWS = new Set([
+              'CI Doctor',
+              'Claude Fixer',
+              'Merge Bot',
+              'Sync from automation-core',
+              'Codex Gate',
+              'Codex Auto-Fix',
+            ]);
+
+            const { data: repoInfo } = await github.rest.repos.get({ owner, repo });
+            const defaultBranch = repoInfo.default_branch;
+
+            const sinceIso = new Date(Date.now() - LOOKBACK_HOURS * 3600 * 1000).toISOString();
+
+            // Full pagination — never trust page 1 only.
+            let runs = [];
+            try {
+              runs = await github.paginate(github.rest.actions.listWorkflowRunsForRepo, {
+                owner, repo,
+                branch: defaultBranch,
+                status: 'failure',
+                created: `>=${sinceIso}`,
+                per_page: 100,
+              });
+            } catch (e) {
+              core.info(`No runs or Actions disabled: ${e.message}`);
+              return;
+            }
+
+            if (!runs.length) {
+              core.info('No failed runs in the lookback window. Nothing to do.');
+              return;
+            }
+
+            // Strip ANSI escapes + CRs from log text.
+            const stripAnsi = (s) => s
+              .replace(/\x1B\[[0-9;]*[A-Za-z]/g, '')
+              .replace(/\r/g, '');
+
+            // Preload open ci-doctor Issues once (paginated) for dedup.
+            const openIssues = await github.paginate(github.rest.issues.listForRepo, {
+              owner, repo, state: 'open', labels: LABEL_DOCTOR, per_page: 100,
+            });
+
+            // Upsert the loop's labels (with the PAT) BEFORE creating any Issue.
+            // A freshly-synced repo has none of these labels, and an Issue
+            // created referencing a non-existent label is created WITHOUT it —
+            // so the issues.labeled event for `claude-fix` never fires and
+            // Claude Fixer never wakes. createLabel is idempotent here: 422
+            // already_exists is expected and ignored.
+            const REQUIRED_LABELS = [
+              { name: LABEL_FIX, color: '1d76db', description: 'Claude, fix this — triggers Claude Fixer' },
+              { name: LABEL_DOCTOR, color: 'b60205', description: 'Opened by CI Doctor' },
+              { name: 'automerge', color: '0e8a16', description: 'May be auto-merged by Merge Bot once green' },
+              { name: LABEL_ESCALATE, color: 'd93f0b', description: 'Escalation — automation stopped, human needed' },
+            ];
+            for (const lbl of REQUIRED_LABELS) {
+              try {
+                await github.rest.issues.createLabel({ owner, repo, ...lbl });
+              } catch (e) {
+                if (e.status !== 422) core.info(`createLabel ${lbl.name} failed (ignored): ${e.message}`);
+              }
+            }
+
+            const seen = new Set();   // (workflowName @ sha7) handled this run
+
+            for (const run of runs) {
+              if (run.conclusion !== 'failure') continue;          // cancelled/skipped → skip
+              if (IGNORE_WORKFLOWS.has(run.name)) continue;
+              const sha7 = (run.head_sha || '').substring(0, 7);
+              const key = `${run.name} @ ${sha7}`;
+              if (seen.has(key)) continue;
+              seen.add(key);
+
+              const title = `[ci-doctor] ${key}`;
+              const existing = openIssues.find((i) => i.title === title);
+
+              if (!existing) {
+                // Failed job names + a log tail from the first failed job.
+                let failedJobNames = [];
+                let logTail = '';
+                try {
+                  const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+                    owner, repo, run_id: run.id, filter: 'latest', per_page: 100,
+                  });
+                  const failedJobs = jobs.filter((j) => j.conclusion === 'failure');
+                  failedJobNames = failedJobs.map((j) => j.name);
+                  if (failedJobs.length) {
+                    try {
+                      const res = await github.request(
+                        'GET /repos/{owner}/{repo}/actions/jobs/{job_id}/logs',
+                        { owner, repo, job_id: failedJobs[0].id }
+                      );
+                      const text = typeof res.data === 'string'
+                        ? res.data
+                        : Buffer.from(res.data).toString('utf8');
+                      const lines = stripAnsi(text).split('\n').filter(Boolean);
+                      logTail = lines.slice(-60).join('\n');
+                    } catch (e) {
+                      logTail = `(could not fetch job logs: ${e.message})`;
+                    }
+                  }
+                } catch (e) {
+                  core.info(`Could not list jobs for run ${run.id}: ${e.message}`);
+                }
+
+                const body = [
+                  `**Workflow \`${run.name}\` failed on \`${defaultBranch}\`.**`,
+                  '',
+                  `- Run: ${run.html_url}`,
+                  `- Commit: \`${sha7}\``,
+                  `- Failed job(s): ${failedJobNames.length ? failedJobNames.map((n) => `\`${n}\``).join(', ') : '(unknown)'}`,
+                  '',
+                  '<details><summary>Failing log tail (last ~60 lines)</summary>',
+                  '',
+                  '```',
+                  logTail || '(no log captured)',
+                  '```',
+                  '',
+                  '</details>',
+                  '',
+                  '---',
+                  '',
+                  '@claude — diagnose the **root cause** of this failure from the logs above, fix it on a new branch, run the repo gate (obey CLAUDE.md if present) until green, then open a PR that closes this Issue with `Fixes #<this-issue-number>`. Never push to `main`.',
+                ].join('\n');
+
+                const { data: created } = await github.rest.issues.create({
+                  owner, repo, title, body,
+                  labels: [LABEL_FIX, LABEL_DOCTOR],
+                });
+                core.info(`Opened ${title} -> #${created.number}`);
+                continue;
+              }
+
+              // Already escalated to a human on a prior scan — leave it
+              // completely alone. Without this, every later scan re-finds the
+              // issue (it still carries the ci-doctor label), re-enters the
+              // escalation branch, and re-posts the needs-dima comment +
+              // Telegram daily. Skip the moment needs-dima is present.
+              if ((existing.labels || []).some((l) => (l.name || l) === LABEL_ESCALATE)) {
+                core.info(`Issue #${existing.number}: already escalated (needs-dima); skipping.`);
+                continue;
+              }
+
+              // Existing Issue → count our attempt comments.
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner, repo, issue_number: existing.number, per_page: 100,
+              });
+              const attempts = comments.filter((c) => (c.body || '').includes(ATTEMPT_MARKER)).length;
+
+              if (attempts < MAX_ATTEMPTS) {
+                const next = attempts + 1;
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: existing.number,
+                  body: `${ATTEMPT_MARKER}\n**attempt ${next}/${MAX_ATTEMPTS}** — still failing on \`${sha7}\`. Latest run: ${run.html_url}\n\n@claude please try again.`,
+                });
+                // Re-label (remove + add) with the PAT so issues.labeled
+                // re-fires and wakes Claude Fixer again.
+                try {
+                  await github.rest.issues.removeLabel({
+                    owner, repo, issue_number: existing.number, name: LABEL_FIX,
+                  });
+                } catch (e) {
+                  core.info(`Label ${LABEL_FIX} not present to remove: ${e.message}`);
+                }
+                await github.rest.issues.addLabels({
+                  owner, repo, issue_number: existing.number, labels: [LABEL_FIX],
+                });
+                core.info(`Issue #${existing.number}: nudged attempt ${next}.`);
+              } else {
+                // Escalate to a human after MAX_ATTEMPTS.
+                try {
+                  await github.rest.issues.removeLabel({
+                    owner, repo, issue_number: existing.number, name: LABEL_FIX,
+                  });
+                } catch (e) { /* already gone */ }
+                await github.rest.issues.addLabels({
+                  owner, repo, issue_number: existing.number, labels: [LABEL_ESCALATE],
+                });
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: existing.number,
+                  body: `🚨 ${MAX_ATTEMPTS} automated fix attempts exhausted. Removed \`${LABEL_FIX}\`, added \`${LABEL_ESCALATE}\`. Human attention needed.`,
+                });
+
+                // Optional Telegram escalation (HTML parse_mode — Markdown
+                // underscores broke us before). Skip silently if unset.
+                const tgToken = process.env.TELEGRAM_BOT_TOKEN;
+                const tgChat = process.env.TELEGRAM_CHAT_ID;
+                if (tgToken && tgChat) {
+                  try {
+                    const text = `🚨 <b>${repo}</b>: CI Doctor gave up after ${MAX_ATTEMPTS} attempts on <b>${run.name}</b>.\nIssue #${existing.number}: ${existing.html_url}`;
+                    const resp = await fetch(`https://api.telegram.org/bot${tgToken}/sendMessage`, {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ chat_id: tgChat, text, parse_mode: 'HTML', disable_web_page_preview: true }),
+                    });
+                    if (!resp.ok) core.info(`Telegram non-200: ${resp.status}`);
+                  } catch (e) {
+                    core.info(`Telegram send failed (ignored): ${e.message}`);
+                  }
+                }
+                core.info(`Issue #${existing.number}: escalated to ${LABEL_ESCALATE}.`);
+              }
+            }

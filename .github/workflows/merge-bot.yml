@@ -1,0 +1,269 @@
+name: Merge Bot
+
+# Generic workflow — synced from automation-core. Closes the self-healing
+# loop: squash-merges PRs that are fully green once codex-gate passes.
+# Event-driven (check_suite / pull_request labeled / codex-gate finished),
+# with a once-daily safety net. The merge uses AUTOMATION_PAT so the push to
+# the base branch triggers downstream workflows (health-check, etc.).
+# fail-soft: if AUTOMATION_PAT is missing, exit GREEN.
+
+on:
+  check_suite:
+    types: [completed]
+  pull_request:
+    types: [labeled]
+  workflow_run:
+    workflows: ["Codex Gate"]
+    types: [completed]
+  schedule:
+    - cron: '30 7 * * *'   # safety net once daily (07:30 UTC) — real-time merges come from the events above
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  checks: read
+  statuses: read
+
+concurrency:
+  group: merge-bot-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail-soft check for AUTOMATION_PAT
+        id: patcheck
+        env:
+          AUTOMATION_PAT: ${{ secrets.AUTOMATION_PAT }}
+        run: |
+          if [ -z "${AUTOMATION_PAT}" ]; then
+            echo "::notice::AUTOMATION_PAT is not set — skipping Merge Bot (fail-soft)."
+            echo "has_pat=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_pat=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Evaluate and merge eligible PRs
+        if: steps.patcheck.outputs.has_pat == 'true'
+        uses: actions/github-script@v7
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        with:
+          github-token: ${{ secrets.AUTOMATION_PAT }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const CODEX_CHECK = 'check-codex-status';
+            const LABEL_AUTOMERGE = 'automerge';
+            const LABEL_ESCALATE = 'needs-dima';
+            const SYNC_TITLE_PREFIX = 'chore(automation): sync from automation-core';
+            const SYNC_BRANCH = 'chore/sync-automation-core';   // branch the sync workflow opens
+            const OWNER_LOGIN = 'funzi7';
+
+            // minimatch-style glob -> RegExp (supports **, *, ?). Inlined to
+            // avoid depending on a package not bundled with github-script.
+            function globToRegExp(glob) {
+              let re = '';
+              for (let i = 0; i < glob.length; i++) {
+                const c = glob[i];
+                if (c === '*') {
+                  if (glob[i + 1] === '*') {
+                    re += '.*';
+                    i++;
+                    if (glob[i + 1] === '/') i++;   // **/ matches zero or more dirs
+                  } else {
+                    re += '[^/]*';
+                  }
+                } else if (c === '?') {
+                  re += '[^/]';
+                } else if ('.+^${}()|[]\\'.includes(c)) {
+                  re += '\\' + c;
+                } else {
+                  re += c;
+                }
+              }
+              return new RegExp('^' + re + '$');
+            }
+
+            async function telegram(text) {
+              const tgToken = process.env.TELEGRAM_BOT_TOKEN;
+              const tgChat = process.env.TELEGRAM_CHAT_ID;
+              if (!tgToken || !tgChat) return;
+              try {
+                await fetch(`https://api.telegram.org/bot${tgToken}/sendMessage`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ chat_id: tgChat, text, parse_mode: 'HTML', disable_web_page_preview: true }),
+                });
+              } catch (e) {
+                core.info(`Telegram failed (ignored): ${e.message}`);
+              }
+            }
+
+            const isClaudeBot = (login) =>
+              !!login && login.endsWith('[bot]') && login.toLowerCase().includes('claude');
+
+            // Gather candidate open PRs (full pagination).
+            const allOpen = await github.paginate(github.rest.pulls.list, {
+              owner, repo, state: 'open', per_page: 100,
+            });
+
+            const candidates = allOpen.filter((pr) => {
+              // needs-dima is a HARD STOP — once a human-escalation label is on
+              // a PR, automation must never touch it again (no re-merge attempt,
+              // no repeated guard comment / Telegram). Filter it out before the
+              // PR ever becomes a candidate.
+              if ((pr.labels || []).some((l) => l.name === LABEL_ESCALATE)) return false;
+              const byBot = isClaudeBot(pr.user && pr.user.login);
+              const hasAutomerge = (pr.labels || []).some((l) => l.name === LABEL_AUTOMERGE);
+              // A sync PR is trusted ONLY if the title matches AND it is
+              // provably ours — a same-repo branch named like the one the
+              // sync workflow opens, or authored by the owner. The title
+              // alone is forgeable: an outside contributor could open a PR
+              // titled "chore(automation): sync from automation-core" from a
+              // fork and ride straight into auto-merge. The same-repo /
+              // owner check closes that hole (fork PRs carry a head.repo
+              // distinct from base, and can't author as the owner).
+              const titleIsSync = (pr.title || '').startsWith(SYNC_TITLE_PREFIX);
+              const sameRepo = !!(pr.head && pr.head.repo && pr.head.repo.full_name === `${owner}/${repo}`);
+              const isTrustedSync = titleIsSync && (
+                (pr.user && pr.user.login === OWNER_LOGIN) ||
+                ((pr.head && pr.head.ref === SYNC_BRANCH) && sameRepo)
+              );
+              return byBot || hasAutomerge || isTrustedSync;
+            });
+
+            if (!candidates.length) {
+              core.info('No automerge candidates.');
+              return;
+            }
+
+            const OK = new Set(['success', 'neutral', 'skipped']);
+
+            for (const prLite of candidates) {
+              const prNumber = prLite.number;
+              // Re-fetch full PR for mergeable + draft + head sha.
+              const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+
+              if (pr.state !== 'open') continue;
+              if (pr.draft) { core.info(`#${prNumber}: draft, skip`); continue; }
+              // mergeable can be null while GitHub computes it — skip this pass.
+              if (pr.mergeable === false) { core.info(`#${prNumber}: not mergeable, skip`); continue; }
+
+              const headSha = pr.head.sha;
+
+              // All check runs on the head sha (paginate).
+              const checkRuns = await github.paginate(github.rest.checks.listForRef, {
+                owner, repo, ref: headSha, per_page: 100,
+              });
+              // All commit statuses on the head sha (paginate).
+              const statuses = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
+                owner, repo, ref: headSha, per_page: 100,
+              });
+
+              let anyRunning = false;
+              let anyFailed = false;
+              for (const c of checkRuns) {
+                if (c.status !== 'completed') { anyRunning = true; continue; }
+                if (!OK.has(c.conclusion)) anyFailed = true;
+              }
+              // Latest status per context (statuses are newest-first).
+              const latestByCtx = new Map();
+              for (const s of statuses) {
+                if (!latestByCtx.has(s.context)) latestByCtx.set(s.context, s.state);
+              }
+              for (const state of latestByCtx.values()) {
+                if (state === 'pending') anyRunning = true;
+                else if (state !== 'success') anyFailed = true;
+              }
+
+              if (anyFailed) { core.info(`#${prNumber}: a check failed, skip`); continue; }
+              if (anyRunning) { core.info(`#${prNumber}: checks still running, skip`); continue; }
+
+              // Codex gate is mandatory when present — never bypass it.
+              const codex = checkRuns.find((c) => c.name === CODEX_CHECK);
+              if (codex && !(codex.status === 'completed' && codex.conclusion === 'success')) {
+                core.info(`#${prNumber}: ${CODEX_CHECK} not success, skip`);
+                continue;
+              }
+
+              // Protected-path guard: .claude-guard.json on the base branch.
+              let guard = null;
+              try {
+                const { data: gf } = await github.rest.repos.getContent({
+                  owner, repo, path: '.claude-guard.json', ref: pr.base.ref,
+                });
+                guard = JSON.parse(Buffer.from(gf.content, 'base64').toString('utf8'));
+              } catch (e) { /* no guard file — nothing protected */ }
+
+              if (guard && Array.isArray(guard.protected) && guard.protected.length) {
+                const files = await github.paginate(github.rest.pulls.listFiles, {
+                  owner, repo, pull_number: prNumber, per_page: 100,
+                });
+                const regexes = guard.protected.map(globToRegExp);
+                const hits = files
+                  .map((f) => f.filename)
+                  .filter((name) => regexes.some((re) => re.test(name)));
+                if (hits.length) {
+                  try {
+                    await github.rest.issues.removeLabel({ owner, repo, issue_number: prNumber, name: LABEL_AUTOMERGE });
+                  } catch (e) { /* maybe not present */ }
+                  await github.rest.issues.addLabels({ owner, repo, issue_number: prNumber, labels: [LABEL_ESCALATE] });
+                  await github.rest.issues.createComment({
+                    owner, repo, issue_number: prNumber,
+                    body: `⛔ Auto-merge blocked: this PR touches protected path(s) listed in \`.claude-guard.json\`:\n${hits.map((h) => `- \`${h}\``).join('\n')}\n\nAdded \`${LABEL_ESCALATE}\` — a human must review and merge.`,
+                  });
+                  await telegram(`⛔ <b>${repo}</b> PR #${prNumber} touches protected paths — escalated to needs-dima.`);
+                  core.info(`#${prNumber}: protected path hit, escalated.`);
+                  continue;
+                }
+              }
+
+              // Squash-merge with the PAT so the push to the base branch
+              // triggers downstream workflows. `sha: headSha` pins the merge to
+              // the exact commit we just evaluated — if the head moved between
+              // the check evaluation and here, GitHub returns 409 and we do NOT
+              // merge an unreviewed/unchecked commit. Idempotent: a parallel run
+              // may already have merged (405/409) — swallow both and skip this
+              // pass (the next event re-evaluates the new head).
+              try {
+                await github.rest.pulls.merge({
+                  owner, repo, pull_number: prNumber, merge_method: 'squash', sha: headSha,
+                });
+                core.info(`#${prNumber}: merged ✅`);
+              } catch (e) {
+                if (e.status === 405 || e.status === 409) {
+                  core.info(`#${prNumber}: head moved / already merged / not mergeable (${e.status}), skip`);
+                  continue;
+                }
+                throw e;
+              }
+
+              // Delete the head branch (same-repo branches only, best-effort).
+              if (pr.head.repo && pr.head.repo.full_name === `${owner}/${repo}`) {
+                try {
+                  await github.rest.git.deleteRef({ owner, repo, ref: `heads/${pr.head.ref}` });
+                } catch (e) { core.info(`branch delete skipped: ${e.message}`); }
+              }
+
+              // If the PR closed a ci-doctor Issue, close it with a summary.
+              const linked = [...(pr.body || '').matchAll(/(?:close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)\s+#(\d+)/gi)]
+                .map((m) => parseInt(m[1], 10));
+              for (const issNum of new Set(linked)) {
+                try {
+                  const { data: iss } = await github.rest.issues.get({ owner, repo, issue_number: issNum });
+                  const isDoctor = (iss.labels || []).some((l) => (l.name || l) === 'ci-doctor');
+                  if (iss.state === 'open' && isDoctor) {
+                    await github.rest.issues.createComment({
+                      owner, repo, issue_number: issNum,
+                      body: `✅ Fixed by #${prNumber} (squash-merged into \`${pr.base.ref}\`). Closing.`,
+                    });
+                    await github.rest.issues.update({ owner, repo, issue_number: issNum, state: 'closed' });
+                  }
+                } catch (e) { core.info(`issue #${issNum} close skipped: ${e.message}`); }
+              }
+            }

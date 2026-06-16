@@ -1,0 +1,10 @@
+{
+  "__doc__": "Copy this file to the ROOT of any repo as `.claude-guard.json` to protect sensitive paths from auto-merge. Merge Bot refuses to auto-merge any PR that changes a file matching one of these globs: it removes the `automerge` label, adds `needs-dima`, comments which path was hit, and (if configured) sends a Telegram ping — a human must then review and merge. Globs are minimatch-style: `*` matches within one path segment, `**` matches across directories, `?` matches a single character. Remove this `__doc__` key in real files or leave it — it is ignored.",
+  "protected": [
+    ".github/workflows/**",
+    "**/*.gradle",
+    "**/build.gradle.kts",
+    "**/ProfitCalculator.kt",
+    "**/data/**/migration/**"
+  ]
+}
