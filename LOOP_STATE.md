@@ -55,9 +55,11 @@ Generic loop workflows live in `workflows/` (sync source) and are copied byte-id
 - **Concurrency:** `group: claude-fix-${{ issue.number || pull_request.number }}`, **`cancel-in-progress: false`** (never kill a paying run).
 - **Auth:** `github_token: AUTOMATION_PAT || github.token`. fail-soft on missing `ANTHROPIC_API_KEY` (exits green).
 
-### codex-auto-fix.yml — the Bridge + Codex-summary archive  (sha `e0bda69`)
-- **Job `trigger_codex_fix`:** on a Codex P1/P2 review, posts **one** `@claude fix` per review wave (per-commit debounce + per-PR concurrency serialize). Circuit breaker `MAX_FIX_ROUNDS = 3` → `needs-dima` + Telegram. Posts with `AUTOMATION_PAT` (else a GITHUB_TOKEN comment wouldn't trigger claude.yml).
-  - Concurrency: `codex-claude-bridge-${{ repo }}-${{ pr }}`, `cancel-in-progress: false`.
+### codex-auto-fix.yml — the Bridge + Codex-summary archive  (sha `e0bda69`; P1-only + cross-channel debounce pending in PR #21)
+- **Job `trigger_codex_fix`:** on a Codex review that carries an **active P1** (real bug / security), posts **exactly one** `@claude fix` per review wave. **P2 (nice-to-have) never auto-triggers** — Codex finds new P2s endlessly, an infinite paid loop; P2 notes stay on the PR for reference and Dima can `@claude fix` one by hand. P1 detection reuses the existing badge substring check (`body.includes("P1")`).
+  - **Cross-channel debounce:** a Codex review with N inline notes fires N events across **two** channels (top-level `issue_comment` **and** inline `pull_request_review_comment`) — the bridge posts its own inline trigger as a review-comment *reply*. The dedupe counts the `[auto-triggered]` marker across **all** channels (issue comments + review comments + reviews), so once one trigger for the current head exists, no further event re-fires → one trigger per wave. (The old code counted only `issues.listComments` and missed the inline replies, so PR #19 got 2 triggers from 3 notes.)
+  - Circuit breaker `MAX_FIX_ROUNDS = 3` → `needs-dima` + Telegram (now counts markers across all channels too). Posts with `AUTOMATION_PAT` (else a GITHUB_TOKEN comment wouldn't trigger claude.yml).
+  - Concurrency: `codex-claude-bridge-${{ repo }}-${{ pr }}`, `cancel-in-progress: false` (serializes near-simultaneous events so the dedupe is seen before the next event runs).
 - **Job `archive_codex_summary`:** archives Codex post-fix summaries to `funzi7/agent-memory` (needs `AGENT_MEMORY_PAT`, fail-soft if absent). Concurrency `codex-summary-archive`.
 - **Triggers:** `pull_request_review: [submitted]`, `pull_request_review_comment: [created]`, `issue_comment: [created]`. **Does NOT listen to `issues` events** (removed in PR #17 — it was waking + skipping in ~2s on every Issue label).
 - _Removed in PR #17:_ the `trigger_codex_on_health_issue` job (auto-tagged `@codex` on `site-health` Issues). Not currently running anywhere — see Open debt.
@@ -151,7 +153,7 @@ Generic loop workflows live in `workflows/` (sync source) and are copied byte-id
 - Telegram control center.
 
 ### Deferred (intentional)
-- **Codex P2 — inline-reply debounce in the bridge:** deferred. `cancel-in-progress` already collapses duplicate runs, so worst case is a few cancelled runs, not a real problem.
+- ~~**Codex P2 — inline-reply debounce in the bridge.**~~ ✅ **Done in PR #21:** real cross-channel debounce (marker deduped across issue comments + inline review comments + reviews) → exactly one `@claude fix` per review wave; and the bridge now triggers on **P1 only** (P2 no longer auto-fires), which also ends the P2 loop.
 - **`trigger_codex_on_health_issue`** (site-health `@codex` auto-tag) was removed from codex-auto-fix in PR #17. If wanted, re-add as a separate `issues`-only workflow so the bridge stays PR-only.
 
 ---
