@@ -78,7 +78,7 @@ Generic loop workflows live in `workflows/` (sync source) and are copied byte-id
 
 ### merge-bot.yml — Merge Bot  (sha `b8c4372`)
 - **Does:** squash-merges (head-SHA-pinned) PRs that are fully green. Candidate = Claude-bot author **OR `automerge` label OR** trusted sync PR; `needs-dima` is a hard stop. `check-codex-status` must **exist AND be success** (fail-closed). `.claude-guard.json` protected-path guard → escalate. Closes linked CI-Doctor Issue.
-- **Triggers:** `check_suite: [completed]`, `workflow_run: ["Codex Gate"] [completed]`, `schedule: '30 7 * * *'`, `workflow_dispatch`. Job early-exits unless a success/neutral `check_suite`, a **successful** Codex Gate `workflow_run`, the cron, or manual.
+- **Triggers:** `workflow_run: ["Codex Gate"] [completed]`, `schedule: '30 7 * * *'`, `workflow_dispatch`. Job early-exits unless a **successful** Codex Gate `workflow_run`, the cron, or manual. (PR #27 dropped the `check_suite` trigger — it stormed on every CI suite yet never fired for the gate's own Actions-created suite.)
 - **Concurrency:** `merge-bot-${{ repo }}`, `cancel-in-progress: false`. Merges with `AUTOMATION_PAT` (so the push triggers downstream).
 
 ### sync-automation-core.yml — per-repo sync  (sha `a7c8563`, lives only in `.github/workflows/`)
@@ -90,8 +90,8 @@ Generic loop workflows live in `workflows/` (sync source) and are copied byte-id
 - **Triggers:** `schedule: '*/30 * * * *'` + `'5 0 1 * *'` (monthly re-enable) + `workflow_dispatch` (`force_enable`, `dry_run`). Auth: `CROSS_REPO_PAT`.
 - ⚠️ **TARGET_REPOS is stale** vs the loop: OptionsProfitTracker + paper-trader also have crons and are NOT protected (see the minutes audit).
 
-### bootstrap.yml — onboarding  (automation-core only)
-- **Does:** installs `sync-automation-core.yml` into eligible repos via PRs (`chore(automation): bootstrap...`). **Triggers:** `workflow_dispatch` only (inputs `dry_run`, `target_repo`). Auth: `CROSS_REPO_PAT`.
+### bootstrap.yml — onboarding + auto-enrollment  (automation-core only)
+- **Does:** installs `sync-automation-core.yml` into eligible repos via PRs (`chore(automation): bootstrap...`). Eligible = owner / non-archived / non-fork / not automation-core / no existing sync workflow / no `.automation-core-ignore` opt-out. **Auto-enrollment (Stage 3):** a weekly `schedule` sweep OPENS an onboarding PR in any newly-eligible repo but **never merges** it — auto-propose, not auto-apply; the PR is the human checkpoint (a brand-new/experimental repo can't get automation wired in and merged with zero review). **Triggers:** `schedule: '0 4 * * 1'` (Mondays 04:00 UTC, NOT dry-run — opens PRs) + `workflow_dispatch` (inputs `dry_run`, `target_repo`; `dry_run` previews without opening PRs). fail-soft: missing `CROSS_REPO_PAT` → green run + notice (no red); a single failing repo is recorded and skipped (per-repo try/catch) so one bad repo can't abort the unattended sweep. Auth: `CROSS_REPO_PAT`.
 
 ---
 
@@ -151,7 +151,7 @@ Generic loop workflows live in `workflows/` (sync source) and are copied byte-id
 - Still TODO: add OPT (+ paper-trader) to minutes-guard `TARGET_REPOS`.
 
 ### Stage 3
-- Auto-enrollment for new repos.
+- ✅ **Auto-enrollment for new repos — DONE** (branch `claude/auto-enrollment`): `bootstrap.yml` now runs on a weekly `schedule` (`0 4 * * 1`, Mondays 04:00 UTC) and automatically opens onboarding PRs in newly-eligible repos. Safety: opt-out via `.automation-core-ignore`; already-enrolled / archived / fork / non-owner repos skipped (reuses the existing eligible-repo scan); PRs are **opened-not-merged** (human checkpoint); the PAT step is fail-soft (missing `CROSS_REPO_PAT` → green + notice); per-repo try/catch so one bad repo doesn't abort the sweep. Manual `workflow_dispatch` + `dry_run` preview preserved.
 - Telegram control center.
 
 ### Deferred (intentional)
