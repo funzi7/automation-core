@@ -17,6 +17,15 @@ Handoff log for the **self-healing-loop build** Claude Chat session. Claude Code
 
 ---
 
+## [2026-06-17 16:40 UTC] auto-enrollment: weekly schedule on bootstrap.yml — onboarding PRs opened, never merged (Stage 3)
+- PR: https://github.com/funzi7/automation-core/pull/28
+- Branch: claude/auto-enrollment
+- Status: open (awaiting merge)
+- What changed: New repos owned by funzi7 now join the loop **automatically**. Chose **Approach A** — added a weekly `schedule` (`0 4 * * 1`, Mondays 04:00 UTC, offset from sync 03:00 / ci-doctor 06–18 / merge-bot 07:30 / minutes-guard \*/30) to the existing **bootstrap.yml** rather than spawning a second `auto-enroll.yml` (one onboarding workflow = one eligible-repo scan + opt-out/already-enrolled checks + create-branch+file+PR flow to maintain; a separate file would duplicate or thinly-wrap that). Reused the proven core untouched; only added triggers + safety. **Safety rails:** opt-out via `.automation-core-ignore` (kept), already-enrolled skip (kept), owner/non-archived/non-fork/not-self eligibility (kept), **PRs are OPENED not merged** (auto-propose, not auto-apply — the PR is the human checkpoint, so a brand-new/experimental repo can't get automation merged with zero review), dry-run preview preserved for manual dispatch. **Hardening the unattended path needed:** schedule-safe input guards (`${{ inputs.dry_run || false }}` / `|| '' }}` — the un-guarded originals `${{ inputs.dry_run }}` render `const DRY_RUN = ;` = a syntax error on a schedule event, where there are no inputs); PAT step is now **fail-soft** (missing `CROSS_REPO_PAT` → green + `core.notice`, was `core.setFailed` → red); per-repo try/catch so one empty/odd repo can't abort the sweep; concurrency group so a manual run and the weekly sweep don't race. Docs: README "How to onboard repos" rewritten (automatic weekly, opt-out, PRs still need a merge); LOOP_STATE Stage 3 marked DONE.
+- Validation: actionlint clean on bootstrap.yml; `node --check` on both github-script blocks (token resolver + bootstrap); YAML parses; pushed blob byte-matches local (`34a029f`). Commit `d5b5b26`.
+- Needs from Dima: merge #28. (Auto-enroll only runs for-real once `CROSS_REPO_PAT` is set — until then it exits green with a notice.)
+- Next: after merge, the next Monday 04:00 UTC sweep opens onboarding PRs in any not-yet-enrolled eligible repo; Dima merges each (or the loop does once green). Remaining Stage 3 item: Telegram control center.
+
 ## [2026-06-17 16:05 UTC] merge-bot: wake ONLY on successful Codex Gate — dropped the check_suite trigger
 - PR: https://github.com/funzi7/automation-core/pull/27
 - Branch: claude/merge-bot-gate-only
