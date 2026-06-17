@@ -1,39 +1,42 @@
 name: Codex Gate
 
-# Blocking status check `check-codex-status`. Two conditions must BOTH hold
-# for a PR to go GREEN:
-#   1. Codex has REVIEWED the current head commit — ANY signal: a review
-#      object, an inline note, a top-level comment, or a 👍 reaction on the
-#      head. This is "wait for first review", NOT "wait for approval": the
-#      moment Codex leaves any signal with no active P1, the gate is green.
-#   2. There is no ACTIVE P1 on the current head (a P1 marker on the head,
-#      not yet followed by a later Codex fix Summary).
-#
-# So the gate BLOCKS when either an active P1 is unresolved OR Codex has not
-# reviewed the current head yet (pending). Everything else is GREEN: a clean
-# review, P2-only, a 👍, or a stale P1 (raised before the latest commit).
+# Blocking status check `check-codex-status`. GREEN requires BOTH:
+#   1. Codex has REVIEWED the current head — ANY signal counts (a review
+#      object, an inline note, a top-level comment, or a 👍 reaction; "on the
+#      head" = commit_id == head SHA OR dated after the latest commit).
+#   2. No ACTIVE P1 on the head (a P1 marker not yet followed by a later
+#      Codex fix Summary).
+# It BLOCKS when an active P1 is unresolved OR Codex hasn't reviewed the head
+# yet (pending). P2 / stale P1 / clean review / 👍 are all green.
 # `codex-p1-acknowledged` label = manual override.
 #
-# P1-only and consistent with the bridge (codex-auto-fix.yml, post-PR #21):
-# only a P1 blocks / triggers a fix; P2 is advisory.
+# HEAD-TARGETED SELF-RERUN (restored — this is the fix for the two P1s Codex
+# raised on PR #25):
+#   merge-bot reads `check-codex-status` via checks.listForRef(pr.head.sha),
+#   i.e. it only sees a check that landed on the HEAD commit. Two clean
+#   signals don't naturally land there:
+#     - a 👍 reaction fires NO workflow event at all, so the head's failed
+#       opened/synchronize run is never recomputed;
+#     - a top-level issue_comment (or a fix-Summary comment) runs on the
+#       DEFAULT branch SHA, so its check never attaches to the head.
+#   So whenever the gate is in a non-green-on-head state — pending (waiting
+#   for the first signal, incl. the 👍 poll) OR a clean verdict computed on a
+#   run that is NOT on the head — it re-dispatches itself via
+#   createWorkflowDispatch against the PR HEAD BRANCH (ref = pr.head.ref). A
+#   dispatch run's head_sha == pr.head.sha, so its check lands on the head
+#   where merge-bot looks. Capped at MAX_ATTEMPTS (5) per head SHA with ~90s
+#   spacing. A new push changes the head SHA and resets the cap.
 #
-# Why this can't wedge red forever (unlike the original gate): the old gate
-# demanded an explicit post-commit *approval marker* and never counted the
-# 👍 reaction, so a clean PR (PR #24: 👍 + zero comments) stayed red until a
-# timeout. Here ANY Codex signal on the head clears it — and Codex reviews
-# automatically on every push, so the wait is short. "On the head" is
-# detected by commit_id == head SHA (robust to clock skew) OR a timestamp
-# after the latest commit, so a real review is never missed. If Codex truly
-# never reviews, the escape hatch is the override label, not a timeout.
+# Why it can't wedge red forever: it waits for the FIRST signal, not an
+# approval; the 👍 reaction and an empty review object both count; "on head"
+# uses commit_id (robust to clock skew). Codex reviews automatically on every
+# push and the poll catches a reaction within the window, so pending → green
+# resolves on its own. If Codex genuinely never reviews, the escape is the
+# override label (no fail-open-merge at timeout — we never merge unreviewed).
 #
 # P1 detection is the SAME as the bridge (p1Pattern / stripSummarySections)
-# across the same 3 channels (reviews + top-level comments + inline review
-# comments), fully paginated. fail-soft: a technical error evaluating a PR
-# does NOT block; a detected P1 always blocks (safety wins).
-#
-# Re-evaluates on every Codex post (pull_request_review / _review_comment /
-# issue_comment) and every push (pull_request: synchronize), so pending →
-# green happens on the next event — no self-rerun loop needed.
+# across the same 3 channels, fully paginated. fail-soft: a technical error
+# evaluating a PR does NOT block; a detected P1 always blocks (safety wins).
 
 on:
   pull_request:
@@ -44,12 +47,14 @@ on:
     types: [created, edited, deleted]
   issue_comment:
     types: [created, edited, deleted]
-  # Manual re-check entry point: dispatch with a pr_number input to
-  # re-evaluate a specific PR (handy after acknowledging a P1 by hand).
+  # Self-rerun / manual re-check entry point. The Trigger step calls
+  # createWorkflowDispatch with this workflow_id + a pr_number input and
+  # ref = the PR head branch, so the fresh run's head_sha == pr.head.sha and
+  # its check lands on the head where merge-bot looks.
   workflow_dispatch:
     inputs:
       pr_number:
-        description: 'PR number to check'
+        description: 'PR number to check (used by the head-targeted self-rerun)'
         required: false
         type: string
 
@@ -57,6 +62,9 @@ permissions:
   contents: read
   pull-requests: read
   issues: read
+  # Needed for the head-targeted self-rerun: getWorkflowRun +
+  # listWorkflowRunsForRepo (read) and createWorkflowDispatch (write).
+  actions: write
 
 jobs:
   check-codex-status:
@@ -72,7 +80,7 @@ jobs:
             // pull_request_review_comment → context.payload.pull_request
             // issue_comment → context.payload.issue (PRs are issues for
             //   the comments API)
-            // workflow_dispatch (manual re-check) → no PR payload at all,
+            // workflow_dispatch (self-rerun / manual) → no PR payload at all,
             //   the PR number comes through as an input; parse it back
             //   into a JS number so downstream filters compare correctly.
             let prNumbers = [];
@@ -100,7 +108,10 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
             const prNumbers = JSON.parse('${{ steps.prs.outputs.numbers }}');
+            const MAX_ATTEMPTS = 5;
 
             const isCodex = (user) =>
               user?.login === 'chatgpt-codex-connector[bot]' ||
@@ -133,85 +144,114 @@ jobs:
                 .replace(/(?:^|\n)#{2,3}\s+Testing[\s\S]*?(?=\n#{2,3}\s|\n---|$)/gi, '');
             }
 
-            // Block the job if ANY PR is blocked (active P1, or pending review).
+            // The check this run produces attaches to the run's head_sha.
+            // merge-bot only reads check-codex-status on pr.head.sha, so a
+            // run whose head_sha != pr.head.sha (issue_comment/issues run on
+            // the default branch) does NOT land where merge-bot looks — we
+            // must re-dispatch on the head branch in that case.
+            let runHeadSha = process.env.GITHUB_SHA;
+            try {
+              const { data: thisRun } = await github.rest.actions.getWorkflowRun({
+                owner, repo, run_id: context.runId,
+              });
+              runHeadSha = thisRun.head_sha || runHeadSha;
+            } catch (e) {
+              core.info(`getWorkflowRun failed (using GITHUB_SHA): ${e.message}`);
+            }
+
             let anyBlocked = false;
             const results = [];
+            // Only one head-targeted rerun is dispatched per job (env-file
+            // carries a single PR); prNumbers is effectively always length 1.
+            let rerun = null;
+
+            // Count prior gate runs already recorded against this head SHA, to
+            // cap the rerun loop. Dispatch runs (ref = head branch) and
+            // pull_request runs both carry head_sha == pr.head.sha; default-
+            // branch issue_comment runs do not, so they don't burn the cap.
+            async function attemptsOnHead(headSha) {
+              try {
+                const runs = await github.rest.actions.listWorkflowRunsForRepo({
+                  owner, repo, workflow_id: 'codex-gate.yml', head_sha: headSha, per_page: 30,
+                });
+                return runs.data.workflow_runs.filter((r) => r.head_sha === headSha).length;
+              } catch (e) {
+                core.info(`listWorkflowRunsForRepo failed (assuming 0 attempts): ${e.message}`);
+                return 0;
+              }
+            }
 
             for (const prNumber of prNumbers) {
               try {
                 const { data: pr } = await github.rest.pulls.get({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  pull_number: prNumber,
+                  owner, repo, pull_number: prNumber,
                 });
                 const headSha = pr.head.sha;
+                const headRef = pr.head.ref;
+                const runningOnHead = runHeadSha === headSha;
+
+                // Schedule a head-targeted rerun (capped). Reason is logged.
+                async function scheduleRerun(reason) {
+                  const attempts = await attemptsOnHead(headSha);
+                  if (attempts >= MAX_ATTEMPTS) {
+                    core.info(
+                      `PR #${prNumber}: rerun cap reached (${attempts}/${MAX_ATTEMPTS}) — not re-dispatching (${reason}).`,
+                    );
+                    return;
+                  }
+                  rerun = { pr: prNumber, branch: headRef };
+                  core.info(
+                    `PR #${prNumber}: scheduling head-targeted rerun (attempt ${attempts + 1}/${MAX_ATTEMPTS}; ${reason}).`,
+                  );
+                }
 
                 // Manual override — admin force-merge.
                 if (pr.labels.some(l => l.name === 'codex-p1-acknowledged')) {
                   results.push(`PR #${prNumber}: ✅ override label present`);
+                  if (!runningOnHead) await scheduleRerun('override — land green on head');
                   continue;
                 }
 
-                // Codex feedback across all three channels, fully
-                // paginated (the default 30/page silently drops the first
-                // Codex review on chatty PRs — the very place a P1 lives).
+                // Codex feedback across all three channels, fully paginated
+                // (the default 30/page silently drops the first Codex review
+                // on chatty PRs — the very place a P1 lives).
                 const reviews = await github.paginate(github.rest.pulls.listReviews, {
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  pull_number: prNumber,
-                  per_page: 100,
+                  owner, repo, pull_number: prNumber, per_page: 100,
                 });
                 const comments = await github.paginate(github.rest.issues.listComments, {
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  issue_number: prNumber,
-                  per_page: 100,
+                  owner, repo, issue_number: prNumber, per_page: 100,
                 });
                 const reviewComments = await github.paginate(github.rest.pulls.listReviewComments, {
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  pull_number: prNumber,
-                  per_page: 100,
+                  owner, repo, pull_number: prNumber, per_page: 100,
                 });
-                // PR-level reactions — Codex leaves a 👍 here when it has
-                // no issues, sometimes WITHOUT any review body. That 👍 is a
-                // valid "reviewed, nothing to fix" signal, so it counts.
+                // PR-level reactions — Codex leaves a 👍 here when it has no
+                // issues, sometimes WITHOUT any review body. That 👍 is a valid
+                // "reviewed, nothing to fix" signal, so it counts. The 👍 fires
+                // no event, so only the rerun poll catches it (see scheduleRerun).
                 const reactions = await github.paginate(github.rest.reactions.listForIssue, {
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  issue_number: prNumber,
-                  per_page: 100,
+                  owner, repo, issue_number: prNumber, per_page: 100,
                 });
 
                 const codexReviews = reviews.filter(r => isCodex(r.user));
                 const codexComments = comments.filter(c => isCodex(c.user));
                 const codexReviewComments = reviewComments.filter(c => isCodex(c.user));
 
-                // Latest commit on the head.
                 const prCommits = await github.paginate(github.rest.pulls.listCommits, {
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  pull_number: prNumber,
-                  per_page: 100,
+                  owner, repo, pull_number: prNumber, per_page: 100,
                 });
                 const latestCommitDate = prCommits.length > 0
                   ? new Date(prCommits[prCommits.length - 1].commit.committer.date)
                   : new Date(pr.created_at);
 
-                // An item is "on the current head" if it was submitted
-                // against the head SHA (exact — robust to clock skew) OR it
-                // is dated after the latest commit. Reviews + inline review
-                // comments carry commit_id; top-level issue comments don't,
-                // so those use the date test only. Used for BOTH the
-                // "has Codex reviewed the head?" check and the active-P1
-                // check, so the two stay consistent (and a doubtful P1 errs
+                // "On the current head" = submitted against the head SHA
+                // (exact, robust to clock skew) OR dated after the latest
+                // commit. Used for BOTH the "has Codex reviewed?" check and the
+                // active-P1 check, so they stay consistent (a doubtful P1 errs
                 // toward blocking — safety wins).
                 const onHead = (date, commitId) =>
                   (!!commitId && commitId === headSha) ||
                   (!!date && new Date(date) > latestCommitDate);
 
-                // bodyForP1 = body with Summary/Testing stripped (used for
-                // p1Pattern). body stays intact for fixSummaryPattern.
                 const allBodies = [
                   ...codexReviews.map(r => ({
                     body: r.body || '',
@@ -238,13 +278,9 @@ jobs:
                        new Date(r.created_at) > latestCommitDate
                 );
 
-                // Has Codex looked at the CURRENT head at all (any channel)?
-                // This is the "first review" signal — NOT an approval. A
-                // review object on the head (even empty/👍) counts.
                 const hasCodexSignalOnHead =
                   allBodies.some(item => item.onHead) || codexThumbsUpOnHead;
 
-                // Active P1 = a P1 marker on the current head.
                 const activeP1Items = allBodies.filter(
                   item => item.onHead && p1Pattern.test(item.bodyForP1)
                 );
@@ -260,6 +296,10 @@ jobs:
                   }
                   if (lastFixDate && new Date(lastFixDate) > new Date(lastActiveP1Date)) {
                     results.push(`PR #${prNumber}: ✅ active Codex P1 followed by a fix Summary`);
+                    // Clean verdict — make sure it lands on the head. The fix
+                    // Summary usually arrives as an issue_comment (default-branch
+                    // run), so without this the head stays red (P1 #2).
+                    if (!runningOnHead) await scheduleRerun('P1-then-Summary green — land on head');
                     continue;
                   }
                   results.push(
@@ -269,43 +309,57 @@ jobs:
                   continue;
                 }
 
-                // 2) No active P1, but Codex hasn't reviewed the current head
-                // yet → PENDING block (wait-for-first-review). This is the
-                // anti-#66/#67-race guard. It is NOT an approval wait: ANY
-                // Codex signal on the head (a review object, inline note,
-                // top-level comment, or 👍) flips this green on the next
-                // event, and Codex reviews automatically on every push — so
-                // it clears in a minute or two, never indefinitely. If Codex
-                // genuinely never reviews, use the override label.
+                // 2) No active P1, but Codex hasn't reviewed the head yet →
+                // PENDING block. Poll via a head-targeted rerun so a 👍 reaction
+                // (which fires no event) is still caught on the head (P1 #1).
                 if (!hasCodexSignalOnHead) {
                   results.push(
-                    `PR #${prNumber}: ⏳ pending — Codex hasn't reviewed head ${headSha.substring(0, 7)} yet; blocking until it does (no approval needed, just a first signal)`
+                    `PR #${prNumber}: ⏳ pending — Codex hasn't reviewed head ${headSha.substring(0, 7)} yet; blocking until it does`
                   );
                   anyBlocked = true;
+                  await scheduleRerun('pending — poll for first Codex signal on head');
                   continue;
                 }
 
                 // 3) Codex reviewed the head and found no active P1 → GREEN.
-                const hadAnyP1 = allBodies.some(item => p1Pattern.test(item.bodyForP1));
-                if (hadAnyP1) {
+                if (codexThumbsUpOnHead && allBodies.every(item => !item.onHead)) {
+                  results.push(`PR #${prNumber}: ✅ Codex reacted 👍 on the head — no issues`);
+                } else if (allBodies.some(item => p1Pattern.test(item.bodyForP1))) {
                   results.push(
                     `PR #${prNumber}: ✅ Codex reviewed head ${headSha.substring(0, 7)} — P1(s) are stale (predate the latest commit)`
                   );
-                } else if (codexThumbsUpOnHead && allBodies.every(item => !item.onHead)) {
-                  results.push(`PR #${prNumber}: ✅ Codex reacted 👍 on the head — no issues`);
                 } else {
                   results.push(`PR #${prNumber}: ✅ Codex reviewed head ${headSha.substring(0, 7)} — no P1`);
                 }
+                // GREEN. If this run isn't on the head (e.g. an issue_comment
+                // run on the default branch, or a 👍 caught by a default-branch
+                // run), re-dispatch on the head branch so the green check lands
+                // on pr.head.sha where merge-bot looks (P1 #2).
+                if (!runningOnHead) await scheduleRerun('clean review green — land on head');
               } catch (err) {
-                // fail-soft: a TECHNICAL failure (API hiccup, rate limit,
-                // etc.) must NEVER wedge a PR red forever. We did not detect
-                // a P1 here, so do not block — log loudly instead. A real
-                // P1 is only ever detected by the pattern above, which
-                // blocks; this branch only fires on genuine exceptions.
+                // fail-soft: a TECHNICAL failure (API hiccup, rate limit, etc.)
+                // must NEVER wedge a PR red forever. We did not detect a P1
+                // here, so do not block — log loudly instead. A real P1 is only
+                // ever detected by the pattern above, which blocks; this branch
+                // only fires on genuine exceptions.
                 results.push(
                   `PR #${prNumber}: ⚠️ gate errored technically — not blocking (fail-soft): ${err.message}`
                 );
                 core.warning(`Codex Gate technical error on PR #${prNumber}: ${err.stack || err.message}`);
+              }
+            }
+
+            // Hand the rerun decision to the Sleep + Trigger steps via env.
+            if (rerun) {
+              const fs = require('fs');
+              const envFile = process.env.GITHUB_ENV;
+              if (envFile) {
+                fs.appendFileSync(envFile, `NEEDS_RERUN=true\n`);
+                fs.appendFileSync(envFile, `RERUN_PR=${rerun.pr}\n`);
+                // RERUN_BRANCH must be a branch name — workflow_dispatch rejects
+                // a raw SHA with 422. The PR head branch's tip is pr.head.sha,
+                // so dispatching against it lands the check on the head.
+                fs.appendFileSync(envFile, `RERUN_BRANCH=${rerun.branch}\n`);
               }
             }
 
@@ -316,8 +370,50 @@ jobs:
               core.setFailed(
                 'Blocked by Codex Gate: an active P1 is unresolved, or Codex has not reviewed the current head yet.\n' +
                 'Resolve by one of:\n' +
-                '  1. Wait — Codex reviews automatically on every push; the gate goes green once Codex posts any signal with no P1 (it re-runs on that event).\n' +
+                '  1. Wait — Codex reviews automatically on every push; the gate self-reruns on the head (max 5 attempts, ~90s apart) and goes green once Codex posts any signal with no P1.\n' +
                 '  2. Push a fix commit — P1s raised before it become stale and clear automatically.\n' +
                 '  3. Add label "codex-p1-acknowledged" to override.'
               );
+            }
+
+      # always(): the evaluate step calls core.setFailed() whenever it blocks,
+      # which sets the step outcome to failure. Without always(), GitHub
+      # implicitly wraps the if as `success() && <expr>` and SKIPS these steps —
+      # exactly the no-op where the rerun never fires. Both rerun steps must run
+      # even when the gate is currently red (that's the whole point: re-evaluate
+      # the head until a clean signal lands green there).
+      - name: Sleep before head-targeted rerun
+        if: always() && env.NEEDS_RERUN == 'true'
+        run: |
+          echo "Waiting 90 seconds before re-dispatching the gate on the PR head..."
+          sleep 90
+
+      # createWorkflowDispatch (not reRunWorkflow): reRun 403s with "already
+      # running" while this run is active. Dispatching a fresh run against the
+      # PR HEAD BRANCH (RERUN_BRANCH) makes the new run's head_sha == pr.head.sha,
+      # so its check-codex-status lands on the head commit where merge-bot reads
+      # it. ref MUST be a branch/tag name (a raw SHA 422s). The workflow file
+      # loads from that ref, so a PR editing codex-gate.yml self-tests its change.
+      - name: Trigger head-targeted self-rerun via workflow_dispatch
+        if: always() && env.NEEDS_RERUN == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = process.env.RERUN_PR;
+            const ref = process.env.RERUN_BRANCH;
+            if (!ref) {
+              core.info('No RERUN_BRANCH set; skipping self-rerun.');
+              return;
+            }
+            core.info(`Dispatching head-targeted gate run for PR #${prNumber} at ref ${ref}`);
+            try {
+              await github.rest.actions.createWorkflowDispatch({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: 'codex-gate.yml',
+                ref,
+                inputs: { pr_number: String(prNumber) },
+              });
+            } catch (e) {
+              core.info(`createWorkflowDispatch failed (ignored): ${e.message}`);
             }
