@@ -55,7 +55,7 @@ Generic loop workflows live in `workflows/` (sync source) and are copied byte-id
 - **Concurrency:** `group: claude-fix-${{ issue.number || pull_request.number }}`, **`cancel-in-progress: false`** (never kill a paying run).
 - **Auth:** `github_token: AUTOMATION_PAT || github.token`. fail-soft on missing `ANTHROPIC_API_KEY` (exits green).
 
-### codex-auto-fix.yml — the Bridge + Codex-summary archive  (sha `e0bda69`; P1-only + cross-channel debounce pending in PR #21)
+### codex-auto-fix.yml — the Bridge + Codex-summary archive  (sha `e0bda69`; P1-only + cross-channel debounce merged via PR #21)
 - **Job `trigger_codex_fix`:** on a Codex review that carries an **active P1** (real bug / security), posts **exactly one** `@claude fix` per review wave. **P2 (nice-to-have) never auto-triggers** — Codex finds new P2s endlessly, an infinite paid loop; P2 notes stay on the PR for reference and Dima can `@claude fix` one by hand. P1 detection reuses the existing badge substring check (`body.includes("P1")`).
   - **Cross-channel debounce:** a Codex review with N inline notes fires N events across **two** channels (top-level `issue_comment` **and** inline `pull_request_review_comment`) — the bridge posts its own inline trigger as a review-comment *reply*. The dedupe counts the `[auto-triggered]` marker across **all** channels (issue comments + review comments + reviews), so once one trigger for the current head exists, no further event re-fires → one trigger per wave. (The old code counted only `issues.listComments` and missed the inline replies, so PR #19 got 2 triggers from 3 notes.)
   - Circuit breaker `MAX_FIX_ROUNDS = 3` → `needs-dima` + Telegram (now counts markers across all channels too). Posts with `AUTOMATION_PAT` (else a GITHUB_TOKEN comment wouldn't trigger claude.yml).
@@ -123,8 +123,8 @@ Generic loop workflows live in `workflows/` (sync source) and are copied byte-id
 |------|--------|-------|
 | **automation-core** | ✅ loop installed & live | Public → free Actions. Source of truth + test bed. Runs the loop on its own PRs (consumer #12). |
 | **paywall-bot** | 🟡 partial | Has `sync-automation-core.yml` (AUTOMATION_PAT variant) + `codex-gate` + `codex-auto-fix` synced. |
-| **OptionsProfitTracker (OPT)** | ⬜ NOT onboarded | **Stage 2.** Private. No sync workflow yet (only `auto-fix-nudge`, `health-check`). Private-repo Actions quota exhausted → blocked until ~July 1 reset. |
-| **thai-rent-finder (TRF)** | ⬜ NOT onboarded | **Stage 2.** Private. Has `codex-gate` + `codex-auto-fix` but **no `sync-automation-core.yml`** → no active ongoing sync. |
+| **OptionsProfitTracker (OPT)** | 🟡 onboarded — PR #12 awaiting merge | **Stage 2.** Private. PR #12 adds sync (AUTOMATION_PAT), health-check→`claude-fix`, `build-gate` (compileDebugKotlin), `.claude-guard.json`, CLAUDE.md loop section. **Installed-and-waiting** — private Actions quota exhausted → activates after the ~July 1 reset. |
+| **thai-rent-finder (TRF)** | 🟡 onboarded — PR #80 awaiting merge | **Stage 2.** Private. Already had `codex-gate` + `codex-auto-fix`; PR #80 adds the missing sync (AUTOMATION_PAT), site-health→`claude-fix`, `build-gate` (`tsc --noEmit`), `.claude-guard.json` (schema/migrations). |
 | 11 other downstream repos | via sync | Receive synced workflows where bootstrapped. fail-soft everywhere → no key/PAT = no red runs, ~0 minutes. |
 
 > Account: GitHub Free, 2000 private-repo Actions min/month, resets the 1st. Public repos (automation-core) are free.
@@ -142,11 +142,11 @@ Generic loop workflows live in `workflows/` (sync source) and are copied byte-id
 
 **All three are live on `main`.** (Other merged loop hardening: head-SHA-pinned merge, 3-round circuit breaker, twice-daily ci-doctor / daily merge-bot crons, success-filtered `workflow_run` trigger, per-wave bridge debounce, `cancel-in-progress: false`, allowlist `--allowedTools`.)
 
-### Stage 2 — onboard OPT + TRF
-- Run **Bootstrap** (needs `CROSS_REPO_PAT`) to install `sync-automation-core.yml` in OPT + TRF.
-- Per repo: build/test gate workflow, `.claude-guard.json` (protect data/migrations/build files), `CLAUDE.md` with the gate command, connect site-health → `claude-fix`.
-- Set `ANTHROPIC_API_KEY` + `AUTOMATION_PAT` on each. (OPT blocked until private quota resets ~July 1.)
-- Add OPT (+ paper-trader) to minutes-guard `TARGET_REPOS`.
+### Stage 2 — onboard OPT + TRF  (onboarding PRs open, awaiting merge)
+- 🟡 **OPT — PR #12 (awaiting merge):** `sync-automation-core.yml` (AUTOMATION_PAT variant); `health-check.yml` now opens `claude-fix` Issues via AUTOMATION_PAT (was the dead `cc @codex`); `pr-build-gate.yml` (`build-gate` = `:app:compileDebugKotlin`, fails on any `^e:` line or non-zero exit); `.claude-guard.json` (`ProfitCalculator` / `StrategicRiskAnalyzer` / `BlackScholesCalculator` / `*Database*` / `*Migration*` / `AppPreferences` / `AvgCostResolver`); CLAUDE.md autonomous-loop section. **Installed-and-waiting** — private quota resets ~July 1.
+- 🟡 **TRF — PR #80 (awaiting merge):** `sync-automation-core.yml` (AUTOMATION_PAT variant); `site-health.yml` now opens `claude-fix` Issues via AUTOMATION_PAT (was `@codex`); `pr-build-gate.yml` (`build-gate` = `tsc --noEmit`; `npm run build` deliberately avoided because it runs `prisma migrate deploy`, which needs a DB); `.claude-guard.json` (`schema.prisma` + `migrations/**`).
+- Bootstrap was **not** used — both PRs add the sync workflow directly. After merge + secrets (`AUTOMATION_PAT`, `ANTHROPIC_API_KEY`, both reportedly already set), the generic loop workflows (`claude`, `codex-auto-fix`, `codex-gate`, `ci-doctor`, `merge-bot`) arrive on the next daily sync.
+- Still TODO: add OPT (+ paper-trader) to minutes-guard `TARGET_REPOS`.
 
 ### Stage 3
 - Auto-enrollment for new repos.
