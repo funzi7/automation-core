@@ -2,20 +2,23 @@ name: Merge Bot
 
 # Generic workflow — synced from automation-core. Closes the self-healing
 # loop: squash-merges PRs that are fully green once codex-gate passes.
-# Woken by: a check_suite that completes (covers most repos' CI), the Codex
-# Gate workflow_run completing (check_suite does NOT fire for Actions-created
-# suites like the gate's), a once-daily safety-net cron, or manual dispatch.
-# The job early-exits unless that signal is a success/neutral check_suite or a
-# SUCCESSFUL Codex Gate run — so it never storms (22x/5min) on red/in-flight. The
-# merge uses AUTOMATION_PAT so the push to the base branch triggers
-# downstream workflows (health-check, etc.). fail-soft: missing PAT → GREEN.
+# Woken by: the Codex Gate workflow_run completing successfully (the only
+# signal that the mandatory gate just turned green on a head), a once-daily
+# safety-net cron, or manual dispatch. check_suite is intentionally NOT a
+# trigger: it fires on every CI suite (storms ~22x/5min on unrelated runs)
+# yet does NOT fire for the gate's own Actions-created suite — so it added
+# noise without covering the case that matters. A build-gate finishing after
+# the gate is already green is still covered: that completion re-runs Codex
+# Gate (or the gate is already success), and the cron is the backstop.
+# The job early-exits unless the signal is a SUCCESSFUL Codex Gate run — so it
+# never storms on red/in-flight. The merge uses AUTOMATION_PAT so the push to
+# the base branch triggers downstream workflows (health-check, etc.).
+# fail-soft: missing PAT → GREEN.
 
 on:
-  check_suite:
-    types: [completed]
   # check_suite does NOT fire for workflow runs created by GitHub Actions
-  # (Codex Gate runs under GITHUB_TOKEN), so without this a green gate would
-  # not wake merge-bot until the daily cron. Filtered to success in the job if:.
+  # (Codex Gate runs under GITHUB_TOKEN), so this workflow_run is what wakes
+  # merge-bot when the gate turns green. Filtered to success in the job if:.
   workflow_run:
     workflows: ["Codex Gate"]
     types: [completed]
@@ -37,18 +40,14 @@ concurrency:
 jobs:
   merge:
     runs-on: ubuntu-latest
-    # Early-exit: proceed ONLY on a signal that a fresh set of checks finished
+    # Early-exit: proceed ONLY on a signal that the mandatory gate just turned
     # GREEN — otherwise skip immediately (no scan). Waking conditions:
-    #   (a) check_suite completed success/neutral,
-    #   (b) Codex Gate workflow_run completed success,
-    #   (c) the daily safety-net cron,
-    #   (d) manual dispatch.
+    #   (a) Codex Gate workflow_run completed success,
+    #   (b) the daily safety-net cron,
+    #   (c) manual dispatch.
     # workflow_run is filtered to success here so the gate's self-rerun loop
     # (which fails each iteration) never wakes merge-bot — only its final pass.
     if: |
-      (github.event_name == 'check_suite' &&
-        (github.event.check_suite.conclusion == 'success' ||
-         github.event.check_suite.conclusion == 'neutral')) ||
       (github.event_name == 'workflow_run' &&
         github.event.workflow_run.conclusion == 'success') ||
       github.event_name == 'schedule' ||
