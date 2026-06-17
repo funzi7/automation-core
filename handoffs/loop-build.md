@@ -17,6 +17,15 @@ Handoff log for the **self-healing-loop build** Claude Chat session. Claude Code
 
 ---
 
+## [2026-06-17 16:05 UTC] merge-bot: wake ONLY on successful Codex Gate — dropped the check_suite trigger
+- PR: https://github.com/funzi7/automation-core/pull/27
+- Branch: claude/merge-bot-gate-only
+- Status: open (awaiting merge)
+- What changed: Removed the `check_suite: [completed]` trigger from merge-bot.yml (and its clause in the job `if:`). `check_suite` was pure noise — it fires on EVERY CI suite completion (the ~22×/5min storm source) yet does NOT fire for the gate's own Actions-created suite (Codex Gate runs under `GITHUB_TOKEN`), which is exactly why `workflow_run["Codex Gate"]` exists. So it added churn without covering the merge-gating signal. Merge Bot now wakes ONLY on: (a) a SUCCESSFUL Codex Gate `workflow_run`, (b) the daily safety-net cron (`30 7 * * *`), (c) manual `workflow_dispatch`. A build-gate finishing after the gate is already green is still covered — that completion re-runs Codex Gate (→ workflow_run fires), with cron as backstop. NO safety weakened: `check-codex-status` must still EXIST + be `success` on `pr.head.sha` (fail-closed); `.claude-guard.json` guard, `needs-dima` hard stop, head-SHA-pinned squash merge, and candidate logic (Claude-bot author / `automerge` label / trusted sync PR) all UNCHANGED. This changes only how often merge-bot wakes, never what it requires to merge.
+- Validation: actionlint clean on both copies; `node --check` on the github-script block; `workflows/` ↔ `.github/workflows/` byte-identical (SHA parity, blob `af5b3dc`); commit `b6fa441`.
+- Needs from Dima: merge #27.
+- Next: after merge, the leaner trigger set syncs to consumer repos on the next daily sync (merge-bot.yml is in `synced_workflows`); verify the gate→merge path: clean review → Codex Gate green on head → workflow_run wakes merge-bot → squash-merge.
+
 ## [2026-06-17 15:09 UTC] codex-gate: "has reviewed" is now date-only (4th Codex P1 — re-pointed commit_id no longer = a fresh review)
 - PR: https://github.com/funzi7/automation-core/pull/25
 - Branch: claude/fix-codex-gate-green
