@@ -17,6 +17,15 @@ Handoff log for the **self-healing-loop build** Claude Chat session. Claude Code
 
 ---
 
+## [2026-06-17 17:20 UTC] privacy scrub: remove the owner's personal name from all public content
+- PR: https://github.com/funzi7/automation-core/pull/29
+- Branch: claude/privacy-scrub
+- Status: open (awaiting merge)
+- What changed: This is a PUBLIC repo; the owner's personal first name appeared in prose/comments/docs. Replaced every standalone occurrence with "the owner" (case-sensitive whole-word swap) across codex-auto-fix.yml comments (3 per copy, both mirror copies kept byte-identical), LOOP_STATE.md (1), handoffs/README.md (1), and this file (5) — 13 total. The `needs-dima` LABEL STRING was left byte-for-byte intact everywhere it appears in workflow logic (addLabels/removeLabel/filters/if:) — renaming it would break ci-doctor/merge-bot/codex-auto-fix. The public GitHub handle `funzi7` (incl. merge-bot's `OWNER_LOGIN`) was left as-is — it's the public account name, not a private personal name. Comments/text only; no workflow logic changed.
+- Validation: repo-wide grep confirms ZERO standalone personal-name occurrences remain (only `needs-dima` label strings); actionlint clean on both codex-auto-fix.yml copies; `workflows/` ↔ `.github/workflows/` codex-auto-fix byte-identical (blob `7005c92`); node --check on the changed github-script block.
+- Needs from the owner: merge #29.
+- Next: after merge, the scrubbed codex-auto-fix.yml syncs to consumer repos on the next daily sync. NOTE: the still-open codex-gate / merge-bot / auto-enroll branches carry newer handoff entries that reintroduce the name — scrub those as they land (or via their own PRs).
+
 ## [2026-06-17 15:09 UTC] codex-gate: "has reviewed" is now date-only (4th Codex P1 — re-pointed commit_id no longer = a fresh review)
 - PR: https://github.com/funzi7/automation-core/pull/25
 - Branch: claude/fix-codex-gate-green
