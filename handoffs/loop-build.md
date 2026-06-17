@@ -17,6 +17,15 @@ Handoff log for the **self-healing-loop build** Claude Chat session. Claude Code
 
 ---
 
+## [2026-06-17 14:56 UTC] codex-gate: clean review = green, P1-only, wait-for-first-review, head-targeted rerun, date-only stale detection
+- PR: https://github.com/funzi7/automation-core/pull/25
+- Branch: claude/fix-codex-gate-green
+- Status: open (awaiting merge; head 526332f, mergeable)
+- What changed: Rewrote codex-gate to (1) go GREEN on a clean review / 👍 / P2-only instead of demanding an explicit approval marker; (2) block only on an ACTIVE P1; (3) wait for Codex's first signal before green (no merge-before-review — the #66/#67 race); (4) head-targeted self-rerun so clean verdicts land `check-codex-status` on `pr.head.sha` where merge-bot reads it (👍 fires no event; issue_comment runs on the default branch); (5) date-only active-P1 detection — GitHub re-points `commit_id` on non-outdated inline comments, which was making an 11h-stale P1 look active and block the PR on itself; (6) rerun-cap now uses workflow-specific `listWorkflowRuns` so only Codex Gate runs count toward `MAX_ATTEMPTS` (`listWorkflowRunsForRepo` ignores `workflow_id`).
+- Validation: actionlint clean on both copies; node --check on all 3 github-script blocks; `workflows/` ↔ `.github/workflows/` byte-identical (SHA parity, blob `2cf1b06`); final commit `526332f`.
+- Needs from Dima: merge #25 (last manual merge — after this the fixed gate is on main and clean PRs go green on the head for merge-bot to auto-merge).
+- Next: verify merge-bot auto-merges once the gate is green on the head; then Stage 3 (auto-enrollment + Telegram control center).
+
 ## [2026-06-17 03:44 UTC] Codex Gate: clean review = green, block only on active P1, + wait-for-first-review
 - PR: https://github.com/funzi7/automation-core/pull/25
 - Branch: claude/fix-codex-gate-green
