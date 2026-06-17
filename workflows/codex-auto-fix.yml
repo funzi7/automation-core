@@ -10,7 +10,7 @@ name: Codex Auto-Fix
 # P1 ONLY: P2 findings (style / nice-to-have) never auto-trigger a
 # paid Claude run — Codex always finds another P2, which created a
 # near-infinite review/fix loop. P2 notes stay on the PR for
-# reference; Dima can post `@claude fix` by hand for a specific one.
+# reference; the owner can post `@claude fix` by hand for a specific one.
 #
 # The comment is posted with AUTOMATION_PAT (not GITHUB_TOKEN): a
 # comment made with the default token does NOT start other workflows
@@ -212,7 +212,7 @@ jobs:
             // one ACTIVE P1 exists for the current head. P2 findings never
             // auto-trigger — Codex finds new P2s endlessly, which is the
             // infinite loop we are stopping. P2 notes stay on the PR for
-            // reference; Dima can @claude fix a specific one by hand.
+            // reference; the owner can @claude fix a specific one by hand.
             // Detection reuses the EXISTING badge check (body.includes("P1")):
             // a Codex P1 badge contains the literal "P1" substring; a P2 badge
             // never does. We scan the triggering body PLUS every Codex note
@@ -335,7 +335,7 @@ jobs:
 
   # Archive Codex post-fix summaries to the agent-memory repo so
   # Claude conversations can read them directly instead of needing
-  # Dima to copy/paste from the PR. Triggers on every Codex
+  # the owner to copy/paste from the PR. Triggers on every Codex
   # issue_comment that includes a "Summary" header (the marker for
   # a fix summary; review comments don't carry that header).
   #
