@@ -2,13 +2,17 @@ name: Codex Gate
 
 # Blocking status check `check-codex-status`. GREEN requires BOTH:
 #   1. Codex has REVIEWED the current head — ANY signal counts (a review
-#      object, an inline note, a top-level comment, or a 👍 reaction; "on the
-#      head" = commit_id == head SHA OR dated after the latest commit).
-#   2. No ACTIVE P1 on the head (a P1 marker not yet followed by a later
-#      Codex fix Summary).
+#      object, an inline note, a top-level comment, or a 👍 reaction).
+#      "Reviewed the head" is GENEROUS: commit_id == head SHA OR dated after
+#      the latest commit.
+#   2. No ACTIVE P1 on the head. "Active" is STRICT and DATE-ONLY: a P1 whose
+#      review/comment is DATED after the latest commit, not yet followed by a
+#      later Codex fix Summary. commit_id is deliberately NOT used here —
+#      GitHub re-points a still-applicable inline comment's commit_id to the
+#      new head, so an old (stale) P1 would otherwise falsely read as active.
 # It BLOCKS when an active P1 is unresolved OR Codex hasn't reviewed the head
-# yet (pending). P2 / stale P1 / clean review / 👍 are all green.
-# `codex-p1-acknowledged` label = manual override.
+# yet (pending). P2 / stale P1 (predating the latest commit) / clean review /
+# 👍 are all green. `codex-p1-acknowledged` label = manual override.
 #
 # HEAD-TARGETED SELF-RERUN (restored — this is the fix for the two P1s Codex
 # raised on PR #25):
@@ -28,11 +32,16 @@ name: Codex Gate
 #   spacing. A new push changes the head SHA and resets the cap.
 #
 # Why it can't wedge red forever: it waits for the FIRST signal, not an
-# approval; the 👍 reaction and an empty review object both count; "on head"
-# uses commit_id (robust to clock skew). Codex reviews automatically on every
-# push and the poll catches a reaction within the window, so pending → green
-# resolves on its own. If Codex genuinely never reviews, the escape is the
-# override label (no fail-open-merge at timeout — we never merge unreviewed).
+# approval; the 👍 reaction and an empty review object both count; the
+# "reviewed the head" test accepts commit_id == head (robust to clock skew).
+# Codex reviews automatically on every push and the poll catches a reaction
+# within the window, so pending → green resolves on its own. If Codex
+# genuinely never reviews, the escape is the override label (no fail-open-
+# merge at timeout — we never merge unreviewed).
+#
+# Why it can't FALSE-BLOCK on a stale P1: the active-P1 test is date-only, so
+# an old P1 whose inline-comment commit_id was re-pointed to the new head is
+# correctly treated as stale (it predates the latest commit) and does not block.
 #
 # P1 detection is the SAME as the bridge (p1Pattern / stripSummarySections)
 # across the same 3 channels, fully paginated. fail-soft: a technical error
@@ -165,18 +174,22 @@ jobs:
             // carries a single PR); prNumbers is effectively always length 1.
             let rerun = null;
 
-            // Count prior gate runs already recorded against this head SHA, to
-            // cap the rerun loop. Dispatch runs (ref = head branch) and
+            // Count prior Codex Gate runs recorded against this head SHA, to
+            // cap the rerun loop. Use the workflow-SPECIFIC endpoint
+            // (actions.listWorkflowRuns, GET /actions/workflows/{id}/runs):
+            // the repo-level listWorkflowRunsForRepo IGNORES workflow_id, so it
+            // would count UNRELATED workflows' runs on the same head SHA and
+            // trip MAX_ATTEMPTS early. Dispatch runs (ref = head branch) and
             // pull_request runs both carry head_sha == pr.head.sha; default-
             // branch issue_comment runs do not, so they don't burn the cap.
             async function attemptsOnHead(headSha) {
               try {
-                const runs = await github.rest.actions.listWorkflowRunsForRepo({
+                const runs = await github.rest.actions.listWorkflowRuns({
                   owner, repo, workflow_id: 'codex-gate.yml', head_sha: headSha, per_page: 30,
                 });
                 return runs.data.workflow_runs.filter((r) => r.head_sha === headSha).length;
               } catch (e) {
-                core.info(`listWorkflowRunsForRepo failed (assuming 0 attempts): ${e.message}`);
+                core.info(`listWorkflowRuns failed (assuming 0 attempts): ${e.message}`);
                 return 0;
               }
             }
@@ -239,37 +252,53 @@ jobs:
                 const prCommits = await github.paginate(github.rest.pulls.listCommits, {
                   owner, repo, pull_number: prNumber, per_page: 100,
                 });
+                // latestCommitDate = the MAX committer date across the PR's
+                // commits. Don't assume listCommits returns them sorted — take
+                // the max explicitly so a P1's "after the latest commit?" test
+                // is always against the real newest commit.
                 const latestCommitDate = prCommits.length > 0
-                  ? new Date(prCommits[prCommits.length - 1].commit.committer.date)
+                  ? new Date(Math.max(...prCommits.map(c => new Date(c.commit.committer.date).getTime())))
                   : new Date(pr.created_at);
 
-                // "On the current head" = submitted against the head SHA
-                // (exact, robust to clock skew) OR dated after the latest
-                // commit. Used for BOTH the "has Codex reviewed?" check and the
-                // active-P1 check, so they stay consistent (a doubtful P1 errs
-                // toward blocking — safety wins).
-                const onHead = (date, commitId) =>
+                // TWO deliberately ASYMMETRIC "on the current head" tests:
+                //   reviewedHead — GENEROUS (commit_id == head SHA OR date after
+                //     the latest commit). Used ONLY for "has Codex looked at this
+                //     head at all?" so we never falsely stay pending.
+                //   activeOnHead — STRICT, DATE ONLY (submitted/created after the
+                //     latest commit). Used for the ACTIVE-P1 block decision.
+                //     commit_id is NOT trusted here: GitHub RE-POINTS an inline
+                //     review comment's commit_id to the new head whenever the
+                //     commented line still exists, so an old (e.g. 11h-stale) P1
+                //     would otherwise read as "on head" via commit_id and falsely
+                //     block. Only a P1 actually DATED after the latest commit is
+                //     active; anything older is stale regardless of commit_id.
+                const reviewedHead = (date, commitId) =>
                   (!!commitId && commitId === headSha) ||
                   (!!date && new Date(date) > latestCommitDate);
+                const activeOnHead = (date) =>
+                  !!date && new Date(date) > latestCommitDate;
 
                 const allBodies = [
                   ...codexReviews.map(r => ({
                     body: r.body || '',
                     bodyForP1: stripSummarySections(r.body || ''),
                     date: r.submitted_at,
-                    onHead: onHead(r.submitted_at, r.commit_id),
+                    reviewedHead: reviewedHead(r.submitted_at, r.commit_id),
+                    activeOnHead: activeOnHead(r.submitted_at),
                   })),
                   ...codexComments.map(c => ({
                     body: c.body || '',
                     bodyForP1: stripSummarySections(c.body || ''),
                     date: c.created_at,
-                    onHead: onHead(c.created_at, null),
+                    reviewedHead: reviewedHead(c.created_at, null),
+                    activeOnHead: activeOnHead(c.created_at),
                   })),
                   ...codexReviewComments.map(c => ({
                     body: c.body || '',
                     bodyForP1: stripSummarySections(c.body || ''),
                     date: c.created_at,
-                    onHead: onHead(c.created_at, c.commit_id),
+                    reviewedHead: reviewedHead(c.created_at, c.commit_id),
+                    activeOnHead: activeOnHead(c.created_at),
                   })),
                 ].sort((a, b) => new Date(a.date) - new Date(b.date));
 
@@ -279,10 +308,12 @@ jobs:
                 );
 
                 const hasCodexSignalOnHead =
-                  allBodies.some(item => item.onHead) || codexThumbsUpOnHead;
+                  allBodies.some(item => item.reviewedHead) || codexThumbsUpOnHead;
 
+                // ACTIVE P1 = a P1 marker DATED after the latest commit (strict,
+                // date-only — a stale P1 with a re-pointed commit_id is NOT active).
                 const activeP1Items = allBodies.filter(
-                  item => item.onHead && p1Pattern.test(item.bodyForP1)
+                  item => item.activeOnHead && p1Pattern.test(item.bodyForP1)
                 );
 
                 // 1) Active P1 → block unless a later fix Summary cleared it.
@@ -290,7 +321,7 @@ jobs:
                   let lastActiveP1Date = null;
                   let lastFixDate = null;
                   for (const item of allBodies) {
-                    if (!item.onHead) continue;
+                    if (!item.activeOnHead) continue;
                     if (p1Pattern.test(item.bodyForP1)) lastActiveP1Date = item.date;
                     if (fixSummaryPattern.test(item.body)) lastFixDate = item.date;
                   }
@@ -322,7 +353,7 @@ jobs:
                 }
 
                 // 3) Codex reviewed the head and found no active P1 → GREEN.
-                if (codexThumbsUpOnHead && allBodies.every(item => !item.onHead)) {
+                if (codexThumbsUpOnHead && allBodies.every(item => !item.reviewedHead)) {
                   results.push(`PR #${prNumber}: ✅ Codex reacted 👍 on the head — no issues`);
                 } else if (allBodies.some(item => p1Pattern.test(item.bodyForP1))) {
                   results.push(
