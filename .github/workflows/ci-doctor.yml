@@ -1,3 +1,6 @@
+# CI Doctor: the self-healing CI watchdog. Detects failed workflow runs on
+# the default branch and opens a `claude-fix` Issue so Claude Fixer can
+# diagnose the root cause and open a repair PR automatically.
 name: CI Doctor
 
 # Generic workflow — synced from automation-core. Detects failed workflow
