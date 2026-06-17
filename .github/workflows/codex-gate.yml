@@ -1,44 +1,39 @@
 name: Codex Gate
 
-# Blocking status check `check-codex-status`. Blocks a PR merge ONLY when
-# Codex has an ACTIVE P1 finding on the current head commit. Everything
-# else is GREEN: a clean review, P2-only feedback, a 👍, a stale P1 (raised
-# before the latest commit), an active P1 already followed by a Codex fix
-# Summary, or no Codex comments at all.
+# Blocking status check `check-codex-status`. Two conditions must BOTH hold
+# for a PR to go GREEN:
+#   1. Codex has REVIEWED the current head commit — ANY signal: a review
+#      object, an inline note, a top-level comment, or a 👍 reaction on the
+#      head. This is "wait for first review", NOT "wait for approval": the
+#      moment Codex leaves any signal with no active P1, the gate is green.
+#   2. There is no ACTIVE P1 on the current head (a P1 marker on the head,
+#      not yet followed by a later Codex fix Summary).
 #
-# Deliberately P1-only and consistent with the bridge (codex-auto-fix.yml,
-# post-PR #21): only a P1 blocks / triggers a fix; P2 is advisory. There is
-# NO "approval marker" requirement — absence of an active P1 is GREEN, not
-# "blocked until Codex explicitly approves".
+# So the gate BLOCKS when either an active P1 is unresolved OR Codex has not
+# reviewed the current head yet (pending). Everything else is GREEN: a clean
+# review, P2-only, a 👍, or a stale P1 (raised before the latest commit).
+# `codex-p1-acknowledged` label = manual override.
 #
-# Why this changed (the bug it fixes): the old gate required an explicit
-# Codex signal dated AFTER the latest commit to pass. When Codex left only
-# a 👍 reaction (not counted as a textual signal) or its review timestamp
-# wasn't strictly after the commit's committer date, the gate fell through
-# to "waiting for re-review" and stayed RED until a 5-attempt timeout —
-# forcing a manual merge on every clean PR (e.g. PR #24: 👍, zero comments,
-# still blocked). The wait/self-rerun loop is gone.
+# P1-only and consistent with the bridge (codex-auto-fix.yml, post-PR #21):
+# only a P1 blocks / triggers a fix; P2 is advisory.
 #
-# Trade-off this accepts: the gate no longer waits for Codex's FIRST
-# review. A brand-new PR with no Codex comment yet evaluates as "no active
-# P1" → green, so merge-bot could merge before Codex weighs in (the old
-# #66/#67 race). This is intentional per the P1-only design; if a P1 lands
-# later, the next event flips the check red. Re-tighten via a short
-# "wait-for-first-review" window if that race resurfaces.
+# Why this can't wedge red forever (unlike the original gate): the old gate
+# demanded an explicit post-commit *approval marker* and never counted the
+# 👍 reaction, so a clean PR (PR #24: 👍 + zero comments) stayed red until a
+# timeout. Here ANY Codex signal on the head clears it — and Codex reviews
+# automatically on every push, so the wait is short. "On the head" is
+# detected by commit_id == head SHA (robust to clock skew) OR a timestamp
+# after the latest commit, so a real review is never missed. If Codex truly
+# never reviews, the escape hatch is the override label, not a timeout.
 #
-# How it decides, per PR:
-#   active P1 (P1 marker dated after the latest commit, not followed by a
-#     later Codex fix Summary)             → ❌ setFailed (blocked)
-#   no active P1 (clean / P2 / 👍 / stale
-#     P1 / no comments)                    → ✅ success (green)
-#   label "codex-p1-acknowledged"          → ✅ success (manual override)
-#   technical error evaluating a PR        → ✅ not blocked (fail-soft: never
-#                                               wedge a PR red on an API hiccup)
+# P1 detection is the SAME as the bridge (p1Pattern / stripSummarySections)
+# across the same 3 channels (reviews + top-level comments + inline review
+# comments), fully paginated. fail-soft: a technical error evaluating a PR
+# does NOT block; a detected P1 always blocks (safety wins).
 #
-# The gate re-evaluates automatically whenever Codex posts (the
-# pull_request_review / _review_comment / issue_comment triggers) and on
-# every new push (pull_request: synchronize), so a P1 that lands after a
-# green check flips it red on the next event.
+# Re-evaluates on every Codex post (pull_request_review / _review_comment /
+# issue_comment) and every push (pull_request: synchronize), so pending →
+# green happens on the next event — no self-rerun loop needed.
 
 on:
   pull_request:
@@ -138,7 +133,7 @@ jobs:
                 .replace(/(?:^|\n)#{2,3}\s+Testing[\s\S]*?(?=\n#{2,3}\s|\n---|$)/gi, '');
             }
 
-            // Block the job if ANY PR has an active, unresolved P1.
+            // Block the job if ANY PR is blocked (active P1, or pending review).
             let anyBlocked = false;
             const results = [];
 
@@ -149,6 +144,7 @@ jobs:
                   repo: context.repo.repo,
                   pull_number: prNumber,
                 });
+                const headSha = pr.head.sha;
 
                 // Manual override — admin force-merge.
                 if (pr.labels.some(l => l.name === 'codex-p1-acknowledged')) {
@@ -177,35 +173,21 @@ jobs:
                   pull_number: prNumber,
                   per_page: 100,
                 });
+                // PR-level reactions — Codex leaves a 👍 here when it has
+                // no issues, sometimes WITHOUT any review body. That 👍 is a
+                // valid "reviewed, nothing to fix" signal, so it counts.
+                const reactions = await github.paginate(github.rest.reactions.listForIssue, {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: prNumber,
+                  per_page: 100,
+                });
 
                 const codexReviews = reviews.filter(r => isCodex(r.user));
                 const codexComments = comments.filter(c => isCodex(c.user));
                 const codexReviewComments = reviewComments.filter(c => isCodex(c.user));
 
-                // bodyForP1 = body with Summary/Testing stripped (used for
-                // p1Pattern). body stays intact for fixSummaryPattern.
-                const allBodies = [
-                  ...codexReviews.map(r => ({
-                    body: r.body || '',
-                    bodyForP1: stripSummarySections(r.body || ''),
-                    date: r.submitted_at,
-                  })),
-                  ...codexComments.map(c => ({
-                    body: c.body || '',
-                    bodyForP1: stripSummarySections(c.body || ''),
-                    date: c.created_at,
-                  })),
-                  ...codexReviewComments.map(c => ({
-                    body: c.body || '',
-                    bodyForP1: stripSummarySections(c.body || ''),
-                    date: c.created_at,
-                  })),
-                ].sort((a, b) => new Date(a.date) - new Date(b.date));
-
-                // Latest commit on the head. A P1 dated at/before this is
-                // STALE — the new commit is presumed to address it — so it
-                // does NOT block. Only a P1 dated AFTER the latest commit
-                // is "active".
+                // Latest commit on the head.
                 const prCommits = await github.paginate(github.rest.pulls.listCommits, {
                   owner: context.repo.owner,
                   repo: context.repo.repo,
@@ -216,48 +198,104 @@ jobs:
                   ? new Date(prCommits[prCommits.length - 1].commit.committer.date)
                   : new Date(pr.created_at);
 
+                // An item is "on the current head" if it was submitted
+                // against the head SHA (exact — robust to clock skew) OR it
+                // is dated after the latest commit. Reviews + inline review
+                // comments carry commit_id; top-level issue comments don't,
+                // so those use the date test only. Used for BOTH the
+                // "has Codex reviewed the head?" check and the active-P1
+                // check, so the two stay consistent (and a doubtful P1 errs
+                // toward blocking — safety wins).
+                const onHead = (date, commitId) =>
+                  (!!commitId && commitId === headSha) ||
+                  (!!date && new Date(date) > latestCommitDate);
+
+                // bodyForP1 = body with Summary/Testing stripped (used for
+                // p1Pattern). body stays intact for fixSummaryPattern.
+                const allBodies = [
+                  ...codexReviews.map(r => ({
+                    body: r.body || '',
+                    bodyForP1: stripSummarySections(r.body || ''),
+                    date: r.submitted_at,
+                    onHead: onHead(r.submitted_at, r.commit_id),
+                  })),
+                  ...codexComments.map(c => ({
+                    body: c.body || '',
+                    bodyForP1: stripSummarySections(c.body || ''),
+                    date: c.created_at,
+                    onHead: onHead(c.created_at, null),
+                  })),
+                  ...codexReviewComments.map(c => ({
+                    body: c.body || '',
+                    bodyForP1: stripSummarySections(c.body || ''),
+                    date: c.created_at,
+                    onHead: onHead(c.created_at, c.commit_id),
+                  })),
+                ].sort((a, b) => new Date(a.date) - new Date(b.date));
+
+                const codexThumbsUpOnHead = reactions.some(
+                  r => isCodex(r.user) && r.content === '+1' &&
+                       new Date(r.created_at) > latestCommitDate
+                );
+
+                // Has Codex looked at the CURRENT head at all (any channel)?
+                // This is the "first review" signal — NOT an approval. A
+                // review object on the head (even empty/👍) counts.
+                const hasCodexSignalOnHead =
+                  allBodies.some(item => item.onHead) || codexThumbsUpOnHead;
+
+                // Active P1 = a P1 marker on the current head.
                 const activeP1Items = allBodies.filter(
-                  item => p1Pattern.test(item.bodyForP1) && new Date(item.date) > latestCommitDate
+                  item => item.onHead && p1Pattern.test(item.bodyForP1)
                 );
 
-                // NO ACTIVE P1 → GREEN. This is the whole point of the fix:
-                // a clean review, P2-only, a 👍, a stale P1, or no Codex
-                // comments at all are all green. No "approval marker" needed.
-                if (activeP1Items.length === 0) {
-                  const hadAnyP1 = allBodies.some(item => p1Pattern.test(item.bodyForP1));
-                  if (hadAnyP1) {
-                    results.push(
-                      `PR #${prNumber}: ✅ no ACTIVE P1 (P1(s) predate the latest commit at ${latestCommitDate.toISOString()} — stale)`
-                    );
-                  } else if (allBodies.length > 0) {
-                    results.push(`PR #${prNumber}: ✅ Codex reviewed — no P1`);
-                  } else {
-                    results.push(`PR #${prNumber}: ✅ no Codex P1 (no Codex comments on this PR)`);
+                // 1) Active P1 → block unless a later fix Summary cleared it.
+                if (activeP1Items.length > 0) {
+                  let lastActiveP1Date = null;
+                  let lastFixDate = null;
+                  for (const item of allBodies) {
+                    if (!item.onHead) continue;
+                    if (p1Pattern.test(item.bodyForP1)) lastActiveP1Date = item.date;
+                    if (fixSummaryPattern.test(item.body)) lastFixDate = item.date;
                   }
+                  if (lastFixDate && new Date(lastFixDate) > new Date(lastActiveP1Date)) {
+                    results.push(`PR #${prNumber}: ✅ active Codex P1 followed by a fix Summary`);
+                    continue;
+                  }
+                  results.push(
+                    `PR #${prNumber}: ❌ active Codex P1 unresolved (last active P1: ${lastActiveP1Date}, last fix: ${lastFixDate || 'none'}, head: ${headSha.substring(0, 7)})`
+                  );
+                  anyBlocked = true;
                   continue;
                 }
 
-                // Active P1 found — was it followed by a Codex fix Summary
-                // (both after latestCommitDate)? If the latest fix Summary
-                // is newer than the latest active P1, treat it as resolved.
-                let lastActiveP1Date = null;
-                let lastFixDate = null;
-                for (const item of allBodies) {
-                  if (new Date(item.date) <= latestCommitDate) continue;
-                  if (p1Pattern.test(item.bodyForP1)) lastActiveP1Date = item.date;
-                  if (fixSummaryPattern.test(item.body)) lastFixDate = item.date;
-                }
-
-                if (lastFixDate && new Date(lastFixDate) > new Date(lastActiveP1Date)) {
-                  results.push(`PR #${prNumber}: ✅ active Codex P1 followed by a fix Summary`);
+                // 2) No active P1, but Codex hasn't reviewed the current head
+                // yet → PENDING block (wait-for-first-review). This is the
+                // anti-#66/#67-race guard. It is NOT an approval wait: ANY
+                // Codex signal on the head (a review object, inline note,
+                // top-level comment, or 👍) flips this green on the next
+                // event, and Codex reviews automatically on every push — so
+                // it clears in a minute or two, never indefinitely. If Codex
+                // genuinely never reviews, use the override label.
+                if (!hasCodexSignalOnHead) {
+                  results.push(
+                    `PR #${prNumber}: ⏳ pending — Codex hasn't reviewed head ${headSha.substring(0, 7)} yet; blocking until it does (no approval needed, just a first signal)`
+                  );
+                  anyBlocked = true;
                   continue;
                 }
 
-                // Active, unresolved P1 → BLOCK. Safety wins on a real P1.
-                results.push(
-                  `PR #${prNumber}: ❌ active Codex P1 unresolved (last active P1: ${lastActiveP1Date}, last fix: ${lastFixDate || 'none'}, latest commit: ${latestCommitDate.toISOString()})`
-                );
-                anyBlocked = true;
+                // 3) Codex reviewed the head and found no active P1 → GREEN.
+                const hadAnyP1 = allBodies.some(item => p1Pattern.test(item.bodyForP1));
+                if (hadAnyP1) {
+                  results.push(
+                    `PR #${prNumber}: ✅ Codex reviewed head ${headSha.substring(0, 7)} — P1(s) are stale (predate the latest commit)`
+                  );
+                } else if (codexThumbsUpOnHead && allBodies.every(item => !item.onHead)) {
+                  results.push(`PR #${prNumber}: ✅ Codex reacted 👍 on the head — no issues`);
+                } else {
+                  results.push(`PR #${prNumber}: ✅ Codex reviewed head ${headSha.substring(0, 7)} — no P1`);
+                }
               } catch (err) {
                 // fail-soft: a TECHNICAL failure (API hiccup, rate limit,
                 // etc.) must NEVER wedge a PR red forever. We did not detect
@@ -276,10 +314,10 @@ jobs:
 
             if (anyBlocked) {
               core.setFailed(
-                'Blocked: an ACTIVE Codex P1 is unresolved on the current head.\n' +
+                'Blocked by Codex Gate: an active P1 is unresolved, or Codex has not reviewed the current head yet.\n' +
                 'Resolve by one of:\n' +
-                '  1. Push a fix commit — P1s raised before it become stale and clear automatically.\n' +
-                '  2. Let Codex post a fix Summary after the P1.\n' +
+                '  1. Wait — Codex reviews automatically on every push; the gate goes green once Codex posts any signal with no P1 (it re-runs on that event).\n' +
+                '  2. Push a fix commit — P1s raised before it become stale and clear automatically.\n' +
                 '  3. Add label "codex-p1-acknowledged" to override.'
               );
             }
