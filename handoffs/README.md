@@ -17,7 +17,7 @@ Each entry uses this template (prepend a new entry to the top of the chat's file
 - Status: <opened / merged-pending / blocked>
 - What changed: <2-4 bullets>
 - Validation: <actionlint / parity / node --check / etc>
-- Needs from Dima: <merge / secrets / decision / nothing>
+- Needs from the owner: <merge / secrets / decision / nothing>
 - Next: <what should happen after>
 ```
 
