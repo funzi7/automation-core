@@ -515,6 +515,15 @@ jobs:
           CODEXLOG_ENTRY_EOF
           )
 
+          # Insert the new entry right after the 5-line header.
+          # Strategy:
+          #   lines 1..5 (header through `---`)
+          #   blank
+          #   new entry
+          #   lines 6..N (everything else — prior entries)
+          # Newest-first ordering preserved. printf is safer than
+          # echo here — it doesn't interpret backslash escapes
+          # regardless of shell options.
           head -n 5 "$LOG_PATH" > /tmp/log-new.md
           printf '\n' >> /tmp/log-new.md
           printf '%s\n' "$NEW_ENTRY" >> /tmp/log-new.md
