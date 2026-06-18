@@ -64,6 +64,7 @@ still happen within minutes — the crons are just the backstop.
 | Secret | Required by | Notes |
 |--------|-------------|-------|
 | `ANTHROPIC_API_KEY` | `claude.yml` | **Required for the fixer.** If absent, Claude Fixer exits green (fail-soft) — no fix, no red runs, ~0 minutes. Set only on the repos you want auto-fixed (cost control). |
+| `CROSS_REPO_PAT` | `bootstrap.yml` (onboarding / auto-enrollment), `minutes-guard.yml` | automation-core only. Cross-repo fine-grained PAT (Contents/PRs/Workflows write, Metadata read; all repos). If absent, auto-enrollment exits green with a notice (fail-soft). |
 | `AUTOMATION_PAT` | `ci-doctor.yml`, `merge-bot.yml`, and `claude.yml` PR creation | **Required for the loop to chain.** Events created with the default `GITHUB_TOKEN` do not trigger other workflows (GitHub loop protection), so Issue/label/merge writes use this PAT. If absent, those workflows exit green (fail-soft) and the loop is inert in that repo. Needs Contents/PRs/Issues write, Metadata read. |
 | `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` | optional | Escalation pings on `needs-owner` / protected-path blocks. Messages use `parse_mode: HTML` (Markdown underscores broke us before). Skipped silently if unset. |
 
@@ -84,15 +85,38 @@ instead of merged.
 
 ## How to onboard repos
 
-Run the **Bootstrap repos** workflow from the Actions tab.
+**Onboarding is automatic.** The **Bootstrap repos** workflow runs on a weekly
+schedule (**Mondays 04:00 UTC**) and opens an onboarding PR titled
+`chore(automation): bootstrap sync from automation-core` in every eligible repo
+that isn't enrolled yet. A repo is **eligible** when it is:
 
-1. Go to Actions → Bootstrap repos → Run workflow
-2. Optional inputs:
-   - `dry_run`: true → only list eligible repos, don't open PRs
+- owned by you (not an org/collaborator repo), not archived, not a fork, and not automation-core itself;
+- not already enrolled (no `.github/workflows/sync-automation-core.yml`);
+- not opted out (no `.automation-core-ignore` at the repo root).
+
+**Auto-enrollment only OPENS the PR — it never merges it.** Merging stays a
+human checkpoint (auto-propose, not auto-apply), so a brand-new or experimental
+repo can't get automation wired in and merged with zero review. Merge the
+onboarding PR to join the loop; from then on the daily sync keeps the repo's
+workflows up to date.
+
+> fail-soft: if `CROSS_REPO_PAT` is missing, the scheduled sweep exits green
+> with a notice (no red run) — onboarding is simply inert until the PAT is set.
+
+### Opt a repo OUT of auto-enrollment
+
+Create `.automation-core-ignore` at the repo root. The weekly sweep (and the
+daily sync) will skip it — this is how you exclude a repo from the loop.
+
+### Manual onboarding (optional)
+
+You can still onboard on demand: Actions → **Bootstrap repos** → Run workflow.
+
+1. Optional inputs:
+   - `dry_run`: true → only list the repos that *would* get a PR, don't open any
    - `target_repo`: limit to a single repo (leave empty for all)
-3. Workflow opens a PR titled `chore(automation): bootstrap sync from automation-core` in each eligible repo
-4. Merge each PR
-5. From then on, daily sync is active in that repo
+2. The workflow opens the same onboarding PR in each eligible repo
+3. Merge each PR — from then on, daily sync is active in that repo
 
 ### Setup (one-time)
 
@@ -131,4 +155,5 @@ Each participating repo has `.github/workflows/sync-automation-core.yml` that:
 
 ## How to opt out a specific repo
 
-Create `.automation-core-ignore` in the repo root. The sync action will skip it.
+Create `.automation-core-ignore` in the repo root. Both the weekly
+auto-enrollment sweep and the per-repo sync action will skip it.
