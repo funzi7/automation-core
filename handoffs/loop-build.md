@@ -17,6 +17,15 @@ Handoff log for the **self-healing-loop build** Claude Chat session. Claude Code
 
 ---
 
+## [2026-06-18 01:50 UTC] privacy re-sweep (automation-core): case-insensitive content check + PR #28/#29 metadata cleaned
+- PR: direct to main (content already clean); plus metadata cleaned on PRs #28 and #29
+- Branch: main (direct commit)
+- Status: done
+- What changed: Re-ran the name scrub on automation-core **case-INSENSITIVELY** (the prior pass in #29 was case-sensitive, so variants could have survived). A working-tree grep across `LOOP_STATE.md`, `README.md`, every `handoffs/*.md`, and all workflow comments found **zero** standalone name occurrences outside the `needs-dima` label — so no content edits were needed; the earlier pass had already caught every case variant. Also cleaned **PR metadata**: PR #28 body had 2 standalone name occurrences and PR #29 body had 2 (backticked technical references); both bodies were rewritten with "the owner". Titles were already clean. The `needs-dima` label string and the `funzi7` handle were left untouched, and no workflow logic changed.
+- Validation: case-insensitive working-tree grep = 0 standalone (only `needs-dima` label substrings remain); no workflow files modified (byte-parity intact); PR #28/#29 bodies re-fetched and confirmed 0 standalone name.
+- Needs from the owner: nothing — public content + #28/#29 metadata are name-free. (Optional commit-message history rewrite was intentionally NOT run; it would force-push and break open branches such as #28 — request it separately if wanted.)
+- Next: if a git-history scrub is desired, authorize it explicitly; otherwise the public surface is clean.
+
 ## [2026-06-17 17:20 UTC] privacy scrub: remove the owner's personal name from all public content
 - PR: https://github.com/funzi7/automation-core/pull/29
 - Branch: claude/privacy-scrub
