@@ -78,7 +78,8 @@ jobs:
             const repo = context.repo.repo;
             const CODEX_CHECK = 'check-codex-status';
             const LABEL_AUTOMERGE = 'automerge';
-            const LABEL_ESCALATE = 'needs-dima';
+            const LABEL_ESCALATE = 'needs-owner';
+            const LABEL_ESCALATE_LEGACY = 'needs-dima';   // backward-compat: still honored as a hard stop
             const SYNC_TITLE_PREFIX = 'chore(automation): sync from automation-core';
             const SYNC_BRANCH = 'chore/sync-automation-core';   // branch the sync workflow opens
             const OWNER_LOGIN = 'funzi7';
@@ -132,11 +133,11 @@ jobs:
             });
 
             const candidates = allOpen.filter((pr) => {
-              // needs-dima is a HARD STOP — once a human-escalation label is on
+              // An escalation label (needs-owner or legacy needs-dima) is a HARD STOP — once a human-escalation label is on
               // a PR, automation must never touch it again (no re-merge attempt,
               // no repeated guard comment / Telegram). Filter it out before the
               // PR ever becomes a candidate.
-              if ((pr.labels || []).some((l) => l.name === LABEL_ESCALATE)) return false;
+              if ((pr.labels || []).some((l) => l.name === LABEL_ESCALATE || l.name === LABEL_ESCALATE_LEGACY)) return false;
               const byBot = isClaudeBot(pr.user && pr.user.login);
               // The `automerge` label is the PRIMARY signal for Claude's fix
               // PRs: claude.yml passes AUTOMATION_PAT as github_token, so PRs
@@ -240,7 +241,7 @@ jobs:
                     await github.rest.issues.removeLabel({ owner, repo, issue_number: prNumber, name: LABEL_AUTOMERGE });
                   } catch (e) { /* maybe not present */ }
                   // Upsert the escalation label first — addLabels only attaches
-                  // labels that already EXIST, so on a fresh repo needs-dima
+                  // labels that already EXIST, so on a fresh repo needs-owner
                   // must be created before it can be applied.
                   try {
                     await github.rest.issues.createLabel({ owner, repo, name: LABEL_ESCALATE, color: 'd93f0b', description: 'Escalation — automation stopped, human needed' });
@@ -250,7 +251,7 @@ jobs:
                     owner, repo, issue_number: prNumber,
                     body: `⛔ Auto-merge blocked: this PR touches protected path(s) listed in \`.claude-guard.json\`:\n${hits.map((h) => `- \`${h}\``).join('\n')}\n\nAdded \`${LABEL_ESCALATE}\` — a human must review and merge.`,
                   });
-                  await telegram(`⛔ <b>${repo}</b> PR #${prNumber} touches protected paths — escalated to needs-dima.`);
+                  await telegram(`⛔ <b>${repo}</b> PR #${prNumber} touches protected paths — escalated to needs-owner.`);
                   core.info(`#${prNumber}: protected path hit, escalated.`);
                   continue;
                 }

@@ -57,7 +57,8 @@ jobs:
             const MAX_ATTEMPTS = 3;
             const LABEL_FIX = 'claude-fix';
             const LABEL_DOCTOR = 'ci-doctor';
-            const LABEL_ESCALATE = 'needs-dima';
+            const LABEL_ESCALATE = 'needs-owner';
+            const LABEL_ESCALATE_LEGACY = 'needs-dima';   // backward-compat: still honored as a hard stop
             const ATTEMPT_MARKER = '<!-- ci-doctor-attempt -->';
 
             // Workflows whose own failures must never spawn fix Issues
@@ -199,10 +200,11 @@ jobs:
               // Already escalated to a human on a prior scan — leave it
               // completely alone. Without this, every later scan re-finds the
               // issue (it still carries the ci-doctor label), re-enters the
-              // escalation branch, and re-posts the needs-dima comment +
-              // Telegram daily. Skip the moment needs-dima is present.
-              if ((existing.labels || []).some((l) => (l.name || l) === LABEL_ESCALATE)) {
-                core.info(`Issue #${existing.number}: already escalated (needs-dima); skipping.`);
+              // escalation branch, and re-posts the escalation comment +
+              // Telegram daily. Skip the moment an escalation label
+              // (needs-owner, or legacy needs-dima) is present.
+              if ((existing.labels || []).some((l) => (l.name || l) === LABEL_ESCALATE || (l.name || l) === LABEL_ESCALATE_LEGACY)) {
+                core.info(`Issue #${existing.number}: already escalated; skipping.`);
                 continue;
               }
 
