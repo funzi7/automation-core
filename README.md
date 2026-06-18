@@ -45,10 +45,10 @@ a cron **twice a day** (06:00 & 18:00 UTC) to sweep the default branch for
 failed runs — its lookback window (13h) overlaps the two runs so nothing slips
 through. Merge Bot keeps only a **once-daily** safety-net cron (07:30 UTC). The
 loop's real responsiveness does **not** come from these schedules but from
-**events**: Merge Bot fires immediately on the Codex Gate `workflow_run`;
-Claude Fixer fires the moment the `claude-fix` label is applied or `@claude` is
-mentioned. So fixes and merges still happen within minutes — the crons are just
-the backstop.
+**events**: Merge Bot fires immediately on `check_suite` completion, PR
+`labeled`, and the Codex Gate `workflow_run`; Claude Fixer fires the moment the
+`claude-fix` label is applied or `@claude` is mentioned. So fixes and merges
+still happen within minutes — the crons are just the backstop.
 
 ### Label dictionary (uniform across all repos)
 
@@ -56,7 +56,7 @@ the backstop.
 |-------|---------|
 | `claude-fix` | "Claude, fix this." Set by ci-doctor; triggers Claude Fixer. |
 | `automerge` | This PR may be auto-merged by Merge Bot once green. |
-| `needs-dima` | Escalation — automation stopped, a human must act. |
+| `needs-owner` | Escalation — automation stopped, a human must act. (Migrated from the legacy escalation label, still honored during the transition.) |
 | `ci-doctor` | Marks Issues opened by CI Doctor (used for dedup + close). |
 
 ### Secrets
@@ -64,9 +64,9 @@ the backstop.
 | Secret | Required by | Notes |
 |--------|-------------|-------|
 | `ANTHROPIC_API_KEY` | `claude.yml` | **Required for the fixer.** If absent, Claude Fixer exits green (fail-soft) — no fix, no red runs, ~0 minutes. Set only on the repos you want auto-fixed (cost control). |
-| `AUTOMATION_PAT` | `ci-doctor.yml`, `merge-bot.yml`, and `claude.yml` PR creation | **Required for the loop to chain.** Events created with the default `GITHUB_TOKEN` do not trigger other workflows (GitHub loop protection), so Issue/label/merge writes use this PAT. If absent, those workflows exit green (fail-soft) and the loop is inert in that repo. Needs Contents/PRs/Issues write, Metadata read. |
 | `CROSS_REPO_PAT` | `bootstrap.yml` (onboarding / auto-enrollment), `minutes-guard.yml` | automation-core only. Cross-repo fine-grained PAT (Contents/PRs/Workflows write, Metadata read; all repos). If absent, auto-enrollment exits green with a notice (fail-soft). |
-| `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` | optional | Escalation pings on `needs-dima` / protected-path blocks. Messages use `parse_mode: HTML` (Markdown underscores broke us before). Skipped silently if unset. |
+| `AUTOMATION_PAT` | `ci-doctor.yml`, `merge-bot.yml`, and `claude.yml` PR creation | **Required for the loop to chain.** Events created with the default `GITHUB_TOKEN` do not trigger other workflows (GitHub loop protection), so Issue/label/merge writes use this PAT. If absent, those workflows exit green (fail-soft) and the loop is inert in that repo. Needs Contents/PRs/Issues write, Metadata read. |
+| `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` | optional | Escalation pings on `needs-owner` / protected-path blocks. Messages use `parse_mode: HTML` (Markdown underscores broke us before). Skipped silently if unset. |
 
 ### fail-soft behaviour
 
@@ -80,7 +80,7 @@ and burn essentially no Actions minutes.
 
 Drop a `.claude-guard.json` in a repo root (see
 `template/claude-guard.example.json`) to list globs Merge Bot must never
-auto-merge. A PR touching a protected path is escalated to `needs-dima`
+auto-merge. A PR touching a protected path is escalated to `needs-owner`
 instead of merged.
 
 ## How to onboard repos
