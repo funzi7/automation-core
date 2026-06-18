@@ -17,6 +17,15 @@ Handoff log for the **self-healing-loop build** Claude Chat session. Claude Code
 
 ---
 
+## [2026-06-18 06:15 UTC] morning report: match CI-doctor workflow by path/name so HEALTH isn't falsely green
+- PR: #31 (push to existing branch `claude/telegram-morning-report`)
+- Branch: claude/telegram-morning-report
+- Status: done (pushed to branch)
+- What changed: Codex P2 (valid): the morning report identified the health workflow by `/health-check|site-health|ci-doctor/i.test(wf.name)`, but the synced doctor declares `name: CI Doctor` (spaced/capitalized) — the hyphenated `ci-doctor` token never matched it, so `out.ciFailing` stayed empty and the digest could falsely report "⚙️ HEALTH: ✅ all green" while CI was red. Fix: match the CI-doctor / health-check / site-health workflow **by PATH first** (most robust — the file is always `ci-doctor.yml` regardless of display name): `/(?:^|\/)(?:ci-doctor|health-check|site-health)\.ya?ml$/.test(wf.path)`, with a spacing/casing-tolerant name regex `/ci[\s-]?doctor|site[\s-]?health|health[\s-]?check/i` as fallback. When the matched workflow's latest run concluded `failure` it's still pushed into `out.ciFailing`, so HEALTH now correctly surfaces red CI. ONLY the health-detection matcher changed — read-only guarantees, dynamic repo discovery, fail-soft secret handling, and the Telegram composition are untouched. Both copies kept byte-identical.
+- Validation: actionlint clean on both copies; `node --check` on the github-script block (async-wrapped); a 10-case matcher self-test passes (catches `CI Doctor` with and without a path, `ci-doctor`, `Site Health`, `Health Check`, `*.yaml`; rejects `Build & Test` / `Merge Bot`); `workflows/` ↔ `.github/workflows/` byte-identical (blob `2f3d63e`); diff is +12/-1 (matcher block only); still read-only (grep finds no write API calls).
+- needs-from-owner: merge #31 once green.
+- Next: with the matcher fixed, a red CI Doctor run in any repo now shows under ⚙️ HEALTH instead of being hidden by a false all-green.
+
 ## [2026-06-18 04:30 UTC] telegram morning report: read-only daily loop digest across all repos
 - PR: (opened from `claude/telegram-morning-report`)
 - Branch: claude/telegram-morning-report

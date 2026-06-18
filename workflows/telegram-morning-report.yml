@@ -155,7 +155,18 @@ jobs:
                   });
                   for (const wf of wfs) {
                     if (wf.state && wf.state.startsWith('disabled')) out.paused = true;
-                    if (/health-check|site-health|ci-doctor/i.test(wf.name || '')) {
+                    // Identify the CI-doctor / health-check / site-health
+                    // workflow. Match by PATH first — most robust: the synced
+                    // doctor file is always ci-doctor.yml even though its
+                    // display name is "CI Doctor", which a hyphenated name
+                    // match would miss (falsely showing HEALTH all-green while
+                    // CI is red). Fall back to a spacing/casing-tolerant name
+                    // regex only if the path doesn't identify it.
+                    const wfPath = (wf.path || '').toLowerCase();
+                    const isHealthWf =
+                      /(?:^|\/)(?:ci-doctor|health-check|site-health)\.ya?ml$/.test(wfPath) ||
+                      /ci[\s-]?doctor|site[\s-]?health|health[\s-]?check/i.test(wf.name || '');
+                    if (isHealthWf) {
                       try {
                         const { data: wr } = await github.rest.actions.listWorkflowRuns({
                           owner, repo, workflow_id: wf.id, per_page: 1,
