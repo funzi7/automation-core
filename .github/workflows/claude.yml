@@ -91,7 +91,7 @@ jobs:
           # `gh api`. git scoped per-subcommand; `git push` is kept because the
           # fixer must push its own branch. gh limited to pr/issue. If the
           # fixer needs something not listed it will fail and land on
-          # needs-dima — preferable to an endless allowlist loop.
+          # needs-owner — preferable to an endless allowlist loop.
           claude_args: |
             --max-turns 20
             --allowedTools "Read,Glob,Grep,Edit,Write,Bash(git status),Bash(git diff),Bash(git log),Bash(git add:*),Bash(git commit:*),Bash(git checkout:*),Bash(git branch:*),Bash(git fetch:*),Bash(git push:*),Bash(gh pr:*),Bash(gh issue:*),Bash(actionlint)"
