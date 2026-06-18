@@ -197,9 +197,25 @@ jobs:
                 owner, repo, ref: headSha, per_page: 100,
               });
 
+              // Keep ONLY the latest check run per name. The Codex gate emits
+              // multiple `check-codex-status` runs on the same head over a PR's
+              // life — an early PENDING/red run before Codex reviews, then a
+              // SUCCESS run after. GitHub's own merge gating uses the most
+              // recent run per name; scanning EVERY run would trip anyFailed on
+              // the stale early-red run and skip a PR whose latest gate is green
+              // (the reason merge-bot never merged). Sort by completion recency
+              // (completed_at, else started_at) descending and keep the first
+              // occurrence of each name. (Commit statuses below are already
+              // deduped per context — newest-first — so they're left as-is.)
+              const recency = (c) => new Date(c.completed_at || c.started_at || 0).getTime();
+              const seenNames = new Set();
+              const latestCheckRuns = [...checkRuns]
+                .sort((a, b) => recency(b) - recency(a))
+                .filter((c) => (seenNames.has(c.name) ? false : (seenNames.add(c.name), true)));
+
               let anyRunning = false;
               let anyFailed = false;
-              for (const c of checkRuns) {
+              for (const c of latestCheckRuns) {
                 if (c.status !== 'completed') { anyRunning = true; continue; }
                 if (!OK.has(c.conclusion)) anyFailed = true;
               }
@@ -220,7 +236,7 @@ jobs:
               // EXIST on the head SHA and be success. If check-codex-status is
               // absent (a repo that hasn't received codex-gate, or the gate
               // hasn't run yet), do NOT merge — never merge an ungated PR.
-              const codex = checkRuns.find((c) => c.name === CODEX_CHECK);
+              const codex = latestCheckRuns.find((c) => c.name === CODEX_CHECK);
               if (!codex || codex.status !== 'completed' || codex.conclusion !== 'success') {
                 core.info(`#${prNumber}: ${CODEX_CHECK} missing or not success, skip`);
                 continue;

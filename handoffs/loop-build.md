@@ -17,6 +17,15 @@ Handoff log for the **self-healing-loop build** Claude Chat session. Claude Code
 
 ---
 
+## [2026-06-18 05:05 UTC] merge-bot: evaluate only the LATEST check run per name (fixes "never merged")
+- PR: direct commit to main
+- Branch: main (direct commit)
+- Status: done
+- What changed: ROOT CAUSE of merge-bot never merging: the Codex gate emits MULTIPLE `check-codex-status` check runs on the same head SHA over a PR's life — an early PENDING/red run when the PR opens (before Codex reviews), then a SUCCESS run after. GitHub's own merge gating uses the most-recent run per name (so its merge button reflects the green one), but merge-bot scanned EVERY check run and set `anyFailed` on the stale early-red one → skipped the merge every time. Fix: after `checks.listForRef`, dedupe to the LATEST run per `name` (sort by `completed_at` then `started_at` descending, keep the first occurrence of each name → `latestCheckRuns`), and use `latestCheckRuns` for BOTH the anyRunning/anyFailed scan AND the codex lookup (`latestCheckRuns.find(c => c.name === 'check-codex-status')`). Commit statuses (listCommitStatusesForRef → latestByCtx) are already deduped per context and were left untouched. Everything else unchanged: candidate filter (needs-owner/legacy hard-stop FIRST, automerge, trusted sync, same-repo `claude/*`), `.claude-guard.json` protected-path guard, head-SHA-pinned squash merge, fail-soft on missing PAT, draft/mergeable checks, branch delete, linked-issue close. Net: a stale early-red gate run no longer blocks a PR whose latest gate is green; a genuinely failing latest check still blocks; a genuine active P1 still blocks (latest codex run is red). Both merge-bot.yml copies kept byte-identical.
+- Validation: actionlint clean on both copies; node --check on the github-script block; `workflows/` ↔ `.github/workflows/` byte-identical (blob `999bc00`); diff is +18/-2 (the dedupe block + 2 reference swaps) — hard-stop, protected-path guard, and head-SHA pin lines are unchanged; dedupe runs BEFORE both the anyFailed scan and the codex lookup.
+- needs-from-owner: nothing — live on main in one commit (handoff + LOOP_STATE in the same commit, no trailing commit, so the codex gate's head-reviewed state isn't reset).
+- Next: green PRs whose latest `check-codex-status` is success now actually auto-merge; the fix syncs to downstream repos on the next daily sync.
+
 ## [2026-06-18 03:20 UTC] merge-bot: auto-merge green PRs from claude/* branches
 - PR: direct commit to main
 - Branch: main (direct commit)
