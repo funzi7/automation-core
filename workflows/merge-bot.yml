@@ -159,7 +159,14 @@ jobs:
                 (pr.user && pr.user.login === OWNER_LOGIN) ||
                 ((pr.head && pr.head.ref === SYNC_BRANCH) && sameRepo)
               );
-              return byBot || hasAutomerge || isTrustedSync;
+              // A PR on a `claude/<...>` branch in THIS repo is Claude Code's
+              // work: claude.yml opens PRs via AUTOMATION_PAT, so they are
+              // authored by the owner (not a bot login) and carry no `automerge`
+              // label — byBot/hasAutomerge both miss them. Every such PR rides a
+              // `claude/` head ref. Requiring the SAME repo (not a fork) makes it
+              // unspoofable from outside: a fork PR carries a different head.repo.
+              const isClaudeBranch = !!(pr.head && pr.head.ref && pr.head.ref.startsWith('claude/')) && sameRepo;
+              return byBot || hasAutomerge || isTrustedSync || isClaudeBranch;
             });
 
             if (!candidates.length) {

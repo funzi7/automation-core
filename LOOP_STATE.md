@@ -77,7 +77,7 @@ Generic loop workflows live in `workflows/` (sync source) and are copied byte-id
 - **Concurrency:** `ci-doctor-${{ repo }}`, `cancel-in-progress: false`. Uses `AUTOMATION_PAT` for all writes.
 
 ### merge-bot.yml — Merge Bot  (sha `b8c4372`)
-- **Does:** squash-merges (head-SHA-pinned) PRs that are fully green. Candidate = Claude-bot author **OR `automerge` label OR** trusted sync PR; `needs-owner` (and the legacy label, for backward-compat) is a hard stop. `check-codex-status` must **exist AND be success** (fail-closed). `.claude-guard.json` protected-path guard → escalate. Closes linked CI-Doctor Issue.
+- **Does:** squash-merges (head-SHA-pinned) PRs that are fully green. Candidate = Claude-bot author **OR `automerge` label OR** trusted sync PR **OR** a same-repo `claude/*` head branch (Claude Code's PRs are AUTOMATION_PAT-authored = owner, not a bot, and carry no `automerge` label, so they're recognized by their `claude/` branch — fork PRs excluded via the same-repo check); `needs-owner` (and the legacy label, for backward-compat) is a hard stop checked FIRST. `check-codex-status` must **exist AND be success** (fail-closed). `.claude-guard.json` protected-path guard → escalate. Closes linked CI-Doctor Issue.
 - **Triggers:** `workflow_run: ["Codex Gate"] [completed]`, `schedule: '30 7 * * *'`, `workflow_dispatch`. Job early-exits unless a **successful** Codex Gate `workflow_run`, the cron, or manual. (PR #27 dropped the `check_suite` trigger.)
 - **Concurrency:** `merge-bot-${{ repo }}`, `cancel-in-progress: false`. Merges with `AUTOMATION_PAT` (so the push triggers downstream).
 
@@ -102,7 +102,7 @@ Generic loop workflows live in `workflows/` (sync source) and are copied byte-id
 - **`cancel-in-progress: false`** on claude.yml — never kill a run that is already burning money; a second event queues behind it.
 - **Final minimal allowlist** in claude.yml (`Read,Glob,Grep,Edit,Write` + scoped `git`/`gh pr`/`gh issue`/`actionlint`; no bare `Bash`, no interpreters, no `gh api`) — ends the "shrink-the-allowlist" loop; if something's missing the fixer fails to `needs-owner` rather than looping.
 - **Codex Gate kept as a blocking check** — the human waits for the loop instead of merging manually.
-- **Merge Bot identifies Claude PRs by the `automerge` label**, not author login (Claude's PRs are PAT-authored = owner `funzi7`, not a bot login).
+- **Merge Bot identifies Claude PRs by the `automerge` label OR a same-repo `claude/*` branch**, not author login (Claude's PRs are PAT-authored = owner `funzi7`, not a bot login). The escalation hard-stop is always checked first, and the protected-path guard still runs before any merge.
 - **Cost:** ~$1–1.7 per Claude fix run (duration-based). A Spending Limit is set in the Anthropic Console.
 - **Escalation label migrated to `needs-owner` (loop-safe).** New escalations tag `needs-owner`; every gate that CHECKS for escalation matches BOTH `needs-owner` and the legacy label (so existing escalations across downstream repos are never orphaned), and `needs-owner` is upserted wherever the legacy label used to be ensured. Workflows ADD only `needs-owner`; the legacy label survives solely inside backward-compat CHECK conditions, awaiting a later cleanup once all repos are re-tagged.
 

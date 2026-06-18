@@ -17,6 +17,15 @@ Handoff log for the **self-healing-loop build** Claude Chat session. Claude Code
 
 ---
 
+## [2026-06-18 03:20 UTC] merge-bot: auto-merge green PRs from claude/* branches
+- PR: direct commit to main
+- Branch: main (direct commit)
+- Status: done
+- What changed: merge-bot's candidate filter now also accepts a PR whose head ref starts with `claude/` AND is in THIS repo (same-repo, not a fork) — `isClaudeBranch`. Claude Code opens its PRs via AUTOMATION_PAT, so they're authored by the owner (not a bot login) and carry no `automerge` label; previously `byBot`/`hasAutomerge` missed them and they never auto-merged. They now auto-merge once codex-gate is green. Safety unchanged and ordered correctly: the escalation hard-stop (`needs-owner` / legacy label) is still the FIRST check and filters the PR out before any acceptance; the `.claude-guard.json` protected-path guard still runs before merge and escalates a protected-path `claude/*` PR to `needs-owner` instead of merging; head-SHA-pinned squash, fail-soft-on-missing-PAT, and codex-gate-must-be-green are untouched. Same-repo requirement makes `claude/*` acceptance unspoofable from a fork (a fork PR carries a different head.repo). Both merge-bot.yml copies kept byte-identical.
+- Validation: actionlint clean on both copies; node --check on the github-script block; `workflows/` ↔ `.github/workflows/` byte-identical (blob `12a4851`); hard-stop + protected-path guard confirmed to run before the new `claude/*` acceptance.
+- needs-from-owner: nothing — change is live on main in one commit (handoff + LOOP_STATE included in the same commit, no trailing commit, so codex-gate head state isn't reset).
+- Next: green PRs on `claude/*` branches now self-merge after codex-gate passes; the leaner candidate logic syncs to downstream repos on the next daily sync.
+
 ## [2026-06-18 02:55 UTC] migrate escalation label → needs-owner (loop-safe, backward-compat) + name re-scrub
 - PR: direct commit to main
 - Branch: main (direct commit)
