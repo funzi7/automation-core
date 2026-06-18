@@ -17,6 +17,15 @@ Handoff log for the **self-healing-loop build** Claude Chat session. Claude Code
 
 ---
 
+## [2026-06-18 04:30 UTC] telegram morning report: read-only daily loop digest across all repos
+- PR: (opened from `claude/telegram-morning-report`)
+- Branch: claude/telegram-morning-report
+- Status: opened (awaiting review/merge by the loop)
+- What changed: New hub-only workflow `telegram-morning-report.yml` (+ byte-identical `.github/workflows/` mirror) sends a once-daily (05:30 UTC) **read-only** Telegram digest of the self-healing loop across ALL of the owner's repos. Repos are discovered **dynamically** (`listForAuthenticatedUser`, affiliation owner, forks/archived excluded) — no hardcoded list, so new repos appear automatically. Per repo (each wrapped in try/catch so one bad/empty repo can't abort the run): open PRs with each PR's `check-codex-status` gate state (🟢/🔴/⏳/⚪), PRs labeled `needs-owner`, merges in the last 24h, failing health-check/site-health/ci-doctor runs, and disabled/paused workflows. Plus account Actions minutes (billing GET, or n/a). Composes ONE structured HTML message (🔴 NEEDS ATTENTION first → ⏳ OPEN PRs → ✅ MERGED 24h → ⚙️ HEALTH → 📊 MINUTES), splitting at ~3800 chars into multiple sends, and also writes the full report to the Actions run summary. This is the Stage-3 "Telegram control center" read-only digest (informational only — no buttons/actions). It is automation-core-only and is NOT added to sync-config (it reads downstream repos centrally, it doesn't deploy to them).
+- Validation: actionlint clean on both copies; node --check on the github-script block; `workflows/` ↔ `.github/workflows/` byte-identical (blob `d2f07e6`); **read-only confirmed** — only `repos.listForAuthenticatedUser` / `pulls.list` / `checks.listForRef` / `actions.listRepoWorkflows` / `actions.listWorkflowRuns` (+ a billing GET and the Telegram POST), ZERO GitHub write calls (no addLabels/merge/createComment/dispatch); fail-soft on every secret (missing AUTOMATION_PAT → exit green; missing Telegram → still log the summary, skip send; billing falls back CROSS_REPO_PAT → AUTOMATION_PAT → n/a); dynamic repo discovery (no hardcoded list).
+- needs-from-owner: review/merge the PR (or let the loop carry it); optionally confirm TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID are set in automation-core so the digest actually sends (otherwise it just logs to the run summary).
+- Next: once merged, the digest runs every morning at 05:30 UTC. A future interactive Telegram control center (buttons to trigger merges/reruns) can build on this read-only base.
+
 ## [2026-06-18 03:20 UTC] merge-bot: auto-merge green PRs from claude/* branches
 - PR: direct commit to main
 - Branch: main (direct commit)

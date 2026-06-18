@@ -93,6 +93,11 @@ Generic loop workflows live in `workflows/` (sync source) and are copied byte-id
 ### bootstrap.yml — onboarding + auto-enrollment  (automation-core only)
 - **Does:** installs `sync-automation-core.yml` into eligible repos via PRs (`chore(automation): bootstrap...`). Eligible = owner / non-archived / non-fork / not automation-core / no existing sync workflow / no `.automation-core-ignore` opt-out. **Auto-enrollment (Stage 3):** a weekly `schedule` sweep OPENS an onboarding PR in any newly-eligible repo but **never merges** it — auto-propose, not auto-apply; the PR is the human checkpoint (a brand-new/experimental repo can't get automation wired in and merged with zero review). **Triggers:** `schedule: '0 4 * * 1'` (Mondays 04:00 UTC, NOT dry-run — opens PRs) + `workflow_dispatch` (inputs `dry_run`, `target_repo`; `dry_run` previews without opening PRs). fail-soft: missing `CROSS_REPO_PAT` → green run + notice (no red); a single failing repo is recorded and skipped (per-repo try/catch) so one bad repo can't abort the unattended sweep. Auth: `CROSS_REPO_PAT`.
 
+### telegram-morning-report.yml — Loop Morning Report  (NEW; automation-core only, NOT synced)
+- **Does:** once-daily **read-only** Telegram digest of the loop's state across ALL of the owner's repos (dynamically discovered via `listForAuthenticatedUser`, forks/archived excluded — new repos appear automatically). Sections: 🔴 NEEDS ATTENTION (PRs labeled `needs-owner`, per repo) → ⏳ OPEN PRs (per repo, each PR's `check-codex-status` gate state 🟢/🔴/⏳/⚪) → ✅ MERGED (24h) → ⚙️ HEALTH (failing health-check/site-health/ci-doctor runs + disabled/paused workflows) → 📊 ACTIONS MINUTES (account billing, or n/a). Splits at ~3800 chars across multiple Telegram messages; also logs the full report to the Actions run summary.
+- **Strictly read-only:** only `repos.listForAuthenticatedUser` / `pulls.list` / `checks.listForRef` / `actions.listRepoWorkflows` / `actions.listWorkflowRuns` (+ a billing GET and the Telegram POST). NO writes anywhere — no labels, comments, merges, or dispatches. Each repo is wrapped in try/catch (one bad/empty repo is noted "unavailable", never aborts the digest).
+- **Triggers:** `schedule: '30 5 * * *'` (05:30 UTC, offset from the other crons) + `workflow_dispatch`. **Permissions:** `contents/actions/pull-requests/issues: read`. **Auth:** `AUTOMATION_PAT` (read across private repos); billing tries `CROSS_REPO_PAT` then falls back to `AUTOMATION_PAT`. fail-soft on every secret: missing `AUTOMATION_PAT` → exit green; missing Telegram creds → still write the run summary, skip the send.
+
 ---
 
 ## Key decisions made
@@ -113,10 +118,10 @@ Generic loop workflows live in `workflows/` (sync source) and are copied byte-id
 | Secret | Used by | Notes |
 |--------|---------|-------|
 | `ANTHROPIC_API_KEY` | claude.yml | Required for the fixer. Absent → fail-soft skip (no fix, ~0 minutes). Set only where you want auto-fix (cost control). |
-| `AUTOMATION_PAT` | claude.yml, ci-doctor, merge-bot, bridge, sync | **All cross-workflow writes** (comment/label/merge/PR). All-repos fine-grained PAT (Contents/PRs/Issues write, Metadata read). Absent → those workflows fail-soft skip (loop inert). |
+| `AUTOMATION_PAT` | claude.yml, ci-doctor, merge-bot, bridge, sync, telegram-morning-report | **All cross-workflow writes** (comment/label/merge/PR) + the morning report's cross-repo reads. All-repos fine-grained PAT (Contents/PRs/Issues write, Metadata read). Absent → those workflows fail-soft skip. |
 | `AGENT_MEMORY_PAT` | codex-auto-fix (archive) | Optional. Absent → archive step fail-soft skips. |
-| `CROSS_REPO_PAT` | bootstrap, minutes-guard | automation-core only. Cross-repo admin (Workflows write). |
-| `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` | ci-doctor, merge-bot, bridge | Optional escalation pings (HTML parse_mode). Skipped silently if unset. |
+| `CROSS_REPO_PAT` | bootstrap, minutes-guard, telegram-morning-report (billing read, optional) | automation-core only. Cross-repo admin (Workflows write); the morning report uses it for the account billing read, falling back to AUTOMATION_PAT. |
+| `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` | ci-doctor, merge-bot, bridge, telegram-morning-report | Optional escalation pings + the daily digest (HTML parse_mode). Skipped silently if unset (the report still logs to the run summary). |
 
 ---
 
@@ -153,7 +158,8 @@ Generic loop workflows live in `workflows/` (sync source) and are copied byte-id
 
 ### Stage 3
 - ✅ **Auto-enrollment for new repos — DONE** (branch `claude/auto-enrollment`): `bootstrap.yml` now runs on a weekly `schedule` (`0 4 * * 1`, Mondays 04:00 UTC) and automatically opens onboarding PRs in newly-eligible repos. Safety: opt-out via `.automation-core-ignore`; already-enrolled / archived / fork / non-owner repos skipped (reuses the existing eligible-repo scan); PRs are **opened-not-merged** (human checkpoint); the PAT step is fail-soft (missing `CROSS_REPO_PAT` → green + notice); per-repo try/catch so one bad repo doesn't abort the sweep. Manual `workflow_dispatch` + `dry_run` preview preserved.
-- Telegram control center.
+- ✅ **Telegram morning report (read-only digest) — DONE** (branch `claude/telegram-morning-report`): a once-daily 05:30 UTC `telegram-morning-report.yml` (automation-core hub only, NOT synced) sends a read-only cross-repo snapshot (escalations / open-PR gate states / 24h merges / health / minutes). fail-soft on every secret.
+- Telegram **interactive** control center (buttons/actions) — still future; the digest is informational only.
 
 ### Deferred (intentional)
 - ~~**Codex P2 — inline-reply debounce in the bridge.**~~ ✅ **Done in PR #21:** real cross-channel debounce (marker deduped across issue comments + inline review comments + reviews) → exactly one `@claude fix` per review wave; and the bridge now triggers on **P1 only** (P2 no longer auto-fires), which also ends the P2 loop.

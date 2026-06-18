@@ -1,0 +1,314 @@
+name: Loop Morning Report
+
+# Once-daily, READ-ONLY Telegram digest of the self-healing loop's state across
+# ALL of the owner's repos. This is a HUB workflow: it runs centrally in
+# automation-core and READS the other repos — it is NOT synced downstream.
+#
+# Strictly read-only: it makes only GET/list/search/checks calls and sends a
+# Telegram message (an external HTTP call, not a GitHub write). It never writes
+# to any repo — no labels, no comments, no merges, no dispatches.
+#
+# fail-soft on every secret:
+#   - AUTOMATION_PAT (read across private repos): absent → exit green + notice.
+#   - TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID (send): absent → still compose the
+#     report into the Actions summary, just skip the send (exit green + notice).
+#   - CROSS_REPO_PAT (only for the account billing read): used if present, else
+#     falls back to AUTOMATION_PAT; a missing/unauthorized billing endpoint just
+#     renders "minutes: n/a" — never a hard failure.
+#
+# Repo discovery is DYNAMIC (listForAuthenticatedUser, affiliation owner) so new
+# repos appear in the report with no edits. Each repo is wrapped in try/catch:
+# one bad/empty/permission-denied repo is noted "unavailable" and never aborts
+# the whole digest.
+
+on:
+  schedule:
+    # Once daily at 05:30 UTC — offset from sync (03:00), ci-doctor (06/18),
+    # merge-bot (07:30), minutes-guard (*/30) to avoid pile-ups.
+    - cron: '30 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  pull-requests: read
+  issues: read
+
+concurrency:
+  group: loop-morning-report-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail-soft check for AUTOMATION_PAT
+        id: patcheck
+        env:
+          AUTOMATION_PAT: ${{ secrets.AUTOMATION_PAT }}
+        run: |
+          if [ -z "${AUTOMATION_PAT}" ]; then
+            echo "::notice::AUTOMATION_PAT is not set — skipping Loop Morning Report (fail-soft). It is needed to read across private repos."
+            echo "has_pat=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_pat=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Compose and send the morning report
+        if: steps.patcheck.outputs.has_pat == 'true'
+        uses: actions/github-script@v7
+        env:
+          AUTOMATION_PAT: ${{ secrets.AUTOMATION_PAT }}
+          CROSS_REPO_PAT: ${{ secrets.CROSS_REPO_PAT }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        with:
+          # AUTOMATION_PAT so the read calls can see private repos.
+          github-token: ${{ secrets.AUTOMATION_PAT }}
+          script: |
+            const owner = context.repo.owner;
+            const LABEL_ESCALATE = 'needs-owner';
+            const GATE_CHECK = 'check-codex-status';
+            const since = new Date(Date.now() - 24 * 3600 * 1000);
+
+            // Minimal HTML-escape for Telegram parse_mode: HTML.
+            const esc = (s) => String(s || '')
+              .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            const trunc = (s, n) => {
+              s = String(s || '');
+              return s.length > n ? s.slice(0, n - 1) + '…' : s;
+            };
+
+            // --- 1) DYNAMIC repo discovery (no hardcoded list) ---------------
+            // Authenticated-user endpoint so private repos are included.
+            // Exclude forks and archived repos.
+            const allRepos = await github.paginate(
+              github.rest.repos.listForAuthenticatedUser,
+              { per_page: 100, affiliation: 'owner' }
+            );
+            const repos = allRepos
+              .filter((r) => !r.fork && !r.archived)
+              .map((r) => r.name)
+              .sort((a, b) => a.localeCompare(b));
+
+            // Gate state for a PR's head SHA from check-codex-status.
+            function gateSymbol(conclusion, present) {
+              if (!present) return '⚪';                    // no gate check yet
+              if (conclusion === 'success') return '🟢';
+              if (['failure', 'timed_out', 'cancelled', 'action_required'].includes(conclusion)) return '🔴';
+              return '⏳';                                  // queued / in_progress / neutral
+            }
+
+            // Count PRs merged in the last 24h without loading every closed PR:
+            // walk closed PRs sorted by updated desc and stop once older than
+            // the window (a merged PR's updated_at >= its merged_at).
+            async function mergedLast24h(repo) {
+              let count = 0;
+              for (let page = 1; page <= 5; page++) {
+                const { data } = await github.rest.pulls.list({
+                  owner, repo, state: 'closed', sort: 'updated',
+                  direction: 'desc', per_page: 100, page,
+                });
+                if (!data.length) break;
+                let stop = false;
+                for (const pr of data) {
+                  if (new Date(pr.updated_at) < since) { stop = true; break; }
+                  if (pr.merged_at && new Date(pr.merged_at) >= since) count++;
+                }
+                if (stop || data.length < 100) break;
+              }
+              return count;
+            }
+
+            // Per-repo gather — all best-effort, never throws to the caller.
+            async function gatherRepo(repo) {
+              const out = {
+                repo, ok: true, openPRs: [], escalations: [],
+                merged24: 0, ciFailing: [], paused: false, error: null,
+              };
+              try {
+                const open = await github.paginate(github.rest.pulls.list, {
+                  owner, repo, state: 'open', per_page: 100,
+                });
+                for (const pr of open) {
+                  const labels = (pr.labels || []).map((l) => l.name);
+                  if (labels.includes(LABEL_ESCALATE)) {
+                    out.escalations.push({ number: pr.number, title: pr.title });
+                  }
+                  let symbol = '⚪';
+                  try {
+                    const runs = await github.paginate(github.rest.checks.listForRef, {
+                      owner, repo, ref: pr.head.sha, per_page: 100,
+                    });
+                    const gate = runs.find((c) => c.name === GATE_CHECK);
+                    symbol = gateSymbol(gate && gate.conclusion, !!gate);
+                  } catch (e) { symbol = '⚪'; }
+                  out.openPRs.push({ number: pr.number, title: pr.title, symbol });
+                }
+
+                out.merged24 = await mergedLast24h(repo);
+
+                // Workflows: detect disabled crons + failing health/doctor runs.
+                try {
+                  const wfs = await github.paginate(github.rest.actions.listRepoWorkflows, {
+                    owner, repo, per_page: 100,
+                  });
+                  for (const wf of wfs) {
+                    if (wf.state && wf.state.startsWith('disabled')) out.paused = true;
+                    if (/health-check|site-health|ci-doctor/i.test(wf.name || '')) {
+                      try {
+                        const { data: wr } = await github.rest.actions.listWorkflowRuns({
+                          owner, repo, workflow_id: wf.id, per_page: 1,
+                        });
+                        const last = wr.workflow_runs && wr.workflow_runs[0];
+                        if (last && last.conclusion === 'failure') out.ciFailing.push(wf.name);
+                      } catch (e) { /* skip this workflow */ }
+                    }
+                  }
+                } catch (e) { /* actions disabled / no perms — skip */ }
+              } catch (e) {
+                out.ok = false;
+                out.error = e.status ? `${e.status}` : (e.message || 'error');
+              }
+              return out;
+            }
+
+            const results = [];
+            for (const repo of repos) {
+              results.push(await gatherRepo(repo));
+            }
+
+            // --- 3) Account Actions minutes (best-effort, read-only) ---------
+            let minutesLine = '📊 ACTIONS MINUTES: n/a';
+            try {
+              const tok = process.env.CROSS_REPO_PAT || process.env.AUTOMATION_PAT;
+              const resp = await fetch(`https://api.github.com/users/${owner}/settings/billing/actions`, {
+                headers: {
+                  Authorization: `Bearer ${tok}`,
+                  Accept: 'application/vnd.github+json',
+                  'X-GitHub-Api-Version': '2022-11-28',
+                },
+              });
+              if (resp.ok) {
+                const b = await resp.json();
+                const used = b.total_minutes_used ?? 0;
+                const included = b.included_minutes ?? 0;
+                const remaining = Math.max(0, included - used);
+                minutesLine = `📊 ACTIONS MINUTES: ${used} used / ${remaining} left (of ${included})`;
+              }
+            } catch (e) { /* keep n/a */ }
+
+            // --- 4) Compose ONE structured, scannable message ----------------
+            const today = new Date().toISOString().slice(0, 10);
+            const lines = [];
+            lines.push(`<b>🌅 Loop morning report — ${today}</b>`);
+
+            const unavailable = results.filter((r) => !r.ok).map((r) => r.repo);
+
+            // 🔴 NEEDS ATTENTION first.
+            const escAll = results.flatMap((r) => r.escalations.map((e) => ({ repo: r.repo, ...e })));
+            lines.push('');
+            if (escAll.length === 0) {
+              lines.push('🔴 <b>NEEDS ATTENTION:</b> ✅ nothing escalated');
+            } else {
+              lines.push(`🔴 <b>NEEDS ATTENTION (${escAll.length}):</b>`);
+              for (const e of escAll) {
+                lines.push(`• ${esc(e.repo)} — #${e.number} ${esc(trunc(e.title, 60))}`);
+              }
+            }
+
+            // ⏳ OPEN PRs (skip repos with none).
+            const withOpen = results.filter((r) => r.openPRs.length > 0);
+            lines.push('');
+            if (withOpen.length === 0) {
+              lines.push('⏳ <b>OPEN PRs:</b> none');
+            } else {
+              const totalOpen = withOpen.reduce((n, r) => n + r.openPRs.length, 0);
+              lines.push(`⏳ <b>OPEN PRs (${totalOpen}):</b>`);
+              for (const r of withOpen) {
+                lines.push(`• <b>${esc(r.repo)}</b> (${r.openPRs.length}):`);
+                for (const p of r.openPRs) {
+                  lines.push(`   ${p.symbol} #${p.number} ${esc(trunc(p.title, 55))}`);
+                }
+              }
+            }
+
+            // ✅ MERGED (24h).
+            const mergedTotal = results.reduce((n, r) => n + r.merged24, 0);
+            const mergedRepos = results.filter((r) => r.merged24 > 0);
+            lines.push('');
+            if (mergedTotal === 0) {
+              lines.push('✅ <b>MERGED (24h):</b> 0');
+            } else {
+              lines.push(`✅ <b>MERGED (24h): ${mergedTotal}</b> — ` +
+                mergedRepos.map((r) => `${esc(r.repo)} ${r.merged24}`).join(', '));
+            }
+
+            // ⚙️ HEALTH.
+            const healthIssues = [];
+            for (const r of results) {
+              if (r.ciFailing.length) healthIssues.push(`${esc(r.repo)}: CI failing (${r.ciFailing.map(esc).join(', ')})`);
+              if (r.paused) healthIssues.push(`${esc(r.repo)}: workflow(s) disabled/paused`);
+            }
+            lines.push('');
+            if (healthIssues.length === 0) {
+              lines.push('⚙️ <b>HEALTH:</b> ✅ all green');
+            } else {
+              lines.push('⚙️ <b>HEALTH:</b>');
+              for (const h of healthIssues) lines.push(`• ${h}`);
+            }
+
+            // 📊 ACTIONS MINUTES.
+            lines.push('');
+            lines.push(minutesLine);
+
+            if (unavailable.length) {
+              lines.push('');
+              lines.push(`⚠️ unavailable this run: ${unavailable.map(esc).join(', ')}`);
+            }
+
+            const fullText = lines.join('\n');
+
+            // --- 5) Always log to the Actions summary (readable even w/o TG) -
+            try {
+              await core.summary
+                .addHeading(`Loop morning report — ${today}`)
+                .addCodeBlock(fullText, 'text')
+                .write();
+            } catch (e) { core.info(`summary write failed (ignored): ${e.message}`); }
+            core.info(fullText);
+
+            // --- Send via Telegram (fail-soft if creds missing) -------------
+            const tgToken = process.env.TELEGRAM_BOT_TOKEN;
+            const tgChat = process.env.TELEGRAM_CHAT_ID;
+            if (!tgToken || !tgChat) {
+              core.notice('TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set — report logged to the run summary, not sent (fail-soft).');
+              return;
+            }
+
+            // Telegram caps a message at ~4096 chars — split on line boundaries
+            // into <=3800-char chunks rather than truncating.
+            const chunks = [];
+            let buf = '';
+            for (const line of fullText.split('\n')) {
+              if ((buf + '\n' + line).length > 3800) { chunks.push(buf); buf = line; }
+              else { buf = buf ? buf + '\n' + line : line; }
+            }
+            if (buf) chunks.push(buf);
+
+            for (const chunk of chunks) {
+              try {
+                const r = await fetch(`https://api.telegram.org/bot${tgToken}/sendMessage`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    chat_id: tgChat, text: chunk,
+                    parse_mode: 'HTML', disable_web_page_preview: true,
+                  }),
+                });
+                if (!r.ok) core.info(`Telegram non-200: ${r.status}`);
+              } catch (e) {
+                core.info(`Telegram send failed (ignored): ${e.message}`);
+              }
+            }
+            core.info(`Sent ${chunks.length} Telegram message(s).`);
