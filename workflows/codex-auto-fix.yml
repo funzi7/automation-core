@@ -22,7 +22,7 @@ name: Codex Auto-Fix
 #     this is the right authentication surface.
 #   - Circuit breaker: capped at 3 @claude fix rounds per PR. After
 #     3 rounds that haven't converged, stop auto-triggering, add the
-#     needs-dima label (merge-bot then ignores the PR), and ping
+#     needs-owner label (merge-bot then ignores the PR), and ping
 #     Telegram if configured. Prevents the near-infinite review/fix
 #     loop (each round costs real money).
 #   - Substring match on "P1" in the review body. Codex uses badge
@@ -166,14 +166,22 @@ jobs:
               // Circuit breaker tripped: the review/fix loop isn't converging.
               // Stop auto-triggering, escalate to a human.
               core.warning(
-                `Circuit breaker: ${autoFixCount} @claude fix rounds on PR #${prNumber} without converging; stopping and escalating to needs-dima.`,
+                `Circuit breaker: ${autoFixCount} @claude fix rounds on PR #${prNumber} without converging; stopping and escalating to needs-owner.`,
               );
+              // Ensure the current escalation label exists, then attach it.
+              // New escalations use needs-owner; legacy needs-dima is still
+              // honored by the gates that CHECK for it. createLabel is
+              // best-effort (422 = already exists) so downstream repos that
+              // don't have needs-owner yet still get it created.
+              try {
+                await github.rest.issues.createLabel({ owner, repo, name: 'needs-owner', color: 'd93f0b', description: 'Escalation — automation stopped, human needed' });
+              } catch (e) { if (e.status !== 422) core.info(`createLabel needs-owner failed (ignored): ${e.message}`); }
               try {
                 await github.rest.issues.addLabels({
-                  owner, repo, issue_number: prNumber, labels: ['needs-dima'],
+                  owner, repo, issue_number: prNumber, labels: ['needs-owner'],
                 });
               } catch (e) {
-                core.info(`addLabel needs-dima failed (ignored): ${e.message}`);
+                core.info(`addLabel needs-owner failed (ignored): ${e.message}`);
               }
               // Telegram escalation (HTML; skip silently if unset).
               const tgToken = process.env.TELEGRAM_BOT_TOKEN;
@@ -185,7 +193,7 @@ jobs:
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                       chat_id: tgChat,
-                      text: `🚨 <b>${repo}</b> PR #${prNumber}: ${autoFixCount} @claude fix rounds didn't converge — escalated to <b>needs-dima</b>.`,
+                      text: `🚨 <b>${repo}</b> PR #${prNumber}: ${autoFixCount} @claude fix rounds didn't converge — escalated to <b>needs-owner</b>.`,
                       parse_mode: 'HTML',
                       disable_web_page_preview: true,
                     }),

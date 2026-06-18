@@ -24,7 +24,7 @@ Claude Fixer (claude.yml)   fixes on a branch — the RELIABLE fixer.
    ▼
 Codex re-reviews the new commit
    │  Circuit breaker: after 3 @claude-fix rounds that don't converge
-   │  → add `needs-dima` + Telegram ping, stop auto-triggering
+   │  → add `needs-owner` + Telegram ping, stop auto-triggering
    ▼
 Merge Bot (merge-bot.yml)   merges when everything is green
                             (identifies Claude PRs by the `automerge` LABEL, not author login,
@@ -38,7 +38,7 @@ Merge Bot (merge-bot.yml)   merges when everything is green
 |-------|---------|
 | `claude-fix` | "Claude, fix this." Set by CI Doctor; triggers Claude Fixer. |
 | `automerge` | May be auto-merged by Merge Bot once green. Set by Claude's PR step. |
-| `needs-dima` | Escalation — automation stopped, a human must act. Hard stop for Merge Bot. |
+| `needs-owner` | Escalation — automation stopped, a human must act. Hard stop for Merge Bot. (Migrated from the legacy label; still honored for backward-compat.) |
 | `ci-doctor` | Marks Issues opened by CI Doctor (dedup + close). |
 
 ---
@@ -58,7 +58,7 @@ Generic loop workflows live in `workflows/` (sync source) and are copied byte-id
 ### codex-auto-fix.yml — the Bridge + Codex-summary archive  (sha `e0bda69`; P1-only + cross-channel debounce merged via PR #21)
 - **Job `trigger_codex_fix`:** on a Codex review that carries an **active P1** (real bug / security), posts **exactly one** `@claude fix` per review wave. **P2 (nice-to-have) never auto-triggers** — Codex finds new P2s endlessly, an infinite paid loop; P2 notes stay on the PR for reference and the owner can `@claude fix` one by hand. P1 detection reuses the existing badge substring check (`body.includes("P1")`).
   - **Cross-channel debounce:** a Codex review with N inline notes fires N events across **two** channels (top-level `issue_comment` **and** inline `pull_request_review_comment`) — the bridge posts its own inline trigger as a review-comment *reply*. The dedupe counts the `[auto-triggered]` marker across **all** channels (issue comments + review comments + reviews), so once one trigger for the current head exists, no further event re-fires → one trigger per wave. (The old code counted only `issues.listComments` and missed the inline replies, so PR #19 got 2 triggers from 3 notes.)
-  - Circuit breaker `MAX_FIX_ROUNDS = 3` → `needs-dima` + Telegram (now counts markers across all channels too). Posts with `AUTOMATION_PAT` (else a GITHUB_TOKEN comment wouldn't trigger claude.yml).
+  - Circuit breaker `MAX_FIX_ROUNDS = 3` → `needs-owner` + Telegram (now counts markers across all channels too). Posts with `AUTOMATION_PAT` (else a GITHUB_TOKEN comment wouldn't trigger claude.yml).
   - Concurrency: `codex-claude-bridge-${{ repo }}-${{ pr }}`, `cancel-in-progress: false` (serializes near-simultaneous events so the dedupe is seen before the next event runs).
 - **Job `archive_codex_summary`:** archives Codex post-fix summaries to `funzi7/agent-memory` (needs `AGENT_MEMORY_PAT`, fail-soft if absent). Concurrency `codex-summary-archive`.
 - **Triggers:** `pull_request_review: [submitted]`, `pull_request_review_comment: [created]`, `issue_comment: [created]`. **Does NOT listen to `issues` events** (removed in PR #17 — it was waking + skipping in ~2s on every Issue label).
@@ -72,13 +72,13 @@ Generic loop workflows live in `workflows/` (sync source) and are copied byte-id
 - **Triggers:** `pull_request: [opened, synchronize, reopened]`, `pull_request_review: [submitted, edited, dismissed]`, `pull_request_review_comment: [created, edited, deleted]`, `issue_comment: [created, edited, deleted]`, `workflow_dispatch` (self-rerun / manual re-check, input `pr_number`, dispatched against the head branch).
 
 ### ci-doctor.yml — CI Doctor  (sha `ae4ba37`)
-- **Does:** scans the default branch for failed runs (13h lookback), opens a `claude-fix` Issue per failure (logs tail + root-cause prompt), upserts the loop labels, nudges ≤3 attempts then escalates to `needs-dima` + Telegram. Skips Issues already escalated.
+- **Does:** scans the default branch for failed runs (13h lookback), opens a `claude-fix` Issue per failure (logs tail + root-cause prompt), upserts the loop labels, nudges ≤3 attempts then escalates to `needs-owner` + Telegram. Skips Issues already escalated.
 - **Triggers:** `schedule: '0 6,18 * * *'` (twice daily) + `workflow_dispatch`.
 - **Concurrency:** `ci-doctor-${{ repo }}`, `cancel-in-progress: false`. Uses `AUTOMATION_PAT` for all writes.
 
 ### merge-bot.yml — Merge Bot  (sha `b8c4372`)
-- **Does:** squash-merges (head-SHA-pinned) PRs that are fully green. Candidate = Claude-bot author **OR `automerge` label OR** trusted sync PR; `needs-dima` is a hard stop. `check-codex-status` must **exist AND be success** (fail-closed). `.claude-guard.json` protected-path guard → escalate. Closes linked CI-Doctor Issue.
-- **Triggers:** `check_suite: [completed]`, `workflow_run: ["Codex Gate"] [completed]`, `schedule: '30 7 * * *'`, `workflow_dispatch`. Job early-exits unless a success/neutral `check_suite`, a **successful** Codex Gate `workflow_run`, the cron, or manual.
+- **Does:** squash-merges (head-SHA-pinned) PRs that are fully green. Candidate = Claude-bot author **OR `automerge` label OR** trusted sync PR; `needs-owner` (and the legacy label, for backward-compat) is a hard stop. `check-codex-status` must **exist AND be success** (fail-closed). `.claude-guard.json` protected-path guard → escalate. Closes linked CI-Doctor Issue.
+- **Triggers:** `workflow_run: ["Codex Gate"] [completed]`, `schedule: '30 7 * * *'`, `workflow_dispatch`. Job early-exits unless a **successful** Codex Gate `workflow_run`, the cron, or manual. (PR #27 dropped the `check_suite` trigger.)
 - **Concurrency:** `merge-bot-${{ repo }}`, `cancel-in-progress: false`. Merges with `AUTOMATION_PAT` (so the push triggers downstream).
 
 ### sync-automation-core.yml — per-repo sync  (sha `a7c8563`, lives only in `.github/workflows/`)
@@ -100,10 +100,11 @@ Generic loop workflows live in `workflows/` (sync source) and are copied byte-id
 - **Claude fixes, Codex reviews.** Codex produces phantom/empty fix commits; Claude is the reliable fixer.
 - **`--max-turns 20`** in claude.yml (balance cost vs completing the task; most fixes need far fewer than 35).
 - **`cancel-in-progress: false`** on claude.yml — never kill a run that is already burning money; a second event queues behind it.
-- **Final minimal allowlist** in claude.yml (`Read,Glob,Grep,Edit,Write` + scoped `git`/`gh pr`/`gh issue`/`actionlint`; no bare `Bash`, no interpreters, no `gh api`) — ends the "shrink-the-allowlist" loop; if something's missing the fixer fails to `needs-dima` rather than looping.
+- **Final minimal allowlist** in claude.yml (`Read,Glob,Grep,Edit,Write` + scoped `git`/`gh pr`/`gh issue`/`actionlint`; no bare `Bash`, no interpreters, no `gh api`) — ends the "shrink-the-allowlist" loop; if something's missing the fixer fails to `needs-owner` rather than looping.
 - **Codex Gate kept as a blocking check** — the human waits for the loop instead of merging manually.
 - **Merge Bot identifies Claude PRs by the `automerge` label**, not author login (Claude's PRs are PAT-authored = owner `funzi7`, not a bot login).
 - **Cost:** ~$1–1.7 per Claude fix run (duration-based). A Spending Limit is set in the Anthropic Console.
+- **Escalation label migrated to `needs-owner` (loop-safe).** New escalations tag `needs-owner`; every gate that CHECKS for escalation matches BOTH `needs-owner` and the legacy label (so existing escalations across downstream repos are never orphaned), and `needs-owner` is upserted wherever the legacy label used to be ensured. Workflows ADD only `needs-owner`; the legacy label survives solely inside backward-compat CHECK conditions, awaiting a later cleanup once all repos are re-tagged.
 
 ---
 
@@ -140,7 +141,7 @@ Generic loop workflows live in `workflows/` (sync source) and are copied byte-id
 |---|----|--------|
 | 1 | **Gate check must EXIST** — merge-bot fails closed if `check-codex-status` is absent (never merge an ungated PR) | ✅ **merged to main** (PR #15, merge-bot `b8c4372`) |
 | 2 | **PAT-author `automerge` label** — Claude's PRs are owner-authored, so claude.yml labels them `automerge` and merge-bot keys off the label | ✅ **merged to main** (PR #15 + #17, claude.yml `a33a4a8`) |
-| 3 | **Escalation label upsert** — `createLabel` before `addLabels` (addLabels only attaches existing labels) so `needs-dima` works on fresh repos | ✅ **merged to main** (PR #15, merge-bot `b8c4372`) |
+| 3 | **Escalation label upsert** — `createLabel` before `addLabels` (addLabels only attaches existing labels) so the escalation label works on fresh repos | ✅ **merged to main** (PR #15, merge-bot `b8c4372`) |
 
 **All three are live on `main`.** (Other merged loop hardening: head-SHA-pinned merge, 3-round circuit breaker, twice-daily ci-doctor / daily merge-bot crons, success-filtered `workflow_run` trigger, per-wave bridge debounce, `cancel-in-progress: false`, allowlist `--allowedTools`.)
 
