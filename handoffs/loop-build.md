@@ -17,6 +17,15 @@ Handoff log for the **self-healing-loop build** Claude Chat session. Claude Code
 
 ---
 
+## [2026-06-18 03:55 UTC] codex→claude bridge: auto @claude fix on an active Codex P1
+- PR: (opened from `claude/codex-claude-bridge`)
+- Branch: claude/codex-claude-bridge
+- Status: opened (awaiting review/merge by the loop)
+- What changed: New dedicated workflow `codex-claude-bridge.yml` (+ byte-identical `.github/workflows/` mirror) closes the last hands-off gap: when Codex posts an **active P1** on a PR, the bridge auto-posts `@claude fix` (via `AUTOMATION_PAT` — mandatory; a GITHUB_TOKEN comment wouldn't wake claude.yml) so claude.yml fixes → Codex re-reviews → gate green → merge-bot merges, with no human in the loop. **P1 ONLY** — P2 never triggers; it reuses codex-gate.yml's EXACT P1 detection verbatim (`isCodex` / `p1Pattern` / `stripSummarySections` / date-only `onHead` against the max committer date), and a P1 already followed by a fix Summary is treated as cleared. Guards: idempotency (one trigger per head) + a 3-round circuit breaker that escalates to `needs-owner` + Telegram (PR-level mirror of ci-doctor's breaker). It cannot self-trigger — its own `@claude fix` is owner-authored (not Codex), so the Codex-author check exits first. Added `codex-claude-bridge.yml` to `sync-config.json.synced_workflows` so it propagates downstream. LOOP_STATE updated (replaced the old "no separate bridge" note + added a workflow section).
+- Validation: actionlint clean on both copies; node --check on the github-script block; `workflows/` ↔ `.github/workflows/` byte-identical (blob `f855cc9`); P2 confirmed NOT to trigger (only `p1Pattern` on an on-head body); 3-round breaker confirmed to escalate to `needs-owner`.
+- needs-from-owner: review/merge the PR (or let the loop carry it). 
+- Next: once merged + synced, every repo's Codex P1 auto-routes to Claude with zero human input. (The older `trigger_codex_fix` job inside codex-auto-fix.yml still does the same job; the dedicated workflow makes it first-class.)
+
 ## [2026-06-18 03:20 UTC] merge-bot: auto-merge green PRs from claude/* branches
 - PR: direct commit to main
 - Branch: main (direct commit)

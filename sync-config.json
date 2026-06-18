@@ -1,6 +1,7 @@
 {
   "synced_workflows": [
     "codex-auto-fix.yml",
+    "codex-claude-bridge.yml",
     "codex-gate.yml",
     "claude.yml",
     "ci-doctor.yml",

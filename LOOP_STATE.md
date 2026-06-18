@@ -45,9 +45,9 @@ Merge Bot (merge-bot.yml)   merges when everything is green
 
 ## Workflows (current state on `main`)
 
-Generic loop workflows live in `workflows/` (sync source) and are copied byte-identical into `.github/workflows/` so automation-core runs the loop on its own PRs (it is consumer #12 of itself). `sync-config.json.synced_workflows = [codex-auto-fix.yml, codex-gate.yml, claude.yml, ci-doctor.yml, merge-bot.yml]`.
+Generic loop workflows live in `workflows/` (sync source) and are copied byte-identical into `.github/workflows/` so automation-core runs the loop on its own PRs (it is consumer #12 of itself). `sync-config.json.synced_workflows = [codex-auto-fix.yml, codex-claude-bridge.yml, codex-gate.yml, claude.yml, ci-doctor.yml, merge-bot.yml]`.
 
-> **Note:** there is **no separate `codex-claude-bridge.yml`** — "the bridge" IS the `trigger_codex_fix` job inside **`codex-auto-fix.yml`**.
+> **Note:** the codex→claude bridge now has a **dedicated** workflow, `codex-claude-bridge.yml` (auto-posts `@claude fix` on an active Codex P1). The older `trigger_codex_fix` job inside `codex-auto-fix.yml` performs the same role and still runs; the dedicated workflow makes the bridge a first-class, independently-synced piece.
 
 ### claude.yml — Claude Fixer  (sha `a33a4a8`)
 - **Does:** runs `anthropics/claude-code-action@v1` to fix a `claude-fix` Issue (or an `@claude` mention), opens a PR (`Fixes #N`), then labels that PR `automerge` (only if the Claude step **succeeded** — `if: steps.claude.outcome == 'success'`).
@@ -63,6 +63,11 @@ Generic loop workflows live in `workflows/` (sync source) and are copied byte-id
 - **Job `archive_codex_summary`:** archives Codex post-fix summaries to `funzi7/agent-memory` (needs `AGENT_MEMORY_PAT`, fail-soft if absent). Concurrency `codex-summary-archive`.
 - **Triggers:** `pull_request_review: [submitted]`, `pull_request_review_comment: [created]`, `issue_comment: [created]`. **Does NOT listen to `issues` events** (removed in PR #17 — it was waking + skipping in ~2s on every Issue label).
 - _Removed in PR #17:_ the `trigger_codex_on_health_issue` job (auto-tagged `@codex` on `site-health` Issues). Not currently running anywhere — see Open debt.
+
+### codex-claude-bridge.yml — Codex→Claude Bridge  (NEW; dedicated bridge)
+- **Does:** when Codex posts an **active P1** on a PR, auto-posts `@claude fix` (via `AUTOMATION_PAT`, MANDATORY — a GITHUB_TOKEN comment wouldn't wake claude.yml) so the loop runs hands-off: bridge → claude.yml fixes → Codex re-reviews → gate green → merge-bot merges. **P1 ONLY** — P2 is advisory and never triggers (uses codex-gate.yml's EXACT P1 detection: `isCodex` / `p1Pattern` / `stripSummarySections` / date-only `onHead` against the max committer date; a P1 already followed by a fix Summary is treated as cleared).
+- **Guards:** idempotency (no second `@claude fix` for a head already triggered) + a 3-round circuit breaker (after 3 non-converging rounds, escalate to `needs-owner` + Telegram — PR-level mirror of ci-doctor's breaker). Never self-triggers: its own `@claude fix` is owner-authored, not Codex, so the Codex-author gate short-circuits it.
+- **Triggers:** `pull_request_review: [submitted]`, `issue_comment: [created]`, `pull_request_review_comment: [created]`. **Permissions:** `contents: read`, `pull-requests: write`, `issues: write`. **Concurrency:** `codex-claude-bridge-${{ repo }}-${{ pr }}`, `cancel-in-progress: false`. fail-soft: missing `AUTOMATION_PAT` → exit green.
 
 ### codex-gate.yml — Codex Gate (blocking check)  (sha `92019ec`; P1-only + wait-for-first-review + head-targeted self-rerun in PR #25)
 - **Does:** the `check-codex-status` blocking check. **GREEN requires BOTH:** (a) Codex has **reviewed the current head** — a Codex signal (review / comment / inline / 👍) **dated after the latest commit** — **and** (b) **no ACTIVE P1** — a P1 marker **dated after the latest commit**, not yet followed by a later Codex fix Summary. **ONE consistent date-only freshness rule for both**: `commit_id` is **never** used to decide freshness, because GitHub re-points a still-applicable inline comment's `commit_id` to the new head — so `commit_id == head` does NOT mean Codex reviewed the new commit. Using it would either falsely block on a stale P1 **or** (the 4th P1) make a stale comment read as a *fresh review* and flip the gate green before Codex re-reviews (merge-before-review via a side door). It **BLOCKS** on an unresolved active P1 **OR** when Codex hasn't reviewed the head yet (**pending**). Otherwise GREEN: clean review, P2-only, 👍, or a **stale P1 (predating the latest commit)** once Codex has re-reviewed. `codex-p1-acknowledged` = manual override. `latestCommitDate` = the **max** committer date across the PR's commits (not assumed sorted). Same P1 detection as the bridge across the same 3 channels, fully paginated.
@@ -105,6 +110,7 @@ Generic loop workflows live in `workflows/` (sync source) and are copied byte-id
 - **Merge Bot identifies Claude PRs by the `automerge` label OR a same-repo `claude/*` branch**, not author login (Claude's PRs are PAT-authored = owner `funzi7`, not a bot login). The escalation hard-stop is always checked first, and the protected-path guard still runs before any merge.
 - **Cost:** ~$1–1.7 per Claude fix run (duration-based). A Spending Limit is set in the Anthropic Console.
 - **Escalation label migrated to `needs-owner` (loop-safe).** New escalations tag `needs-owner`; every gate that CHECKS for escalation matches BOTH `needs-owner` and the legacy label (so existing escalations across downstream repos are never orphaned), and `needs-owner` is upserted wherever the legacy label used to be ensured. Workflows ADD only `needs-owner`; the legacy label survives solely inside backward-compat CHECK conditions, awaiting a later cleanup once all repos are re-tagged.
+- **Dedicated codex→claude bridge (`codex-claude-bridge.yml`)** auto-posts `@claude fix` on an active Codex P1 (P1-only, same detection as the gate), with idempotency + a 3-round breaker to `needs-owner`. Synced to downstream repos via `sync-config.json`.
 
 ---
 
@@ -113,10 +119,10 @@ Generic loop workflows live in `workflows/` (sync source) and are copied byte-id
 | Secret | Used by | Notes |
 |--------|---------|-------|
 | `ANTHROPIC_API_KEY` | claude.yml | Required for the fixer. Absent → fail-soft skip (no fix, ~0 minutes). Set only where you want auto-fix (cost control). |
-| `AUTOMATION_PAT` | claude.yml, ci-doctor, merge-bot, bridge, sync | **All cross-workflow writes** (comment/label/merge/PR). All-repos fine-grained PAT (Contents/PRs/Issues write, Metadata read). Absent → those workflows fail-soft skip (loop inert). |
+| `AUTOMATION_PAT` | claude.yml, ci-doctor, merge-bot, bridge, codex-claude-bridge, sync | **All cross-workflow writes** (comment/label/merge/PR). All-repos fine-grained PAT (Contents/PRs/Issues write, Metadata read). Absent → those workflows fail-soft skip (loop inert). |
 | `AGENT_MEMORY_PAT` | codex-auto-fix (archive) | Optional. Absent → archive step fail-soft skips. |
 | `CROSS_REPO_PAT` | bootstrap, minutes-guard | automation-core only. Cross-repo admin (Workflows write). |
-| `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` | ci-doctor, merge-bot, bridge | Optional escalation pings (HTML parse_mode). Skipped silently if unset. |
+| `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` | ci-doctor, merge-bot, bridge, codex-claude-bridge | Optional escalation pings (HTML parse_mode). Skipped silently if unset. |
 
 ---
 
@@ -148,7 +154,7 @@ Generic loop workflows live in `workflows/` (sync source) and are copied byte-id
 ### Stage 2 — onboard OPT + TRF  (onboarding PRs open, awaiting merge)
 - 🟡 **OPT — PR #12 (awaiting merge):** `sync-automation-core.yml` (AUTOMATION_PAT variant); `health-check.yml` now opens `claude-fix` Issues via AUTOMATION_PAT (was the dead `cc @codex`); `pr-build-gate.yml` (`build-gate` = `:app:compileDebugKotlin`, fails on any `^e:` line or non-zero exit); `.claude-guard.json` (`ProfitCalculator` / `StrategicRiskAnalyzer` / `BlackScholesCalculator` / `*Database*` / `*Migration*` / `AppPreferences` / `AvgCostResolver`); CLAUDE.md autonomous-loop section. **Installed-and-waiting** — private quota resets ~July 1.
 - 🟡 **TRF — PR #80 (awaiting merge):** `sync-automation-core.yml` (AUTOMATION_PAT variant); `site-health.yml` now opens `claude-fix` Issues via AUTOMATION_PAT (was `@codex`); `pr-build-gate.yml` (`build-gate` = `tsc --noEmit`; `npm run build` deliberately avoided because it runs `prisma migrate deploy`, which needs a DB); `.claude-guard.json` (`schema.prisma` + `migrations/**`).
-- Bootstrap was **not** used — both PRs add the sync workflow directly. After merge + secrets (`AUTOMATION_PAT`, `ANTHROPIC_API_KEY`, both reportedly already set), the generic loop workflows (`claude`, `codex-auto-fix`, `codex-gate`, `ci-doctor`, `merge-bot`) arrive on the next daily sync.
+- Bootstrap was **not** used — both PRs add the sync workflow directly. After merge + secrets (`AUTOMATION_PAT`, `ANTHROPIC_API_KEY`, both reportedly already set), the generic loop workflows (`claude`, `codex-auto-fix`, `codex-claude-bridge`, `codex-gate`, `ci-doctor`, `merge-bot`) arrive on the next daily sync.
 - Still TODO: add OPT (+ paper-trader) to minutes-guard `TARGET_REPOS`.
 
 ### Stage 3

@@ -1,0 +1,257 @@
+name: Codex→Claude Bridge
+
+# Closes the last hands-off gap in the self-healing loop. When Codex posts a
+# review with an ACTIVE P1 on a PR, nobody types "@claude fix", so the PR
+# stalls. This bridge auto-detects a Codex P1 and posts "@claude fix" so
+# claude.yml picks it up → Claude fixes on the branch → Codex re-reviews →
+# codex-gate goes green → merge-bot merges. Fully autonomous.
+#
+# P1 ONLY: it fires solely on an ACTIVE P1 (a P1 marker dated AFTER the latest
+# commit, not yet cleared by a later Codex fix Summary). P2 is advisory and
+# NEVER triggers a fix — chasing P2 burns API budget. The P1 detection here is
+# the SAME as codex-gate.yml (isCodex / p1Pattern / stripSummarySections /
+# date-only onHead freshness) — copied verbatim, not reinvented.
+#
+# AUTOMATION_PAT is MANDATORY: a "@claude fix" comment posted with the default
+# GITHUB_TOKEN does NOT trigger claude.yml (GitHub loop protection), so the
+# bridge would be a no-op. fail-soft: missing PAT → exit GREEN with a notice.
+#
+# Guards: idempotency (don't re-post for a head already triggered) and a
+# 3-round circuit breaker (after 3 @claude fix rounds that don't converge,
+# stop and escalate to needs-owner + Telegram — mirrors ci-doctor's breaker,
+# at PR level). The bridge never self-triggers: its own "@claude fix" comment
+# is authored by the owner (via the PAT), not Codex, so the Codex-author gate
+# short-circuits it.
+
+on:
+  pull_request_review:
+    types: [submitted]
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+concurrency:
+  # Serialize per PR so the idempotency/loop guards see prior @claude fix
+  # comments before the next event is processed (never kill an in-flight run).
+  group: codex-claude-bridge-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  bridge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail-soft check for AUTOMATION_PAT
+        id: patcheck
+        env:
+          AUTOMATION_PAT: ${{ secrets.AUTOMATION_PAT }}
+        run: |
+          if [ -z "${AUTOMATION_PAT}" ]; then
+            echo "::notice::AUTOMATION_PAT is not set — skipping Codex→Claude bridge (fail-soft). A @claude fix comment posted with GITHUB_TOKEN would not trigger claude.yml."
+            echo "has_pat=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_pat=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Auto @claude fix on an active Codex P1
+        if: steps.patcheck.outputs.has_pat == 'true'
+        uses: actions/github-script@v7
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        with:
+          # AUTOMATION_PAT is REQUIRED: the posted @claude comment must be
+          # authored by the owner (not GITHUB_TOKEN) for claude.yml to fire.
+          github-token: ${{ secrets.AUTOMATION_PAT }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const LABEL_ESCALATE = 'needs-owner';
+            const MAX_FIX_ROUNDS = 3;
+
+            // ---- P1 detection: copied VERBATIM from codex-gate.yml ----
+            const isCodex = (user) =>
+              user?.login === 'chatgpt-codex-connector[bot]' ||
+              user?.login === 'codex' ||
+              (user?.type === 'Bot' && user?.login?.toLowerCase().includes('codex'));
+
+            // Codex marks P1 findings exactly two ways:
+            //   - "P1-orange" image-badge URL fragment (can be inline)
+            //   - a line-leading severity label after optional markdown
+            //     prefixes: **P1**, [P1], or P1:
+            // Prose containing the literal "P1" mid-sentence must NOT match.
+            const p1Pattern = /(?:P1-orange|(?:^|\n)[\s>*\-_#`]*(?:\*\*\s*P1\s*\*\*|\[P1\]|P1:))/i;
+            const fixSummaryPattern = /###\s+Summary[\s\S]+commit/i;
+
+            // Strip Codex's own post-fix "## Summary" / "## Testing" sections
+            // before running p1Pattern, so a fix Summary that quotes an earlier
+            // P1 verbatim isn't misread as a fresh P1. fixSummaryPattern still
+            // uses the original body — it is looking *for* the Summary.
+            function stripSummarySections(body) {
+              if (!body) return '';
+              return body
+                .replace(/(?:^|\n)#{2,3}\s+Summary[\s\S]*?(?=\n#{2,3}\s|\n---|$)/gi, '')
+                .replace(/(?:^|\n)#{2,3}\s+Testing[\s\S]*?(?=\n#{2,3}\s|\n---|$)/gi, '');
+            }
+
+            async function telegram(text) {
+              const tgToken = process.env.TELEGRAM_BOT_TOKEN;
+              const tgChat = process.env.TELEGRAM_CHAT_ID;
+              if (!tgToken || !tgChat) return;
+              try {
+                await fetch(`https://api.telegram.org/bot${tgToken}/sendMessage`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ chat_id: tgChat, text, parse_mode: 'HTML', disable_web_page_preview: true }),
+                });
+              } catch (e) {
+                core.info(`Telegram failed (ignored): ${e.message}`);
+              }
+            }
+
+            // 1) Resolve the PR number from the event payload.
+            //    pull_request_review / pull_request_review_comment → pull_request
+            //    issue_comment → issue (PRs are issues for the comments API)
+            let prNumber = null;
+            if (context.payload.pull_request) {
+              prNumber = context.payload.pull_request.number;
+            } else if (context.payload.issue && context.payload.issue.pull_request) {
+              prNumber = context.payload.issue.number;
+            }
+            if (!prNumber) {
+              core.info('No PR in payload; skipping.');
+              return;
+            }
+
+            // 2) The triggering author MUST be Codex. This also prevents the
+            //    bridge from self-triggering: its own "@claude fix" comment is
+            //    authored by the owner (via the PAT), not Codex, so it exits here.
+            const triggerUser =
+              (context.payload.review && context.payload.review.user) ||
+              (context.payload.comment && context.payload.comment.user) ||
+              null;
+            if (!isCodex(triggerUser)) {
+              core.info('Trigger author is not Codex; skipping.');
+              return;
+            }
+
+            // 3) Gather Codex feedback across all 3 channels, fully paginated
+            //    (default 30/page silently drops the first Codex review on
+            //    chatty PRs — the very place a P1 lives).
+            const reviews = await github.paginate(github.rest.pulls.listReviews, {
+              owner, repo, pull_number: prNumber, per_page: 100,
+            });
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number: prNumber, per_page: 100,
+            });
+            const reviewComments = await github.paginate(github.rest.pulls.listReviewComments, {
+              owner, repo, pull_number: prNumber, per_page: 100,
+            });
+
+            const codexReviews = reviews.filter((r) => isCodex(r.user));
+            const codexComments = comments.filter((c) => isCodex(c.user));
+            const codexReviewComments = reviewComments.filter((c) => isCodex(c.user));
+
+            const prCommits = await github.paginate(github.rest.pulls.listCommits, {
+              owner, repo, pull_number: prNumber, per_page: 100,
+            });
+            // latestCommitDate = the MAX committer date across the PR's commits
+            // (don't assume listCommits is sorted) — exactly as the gate.
+            const latestCommitDate = prCommits.length > 0
+              ? new Date(Math.max(...prCommits.map((c) => new Date(c.commit.committer.date).getTime())))
+              : new Date(0);
+
+            // A Codex signal counts as "on the current head" ONLY if it is DATED
+            // AFTER the latest commit. commit_id is deliberately NOT used (GitHub
+            // re-points a still-applicable inline comment's commit_id to the new
+            // head). Same date-only freshness as codex-gate.yml.
+            const onHead = (date) => !!date && new Date(date) > latestCommitDate;
+
+            const allBodies = [
+              ...codexReviews.map((r) => ({
+                body: r.body || '',
+                bodyForP1: stripSummarySections(r.body || ''),
+                date: r.submitted_at,
+                onHead: onHead(r.submitted_at),
+              })),
+              ...codexComments.map((c) => ({
+                body: c.body || '',
+                bodyForP1: stripSummarySections(c.body || ''),
+                date: c.created_at,
+                onHead: onHead(c.created_at),
+              })),
+              ...codexReviewComments.map((c) => ({
+                body: c.body || '',
+                bodyForP1: stripSummarySections(c.body || ''),
+                date: c.created_at,
+                onHead: onHead(c.created_at),
+              })),
+            ].sort((a, b) => new Date(a.date) - new Date(b.date));
+
+            // ACTIVE P1 = a P1 marker DATED after the latest commit. P2 never
+            // matches p1Pattern, so a P2-only / clean review yields zero active
+            // P1 and the bridge does nothing.
+            const activeP1Items = allBodies.filter(
+              (item) => item.onHead && p1Pattern.test(item.bodyForP1)
+            );
+            if (activeP1Items.length === 0) {
+              core.info(`PR #${prNumber}: no active Codex P1 on the current head (P2/clean) — nothing to do.`);
+              return;
+            }
+
+            // P1-then-Summary: if Codex posted a fix Summary AFTER the last
+            // active P1, the P1 is already resolved — do NOT trigger (same
+            // clearing rule as the gate).
+            let lastActiveP1Date = null;
+            let lastFixDate = null;
+            for (const item of allBodies) {
+              if (!item.onHead) continue;
+              if (p1Pattern.test(item.bodyForP1)) lastActiveP1Date = item.date;
+              if (fixSummaryPattern.test(item.body)) lastFixDate = item.date;
+            }
+            if (lastFixDate && new Date(lastFixDate) > new Date(lastActiveP1Date)) {
+              core.info(`PR #${prNumber}: active P1 already followed by a fix Summary — not re-triggering.`);
+              return;
+            }
+
+            // Prior "@claude fix" requests on this PR (by the owner/automation,
+            // never Codex) — the round counter for the guards below.
+            const fixRequests = comments.filter(
+              (c) => !isCodex(c.user) && /@claude\s+fix/i.test(c.body || '')
+            );
+
+            // 4) Idempotency: if a "@claude fix" already exists for the CURRENT
+            //    head (dated after the latest commit), don't post again — Claude
+            //    fixes every P1 in one run, so one trigger per head is enough.
+            if (fixRequests.some((c) => onHead(c.created_at))) {
+              core.info(`PR #${prNumber}: already triggered @claude fix for the current head; debouncing.`);
+              return;
+            }
+
+            // 5) Loop guard: after MAX_FIX_ROUNDS @claude fix rounds on this PR
+            //    that didn't converge, stop and escalate to a human (mirrors
+            //    ci-doctor's 3-attempt circuit breaker, at PR level).
+            if (fixRequests.length >= MAX_FIX_ROUNDS) {
+              core.warning(`PR #${prNumber}: ${fixRequests.length} @claude fix rounds without converging — escalating to ${LABEL_ESCALATE}.`);
+              try {
+                await github.rest.issues.createLabel({ owner, repo, name: LABEL_ESCALATE, color: 'd93f0b', description: 'Escalation — automation stopped, human needed' });
+              } catch (e) { if (e.status !== 422) core.info(`createLabel ${LABEL_ESCALATE} failed (ignored): ${e.message}`); }
+              try {
+                await github.rest.issues.addLabels({ owner, repo, issue_number: prNumber, labels: [LABEL_ESCALATE] });
+              } catch (e) { core.info(`addLabel ${LABEL_ESCALATE} failed (ignored): ${e.message}`); }
+              await telegram(`🚨 <b>${repo}</b> PR #${prNumber}: ${fixRequests.length} @claude fix rounds didn't converge — escalated to <b>${LABEL_ESCALATE}</b>.`);
+              return;
+            }
+
+            // 6) Post "@claude fix" with the PAT so claude.yml actually fires.
+            //    First line is the bare mention claude.yml matches on.
+            await github.rest.issues.createComment({
+              owner, repo, issue_number: prNumber,
+              body: `@claude fix\n\n_Auto-requested by the Codex→Claude bridge: Codex flagged ${activeP1Items.length} active P1 finding(s) on the current head._`,
+            });
+            core.info(`PR #${prNumber}: posted @claude fix (${activeP1Items.length} active P1, round ${fixRequests.length + 1}/${MAX_FIX_ROUNDS}).`);
