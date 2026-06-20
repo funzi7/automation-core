@@ -17,6 +17,15 @@ Handoff log for the **self-healing-loop build** Claude Chat session. Claude Code
 
 ---
 
+## [2026-06-20 18:10 UTC] standardize on needs-owner — remove the legacy escalation label entirely
+- PR: direct commit to main
+- Branch: main (direct commit)
+- Status: done
+- What changed: Removed the backward-compat dual-matching and standardized fully on `needs-owner`. Step A (read-only): swept all OPEN issues + PRs in this repo for the old escalation label — **0 stragglers** (no re-tag needed). Step B: deleted the `LABEL_ESCALATE_LEGACY` constant from `ci-doctor.yml` and `merge-bot.yml`, and dropped every `|| ... LABEL_ESCALATE_LEGACY` clause — merge-bot's candidate hard-stop is now `some(l => l.name === LABEL_ESCALATE)` and ci-doctor's "already escalated" skip is now `=== LABEL_ESCALATE` only. `codex-auto-fix.yml`'s escalation comment lost its legacy mention (it already only ADDED `needs-owner`). Docs updated: README label table, LOOP_STATE label table + merge-bot description + the migration note now say the old label is fully removed and `needs-owner` is the single source of truth. ONLY the escalation-label logic/prose changed — no other workflow logic touched. `funzi7` untouched. The old label string now appears NOWHERE in the repo (workflows, comments, or docs).
+- Validation: actionlint clean on all 6 changed workflow copies; node --check on every changed github-script block; `workflows/` ↔ `.github/workflows/` byte-identical for all three (ci-doctor / merge-bot / codex-auto-fix); legacy-label grep (case-insensitive, whole repo) = 0; target-name grep = 0; `needs-owner` still present in every add/check path; `funzi7` unchanged.
+- needs-from-owner: nothing — live on main in one commit (handoff + LOOP_STATE in the same commit, no trailing commit, so the codex gate's head-reviewed state isn't reset). Downstream repos pick up the leaner logic on the next daily sync.
+- Next: with no compat shim, a single `needs-owner` is the only escalation signal everywhere; nothing else to do unless a repo somewhere still has the old label on an item (none did at removal time).
+
 ## [2026-06-18 05:05 UTC] merge-bot: evaluate only the LATEST check run per name (fixes "never merged")
 - PR: direct commit to main
 - Branch: main (direct commit)
