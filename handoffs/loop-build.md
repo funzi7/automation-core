@@ -17,6 +17,15 @@ Handoff log for the **self-healing-loop build** Claude Chat session. Claude Code
 
 ---
 
+## [2026-06-21 02:10 UTC] docs: add comprehensive CONTEXT.md handoff briefing
+- PR: direct commit to main
+- Branch: main (direct commit)
+- Status: done
+- What changed: Created `handoffs/CONTEXT.md` — a single, self-contained briefing so any brand-new chat or different AI can understand the ENTIRE system and continue without prior chat history. Seven sections: (1) PURPOSE (public hub for a self-healing CI/CD loop synced to ~14 downstream repos; the owner's chat-as-coordinator → Claude Code / Codex execute model); (2) ARCHITECTURE (the full push→PR→Codex review→bridge→Claude Fixer→re-review→3-round breaker→needs-owner+Telegram→merge-bot loop, naming every workflow file); (3) KEY MECHANISMS (codex-gate date-only freshness + capped head-targeted self-rerun; merge-bot candidate set + needs-owner hard stop + `.claude-guard.json` protected-path guard + head-SHA-pinned squash + latest-check-run-per-name dedupe; the bridge's P1+P2-exclude-P3 badge detection + idempotency + 3-attempt breaker + Codex-author guard); (4) HARD-WON LESSONS (same-commit handoff or the gate resets red; merge-bot must dedupe to latest-per-name; the gate's fresh-PR red flicker is by-design fail-closed; Codex pushes fixes to a branch AND opens a parallel make_pr PR; Codex keeps re-adding the legacy escalation label — 0 carry it now and it must stay gone; protected-path PRs need manual merge; the owner merges — never claim a merge without confirmed closure; public repo = the owner's name never appears; claude.yml's paid budget is exhausted so the automated fixer can't run — hence Codex-as-backup matters); (5) CURRENT STATE (per-workflow live-on-main table; AUTOMATION_PAT present; morning report on PR #31, open, needs manual merge as it touches protected paths); (6) OPEN DECISIONS/TODO (history-rewrite decision for the legacy label; mutual review; Codex-as-backup; PR #31 cleanup; add branch protection once stable); (7) CONVENTIONS. Also pointed `LOOP_STATE.md` at CONTEXT.md as the canonical full briefing.
+- Validation: legacy-label grep (whole repo, case-insensitive) = 0; owner-name standalone grep = 0; CONTEXT.md contains all 7 numbered sections; LOOP_STATE links to it.
+- needs-from-owner: nothing — live on main in one commit (handoff + LOOP_STATE + CONTEXT.md all in the same commit, no trailing commit, so the gate's head-reviewed state isn't reset).
+- Next: new sessions start from `handoffs/CONTEXT.md`; keep it current as mechanisms change.
+
 ## [2026-06-21 01:30 UTC] bridge: trigger auto-fix on P1 AND P2 (exclude P3)
 - PR: direct commit to main
 - Branch: main (direct commit)

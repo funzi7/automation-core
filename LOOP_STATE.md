@@ -5,6 +5,8 @@
 
 **Resume in a new chat:** _"Read LOOP_STATE.md in funzi7/automation-core to see where the self-healing loop project stands, then continue."_
 
+> 📖 **Canonical full briefing:** [`handoffs/CONTEXT.md`](handoffs/CONTEXT.md) is the single self-contained handoff that lets a brand-new chat or a different AI understand the ENTIRE system (purpose, architecture, key mechanisms, hard-won lessons, current state, open TODOs, conventions). Start there; this file is the detailed per-workflow reference.
+
 ---
 
 ## Architecture (planned end state)
