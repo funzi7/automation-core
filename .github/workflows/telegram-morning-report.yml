@@ -10,11 +10,13 @@ name: Loop Morning Report
 #
 # fail-soft on every secret:
 #   - AUTOMATION_PAT (read across private repos): absent → exit green + notice.
-#   - TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID (send): absent → still compose the
-#     report into the Actions summary, just skip the send (exit green + notice).
+#   - TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID (send): absent → skip the send and
+#     write ONLY a minimal counts line publicly (exit green + notice). The full
+#     digest (private repo names + titles) is NEVER written to the public log.
 #   - CROSS_REPO_PAT (only for the account billing read): used if present, else
-#     falls back to AUTOMATION_PAT; a missing/unauthorized billing endpoint just
-#     renders "minutes: n/a" — never a hard failure.
+#     falls back to AUTOMATION_PAT; a dead/unauthorized billing endpoint (the
+#     legacy endpoint is gone on Enhanced Billing accounts) renders
+#     "minutes: unavailable" — never a hard failure.
 #
 # Repo discovery is DYNAMIC (listForAuthenticatedUser, affiliation owner) so new
 # repos appear in the report with no edits. Each repo is wrapped in try/catch:
@@ -224,7 +226,14 @@ jobs:
             }
 
             // --- 3) Account Actions minutes (best-effort, read-only) ---------
-            let minutesLine = '📊 ACTIONS MINUTES: n/a';
+            // The legacy /users/{owner}/settings/billing/actions endpoint is
+            // DEAD on accounts migrated to GitHub's Enhanced Billing platform —
+            // it returns non-OK there. Default to an honest "unavailable" (not a
+            // fake "n/a" that looks like a transient miss); only show real
+            // numbers when the endpoint actually answers. Never fails the job.
+            // Part of the Telegram-only digest (kept out of the public summary
+            // by the counts-only logging below).
+            let minutesLine = '📊 ACTIONS MINUTES: unavailable';
             try {
               const tok = process.env.CROSS_REPO_PAT || process.env.AUTOMATION_PAT;
               const resp = await fetch(`https://api.github.com/users/${owner}/settings/billing/actions`, {
@@ -241,7 +250,7 @@ jobs:
                 const remaining = Math.max(0, included - used);
                 minutesLine = `📊 ACTIONS MINUTES: ${used} used / ${remaining} left (of ${included})`;
               }
-            } catch (e) { /* keep n/a */ }
+            } catch (e) { /* keep "unavailable" */ }
 
             // --- 4) Compose ONE structured, scannable message ----------------
             const today = new Date().toISOString().slice(0, 10);
@@ -315,20 +324,35 @@ jobs:
 
             const fullText = lines.join('\n');
 
-            // --- 5) Always log to the Actions summary (readable even w/o TG) -
-            try {
-              await core.summary
-                .addHeading(`Loop morning report — ${today}`)
-                .addCodeBlock(fullText, 'text')
-                .write();
-            } catch (e) { core.info(`summary write failed (ignored): ${e.message}`); }
-            core.info(fullText);
+            // --- 5) PUBLIC logs get COUNTS ONLY (this repo is PUBLIC) --------
+            // The full digest (fullText) contains PRIVATE repo names + PR/Issue
+            // titles gathered via AUTOMATION_PAT. It must go ONLY to Telegram
+            // (the private destination) — NEVER to the Actions run summary or
+            // the job log, both readable by anyone on a public repo. So we emit
+            // only a minimal, non-sensitive counts line publicly (no repo names,
+            // no titles, no private identifiers).
+            const reposScanned = results.length;
+            const needsAttention = escAll.length;
+            const writePublicStatus = async (statusNote) => {
+              const statusLine =
+                `Morning report ${statusNote}. Repos scanned: ${reposScanned}. Needs-attention items: ${needsAttention}.`;
+              try {
+                await core.summary
+                  .addHeading(`Loop morning report — ${today}`)
+                  .addRaw(statusLine)
+                  .write();
+              } catch (e) { core.info(`summary write failed (ignored): ${e.message}`); }
+              core.info(statusLine);
+            };
 
             // --- Send via Telegram (fail-soft if creds missing) -------------
             const tgToken = process.env.TELEGRAM_BOT_TOKEN;
             const tgChat = process.env.TELEGRAM_CHAT_ID;
             if (!tgToken || !tgChat) {
-              core.notice('TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set — report logged to the run summary, not sent (fail-soft).');
+              // fail-soft: do NOT dump the detailed report publicly as a
+              // fallback — only the minimal counts line + a note.
+              await writePublicStatus('not sent (Telegram not configured)');
+              core.notice('TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set — wrote counts only to the run summary; full digest skipped (fail-soft).');
               return;
             }
 
@@ -357,4 +381,4 @@ jobs:
                 core.info(`Telegram send failed (ignored): ${e.message}`);
               }
             }
-            core.info(`Sent ${chunks.length} Telegram message(s).`);
+            await writePublicStatus(`sent to Telegram (${chunks.length} message(s))`);

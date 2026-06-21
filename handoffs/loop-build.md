@@ -17,6 +17,15 @@ Handoff log for the **self-healing-loop build** Claude Chat session. Claude Code
 
 ---
 
+## [2026-06-21 04:30 UTC] morning report: keep private digest out of public logs + honest minutes label
+- PR: #31 (push to existing branch `claude/telegram-morning-report`)
+- Branch: claude/telegram-morning-report
+- Status: done (pushed to branch)
+- What changed: Fixed two valid Codex findings in `telegram-morning-report.yml`. **P1 (private data in PUBLIC logs):** automation-core is public, but the report wrote the FULL digest (`fullText` — private repo names + PR/Issue titles gathered via AUTOMATION_PAT) to `core.summary` (addCodeBlock) AND `core.info(fullText)`, so anyone viewing the public run could read private-repo detail. Now the full digest goes ONLY to Telegram (the private destination); the public Actions summary/log gets a minimal counts-only line via a `writePublicStatus(note)` helper — `"Morning report <note>. Repos scanned: N. Needs-attention items: M."` with NO repo names, titles, or private identifiers. The Telegram-missing fail-soft path no longer dumps the report publicly as a fallback — it writes the same counts line + "Telegram not configured" and returns. `fullText` is now referenced only at its definition and the Telegram chunk-split (verified: `addCodeBlock(fullText)` = 0, `core.info(fullText)` = 0). **P2 (dead billing endpoint):** the legacy `/users/{owner}/settings/billing/actions` endpoint is gone on Enhanced Billing accounts and always returns non-OK, so the digest showed a misleading "n/a" daily. Now it defaults to an honest "📊 ACTIONS MINUTES: unavailable" and only shows real numbers when the endpoint actually answers; still best-effort, never fails the job, and part of the Telegram-only digest. Kept intact: Issue-escalation detection (`issues.listForRepo`, needs-owner only, PR-vs-Issue `kind`), the latest-check-run-per-name gate dedupe (`latestCheckRunsByName`), dynamic repo discovery, all fail-soft secret handling, and READ-ONLY behavior. Both copies byte-identical.
+- Validation: actionlint clean on both copies; `node --check` on the github-script block; `workflows/` ↔ `.github/workflows/` byte-identical (blob `8fa29d9`); the full digest never reaches `core.summary`/`core.info` (only the minimal counts line does); minutes labeled "unavailable" on failure (no fake "n/a"); read-only confirmed (no write API calls); legacy-label grep (whole repo, ci) = 0; owner-name standalone grep = 0.
+- needs-from-owner: merge #31 once the gate is green. It touches protected workflow paths → merge-bot will NOT auto-merge; needs a manual merge. The push is a new head, so the Codex gate will re-review before it can go green.
+- Next: after merge, the public run summary shows only counts; full detail is Telegram-only; minutes read "unavailable" until a working billing source is wired up.
+
 ## [2026-06-21 03:40 UTC] PR #31 cleanup: keep issue-escalation detection, ensure NO legacy label
 - PR: #31 (push to existing branch `claude/telegram-morning-report`)
 - Branch: claude/telegram-morning-report
