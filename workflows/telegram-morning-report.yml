@@ -366,6 +366,12 @@ jobs:
             }
             if (buf) chunks.push(buf);
 
+            // Track delivery: the report goes ONLY to Telegram (the digest is
+            // never written to the public log), so a failed send means it
+            // vanishes silently. Count a chunk as delivered ONLY on a 2xx; any
+            // non-2xx or throw counts as not delivered.
+            let delivered = 0;
+            const total = chunks.length;
             for (const chunk of chunks) {
               try {
                 const r = await fetch(`https://api.telegram.org/bot${tgToken}/sendMessage`, {
@@ -376,9 +382,22 @@ jobs:
                     parse_mode: 'HTML', disable_web_page_preview: true,
                   }),
                 });
-                if (!r.ok) core.info(`Telegram non-200: ${r.status}`);
+                if (r.ok) delivered++;
+                else core.info(`Telegram non-200: ${r.status}`);
               } catch (e) {
                 core.info(`Telegram send failed (ignored): ${e.message}`);
               }
             }
-            await writePublicStatus(`sent to Telegram (${chunks.length} message(s))`);
+
+            // Report the REAL outcome. Success ONLY if every chunk was delivered;
+            // otherwise mark FAILED (counts only — never any digest content) and
+            // make it visible in the Actions run via core.warning + setFailed, so
+            // a dropped report (revoked token / wrong chat id / bot removed) can
+            // never read as a silent success.
+            if (delivered === total) {
+              await writePublicStatus(`sent to Telegram (${total} message(s))`);
+            } else {
+              await writePublicStatus(`FAILED to send to Telegram (${delivered}/${total} chunks delivered)`);
+              core.warning(`Telegram delivery failed: ${delivered}/${total} chunks delivered.`);
+              core.setFailed(`Morning report delivery failed: ${delivered}/${total} Telegram chunks delivered. Repos scanned: ${reposScanned}. Needs-attention items: ${needsAttention}.`);
+            }

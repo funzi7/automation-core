@@ -17,6 +17,15 @@ Handoff log for the **self-healing-loop build** Claude Chat session. Claude Code
 
 ---
 
+## [2026-06-21 05:10 UTC] morning report: report Telegram delivery honestly (fail visibly, never false-success)
+- PR: #31 (push to existing branch `claude/telegram-morning-report`)
+- Branch: claude/telegram-morning-report
+- Status: done (pushed to branch)
+- What changed: Fixed a valid Codex P2. The Telegram send loop logged per-chunk non-200/exceptions but then unconditionally wrote "sent to Telegram" to the public counts line — so when Telegram rejected every chunk (revoked token / wrong chat id / bot removed), the only detailed copy of the report (Telegram-only by design) silently vanished while the run summary claimed success. Fix: track delivery across all chunks — count a chunk delivered ONLY on a 2xx; any non-2xx or throw counts as not delivered. Success is now gated on `delivered === total`: all chunks OK → public line "Morning report sent to Telegram (N message(s)). Repos scanned: X. Needs-attention items: Y."; otherwise → "Morning report FAILED to send to Telegram (D/T chunks delivered). …" PLUS `core.warning` and `core.setFailed`, both with **counts-only** text (no repo names, titles, or digest content), so a dropped/partial report is visibly red in the Actions run instead of a false success. The Telegram-**not-configured** fail-soft path is kept distinct — it stays green/informational ("not sent (Telegram not configured)") and does NOT setFailed. Everything else preserved: the full digest still goes ONLY to Telegram; public logs stay counts-only; Issue-escalation detection (`issues.listForRepo`, needs-owner only, PR-vs-Issue distinction); latest-check-run-per-name gate dedupe (`latestCheckRunsByName`); dynamic repo discovery; all other fail-soft secret handling; READ-ONLY (no write API calls). Both copies byte-identical.
+- Validation: actionlint clean on both copies; `node --check` on the github-script block; a 4-case logic self-test (all-ok→success/no-fail, all-fail→failure+setFailed, partial→failure+setFailed, single-ok→success); `workflows/` ↔ `.github/workflows/` byte-identical (blob `8f72942`); the "sent to Telegram" success string sits inside the `delivered === total` branch only; a failure path with `core.warning`/`core.setFailed` (counts-only) exists; the not-configured path stays green; full digest never reaches `core.summary`/`core.info` (= 0); read-only confirmed; legacy-label grep (whole repo, ci) = 0; owner-name standalone grep = 0.
+- needs-from-owner: merge #31 once the gate is green. It touches protected workflow paths → merge-bot will NOT auto-merge; needs a manual merge. The push is a new head, so the Codex gate will re-review before it can go green.
+- Next: a failed Telegram delivery now turns the daily run red with a counts-only message, so the owner notices instead of the report vanishing silently.
+
 ## [2026-06-21 04:30 UTC] morning report: keep private digest out of public logs + honest minutes label
 - PR: #31 (push to existing branch `claude/telegram-morning-report`)
 - Branch: claude/telegram-morning-report
