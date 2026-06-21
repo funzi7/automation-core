@@ -17,6 +17,15 @@ Handoff log for the **self-healing-loop build** Claude Chat session. Claude Code
 
 ---
 
+## [2026-06-21 03:40 UTC] PR #31 cleanup: keep issue-escalation detection, ensure NO legacy label
+- PR: #31 (push to existing branch `claude/telegram-morning-report`)
+- Branch: claude/telegram-morning-report
+- Status: done (pushed to branch)
+- What changed: First integrated latest `main` (`d93462e`); the handoff-log conflict was resolved keeping BOTH dated entries (newest on top). Finding: the Codex "honor legacy escalations" fix (its commit `9a85d0c`) was **never landed** in this repo — Codex's own run summary reported `git push` failed ("no configured push destination"), and PR #31's commit list contains no such commit. So on this branch the legacy escalation label was already absent (grep = 0 — nothing to remove) AND the standalone Issue-escalation feature the owner wanted was also never present. To deliver the intended end state (feature present, legacy gone), I implemented the Issue-escalation detection cleanly with `needs-owner` ONLY — which also resolves Codex's still-open P2 ("Include escalated CI Doctor issues"): in `gatherRepo`, after the open-PR scan, a `issues.listForRepo({ state:'open', labels: 'needs-owner' })` pass discovers escalated open Issues, **skips any carrying `pull_request`** (PR escalations are already captured from `pulls.list`, so no double-count), and pushes them as `{ kind:'Issue' }`; PR escalations are tagged `{ kind:'PR' }`; the 🔴 NEEDS ATTENTION section now prints the PR-vs-Issue kind. Escalation is detected by `needs-owner` only — no legacy-label constant, predicate, or string anywhere. Kept the earlier latest-check-run-per-name gate dedupe (`latestCheckRunsByName`) intact. File stays **read-only** (the new call is `issues.listForRepo`, a GET; `issues: read` permission already present). Dynamic repo discovery and fail-soft secret handling untouched. Both copies byte-identical.
+- Validation: actionlint clean on both copies; `node --check` on the github-script block; `workflows/` ↔ `.github/workflows/` byte-identical (blob `b171cec`); read-only confirmed (grep for addLabels/removeLabel/createLabel/merge/createComment/dispatch/update/delete = none); legacy-label grep (whole repo, ci) = 0; owner-name standalone grep = 0; `issues.listForRepo` present; gate dedupe present.
+- needs-from-owner: merge #31 once the gate is green. It touches protected workflow paths, so merge-bot will NOT auto-merge — needs a manual merge. The push is a new head, so the Codex gate will re-review before it can go green.
+- Next: after merge, escalated open Issues (e.g. CI Doctor's needs-owner Issues) appear in the morning digest's NEEDS ATTENTION alongside PR escalations.
+
 ## [2026-06-21 02:10 UTC] docs: add comprehensive CONTEXT.md handoff briefing
 - PR: direct commit to main
 - Branch: main (direct commit)

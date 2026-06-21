@@ -149,7 +149,7 @@ jobs:
                 for (const pr of open) {
                   const labels = (pr.labels || []).map((l) => l.name);
                   if (labels.includes(LABEL_ESCALATE)) {
-                    out.escalations.push({ number: pr.number, title: pr.title });
+                    out.escalations.push({ number: pr.number, title: pr.title, kind: 'PR' });
                   }
                   let symbol = '⚪';
                   try {
@@ -162,6 +162,23 @@ jobs:
                   } catch (e) { symbol = '⚪'; }
                   out.openPRs.push({ number: pr.number, title: pr.title, symbol });
                 }
+
+                // Standalone open ISSUES escalated to a human (needs-owner) —
+                // e.g. CI Doctor adds needs-owner to an Issue when it exhausts
+                // retries, which the PR scan above never sees. issues.listForRepo
+                // returns BOTH issues and PRs (a PR is an issue in this API), so
+                // skip anything carrying `pull_request` — those PR escalations are
+                // already captured from pulls.list, which also dedupes them.
+                // Escalation is detected by needs-owner ONLY. Read-only.
+                try {
+                  const escIssues = await github.paginate(github.rest.issues.listForRepo, {
+                    owner, repo, state: 'open', labels: LABEL_ESCALATE, per_page: 100,
+                  });
+                  for (const is of escIssues) {
+                    if (is.pull_request) continue;
+                    out.escalations.push({ number: is.number, title: is.title, kind: 'Issue' });
+                  }
+                } catch (e) { /* issues disabled / no perms — skip */ }
 
                 out.merged24 = await mergedLast24h(repo);
 
@@ -241,7 +258,8 @@ jobs:
             } else {
               lines.push(`🔴 <b>NEEDS ATTENTION (${escAll.length}):</b>`);
               for (const e of escAll) {
-                lines.push(`• ${esc(e.repo)} — #${e.number} ${esc(trunc(e.title, 60))}`);
+                const kind = e.kind === 'Issue' ? 'Issue' : 'PR';
+                lines.push(`• ${esc(e.repo)} — ${kind} #${e.number} ${esc(trunc(e.title, 60))}`);
               }
             }
 
