@@ -99,6 +99,22 @@ jobs:
               return '⏳';                                  // queued / in_progress / neutral
             }
 
+            // Keep only the LATEST check run per name. The Codex gate emits
+            // multiple `check-codex-status` runs on the same head over a PR's
+            // life (an early pending/red one, then a success after Codex
+            // reviews); a plain `.find` could return the stale red run and show
+            // a PR whose latest gate is green as red/pending. Sort by recency
+            // (completed_at, else started_at) descending and keep the first
+            // occurrence of each name — matching GitHub's own gate evaluation
+            // (same fix already applied to merge-bot.yml).
+            function latestCheckRunsByName(runs) {
+              const recency = (c) => new Date(c.completed_at || c.started_at || 0).getTime();
+              const seen = new Set();
+              return [...runs]
+                .sort((a, b) => recency(b) - recency(a))
+                .filter((c) => (seen.has(c.name) ? false : (seen.add(c.name), true)));
+            }
+
             // Count PRs merged in the last 24h without loading every closed PR:
             // walk closed PRs sorted by updated desc and stop once older than
             // the window (a merged PR's updated_at >= its merged_at).
@@ -140,7 +156,8 @@ jobs:
                     const runs = await github.paginate(github.rest.checks.listForRef, {
                       owner, repo, ref: pr.head.sha, per_page: 100,
                     });
-                    const gate = runs.find((c) => c.name === GATE_CHECK);
+                    const latestRuns = latestCheckRunsByName(runs);
+                    const gate = latestRuns.find((c) => c.name === GATE_CHECK);
                     symbol = gateSymbol(gate && gate.conclusion, !!gate);
                   } catch (e) { symbol = '⚪'; }
                   out.openPRs.push({ number: pr.number, title: pr.title, symbol });

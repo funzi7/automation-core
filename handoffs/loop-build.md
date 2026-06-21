@@ -17,6 +17,15 @@ Handoff log for the **self-healing-loop build** Claude Chat session. Claude Code
 
 ---
 
+## [2026-06-20 18:40 UTC] morning report: dedupe gate checks to latest-per-name (no false red)
+- PR: #31 (push to existing branch `claude/telegram-morning-report`)
+- Branch: claude/telegram-morning-report
+- Status: done (pushed to branch)
+- What changed: First integrated latest `main` (commit `4df920b` — the legacy escalation label fully removed) into this branch; the merge conflict in this handoff log was resolved by keeping BOTH dated entries (newest on top). The branch now carries no legacy-label clause anywhere, and the NEEDS ATTENTION section matches only `needs-owner`. Then fixed the gate-state bug: the digest computed each open PR's `check-codex-status` symbol with `runs.find(c => c.name === GATE_CHECK)`, but the Codex gate emits multiple runs of that check on the same head (an early pending/red one, then a success after Codex reviews), so `.find` could return the stale red run and show a green PR as red/pending. Added a `latestCheckRunsByName(runs)` helper (sort by recency — `completed_at`, else `started_at`, descending — and keep the first occurrence of each name) and call it before the lookup: `const latestRuns = latestCheckRunsByName(runs); const gate = latestRuns.find(c => c.name === GATE_CHECK);`. This mirrors the fix already on merge-bot.yml. ONLY the gate-state computation changed — read-only guarantees, dynamic repo discovery, fail-soft secret handling, the Telegram composition, and NEEDS ATTENTION (needs-owner only) are untouched. Both copies kept byte-identical.
+- Validation: actionlint clean on both copies; `node --check` on the github-script block (async-wrapped); a helper self-test confirms it picks the latest `success` over a stale earlier `failure`, dedupes names, and prefers a latest in-progress run over an older completed one; `workflows/` ↔ `.github/workflows/` byte-identical (blob `8e42961`); still read-only (grep finds no write API calls); legacy-label grep = 0; owner-name grep = 0.
+- needs-from-owner: merge #31 once green.
+- Next: open PRs whose latest `check-codex-status` is green now show 🟢 in the digest instead of a false 🔴/⏳ from a stale early run.
+
 ## [2026-06-20 18:10 UTC] standardize on needs-owner — remove the legacy escalation label entirely
 - PR: direct commit to main
 - Branch: main (direct commit)
