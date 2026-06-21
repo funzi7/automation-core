@@ -38,7 +38,7 @@ Merge Bot (merge-bot.yml)   merges when everything is green
 |-------|---------|
 | `claude-fix` | "Claude, fix this." Set by CI Doctor; triggers Claude Fixer. |
 | `automerge` | May be auto-merged by Merge Bot once green. Set by Claude's PR step. |
-| `needs-owner` | Escalation — automation stopped, a human must act. Hard stop for Merge Bot. (Migrated from the legacy label; still honored for backward-compat.) |
+| `needs-owner` | Escalation — automation stopped, a human must act. Hard stop for Merge Bot. (The sole escalation label; the older one was fully removed.) |
 | `ci-doctor` | Marks Issues opened by CI Doctor (dedup + close). |
 
 ---
@@ -77,7 +77,7 @@ Generic loop workflows live in `workflows/` (sync source) and are copied byte-id
 - **Concurrency:** `ci-doctor-${{ repo }}`, `cancel-in-progress: false`. Uses `AUTOMATION_PAT` for all writes.
 
 ### merge-bot.yml — Merge Bot  (sha `b8c4372`)
-- **Does:** squash-merges (head-SHA-pinned) PRs that are fully green. Candidate = Claude-bot author **OR `automerge` label OR** trusted sync PR **OR** a same-repo `claude/*` head branch (Claude Code's PRs are AUTOMATION_PAT-authored = owner, not a bot, and carry no `automerge` label, so they're recognized by their `claude/` branch — fork PRs excluded via the same-repo check); `needs-owner` (and the legacy label, for backward-compat) is a hard stop checked FIRST. `check-codex-status` must **exist AND be success** (fail-closed). `.claude-guard.json` protected-path guard → escalate. Closes linked CI-Doctor Issue. **Evaluates only the LATEST check run per name** (GitHub emits multiple `check-codex-status` runs on a head — an early pending/red one, then a success after Codex reviews); scanning every run tripped on the stale early-red run and skipped every merge — the reason merge-bot never merged. Now deduped to the most recent run per name (by `completed_at`/`started_at`), matching GitHub's own gating.
+- **Does:** squash-merges (head-SHA-pinned) PRs that are fully green. Candidate = Claude-bot author **OR `automerge` label OR** trusted sync PR **OR** a same-repo `claude/*` head branch (Claude Code's PRs are AUTOMATION_PAT-authored = owner, not a bot, and carry no `automerge` label, so they're recognized by their `claude/` branch — fork PRs excluded via the same-repo check); `needs-owner` is a hard stop checked FIRST. `check-codex-status` must **exist AND be success** (fail-closed). `.claude-guard.json` protected-path guard → escalate. Closes linked CI-Doctor Issue. **Evaluates only the LATEST check run per name** (GitHub emits multiple `check-codex-status` runs on a head — an early pending/red one, then a success after Codex reviews); scanning every run tripped on the stale early-red run and skipped every merge — the reason merge-bot never merged. Now deduped to the most recent run per name (by `completed_at`/`started_at`), matching GitHub's own gating.
 - **Triggers:** `workflow_run: ["Codex Gate"] [completed]`, `schedule: '30 7 * * *'`, `workflow_dispatch`. Job early-exits unless a **successful** Codex Gate `workflow_run`, the cron, or manual. (PR #27 dropped the `check_suite` trigger.)
 - **Concurrency:** `merge-bot-${{ repo }}`, `cancel-in-progress: false`. Merges with `AUTOMATION_PAT` (so the push triggers downstream).
 
@@ -109,7 +109,7 @@ Generic loop workflows live in `workflows/` (sync source) and are copied byte-id
 - **Codex Gate kept as a blocking check** — the human waits for the loop instead of merging manually.
 - **Merge Bot identifies Claude PRs by the `automerge` label OR a same-repo `claude/*` branch**, not author login (Claude's PRs are PAT-authored = owner `funzi7`, not a bot login). The escalation hard-stop is always checked first, and the protected-path guard still runs before any merge. **Merge Bot evaluates only the LATEST check run per name** (GitHub creates a fresh `check-codex-status` run on each gate pass; the old early-red run must be ignored) — this was why merge-bot never merged.
 - **Cost:** ~$1–1.7 per Claude fix run (duration-based). A Spending Limit is set in the Anthropic Console.
-- **Escalation label migrated to `needs-owner` (loop-safe).** New escalations tag `needs-owner`; every gate that CHECKS for escalation matches BOTH `needs-owner` and the legacy label (so existing escalations across downstream repos are never orphaned), and `needs-owner` is upserted wherever the legacy label used to be ensured. Workflows ADD only `needs-owner`; the legacy label survives solely inside backward-compat CHECK conditions, awaiting a later cleanup once all repos are re-tagged.
+- **Escalation label standardized on `needs-owner` (older label fully removed).** Every workflow now adds AND checks only `needs-owner`. The earlier backward-compat dual-matching (the `LABEL_ESCALATE_LEGACY` constant and the `|| ... LEGACY` clauses in merge-bot's candidate hard-stop and ci-doctor's "already escalated" skip) has been deleted — there were no open issues/PRs still carrying the old label, so the compat shim was unnecessary complexity. `needs-owner` is the single source of truth.
 
 ---
 

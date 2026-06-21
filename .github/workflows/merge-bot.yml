@@ -79,7 +79,6 @@ jobs:
             const CODEX_CHECK = 'check-codex-status';
             const LABEL_AUTOMERGE = 'automerge';
             const LABEL_ESCALATE = 'needs-owner';
-            const LABEL_ESCALATE_LEGACY = 'needs-dima';   // backward-compat: still honored as a hard stop
             const SYNC_TITLE_PREFIX = 'chore(automation): sync from automation-core';
             const SYNC_BRANCH = 'chore/sync-automation-core';   // branch the sync workflow opens
             const OWNER_LOGIN = 'funzi7';
@@ -133,11 +132,11 @@ jobs:
             });
 
             const candidates = allOpen.filter((pr) => {
-              // An escalation label (needs-owner or legacy needs-dima) is a HARD STOP — once a human-escalation label is on
+              // The escalation label (needs-owner) is a HARD STOP — once a human-escalation label is on
               // a PR, automation must never touch it again (no re-merge attempt,
               // no repeated guard comment / Telegram). Filter it out before the
               // PR ever becomes a candidate.
-              if ((pr.labels || []).some((l) => l.name === LABEL_ESCALATE || l.name === LABEL_ESCALATE_LEGACY)) return false;
+              if ((pr.labels || []).some((l) => l.name === LABEL_ESCALATE)) return false;
               const byBot = isClaudeBot(pr.user && pr.user.login);
               // The `automerge` label is the PRIMARY signal for Claude's fix
               // PRs: claude.yml passes AUTOMATION_PAT as github_token, so PRs

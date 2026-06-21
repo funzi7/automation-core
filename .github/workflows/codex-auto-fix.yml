@@ -168,11 +168,10 @@ jobs:
               core.warning(
                 `Circuit breaker: ${autoFixCount} @claude fix rounds on PR #${prNumber} without converging; stopping and escalating to needs-owner.`,
               );
-              // Ensure the current escalation label exists, then attach it.
-              // New escalations use needs-owner; legacy needs-dima is still
-              // honored by the gates that CHECK for it. createLabel is
-              // best-effort (422 = already exists) so downstream repos that
-              // don't have needs-owner yet still get it created.
+              // Ensure the escalation label exists, then attach it.
+              // createLabel is best-effort (422 = already exists) so
+              // downstream repos that don't have needs-owner yet still get
+              // it created.
               try {
                 await github.rest.issues.createLabel({ owner, repo, name: 'needs-owner', color: 'd93f0b', description: 'Escalation — automation stopped, human needed' });
               } catch (e) { if (e.status !== 422) core.info(`createLabel needs-owner failed (ignored): ${e.message}`); }

@@ -56,7 +56,7 @@ still happen within minutes — the crons are just the backstop.
 |-------|---------|
 | `claude-fix` | "Claude, fix this." Set by ci-doctor; triggers Claude Fixer. |
 | `automerge` | This PR may be auto-merged by Merge Bot once green. |
-| `needs-owner` | Escalation — automation stopped, a human must act. (Migrated from the legacy escalation label, still honored during the transition.) |
+| `needs-owner` | Escalation — automation stopped, a human must act. (The single escalation label; the earlier one was fully removed.) |
 | `ci-doctor` | Marks Issues opened by CI Doctor (used for dedup + close). |
 
 ### Secrets
