@@ -2,15 +2,17 @@ name: Codex Auto-Fix
 
 # Auto-respond to Codex bot reviews with `@claude fix` so Claude
 # (the trusted fixer, via claude.yml) drives the follow-up commit
-# when Codex flags a P1 issue (a real bug or security hole).
+# when Codex flags a P1 or P2 issue (a real bug, a security hole, or
+# an important correctness/quality finding).
 # Direction is deliberate: Codex reviews, Claude fixes — we never
 # hand the fix back to Codex. Without this workflow a human would
 # have to type the trigger.
 #
-# P1 ONLY: P2 findings (style / nice-to-have) never auto-trigger a
-# paid Claude run — Codex always finds another P2, which created a
-# near-infinite review/fix loop. P2 notes stay on the PR for
-# reference; the owner can post `@claude fix` by hand for a specific one.
+# P1 + P2 (P3 EXCLUDED): a P1 or P2 finding auto-triggers a fix — P2
+# routinely carries real correctness issues (e.g. "false-green health"),
+# so it should be fixed, not just noted. P3 is minor styling/cosmetic
+# and NEVER auto-triggers a paid Claude run. The 3-round circuit breaker
+# (below) still bounds the loop so an endless trickle can't run forever.
 #
 # The comment is posted with AUTOMATION_PAT (not GITHUB_TOKEN): a
 # comment made with the default token does NOT start other workflows
@@ -25,11 +27,11 @@ name: Codex Auto-Fix
 #     needs-owner label (merge-bot then ignores the PR), and ping
 #     Telegram if configured. Prevents the near-infinite review/fix
 #     loop (each round costs real money).
-#   - Substring match on "P1" in the review body. Codex uses badge
-#     URLs like `P1-orange?style=flat` so the literal substring is
-#     reliable; "no issues" reviews don't include that token. (Same
-#     existing detection — P2 is intentionally NOT matched, so P2-
-#     only reviews never start a run.)
+#   - Substring match on "P1"/"P2" in the review body. Codex tags each
+#     finding with a shields.io severity badge whose label is the
+#     literal token: `P1-orange`, `P2-yellow`, `P3-...`. Matching "P1"
+#     or "P2" catches P1/P2 and never a P3-only finding; "no issues"
+#     reviews carry no severity badge at all.
 #   - Cross-channel debounce: a Codex review with N inline comments
 #     fires N events across TWO channels (issue comments AND review
 #     comments). We dedupe the "[auto-triggered]" marker across BOTH
@@ -69,11 +71,11 @@ jobs:
       cancel-in-progress: false
     # Per-event explicit gate: each clause requires (1) the right
     # event_name, (2) the bot author on the right payload field, and
-    # (3) a P1 marker in the body. Pulling P1 into the if: short-
-    # circuits the runner for both "Codex says LGTM" AND P2-only
-    # reviews entirely — P2 must never start a paid fix run — instead
+    # (3) a P1 OR P2 marker in the body. Pulling severity into the if:
+    # short-circuits the runner for "Codex says LGTM" AND P3-only
+    # reviews entirely — P3 must never start a paid fix run — instead
     # of starting the runner and bailing in JS. (The check step still
-    # confirms an ACTIVE P1 across the whole review wave.)
+    # confirms an ACTIVE P1/P2 across the whole review wave.)
     #
     # Three branches mirror the on: events that can carry actionable
     # bot feedback: PR review, inline review-comment, top-level
@@ -82,13 +84,13 @@ jobs:
     if: |
       (github.event_name == 'pull_request_review' &&
        github.event.review.user.login == 'chatgpt-codex-connector[bot]' &&
-       contains(github.event.review.body, 'P1')) ||
+       (contains(github.event.review.body, 'P1') || contains(github.event.review.body, 'P2'))) ||
       (github.event_name == 'pull_request_review_comment' &&
        github.event.comment.user.login == 'chatgpt-codex-connector[bot]' &&
-       contains(github.event.comment.body, 'P1')) ||
+       (contains(github.event.comment.body, 'P1') || contains(github.event.comment.body, 'P2'))) ||
       (github.event_name == 'issue_comment' &&
        github.event.comment.user.login == 'chatgpt-codex-connector[bot]' &&
-       contains(github.event.comment.body, 'P1'))
+       (contains(github.event.comment.body, 'P1') || contains(github.event.comment.body, 'P2')))
 
     steps:
       - name: Check if review has actionable feedback
@@ -215,16 +217,16 @@ jobs:
               ? new Date(prCommits[prCommits.length - 1].commit.committer.date)
               : new Date(0);
 
-            // P1-ONLY gate. Auto-trigger a (paid) Claude run only when at least
-            // one ACTIVE P1 exists for the current head. P2 findings never
-            // auto-trigger — Codex finds new P2s endlessly, which is the
-            // infinite loop we are stopping. P2 notes stay on the PR for
-            // reference; the owner can @claude fix a specific one by hand.
-            // Detection reuses the EXISTING badge check (body.includes("P1")):
-            // a Codex P1 badge contains the literal "P1" substring; a P2 badge
-            // never does. We scan the triggering body PLUS every Codex note
-            // left after the latest commit, so the wave's P1 is seen no matter
-            // which event (review body or a sibling inline note) we run on.
+            // P1 + P2 gate (P3 EXCLUDED). Auto-trigger a (paid) Claude run when
+            // at least one ACTIVE P1 OR P2 finding exists for the current head.
+            // P3 is minor styling/cosmetic and must NEVER start a fix run.
+            // Detection reuses the EXISTING badge check: Codex tags each finding
+            // with a shields.io severity badge whose label is the literal token
+            // — `P1-orange`, `P2-yellow`, `P3-...` — so body.includes("P1") /
+            // includes("P2") catch P1/P2 and never match a P3-only finding.
+            // Freshness is unchanged: we scan the triggering body PLUS every
+            // Codex note left AFTER the latest commit, so a finding on a
+            // superseded commit doesn't count (same array the P1 logic used).
             const currentBody =
               context.payload.comment?.body || context.payload.review?.body || "";
             const codexBodiesThisWave = norm
@@ -232,13 +234,20 @@ jobs:
               .map((e) => e.body || "");
             codexBodiesThisWave.push(currentBody);
             const hasP1 = codexBodiesThisWave.some((b) => b.includes("P1"));
-            if (!hasP1) {
+            const hasP2 = codexBodiesThisWave.some((b) => b.includes("P2"));
+            if (!hasP1 && !hasP2) {
               core.info(
-                `PR #${prNumber}: only P2 (no active P1) on the current head — P2 is advisory, not auto-triggering.`,
+                `PR #${prNumber}: no active P1/P2 on the current head (P3-only or clean) — not auto-triggering.`,
               );
               core.setOutput("should_trigger", "false");
               return;
             }
+            // Which severities triggered (for the posted comment) + a best-effort
+            // finding count: each inline Codex finding carries one `![Px Badge]`
+            // alt-text, so count those across the wave's bodies.
+            const sevLabel = hasP1 && hasP2 ? "P1/P2" : (hasP1 ? "P1" : "P2");
+            const findingN =
+              codexBodiesThisWave.reduce((n, b) => n + ((b.match(/!\[P[12] Badge\]/g) || []).length), 0) || 1;
 
             // Cross-channel debounce: if a @claude fix marker already exists for
             // the current head in ANY channel, don't post again — Claude fixes
@@ -256,10 +265,12 @@ jobs:
             }
 
             core.info(
-              `PR #${prNumber}: active P1 found; prior auto-fixes=${autoFixCount} — triggering one @claude fix.`,
+              `PR #${prNumber}: active ${sevLabel} found (${findingN} finding(s)); prior auto-fixes=${autoFixCount} — triggering one @claude fix.`,
             );
             core.setOutput("should_trigger", "true");
             core.setOutput("pr_number", prNumber.toString());
+            core.setOutput("severity_label", sevLabel);
+            core.setOutput("finding_count", String(findingN));
 
       - name: Comment on PR to trigger Claude fix
         if: steps.check_review.outputs.should_trigger == 'true'
@@ -283,7 +294,15 @@ jobs:
             //
             // "[auto-triggered]" stays on a later line as the
             // marker the circuit-breaker (previous step) counts.
-            const baseBody = "@claude fix\n\n[auto-triggered]";
+            // Surface which severity triggered (P1, P2, or both) + a best-effort
+            // finding count from the check step. Kept on a LATER line so the
+            // literal "@claude fix" first line and the "[auto-triggered]" marker
+            // the circuit-breaker counts both stay byte-exact.
+            const sevLabel = "${{ steps.check_review.outputs.severity_label }}" || "P1/P2";
+            const findingCount = "${{ steps.check_review.outputs.finding_count }}" || "1";
+            const triggerNote =
+              `Auto-requested by the bridge: Codex flagged ${findingCount} active ${sevLabel} finding(s) on the current head.`;
+            const baseBody = `@claude fix\n\n[auto-triggered]\n\n${triggerNote}`;
 
             // Route the trigger reply to wherever Codex left the
             // feedback so the bot can correlate the @-mention with
@@ -320,7 +339,7 @@ jobs:
               payload.review
             ) {
               const body =
-                `@claude fix\n\n[auto-triggered]\n\n(review: ${payload.review.html_url})`;
+                `@claude fix\n\n[auto-triggered]\n\n${triggerNote}\n\n(review: ${payload.review.html_url})`;
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,

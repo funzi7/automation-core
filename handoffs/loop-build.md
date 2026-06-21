@@ -17,6 +17,15 @@ Handoff log for the **self-healing-loop build** Claude Chat session. Claude Code
 
 ---
 
+## [2026-06-21 01:30 UTC] bridge: trigger auto-fix on P1 AND P2 (exclude P3)
+- PR: direct commit to main
+- Branch: main (direct commit)
+- Status: done
+- What changed: Expanded the codex→claude bridge (the `trigger_codex_fix` job in `codex-auto-fix.yml`) from P1-only to **P1 + P2, excluding P3**. P2 findings routinely carry real correctness issues (e.g. the "false-green health" P2 on PR #31), so they should be auto-fixed, not just noted; P3 is minor styling/cosmetic and must never start a paid run. Confirmed the literal severity marker by inspecting real Codex comments in this repo: each finding renders a shields.io badge whose label is the literal token — `![P1 Badge](.../badge/P1-orange...)`, `![P2 Badge](.../badge/P2-yellow...)`, `P3-...`. The job-level `if:` gate now fires when a body `contains 'P1' || 'P2'` (per channel); the JS check computes `hasP1 = some(b.includes("P1"))` and `hasP2 = some(b.includes("P2"))` and triggers when either is true — a P3-only finding contains neither token, so it never triggers. Same freshness rule (only Codex bodies dated AFTER the latest commit, plus the triggering body — reused the existing `codexBodiesThisWave` array, no parallel detection path). The posted `@claude fix` comment now notes the severity (`P1`, `P2`, or `P1/P2`) and a best-effort finding count (counts `![Px Badge]` alt-texts). Safety rails UNCHANGED: idempotency (`alreadyThisWave` marker dedupe for the current head), the 3-round circuit breaker (`MAX_FIX_ROUNDS = 3` → adds `needs-owner` + Telegram), and the Codex-author-only guard (bot login in both the `if:` and the `e.login === CODEX` JS filter) all still run as before. The literal `@claude fix` first line and the `[auto-triggered]` breaker marker are byte-exact. Both copies kept byte-identical. (NOT in scope here: the Codex-as-backup fallback — that's a separate step pending verification Codex can push to a branch. claude.yml unchanged.)
+- Validation: actionlint clean on both copies; node --check on all 3 github-script blocks; a 7-case detection self-test passes (P1→trigger, P2→trigger, P3→NO trigger, P1+P2→"P1/P2" count 2, P2+P3→trigger on P2 ignoring P3, P1+P3→P1, clean review→NO trigger); safety-rail greps confirm breaker/idempotency/author-guard intact; `workflows/` ↔ `.github/workflows/` byte-identical (blob `6d7328b`).
+- needs-from-owner: nothing — live on main in one commit (handoff + LOOP_STATE in the same commit, no trailing commit, so the codex gate's head-reviewed state isn't reset). Downstream repos pick up the wider trigger on the next daily sync.
+- Next: P2 correctness findings now get auto-fixed like P1; the 3-round breaker keeps any endless trickle bounded. The Codex-as-backup fallback remains a separate, later step.
+
 ## [2026-06-20 18:10 UTC] standardize on needs-owner — remove the legacy escalation label entirely
 - PR: direct commit to main
 - Branch: main (direct commit)
