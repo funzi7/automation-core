@@ -1,0 +1,261 @@
+name: Codex Backup Fix
+
+# Backup fixer for the self-healing loop. Dispatched by claude-fallback-watchdog
+# when Claude doesn't deliver a fix within the timeout. Runs Codex IN GitHub
+# Actions (openai/codex-action@v1) — NOT Codex Cloud, which strips secrets before
+# its agent phase and therefore cannot push. This workflow generates a patch and
+# pushes it directly to the EXISTING PR head branch (no new PR; merge-bot needs
+# no change). Codex then auto-reviews the new head and the Codex Gate re-checks.
+#
+# PREREQUISITES (PER-REPO — `sync` does NOT copy secrets or Actions settings):
+#   - secret OPENAI_API_KEY on the repo.
+#   - Settings → Actions → General → Workflow permissions = Read and write.
+# Without these the run fails-soft / cannot push; that is expected on a repo that
+# has not opted into Codex fallback.
+#
+# SECURITY (public repo): fork PRs are NEVER run through the agent (secrets must
+# not be exposed to fork code) — Job 1 stops and escalates to needs-owner.
+# Read handoffs/CONTEXT.md for the full loop.
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to fix'
+        required: true
+      head_sha:
+        description: 'Head SHA the fix targets'
+        required: true
+      attempt:
+        description: 'Cumulative attempt number (from the watchdog)'
+        required: true
+
+concurrency:
+  group: codex-backup-fix-${{ github.repository }}-${{ inputs.pr_number }}
+  cancel-in-progress: false
+
+jobs:
+  generate-patch:
+    runs-on: ubuntu-latest
+    # NO write token in this job — it runs the agent, which must never hold
+    # push credentials.
+    permissions:
+      contents: read
+    outputs:
+      proceed: ${{ steps.guard.outputs.proceed }}
+    steps:
+      - name: Fork-PR security guard (no agent or secrets on forks)
+        id: guard
+        uses: actions/github-script@v7
+        env:
+          AUTOMATION_PAT: ${{ secrets.AUTOMATION_PAT }}
+        with:
+          github-token: ${{ secrets.AUTOMATION_PAT }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const prNumber = parseInt("${{ inputs.pr_number }}", 10);
+            const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+            const sameRepo =
+              pr.head && pr.head.repo && pr.head.repo.full_name === `${owner}/${repo}`;
+            if (!sameRepo) {
+              // SECURITY: a fork PR's head is untrusted code. Never run the agent
+              // or expose OPENAI_API_KEY on it. Escalate to a human and STOP the
+              // whole workflow (this fails the job, so apply-and-push is skipped).
+              try {
+                await github.rest.issues.addLabels({
+                  owner, repo, issue_number: prNumber, labels: ['needs-owner'],
+                });
+              } catch (e) { core.info(`addLabel failed (ignored): ${e.message}`); }
+              core.setOutput("proceed", "false");
+              core.setFailed(
+                `Fork PR #${prNumber}: refusing to run the Codex backup on fork code — escalated to needs-owner.`,
+              );
+              return;
+            }
+            core.setOutput("proceed", "true");
+
+      - name: Checkout PR head (read-only, no persisted creds)
+        if: steps.guard.outputs.proceed == 'true'
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.head_sha }}
+          persist-credentials: false
+
+      - name: Gather the active Codex finding for this head
+        if: steps.guard.outputs.proceed == 'true'
+        uses: actions/github-script@v7
+        env:
+          AUTOMATION_PAT: ${{ secrets.AUTOMATION_PAT }}
+        with:
+          github-token: ${{ secrets.AUTOMATION_PAT }}
+          script: |
+            // Write the active Codex P1/P2 finding text to a workspace file so
+            // the agent can read what to fix. Best-effort; an empty/derived note
+            // is acceptable. The file is UNTRACKED, so `git diff HEAD` (used to
+            // capture the patch) never includes it.
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const prNumber = parseInt("${{ inputs.pr_number }}", 10);
+            const CODEX = 'chatgpt-codex-connector[bot]';
+            const [rc, rv] = await Promise.all([
+              github.paginate(github.rest.pulls.listReviewComments, {
+                owner, repo, pull_number: prNumber, per_page: 100,
+              }),
+              github.paginate(github.rest.pulls.listReviews, {
+                owner, repo, pull_number: prNumber, per_page: 100,
+              }),
+            ]);
+            const texts = [...rc, ...rv]
+              .filter((c) => (c.user && c.user.login) === CODEX)
+              .map((c) => c.body || "")
+              .filter((b) => b.includes("P1") || b.includes("P2"));
+            const fs = require('fs');
+            const out = texts.join("\n\n---\n\n").slice(0, 8000) ||
+              "No specific Codex finding text was captured; review the PR diff and fix any P1/P2 issues Codex would raise.";
+            fs.writeFileSync('codex-finding.txt', out);
+            core.info(`Wrote codex-finding.txt with ${texts.length} finding section(s).`);
+
+      - name: Run Codex to fix the finding (CI agent, not Cloud)
+        if: steps.guard.outputs.proceed == 'true'
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          # workspace-write lets the agent edit the working tree; drop-sudo is the
+          # default safety strategy (no privilege escalation).
+          sandbox: workspace-write
+          safety-strategy: drop-sudo
+          allow-users: '*'
+          prompt: |
+            You are the BACKUP fixer for pull request #${{ inputs.pr_number }} in this
+            repository. The primary fixer did not deliver in time. The active Codex
+            review finding(s) for the current head are in the file `codex-finding.txt`
+            at the repository root. Read that file, then fix the finding(s) in the
+            working tree with the MINIMAL change that resolves them. Do not refactor
+            unrelated code. Do NOT add or reference any escalation label. If you edit a
+            workflow under `.github/workflows/` or `workflows/`, keep both copies
+            byte-identical. Do not commit or push — just leave the fix in the working
+            tree.
+
+      - name: Capture the patch (no push in this job)
+        if: steps.guard.outputs.proceed == 'true'
+        run: |
+          # Remove the untracked finding file just in case, then capture only
+          # tracked changes the agent made. The file always exists (possibly
+          # empty) so the artifact upload + download below are reliable.
+          rm -f codex-finding.txt
+          git diff --binary HEAD > codex.patch || true
+          if [ -s codex.patch ]; then
+            echo "Patch captured ($(wc -l < codex.patch) lines)."
+          else
+            echo "::notice::Codex produced no changes — empty patch."
+          fi
+
+      - name: Upload patch artifact
+        if: steps.guard.outputs.proceed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-patch
+          path: codex.patch
+          if-no-files-found: ignore
+          retention-days: 1
+
+  apply-and-push:
+    needs: generate-patch
+    if: needs.generate-patch.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Resolve PR head ref + stale-head guard
+        id: resolve
+        uses: actions/github-script@v7
+        env:
+          AUTOMATION_PAT: ${{ secrets.AUTOMATION_PAT }}
+        with:
+          github-token: ${{ secrets.AUTOMATION_PAT }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const prNumber = parseInt("${{ inputs.pr_number }}", 10);
+            const inputSha = "${{ inputs.head_sha }}";
+            const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+            // STALE-HEAD GUARD: if the head advanced while Codex worked, the patch
+            // is against an old tree — do NOT apply it. A fresh review on the new
+            // head starts a new cycle.
+            const stale = pr.head.sha !== inputSha;
+            core.setOutput("head_ref", pr.head.ref);
+            core.setOutput("stale", stale ? "true" : "false");
+
+      - name: Checkout PR head branch (write creds via AUTOMATION_PAT)
+        if: steps.resolve.outputs.stale == 'false'
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.resolve.outputs.head_ref }}
+          token: ${{ secrets.AUTOMATION_PAT }}
+          fetch-depth: 0
+
+      - name: Download patch artifact
+        if: steps.resolve.outputs.stale == 'false'
+        uses: actions/download-artifact@v4
+        with:
+          name: codex-patch
+          path: .
+
+      - name: Apply patch and push to the PR head branch
+        if: steps.resolve.outputs.stale == 'false'
+        env:
+          HEAD_REF: ${{ steps.resolve.outputs.head_ref }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          if [ ! -s codex.patch ]; then
+            echo "::notice::No patch to apply (empty) — nothing to push."
+            exit 0
+          fi
+          git config user.name 'codex-backup'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git apply --index codex.patch
+          git commit -m "fix(codex): resolve review finding on PR #${PR_NUMBER}"
+          git push origin "HEAD:${HEAD_REF}"
+
+      - name: Post pushed marker (counts-only)
+        if: steps.resolve.outputs.stale == 'false'
+        uses: actions/github-script@v7
+        env:
+          AUTOMATION_PAT: ${{ secrets.AUTOMATION_PAT }}
+        with:
+          github-token: ${{ secrets.AUTOMATION_PAT }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const prNumber = parseInt("${{ inputs.pr_number }}", 10);
+            const attempt = "${{ inputs.attempt }}";
+            const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+            const newSha = pr.head.sha;
+            await github.rest.issues.createComment({
+              owner, repo, issue_number: prNumber,
+              body: `<!-- ai-loop:v1 root_pr=${prNumber} head=${newSha} attempt=${attempt} agent=codex state=pushed -->\nCodex backup pushed a fix to the PR head branch (attempt ${attempt}). Codex will re-review the new head.`,
+            });
+
+      - name: Note stale-head skip (no push)
+        if: steps.resolve.outputs.stale == 'true'
+        uses: actions/github-script@v7
+        env:
+          AUTOMATION_PAT: ${{ secrets.AUTOMATION_PAT }}
+        with:
+          github-token: ${{ secrets.AUTOMATION_PAT }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const prNumber = parseInt("${{ inputs.pr_number }}", 10);
+            core.warning(
+              `PR #${prNumber}: head advanced while Codex worked — skipping the stale patch (a fresh review on the new head starts a new cycle).`,
+            );
+            try {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: prNumber,
+                body: `Codex backup patch went stale: the PR head advanced while Codex worked, so the patch was not applied. A fresh review on the new head will start a new cycle.`,
+              });
+            } catch (e) { core.info(`note failed (ignored): ${e.message}`); }

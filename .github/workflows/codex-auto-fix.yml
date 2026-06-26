@@ -267,10 +267,31 @@ jobs:
             core.info(
               `PR #${prNumber}: active ${sevLabel} found (${findingN} finding(s)); prior auto-fixes=${autoFixCount} — triggering one @claude fix.`,
             );
+            // ai-loop attempt counting (Part 1): an "attempt" is counted ONLY
+            // by `ai-loop:v1 ... attempt=` markers ALREADY on this PR (any
+            // agent) — never by Codex reviews, inline notes, commits, watchdog
+            // re-runs, debounced @claude fix, or un-pushed patches. The next
+            // attempt is max(existing attempt)+1. The marker (posted below) lets
+            // the claude-fallback watchdog know Claude was asked on this head.
+            const attemptRe = /ai-loop:v1[^>]*\battempt=(\d+)/g;
+            let maxAttempt = 0;
+            for (const e of norm) {
+              let mm;
+              while ((mm = attemptRe.exec(e.body || "")) !== null) {
+                const n = parseInt(mm[1], 10);
+                if (Number.isFinite(n) && n > maxAttempt) maxAttempt = n;
+              }
+            }
+            const nextAttempt = maxAttempt + 1;
+            const headSha = prCommits.length
+              ? prCommits[prCommits.length - 1].sha
+              : "";
             core.setOutput("should_trigger", "true");
             core.setOutput("pr_number", prNumber.toString());
             core.setOutput("severity_label", sevLabel);
             core.setOutput("finding_count", String(findingN));
+            core.setOutput("attempt", String(nextAttempt));
+            core.setOutput("head_sha", headSha);
 
       - name: Comment on PR to trigger Claude fix
         if: steps.check_review.outputs.should_trigger == 'true'
@@ -302,7 +323,16 @@ jobs:
             const findingCount = "${{ steps.check_review.outputs.finding_count }}" || "1";
             const triggerNote =
               `Auto-requested by the bridge: Codex flagged ${findingCount} active ${sevLabel} finding(s) on the current head.`;
-            const baseBody = `@claude fix\n\n[auto-triggered]\n\n${triggerNote}`;
+            // Structured loop marker for the claude-fallback watchdog (Part 1).
+            // PREPENDED on its own line (an invisible HTML comment — it does NOT
+            // disturb the "@claude fix" mention parser or the [auto-triggered]
+            // breaker marker). state=requested agent=claude lets the watchdog see
+            // Claude was asked on THIS head and count the attempt.
+            const attempt = "${{ steps.check_review.outputs.attempt }}" || "1";
+            const markerHead = "${{ steps.check_review.outputs.head_sha }}";
+            const loopMarker =
+              `<!-- ai-loop:v1 root_pr=${prNumber} head=${markerHead} attempt=${attempt} agent=claude state=requested -->`;
+            const baseBody = `${loopMarker}\n@claude fix\n\n[auto-triggered]\n\n${triggerNote}`;
 
             // Route the trigger reply to wherever Codex left the
             // feedback so the bot can correlate the @-mention with
@@ -339,7 +369,7 @@ jobs:
               payload.review
             ) {
               const body =
-                `@claude fix\n\n[auto-triggered]\n\n${triggerNote}\n\n(review: ${payload.review.html_url})`;
+                `${loopMarker}\n@claude fix\n\n[auto-triggered]\n\n${triggerNote}\n\n(review: ${payload.review.html_url})`;
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,

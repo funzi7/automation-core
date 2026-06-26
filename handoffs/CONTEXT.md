@@ -159,6 +159,54 @@ merged → (sync propagates updated workflows to ~14 downstream repos daily)
   bot login — enforced in both the job `if:` and the JS author filter.
 - Posts with **AUTOMATION_PAT** (a GITHUB_TOKEN-authored comment would not
   trigger `claude.yml`).
+- **ai-loop markers (v1):** each `@claude fix` is prepended with an invisible
+  HTML-comment marker on its own line:
+  `<!-- ai-loop:v1 root_pr=<n> head=<sha> attempt=<N> agent=claude state=requested -->`.
+  The marker is for the watchdog (below), not for Claude, and does not disturb
+  the `@claude fix` mention line or the `[auto-triggered]` breaker marker.
+  **Counting rule (applies everywhere):** an "attempt" is counted ONLY by
+  `ai-loop:v1 … attempt=` markers on the PR — never by Codex reviews, inline
+  notes, commits, watchdog re-runs on the same marker, debounced duplicate
+  `@claude fix`, or an un-pushed patch. Next attempt = max(attempt)+1.
+
+### Codex backup fixer + watchdog (Claude is first, Codex is backup)
+Claude is the FIRST fixer; Codex is a BACKUP fixer that runs **in GitHub
+Actions** (NOT Codex Cloud — Cloud strips secrets before its agent phase, so it
+cannot push).
+
+- **`claude-fallback-watchdog.yml`** — schedule `2-59/5 * * * *` (every 5 min) +
+  `workflow_dispatch`. For each open PR with a `state=requested agent=claude`
+  ai-loop marker on the current head, it fires the Codex backup ONLY when ALL
+  hold: PR still open; the marker's `head` still equals the PR head SHA; Claude
+  has not delivered (no Claude-app commit on the head after the marker); ≥ the
+  **20-minute** timeout has elapsed since the marker's comment; no `agent=codex`
+  marker already exists for this head; and cumulative attempts < 3. It then
+  `workflow_dispatch`-es `codex-backup-fix.yml` (inputs `pr_number`, `head_sha`,
+  `attempt=max+1`) and posts a `agent=codex state=requested` marker so the
+  attempt is counted and never re-fired. At 3 attempts it adds `needs-owner` +
+  a counts-only Telegram alert instead of firing Codex.
+- **`codex-backup-fix.yml`** — `workflow_dispatch` (pr_number, head_sha,
+  attempt), two jobs:
+  - **`generate-patch`** (`permissions: contents: read` — NO write token):
+    fork-PR security guard FIRST (if head repo ≠ this repo → add `needs-owner`
+    and stop the whole workflow; never run the agent or expose secrets on fork
+    code); checkout the exact `head_sha` (`persist-credentials: false`); run
+    `openai/codex-action@v1` (`openai-api-key: OPENAI_API_KEY`, `sandbox:
+    workspace-write`, `safety-strategy: drop-sudo`) with a prompt pointing the
+    agent at the active Codex finding; capture `git diff --binary HEAD >
+    codex.patch` and upload it as an artifact. Does NOT push.
+  - **`apply-and-push`** (`permissions: contents/pull-requests/issues: write`):
+    download the patch; **stale-head guard** — re-read the PR head SHA and if it
+    moved since `head_sha`, do NOT apply the stale patch (post a counts-only note
+    and exit; a fresh review on the new head starts a new cycle); otherwise
+    `git apply --index`, commit, and **push directly to the PR head branch**
+    (`git push origin HEAD:<head_ref>`). Posts a `agent=codex state=pushed`
+    marker. Net: the existing PR gets a new commit → Codex auto-reviews → Codex
+    Gate re-checks → merge-bot proceeds. **No new PR is created.**
+- **Claude-reviews-Codex is best-effort, NOT a gate.** No required check depends
+  on Claude reviewing Codex's fix — Claude being unavailable (no budget) is a
+  known-normal state, and gating on it would deadlock exactly when Codex is the
+  backup. The **Codex Gate remains the only required merge gate.**
 
 ---
 
@@ -212,7 +260,9 @@ consumer of itself).
 | `claude.yml` (Claude Fixer) | ✅ yes | **Paid budget currently exhausted** — automated fixer can't run. |
 | `ci-doctor.yml` | ✅ yes | Escalates to `needs-owner` only. |
 | `merge-bot.yml` | ✅ yes | Latest-check-run-per-name dedupe; `needs-owner` hard stop; protected-path guard. |
-| `telegram-morning-report.yml` | ⏳ **PR #31 (open)** | Hub-only read-only digest. Touches protected workflow paths → needs a **manual merge**. |
+| `telegram-morning-report.yml` | ✅ yes (PR #31 merged) | Hub-only read-only digest; counts-only public logs; honest Telegram delivery + minutes. |
+| `claude-fallback-watchdog.yml` | ✅ yes (synced) | Fires the Codex backup when Claude times out (20 min); marker-based attempt counting; 3 → `needs-owner` + Telegram. |
+| `codex-backup-fix.yml` | ✅ yes (synced) | Codex backup fixer via `openai/codex-action@v1`; fork guard + stale-head guard; pushes to the PR head branch (no new PR). |
 | `bootstrap.yml` | ✅ yes (hub-only) | Onboards a new repo. |
 | `minutes-guard.yml` | ✅ yes (hub-only) | Actions-minutes guard. |
 
@@ -222,6 +272,19 @@ consumer of itself).
   escalation label. **0** issues/PRs carry the legacy label.
 - `workflows/` and `.github/workflows/` copies are kept **byte-identical** for
   every synced workflow.
+
+### Downstream requirement for the Codex backup fixer (per-repo)
+`sync` copies workflow files only — it does **NOT** copy secrets or Actions
+settings. So each downstream repo that wants the Codex fallback must
+**independently**:
+- set the **`OPENAI_API_KEY`** secret, and
+- set **Settings → Actions → General → Workflow permissions = Read and write**
+  (the backup needs to push the fix commit to the PR head branch).
+
+Without these the backup simply fails-soft / can't push — harmless on a repo
+that hasn't opted in. On **public** repos, **fork PRs are skipped and escalated
+to `needs-owner`** (the agent never runs on untrusted fork code, so secrets are
+never exposed).
 
 ---
 
@@ -236,10 +299,12 @@ consumer of itself).
 2. **Build mutual review.** Each agent reviews **and** fixes the other: Codex
    reviews Claude's fixes; Claude reviews Codex's fixes — up to a **3-round
    limit**, then escalate to `needs-owner`.
-3. **Build Codex-as-backup.** When Claude Fixer has no budget (current state) or
-   doesn't respond, the bridge should post **`@codex fix`** so Codex lands the
-   fix instead. (Confirmed Codex can push to a branch — see Lesson 4.) This is a
-   separate, not-yet-built step.
+3. **Codex-as-backup — DONE.** Built as `claude-fallback-watchdog.yml` +
+   `codex-backup-fix.yml`: when Claude doesn't deliver within 20 min, the
+   watchdog dispatches the Codex backup, which runs `openai/codex-action@v1` in
+   GitHub Actions (not Cloud, which can't push) and pushes the fix to the PR head
+   branch — no new PR. Per-repo prerequisites: `OPENAI_API_KEY` + Read-and-write
+   workflow permissions (see Downstream requirement above).
 4. **Clean up PR #31 before merge.** It currently carries a Codex commit that
    **re-added the legacy escalation label**. Cleanup = keep the Issue-escalation
    detection Codex added, but **drop the re-added label**, then merge manually
