@@ -97,7 +97,14 @@ merged → (sync propagates updated workflows to ~14 downstream repos daily)
 
 ### codex-gate.yml — the blocking gate
 - Publishes the `check-codex-status` check; **fail-closed** (red until proven
-  green).
+  green). **(fix #11)** The job is named **`codex-gate`** and it publishes
+  `check-codex-status` as an EXPLICIT check-run (octokit `checks.create`/`update`
+  on the PR head, find-and-update so there's one per head) carrying
+  `output.title`/`summary` — so a red gate shows WHY instead of a blank red
+  square: 🟡 "Waiting for Codex review" (pending), 🔴 "Active Codex P1/P2"
+  (blocked), 🟢 "Reviewed — clear" (green). The GREEN/RED **logic is unchanged**;
+  publishing is fail-soft (a cosmetic output error never flips the verdict). The
+  check NAME stays exactly `check-codex-status` (merge-bot reads it).
 - **GREEN requires BOTH:** (a) Codex has **reviewed the current head**, and
   (b) there is **no ACTIVE P1 and no ACTIVE P2** (matching the bridge's
   trigger severity — see fix #6 / Hard-Won Lesson 11). P3 never blocks.

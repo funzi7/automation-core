@@ -17,6 +17,15 @@ Handoff log for the **self-healing-loop build** Claude Chat session. Claude Code
 
 ---
 
+## [2026-06-29 14:00 UTC] fix #11: codex-gate publishes check-codex-status with output.title/summary (no more blank red)
+- PR: direct commit to main
+- Branch: main (direct commit)
+- Status: done
+- What changed: `check-codex-status` was the JOB's own status check (the job was named `check-codex-status`), so its red/green carried EMPTY output — a blocked gate showed a blank red square with no reason. Fix #11 (output text only — verdict logic untouched): **renamed the job to `codex-gate`** and now publishes `check-codex-status` as an EXPLICIT check-run via octokit `checks.create`/`checks.update` on the PR head (find-and-update → exactly one per head, no job-status duplicate; the name stays exactly `check-codex-status` so merge-bot's `checks.listForRef` still finds it). Added `checks: write` to permissions. Per state: 🟡 **"Waiting for Codex review"** (pending — summary names the head + rerun attempt N/MAX + the `codex-p1-acknowledged` override), 🔴 **"Active Codex P1/P2"** (blocked — names last-active/last-fix dates), 🟢 **"Reviewed — clear"** (clean review / stale-only P1/P2 / 👍 / override) — each includes the 7-char head SHA. The conclusion mirrors the existing verdict (`success` green, `failure` pending/blocked). Publishing is wrapped in try/catch and FAIL-SOFT: a cosmetic output error logs and is ignored — the job's own `setFailed`/conclusion still reflects the real verdict. Did NOT touch the freshness rule, P1/P2 detection, head-targeted self-rerun, or MAX_ATTEMPTS. Both copies byte-identical.
+- Validation: actionlint clean on both copies; node --check on all 3 github-script blocks; confirmed the job `check-codex-status:` is gone / `codex-gate:` present, one real `checks.create` + one `checks.update`, 5 `publishGateCheck` call sites, `checks: write` added; `workflows/` ↔ `.github/workflows/` byte-identical (blob `00564f4`).
+- needs-from-owner: nothing — live on main in one commit. Propagates to downstreams on the next daily sync.
+- Next: a red Codex Gate now states the reason inline (waiting / active P1-P2 / clear); combined with find-and-update there's a single `check-codex-status` per head, which also trims the stale-red duplication. Remaining: close #38 if still open; fresh downstream sync (fixes #6–#11).
+
 ## [2026-06-29 13:00 UTC] fix #10: claude.yml swaps the triggering comment's 👀 → 👎 on a failed fix
 - PR: direct commit to main
 - Branch: main (direct commit)

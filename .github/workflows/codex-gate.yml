@@ -84,9 +84,14 @@ permissions:
   # Needed for the head-targeted self-rerun: getWorkflowRun +
   # listWorkflowRunsForRepo (read) and createWorkflowDispatch (write).
   actions: write
+  # fix #11: publish the explicit `check-codex-status` check-run with output text.
+  checks: write
 
 jobs:
-  check-codex-status:
+  # fix #11: the JOB is `codex-gate` (its job-status check is cosmetic); the
+  # blocking `check-codex-status` check merge-bot reads is published EXPLICITLY
+  # below via checks.create/update so it carries a human-readable reason.
+  codex-gate:
     runs-on: ubuntu-latest
     steps:
       - name: Resolve PR number(s) to check
@@ -211,12 +216,40 @@ jobs:
               }
             }
 
+            // fix #11: publish the `check-codex-status` check-run WITH output text
+            // so a red gate shows WHY (the empty-output blank-red-square problem).
+            // The JOB is now `codex-gate`; this explicit check-run keeps the exact
+            // name merge-bot reads (checks.listForRef → 'check-codex-status').
+            // Find-and-update keeps one per head. FAIL-SOFT: a publish error is
+            // purely cosmetic and must NEVER change the job's own verdict/conclusion.
+            async function publishGateCheck(headSha, conclusion, title, summary) {
+              try {
+                const existing = await github.paginate(github.rest.checks.listForRef, {
+                  owner, repo, ref: headSha, per_page: 100,
+                });
+                const mine = existing.find((c) => c.name === 'check-codex-status');
+                const body = {
+                  owner, repo, status: 'completed', conclusion,
+                  output: { title, summary },
+                };
+                if (mine) {
+                  await github.rest.checks.update({ ...body, check_run_id: mine.id });
+                } else {
+                  await github.rest.checks.create({ ...body, name: 'check-codex-status', head_sha: headSha });
+                }
+              } catch (e) {
+                core.info(`publishGateCheck failed (ignored, cosmetic): ${e.message}`);
+              }
+            }
+
             for (const prNumber of prNumbers) {
               try {
                 const { data: pr } = await github.rest.pulls.get({
                   owner, repo, pull_number: prNumber,
                 });
                 const headSha = pr.head.sha;
+                const head7 = headSha.substring(0, 7);
+                const attempts = await attemptsOnHead(headSha);
                 const headRef = pr.head.ref;
                 const runningOnHead = runHeadSha === headSha;
 
@@ -238,6 +271,8 @@ jobs:
                 // Manual override — admin force-merge.
                 if (pr.labels.some(l => l.name === 'codex-p1-acknowledged')) {
                   results.push(`PR #${prNumber}: ✅ override label present`);
+                  await publishGateCheck(headSha, 'success', '🟢 Reviewed — clear',
+                    `Override label \`codex-p1-acknowledged\` is set on ${head7} — gate forced green.`);
                   if (!runningOnHead) await scheduleRerun('override — land green on head');
                   continue;
                 }
@@ -348,6 +383,8 @@ jobs:
                   }
                   if (lastFixDate && new Date(lastFixDate) > new Date(lastActiveSevDate)) {
                     results.push(`PR #${prNumber}: ✅ active Codex P1/P2 followed by a fix Summary`);
+                    await publishGateCheck(headSha, 'success', '🟢 Reviewed — clear',
+                      `Codex's P1/P2 on ${head7} was followed by a fix Summary — resolved, no active P1/P2.`);
                     // Clean verdict — make sure it lands on the head. The fix
                     // Summary usually arrives as an issue_comment (default-branch
                     // run), so without this the head stays red (P1 #2).
@@ -357,6 +394,8 @@ jobs:
                   results.push(
                     `PR #${prNumber}: ❌ active Codex P1/P2 unresolved (last active: ${lastActiveSevDate}, last fix: ${lastFixDate || 'none'}, head: ${headSha.substring(0, 7)})`
                   );
+                  await publishGateCheck(headSha, 'failure', '🔴 Active Codex P1/P2',
+                    `An unresolved Codex P1/P2 on ${head7} is blocking merge. It clears when Codex posts a fix Summary or the head is updated (last active ${lastActiveSevDate}, last fix ${lastFixDate || 'none'}).`);
                   anyBlocked = true;
                   continue;
                 }
@@ -368,6 +407,8 @@ jobs:
                   results.push(
                     `PR #${prNumber}: ⏳ pending — Codex hasn't reviewed head ${headSha.substring(0, 7)} yet; blocking until it does`
                   );
+                  await publishGateCheck(headSha, 'failure', '🟡 Waiting for Codex review',
+                    `Codex hasn't reviewed ${head7} yet (rerun attempt ${attempts}/${MAX_ATTEMPTS}). The gate re-checks automatically; it turns green once Codex reviews with no active P1/P2. Manual override: add the \`codex-p1-acknowledged\` label.`);
                   anyBlocked = true;
                   await scheduleRerun('pending — poll for first Codex signal on head');
                   continue;
@@ -383,6 +424,8 @@ jobs:
                 } else {
                   results.push(`PR #${prNumber}: ✅ Codex reviewed head ${headSha.substring(0, 7)} — no P1/P2`);
                 }
+                await publishGateCheck(headSha, 'success', '🟢 Reviewed — clear',
+                  `Codex reviewed ${head7} with no active P1/P2.`);
                 // GREEN. If this run isn't on the head (e.g. an issue_comment
                 // run on the default branch, or a 👍 caught by a default-branch
                 // run), re-dispatch on the head branch so the green check lands
