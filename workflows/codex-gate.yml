@@ -14,9 +14,10 @@ name: Codex Gate
 # active OR (b) make a stale comment falsely read as a fresh review and flip
 # the gate green before Codex actually re-reviews — the merge-before-review
 # race through a side door. Date-only closes both.
-# It BLOCKS when an active P1 is unresolved OR Codex hasn't reviewed the head
-# yet (pending). P2 / stale P1 (predating the latest commit) / clean review /
-# 👍 are all green. `codex-p1-acknowledged` label = manual override.
+# It BLOCKS when an active P1 OR an active P2 is unresolved OR Codex hasn't
+# reviewed the head yet (pending). A stale P1/P2 (predating the latest commit) /
+# clean review / 👍 / P3 are all green. `codex-p1-acknowledged` label = manual
+# override.
 #
 # HEAD-TARGETED SELF-RERUN (restored — this is the fix for the two P1s Codex
 # raised on PR #25):
@@ -49,9 +50,12 @@ name: Codex Gate
 # active-P1 test is the same date-only basis, so a stale P1 doesn't false-block
 # either.)
 #
-# P1 detection is the SAME as the bridge (p1Pattern / stripSummarySections)
-# across the same 3 channels, fully paginated. fail-soft: a technical error
-# evaluating a PR does NOT block; a detected P1 always blocks (safety wins).
+# P1 AND P2 detection is the SAME as the bridge (p1Pattern/p2Pattern via the
+# same badge fragments + stripSummarySections) across the same 3 channels, fully
+# paginated — gate-block severity == bridge-trigger severity, so a P2-no-P1 PR
+# can't merge before its fix lands (the race Codex flagged on #48). fail-soft: a
+# technical error evaluating a PR does NOT block; a detected P1/P2 always blocks
+# (safety wins).
 
 on:
   pull_request:
@@ -144,6 +148,13 @@ jobs:
             // sentence MUST NOT match — only a real badge or a real
             // line-leading severity label.
             const p1Pattern = /(?:P1-orange|(?:^|\n)[\s>*\-_#`]*(?:\*\*\s*P1\s*\*\*|\[P1\]|P1:))/i;
+            // P2 mirrors p1Pattern EXACTLY (badge fragment `P2-yellow` + a
+            // line-leading **P2** / [P2] / P2:). This is the SAME marker the
+            // bridge keys on for an active P2 — its P2 badge renders as
+            // `![P2 Badge](…/badge/P2-yellow…)`, which contains `P2-yellow` —
+            // so the gate blocks on precisely the P2s the bridge routes to
+            // Claude. Mid-prose "P2" tokens MUST NOT match (same discipline).
+            const p2Pattern = /(?:P2-yellow|(?:^|\n)[\s>*\-_#`]*(?:\*\*\s*P2\s*\*\*|\[P2\]|P2:))/i;
             const fixSummaryPattern = /###\s+Summary[\s\S]+commit/i;
 
             // Codex's own post-fix Summary blocks frequently quote earlier
@@ -311,34 +322,40 @@ jobs:
 
                 // Has Codex actually reviewed the CURRENT head? = any Codex
                 // signal (review / comment / inline / 👍) DATED after the latest
-                // commit. Date-only, same basis as activeP1Items below.
+                // commit. Date-only, same basis as activeSevItems below.
                 const hasCodexSignalOnHead =
                   allBodies.some(item => item.onHead) || codexThumbsUpOnHead;
 
-                // ACTIVE P1 = a P1 marker DATED after the latest commit.
-                const activeP1Items = allBodies.filter(
-                  item => item.onHead && p1Pattern.test(item.bodyForP1)
+                // ACTIVE P1/P2 = a P1 OR P2 marker DATED after the latest
+                // commit. The gate must block on BOTH severities: the bridge
+                // sends a Claude fix on P1 AND P2, so blocking on P1 only let a
+                // P2-no-P1 PR merge BEFORE the fix landed — the merge-before-fix
+                // race Codex flagged on #48. (bodyForP1 is the Summary-stripped
+                // body; stripping is severity-agnostic, so it's reused for P2.)
+                const activeSevItems = allBodies.filter(
+                  item => item.onHead &&
+                    (p1Pattern.test(item.bodyForP1) || p2Pattern.test(item.bodyForP1))
                 );
 
-                // 1) Active P1 → block unless a later fix Summary cleared it.
-                if (activeP1Items.length > 0) {
-                  let lastActiveP1Date = null;
+                // 1) Active P1/P2 → block unless a later fix Summary cleared it.
+                if (activeSevItems.length > 0) {
+                  let lastActiveSevDate = null;
                   let lastFixDate = null;
                   for (const item of allBodies) {
                     if (!item.onHead) continue;
-                    if (p1Pattern.test(item.bodyForP1)) lastActiveP1Date = item.date;
+                    if (p1Pattern.test(item.bodyForP1) || p2Pattern.test(item.bodyForP1)) lastActiveSevDate = item.date;
                     if (fixSummaryPattern.test(item.body)) lastFixDate = item.date;
                   }
-                  if (lastFixDate && new Date(lastFixDate) > new Date(lastActiveP1Date)) {
-                    results.push(`PR #${prNumber}: ✅ active Codex P1 followed by a fix Summary`);
+                  if (lastFixDate && new Date(lastFixDate) > new Date(lastActiveSevDate)) {
+                    results.push(`PR #${prNumber}: ✅ active Codex P1/P2 followed by a fix Summary`);
                     // Clean verdict — make sure it lands on the head. The fix
                     // Summary usually arrives as an issue_comment (default-branch
                     // run), so without this the head stays red (P1 #2).
-                    if (!runningOnHead) await scheduleRerun('P1-then-Summary green — land on head');
+                    if (!runningOnHead) await scheduleRerun('P1/P2-then-Summary green — land on head');
                     continue;
                   }
                   results.push(
-                    `PR #${prNumber}: ❌ active Codex P1 unresolved (last active P1: ${lastActiveP1Date}, last fix: ${lastFixDate || 'none'}, head: ${headSha.substring(0, 7)})`
+                    `PR #${prNumber}: ❌ active Codex P1/P2 unresolved (last active: ${lastActiveSevDate}, last fix: ${lastFixDate || 'none'}, head: ${headSha.substring(0, 7)})`
                   );
                   anyBlocked = true;
                   continue;
@@ -359,12 +376,12 @@ jobs:
                 // 3) Codex reviewed the head and found no active P1 → GREEN.
                 if (codexThumbsUpOnHead && allBodies.every(item => !item.onHead)) {
                   results.push(`PR #${prNumber}: ✅ Codex reacted 👍 on the head — no issues`);
-                } else if (allBodies.some(item => p1Pattern.test(item.bodyForP1))) {
+                } else if (allBodies.some(item => p1Pattern.test(item.bodyForP1) || p2Pattern.test(item.bodyForP1))) {
                   results.push(
-                    `PR #${prNumber}: ✅ Codex reviewed head ${headSha.substring(0, 7)} — P1(s) are stale (predate the latest commit)`
+                    `PR #${prNumber}: ✅ Codex reviewed head ${headSha.substring(0, 7)} — P1/P2(s) are stale (predate the latest commit)`
                   );
                 } else {
-                  results.push(`PR #${prNumber}: ✅ Codex reviewed head ${headSha.substring(0, 7)} — no P1`);
+                  results.push(`PR #${prNumber}: ✅ Codex reviewed head ${headSha.substring(0, 7)} — no P1/P2`);
                 }
                 // GREEN. If this run isn't on the head (e.g. an issue_comment
                 // run on the default branch, or a 👍 caught by a default-branch
@@ -403,10 +420,10 @@ jobs:
 
             if (anyBlocked) {
               core.setFailed(
-                'Blocked by Codex Gate: an active P1 is unresolved, or Codex has not reviewed the current head yet.\n' +
+                'Blocked by Codex Gate: an active P1 or P2 is unresolved, or Codex has not reviewed the current head yet.\n' +
                 'Resolve by one of:\n' +
-                '  1. Wait — Codex reviews automatically on every push; the gate self-reruns on the head (max 5 attempts, ~90s apart) and goes green once Codex posts any signal with no P1.\n' +
-                '  2. Push a fix commit — P1s raised before it become stale and clear automatically.\n' +
+                '  1. Wait — Codex reviews automatically on every push; the gate self-reruns on the head (max 5 attempts, ~90s apart) and goes green once Codex posts any signal with no active P1/P2.\n' +
+                '  2. Push a fix commit — P1/P2s raised before it become stale and clear automatically.\n' +
                 '  3. Add label "codex-p1-acknowledged" to override.'
               );
             }

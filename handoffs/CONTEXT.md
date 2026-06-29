@@ -99,7 +99,8 @@ merged → (sync propagates updated workflows to ~14 downstream repos daily)
 - Publishes the `check-codex-status` check; **fail-closed** (red until proven
   green).
 - **GREEN requires BOTH:** (a) Codex has **reviewed the current head**, and
-  (b) there is **no ACTIVE P1**.
+  (b) there is **no ACTIVE P1 and no ACTIVE P2** (matching the bridge's
+  trigger severity — see fix #6 / Hard-Won Lesson 11). P3 never blocks.
 - **Date-only freshness:** a Codex signal (review / comment / inline note / 👍)
   counts only if it is **dated AFTER the latest commit** on the PR
   (`onHead(date) = date > latestCommitDate`, where `latestCommitDate` is the MAX
@@ -255,6 +256,14 @@ cannot push).
     — it does **not** grant the PAT any scope. Fixing it is a manual PAT-settings
     action; the watchdog now surfaces the failure loudly (annotation + Telegram)
     and retries without burning an attempt until the scope is granted.
+11. **Bridge-trigger severity and gate-block severity MUST match.** The bridge
+    sends a Claude fix on P1 **and** P2, but the Codex Gate originally blocked on
+    P1 only — so a **P2-no-P1** PR could go green and **merge BEFORE the fix
+    landed** (the merge-before-fix race). Codex caught this on #48. Fix #6: the
+    gate now blocks on active P1 **or** active P2, using a `p2Pattern` that
+    mirrors `p1Pattern` against the same `P2-yellow` badge the bridge keys on, so
+    the two always agree on "what is an active P2". Rule of thumb: any severity
+    the bridge auto-fixes, the gate must also block on.
 
 ---
 
@@ -329,10 +338,15 @@ never exposed).
    (4) watchdog makes a blocked dispatch loud + retryable (no burned attempt);
    (5) the bridge never auto-@claude-fixes the `chore/sync-automation-core` PR
    (fix upstream, not the downstream copy).
-8. **Next steps:** close #38 (the sync PR that tripped the breaker — its findings
-   belong upstream, now suppressed); run a **fresh sync to downstreams** so they
-   get these workflow fixes; add **idempotency to paywall-bot's Quality Monitor**
-   (it opens a self-PR per run — dedupe so it doesn't pile up report PRs).
+8. **Fix #6 — DONE (this commit):** the Codex Gate now blocks on an active **P2**
+   as well as P1 (`p2Pattern` mirrors `p1Pattern` against the `P2-yellow` badge
+   the bridge keys on), closing the merge-before-fix race a P2-no-P1 PR had — the
+   gate-block severity now matches the bridge-trigger severity. Closes Codex #48.
+9. **paywall-bot Quality Monitor pileup — DONE** (rolling Issue + cleanup; PR #49,
+   Issue #50). Owner-driven by default (`ROUTE_FINDINGS_TO_AUTOFIX=False`).
+10. **Next steps:** close #38 (the sync PR that tripped the breaker — its findings
+    belong upstream, now suppressed); run a **fresh sync to downstreams** so they
+    pick up these workflow fixes.
 
 ---
 

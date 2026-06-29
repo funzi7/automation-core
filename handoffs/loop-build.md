@@ -17,6 +17,15 @@ Handoff log for the **self-healing-loop build** Claude Chat session. Claude Code
 
 ---
 
+## [2026-06-29 09:00 UTC] fix #6: Codex Gate blocks on active P2 too (closes Codex #48 merge-before-fix race)
+- PR: direct commit to main
+- Branch: main (direct commit)
+- Status: done
+- What changed: The bridge sends a Claude fix on P1 **and** P2, but the Codex Gate only failed on P1 — so a **P2-no-P1** PR could go green and merge BEFORE the fix landed (the merge-before-fix race Codex flagged on #48). In `codex-gate.yml` I added `p2Pattern` mirroring `p1Pattern` EXACTLY — badge fragment `P2-yellow` (the same badge the bridge keys on: `![P2 Badge](…/badge/P2-yellow…)`) plus line-leading `**P2**`/`[P2]`/`P2:`, with the same mid-prose discipline (a bare "P2" token never matches). The active-detection now uses `activeSevItems` (P1 OR P2, dated after the latest commit, via the same `onHead` freshness + `stripSummarySections`), and the later-fix-Summary-clears-it logic tracks the last active P1/P2 vs last fix Summary just as P1 did. The gate now BLOCKS when an active P1 **or** P2 is unresolved OR Codex hasn't reviewed the head; a stale P1/P2, a clean review, 👍, or P3 → pass. Head-targeted self-rerun + `codex-p1-acknowledged` override are unchanged and now cover the combined P1/P2 state. Header comment block + the setFailed guidance updated to say P1/P2. Both copies byte-identical.
+- Validation: actionlint clean on both copies; `node --check` on the gate github-script blocks; an 8-case `p2Pattern` self-test passes (matches the P2 badge + line-leading `**P2**`/`[P2]`/`P2:`; rejects mid-prose "P2", `GCP2`, and the P1/P3 badges); `workflows/` ↔ `.github/workflows/` byte-identical (blob `73b3c7d`).
+- needs-from-owner: nothing — live on main in one commit (handoff + LOOP_STATE + CONTEXT in the same commit). Propagates to downstreams on the next daily sync.
+- Next: gate-block severity now equals bridge-trigger severity (P1+P2) — Codex #48 is closed. Remaining: close #38, fresh sync to downstreams.
+
 ## [2026-06-27 08:00 UTC] loop hardening: 5 fixes (automerge scope, fresh-issue wake, ignore infra, loud dispatch, no sync auto-fix)
 - PR: direct commit to main
 - Branch: main (direct commit)
