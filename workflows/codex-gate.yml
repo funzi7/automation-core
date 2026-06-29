@@ -33,8 +33,10 @@ name: Codex Gate
 #   run that is NOT on the head — it re-dispatches itself via
 #   createWorkflowDispatch against the PR HEAD BRANCH (ref = pr.head.ref). A
 #   dispatch run's head_sha == pr.head.sha, so its check lands on the head
-#   where merge-bot looks. Capped at MAX_ATTEMPTS (5) per head SHA with ~90s
-#   spacing. A new push changes the head SHA and resets the cap.
+#   where merge-bot looks. Capped at MAX_ATTEMPTS (3) per head SHA with ~90s
+#   spacing. A new push changes the head SHA and resets the cap. (Since fix #11
+#   the check is published on the head from every run, so this poll now mainly
+#   covers the 👍-reaction case, which fires no event.)
 #
 # Why it can't wedge red forever: it waits for the FIRST post-commit signal,
 # not an approval; the 👍 reaction and an empty review object both count.
@@ -76,6 +78,20 @@ on:
         description: 'PR number to check (used by the head-targeted self-rerun)'
         required: false
         type: string
+
+# fix #12: collapse the burst of redundant gate runs per PR. A Codex review fires
+# pull_request_review AND pull_request_review_comment (one per inline note), and a
+# push fires a pull_request run + its head-targeted self-rerun — ~4 runs per wave.
+# This cancels OVERLAPPING runs for the SAME PR, leaving only the latest
+# authoritative one. Sequential self-rerun attempts (~90s apart) don't overlap, so
+# concurrency leaves them alone (intended). Safe: every run publishes
+# check-codex-status on the PR HEAD sha (fix #11), so the surviving run's
+# find-and-update lands the check on the head — a canceled/superseded run never
+# leaves a stale or half check. The `|| github.run_id` fallback guarantees a
+# non-empty group key.
+concurrency:
+  group: codex-gate-pr-${{ github.event.pull_request.number || github.event.inputs.pr_number || github.event.issue.number || github.run_id }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -135,7 +151,11 @@ jobs:
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const prNumbers = JSON.parse('${{ steps.prs.outputs.numbers }}');
-            const MAX_ATTEMPTS = 5;
+            // fix #12: lowered 5→3. Since fix #11 lands the check on the head
+            // from EVERY run, the head-targeted self-rerun's only remaining job is
+            // catching a 👍 reaction (which fires no event). 3 polls (~90s apart,
+            // per-head reset) is enough for that; the poll is kept, just capped lower.
+            const MAX_ATTEMPTS = 3;
 
             const isCodex = (user) =>
               user?.login === 'chatgpt-codex-connector[bot]' ||

@@ -17,6 +17,15 @@ Handoff log for the **self-healing-loop build** Claude Chat session. Claude Code
 
 ---
 
+## [2026-06-29 15:00 UTC] fix #12: collapse codex-gate's duplicate runs (concurrency) + MAX_ATTEMPTS 5→3
+- PR: direct commit to main
+- Branch: main (direct commit)
+- Status: done
+- What changed: codex-gate over-ran (~275 runs on a downstream). A Codex review fires BOTH `pull_request_review` and `pull_request_review_comment` (one per inline note), and a push fires a `pull_request` run + its head-targeted self-rerun → ~4 gate runs per review wave. STEP 1 confirmed: `on:` = pull_request/pull_request_review/pull_request_review_comment/issue_comment + workflow_dispatch(pr_number); NO top-level `concurrency` existed; `MAX_ATTEMPTS = 5` gated the self-rerun in `scheduleRerun`. Fix: (1) added a top-level **`concurrency`** block — `group: codex-gate-pr-${{ github.event.pull_request.number || github.event.inputs.pr_number || github.event.issue.number || github.run_id }}`, `cancel-in-progress: true` — so OVERLAPPING runs for the same PR cancel down to the latest authoritative one; sequential ~90s self-reruns don't overlap so they're untouched; the `|| github.run_id` fallback guarantees a non-empty group. SAFETY confirmed in code: `publishGateCheck` creates `check-codex-status` with `head_sha: headSha` (the resolved PR HEAD, fix #11), so the surviving run's find-and-update lands the check on the head — a canceled/superseded run never leaves a stale/half check. (2) Lowered **`MAX_ATTEMPTS` 5→3** (poll KEPT) — since fix #11 lands the check on the head from every run, the self-rerun's only remaining job is catching a 👍 reaction (fires no event), so 3 polls (~90s, per-head reset) suffice; updated the header comment that stated (5). Did NOT change the date-only freshness rule, P1/P2 detection, the `codex-p1-acknowledged` override, or the verdict→conclusion mapping. Both copies byte-identical.
+- Validation: actionlint clean on both copies; node --check on all 3 github-script blocks; YAML parse confirms `concurrency.group` (with the `|| run_id` non-empty fallback) + `cancel-in-progress: true`; `MAX_ATTEMPTS = 3` (no `= 5` left); the check create stays `head_sha: headSha`; `workflows/` ↔ `.github/workflows/` byte-identical (blob `c6dba57`).
+- needs-from-owner: nothing — live on main in one commit. Propagates to downstreams on the next daily sync.
+- Next: far fewer gate runs per PR (the simultaneous review/review_comment burst + push/self-rerun overlap collapse to one), and a smaller poll cap — while the verdict and the head-pinned check are unchanged. Remaining: close #38 if still open; fresh downstream sync (fixes #6–#12).
+
 ## [2026-06-29 14:00 UTC] fix #11: codex-gate publishes check-codex-status with output.title/summary (no more blank red)
 - PR: direct commit to main
 - Branch: main (direct commit)

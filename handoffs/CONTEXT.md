@@ -117,7 +117,21 @@ merged → (sync propagates updated workflows to ~14 downstream repos daily)
   fresh review.
 - **Head-targeted self-rerun (capped):** re-runs itself so a clean verdict lands
   on `pr.head.sha`; the rerun count is capped (via a workflow-specific
-  `listWorkflowRuns` lookup) so it can't loop forever.
+  `listWorkflowRuns` lookup) so it can't loop forever. **(fix #12)** `MAX_ATTEMPTS`
+  lowered **5→3** — since fix #11 lands the check on the head from every run, the
+  poll's only remaining job is catching a 👍 reaction (which fires no event), so
+  3 polls suffice. The poll is kept (not removed).
+- **Run-collapsing concurrency (fix #12):** a top-level `concurrency` block
+  (`group: codex-gate-pr-<pr#||inputs.pr_number||issue#||run_id>`,
+  `cancel-in-progress: true`) cancels OVERLAPPING gate runs for the SAME PR,
+  leaving only the latest authoritative run. A Codex review fires both
+  `pull_request_review` and `pull_request_review_comment` (one per inline note)
+  and a push fires a `pull_request` run + its self-rerun — ~4 runs/wave; this
+  collapses the simultaneous burst to one. Sequential self-reruns (~90s apart)
+  don't overlap, so they're untouched. Safe because every run publishes
+  `check-codex-status` on the PR HEAD sha (fix #11), so the surviving run's
+  find-and-update lands the check on the head — a canceled run leaves no stale
+  check. The `|| github.run_id` fallback guarantees a non-empty group key.
 - **Triggers** on `push` + review + comment events so it re-evaluates whenever
   the head or the review state changes.
 - Manual override label: `codex-p1-acknowledged`.
