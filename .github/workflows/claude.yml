@@ -22,7 +22,7 @@ on:
   pull_request_review_comment:
     types: [created]
   issues:
-    types: [labeled, assigned]
+    types: [opened, labeled, assigned]
 
 # One fix at a time per Issue/PR. cancel-in-progress: FALSE — a Claude run
 # costs money by the minute, so we must NEVER cancel one that is already
@@ -50,7 +50,8 @@ jobs:
       (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
       (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
       (github.event_name == 'issues' && github.event.action == 'assigned') ||
-      (github.event_name == 'issues' && github.event.action == 'labeled' && github.event.label.name == 'claude-fix')
+      (github.event_name == 'issues' && github.event.action == 'labeled' && github.event.label.name == 'claude-fix') ||
+      (github.event_name == 'issues' && github.event.action == 'opened' && contains(join(github.event.issue.labels.*.name, ','), 'claude-fix'))
     runs-on: ubuntu-latest
     steps:
       - name: Fail-soft check for ANTHROPIC_API_KEY
@@ -149,12 +150,11 @@ jobs:
               } catch (e) { core.info(`addLabel automerge on #${prNumber} failed (ignored): ${e.message}`); }
             }
 
-            // @claude on an existing PR (review-comment event) → label that PR.
-            if (context.payload.pull_request) { await label(context.payload.pull_request.number); return; }
-            // issue_comment on a PR (PRs are issues for that API) → label it.
-            if (context.payload.issue && context.payload.issue.pull_request) { await label(context.payload.issue.number); return; }
-            // Otherwise a claude-fix Issue: Claude opened a NEW PR that closes it
-            // (Fixes #N). Find the open PR(s) linking this issue and label them.
+            // ONLY label a PR that Claude CREATED to resolve a claude-fix Issue:
+            // Claude opened a NEW PR closing the triggering Issue (Fixes #N); find
+            // the open PR(s) linking this issue and label those. We deliberately do
+            // NOT label an arbitrary PR reached via an @claude mention — that would
+            // auto-merge any PR that merely mentions Claude (Codex P1).
             const issueNum = context.payload.issue && context.payload.issue.number;
             if (!issueNum) { core.info('No issue/PR context to label.'); return; }
             const open = await github.paginate(github.rest.pulls.list, { owner, repo, state: 'open', per_page: 100 });

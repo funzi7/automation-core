@@ -245,6 +245,16 @@ cannot push).
    **manually-run Claude Code are separate** and still work. This is exactly why
    **Codex-as-backup** (see TODO) matters — when the paid fixer is down,
    something else has to land the fix.
+10. **AUTOMATION_PAT must have the fine-grained `Actions: write` scope.** Without
+    it, `createWorkflowDispatch` (watchdog → backup-fix) and minutes-guard's
+    enable/disable calls all fail with **403 "Resource not accessible by personal
+    access token"**. This was the confirmed root cause of the backup never
+    running on PR #33: the watchdog matched and *tried* to dispatch, but the
+    dispatch 403'd and was swallowed by `core.warning`. The repo's **Workflow
+    permissions** setting (Settings → Actions) governs only the **GITHUB_TOKEN**
+    — it does **not** grant the PAT any scope. Fixing it is a manual PAT-settings
+    action; the watchdog now surfaces the failure loudly (annotation + Telegram)
+    and retries without burning an attempt until the scope is granted.
 
 ---
 
@@ -257,11 +267,11 @@ consumer of itself).
 |----------|---------------|-------|
 | `codex-auto-fix.yml` (Bridge + archive) | ✅ yes | Bridge now triggers on **P1 + P2** (P3 excluded). |
 | `codex-gate.yml` | ✅ yes | Date-only freshness; head-targeted capped self-rerun. |
-| `claude.yml` (Claude Fixer) | ✅ yes | **Paid budget currently exhausted** — automated fixer can't run. |
-| `ci-doctor.yml` | ✅ yes | Escalates to `needs-owner` only. |
+| `claude.yml` (Claude Fixer) | ✅ yes | **Paid budget currently exhausted.** Now wakes on `issues.opened` carrying `claude-fix` (not just `labeled`); `automerge` is applied ONLY to a PR Claude CREATES to close a claude-fix Issue (no longer to any PR that @-mentions Claude). |
+| `ci-doctor.yml` | ✅ yes | Escalates to `needs-owner` only. IGNORE_WORKFLOWS now also skips `Codex Backup Fix` + `Claude Fallback Watchdog` (not product CI). |
 | `merge-bot.yml` | ✅ yes | Latest-check-run-per-name dedupe; `needs-owner` hard stop; protected-path guard. |
 | `telegram-morning-report.yml` | ✅ yes (PR #31 merged) | Hub-only read-only digest; counts-only public logs; honest Telegram delivery + minutes. |
-| `claude-fallback-watchdog.yml` | ✅ yes (synced) | Fires the Codex backup when Claude times out (20 min); marker-based attempt counting; 3 → `needs-owner` + Telegram. |
+| `claude-fallback-watchdog.yml` | ✅ yes (synced) | Fires the Codex backup when Claude times out (20 min); marker-based attempt counting; 3 → `needs-owner` + Telegram. A **blocked dispatch is now loud** (`core.error` + Telegram + a `state=dispatch_failed` marker with NO `attempt=`) and does NOT burn an attempt → auto-retries each tick until the PAT scope is fixed. |
 | `codex-backup-fix.yml` | ✅ yes (synced) | Codex backup fixer via `openai/codex-action@v1`; fork guard + stale-head guard; pushes to the PR head branch (no new PR). |
 | `bootstrap.yml` | ✅ yes (hub-only) | Onboards a new repo. |
 | `minutes-guard.yml` | ✅ yes (hub-only) | Actions-minutes guard. |
@@ -305,12 +315,24 @@ never exposed).
    GitHub Actions (not Cloud, which can't push) and pushes the fix to the PR head
    branch — no new PR. Per-repo prerequisites: `OPENAI_API_KEY` + Read-and-write
    workflow permissions (see Downstream requirement above).
-4. **Clean up PR #31 before merge.** It currently carries a Codex commit that
-   **re-added the legacy escalation label**. Cleanup = keep the Issue-escalation
-   detection Codex added, but **drop the re-added label**, then merge manually
-   (it touches protected paths).
+4. **PR #31 — DONE** (merged). The morning report is live.
 5. **`main` is unprotected** — intentionally, so Claude Code can push directly.
    **Add branch protection once the loop is stable.**
+6. **Grant `AUTOMATION_PAT` the fine-grained `Actions: write` scope (MANUAL).**
+   This is the outstanding blocker for the Codex backup: without it the watchdog's
+   `createWorkflowDispatch` 403s (and minutes-guard's enable/disable too). Repo
+   Workflow-permissions does NOT cover the PAT — see Hard-Won Lesson 10.
+7. **Five loop-hardening fixes — DONE (this commit):** (1) `claude.yml` only labels
+   `automerge` on a PR Claude creates for a claude-fix Issue (not any @claude
+   mention); (2) `claude.yml` wakes on `issues.opened` carrying `claude-fix`;
+   (3) `ci-doctor.yml` ignores `Codex Backup Fix` + `Claude Fallback Watchdog`;
+   (4) watchdog makes a blocked dispatch loud + retryable (no burned attempt);
+   (5) the bridge never auto-@claude-fixes the `chore/sync-automation-core` PR
+   (fix upstream, not the downstream copy).
+8. **Next steps:** close #38 (the sync PR that tripped the breaker — its findings
+   belong upstream, now suppressed); run a **fresh sync to downstreams** so they
+   get these workflow fixes; add **idempotency to paywall-bot's Quality Monitor**
+   (it opens a self-PR per run — dedupe so it doesn't pile up report PRs).
 
 ---
 

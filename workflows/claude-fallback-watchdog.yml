@@ -126,8 +126,10 @@ jobs:
                 // keep explicit for clarity.)
                 if (claudeReq.head !== headSha) continue;
 
-                // Already fired Codex for this exact head? (any codex marker on head)
-                if (marked.some((a) => a.agent === 'codex' && a.head === headSha)) continue;
+                // Already fired Codex for this exact head? Match only a codex
+                // requested/pushed marker — a watchdog dispatch_failed marker must
+                // NOT be read as "already fired" (that would block the auto-retry).
+                if (marked.some((a) => a.agent === 'codex' && (a.state === 'requested' || a.state === 'pushed') && a.head === headSha)) continue;
 
                 // Has Claude already delivered for this head? A commit on the head
                 // authored by the Claude app AFTER the request marker. (A linked
@@ -188,7 +190,39 @@ jobs:
                     },
                   });
                 } catch (e) {
-                  core.warning(`PR #${prNumber}: failed to dispatch ${BACKUP_WORKFLOW} (ignored): ${e.message}`);
+                  // Make a blocked dispatch LOUD (root cause: createWorkflowDispatch
+                  // 403 when AUTOMATION_PAT lacks Actions: write). Do NOT burn an
+                  // attempt or escalate — leave the attempt un-marked so the watchdog
+                  // retries each tick and self-heals once the PAT scope is fixed.
+                  core.error(`PR #${prNumber}: backup dispatch failed — ${e.message}`);
+                  const tgToken = process.env.TELEGRAM_BOT_TOKEN;
+                  const tgChat = process.env.TELEGRAM_CHAT_ID;
+                  if (tgToken && tgChat) {
+                    try {
+                      await fetch(`https://api.telegram.org/bot${tgToken}/sendMessage`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                          chat_id: tgChat,
+                          text: `⚠️ ${repo} PR #${prNumber}: backup dispatch failed — ${e.message}`,
+                          disable_web_page_preview: true,
+                        }),
+                      });
+                    } catch (e2) { core.info(`Telegram failed (ignored): ${e2.message}`); }
+                  }
+                  // Dedupe the failure flag to once per head — NO attempt= field, so
+                  // it never burns an attempt and never trips the attempt counter.
+                  const alreadyFlagged = marked.some(
+                    (a) => a.agent === 'watchdog' && a.state === 'dispatch_failed' && a.head === headSha,
+                  );
+                  if (!alreadyFlagged) {
+                    try {
+                      await github.rest.issues.createComment({
+                        owner, repo, issue_number: prNumber,
+                        body: `<!-- ai-loop:v1 root_pr=${prNumber} head=${headSha} agent=watchdog state=dispatch_failed -->\nBackup dispatch was blocked (see run logs / annotations). The watchdog will retry automatically once resolved; no attempt was consumed.`,
+                      });
+                    } catch (e2) { core.info(`marker comment failed (ignored): ${e2.message}`); }
+                  }
                   continue;
                 }
                 // Record a codex/requested marker so the attempt is counted and

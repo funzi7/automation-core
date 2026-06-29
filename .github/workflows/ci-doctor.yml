@@ -69,6 +69,8 @@ jobs:
               'Sync from automation-core',
               'Codex Gate',
               'Codex Auto-Fix',
+              'Codex Backup Fix',
+              'Claude Fallback Watchdog',
             ]);
 
             const { data: repoInfo } = await github.rest.repos.get({ owner, repo });

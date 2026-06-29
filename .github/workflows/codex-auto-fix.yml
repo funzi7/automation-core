@@ -126,6 +126,25 @@ jobs:
               return;
             }
 
+            // Fix 5: NEVER auto-@claude-fix the downstream sync PR. Its Codex
+            // findings are about the UPSTREAM workflow design and must be fixed in
+            // automation-core upstream — auto-patching the downstream copy would
+            // diverge it from upstream and trip the 3-round breaker → needs-owner.
+            // Codex still reviews it; only the auto-trigger is suppressed.
+            try {
+              const { data: prData } = await github.rest.pulls.get({
+                owner, repo, pull_number: prNumber,
+              });
+              const headRef = (prData.head && prData.head.ref) || "";
+              const prTitle = prData.title || "";
+              if (headRef === 'chore/sync-automation-core' ||
+                  prTitle.startsWith('chore(automation): sync from automation-core')) {
+                core.info(`PR #${prNumber}: sync PR — auto-trigger suppressed (fix upstream, not the downstream copy).`);
+                core.setOutput("should_trigger", "false");
+                return;
+              }
+            } catch (e) { core.info(`sync-PR check failed (ignored): ${e.message}`); }
+
             const MARKER = "[auto-triggered]";
             const CODEX = "chatgpt-codex-connector[bot]";
 
