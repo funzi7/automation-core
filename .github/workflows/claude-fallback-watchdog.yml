@@ -49,6 +49,11 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Gate for the Codex backup fixer. Anything other than exactly 'true'
+          # (incl. unset) = DISABLED. Default disabled: the backup needs OpenAI
+          # quota, which is exhausted (fix #8); flip the repo/Org Actions variable
+          # CODEX_BACKUP_ENABLED to 'true' to re-enable once quota is restored.
+          CODEX_BACKUP_ENABLED: ${{ vars.CODEX_BACKUP_ENABLED }}
         with:
           # AUTOMATION_PAT so the dispatch + marker comment can trigger and
           # cross repos; GITHUB_TOKEN-authored events don't start workflows.
@@ -61,6 +66,9 @@ jobs:
             const MAX_ATTEMPTS = 3;
             const CLAUDE_APP = 'claude[bot]';     // Claude fixer commit author login
             const BACKUP_WORKFLOW = 'codex-backup-fix.yml';
+            // fix #8: only dispatch the (OpenAI-quota-dependent) Codex backup
+            // when CODEX_BACKUP_ENABLED is EXACTLY 'true'; otherwise escalate.
+            const codexBackupEnabled = process.env.CODEX_BACKUP_ENABLED === 'true';
             const dispatchRef =
               (context.payload.repository && context.payload.repository.default_branch) || 'main';
 
@@ -151,6 +159,48 @@ jobs:
 
                 // Timeout elapsed since the request?
                 if (Date.now() - claudeReq.at < TIMEOUT_MS) continue;
+
+                // fix #8: the Codex backup fixer needs OpenAI quota (currently
+                // exhausted), so it's gated OFF by default. When disabled, do NOT
+                // dispatch the dead backup — escalate to a human on the FIRST
+                // timeout instead. Re-enableable: set Actions variable
+                // CODEX_BACKUP_ENABLED='true' to restore the dispatch path.
+                if (!codexBackupEnabled) {
+                  // Escalate once per head: skip if already escalated by the
+                  // watchdog for this head, or needs-owner is already on the PR.
+                  const alreadyEscalated =
+                    marked.some((a) => a.agent === 'watchdog' && a.state === 'escalated' && a.head === headSha) ||
+                    (pr.labels || []).some((l) => (l.name || l) === LABEL_ESCALATE);
+                  if (alreadyEscalated) continue;
+                  try {
+                    await github.rest.issues.addLabels({
+                      owner, repo, issue_number: prNumber, labels: [LABEL_ESCALATE],
+                    });
+                  } catch (e) { core.info(`addLabel failed (ignored): ${e.message}`); }
+                  try {
+                    await github.rest.issues.createComment({
+                      owner, repo, issue_number: prNumber,
+                      body: `<!-- ai-loop:v1 root_pr=${prNumber} head=${headSha} agent=watchdog state=escalated -->\nClaude didn't fix PR #${prNumber} within the timeout and the autonomous backup is disabled (no OpenAI quota) — needs a manual fix.`,
+                    });
+                  } catch (e) { core.info(`escalation comment failed (ignored): ${e.message}`); }
+                  const tgToken = process.env.TELEGRAM_BOT_TOKEN;
+                  const tgChat = process.env.TELEGRAM_CHAT_ID;
+                  if (tgToken && tgChat) {
+                    try {
+                      await fetch(`https://api.telegram.org/bot${tgToken}/sendMessage`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                          chat_id: tgChat,
+                          text: `🚨 ${repo} PR #${prNumber}: Claude didn't fix in time and the backup is disabled — escalated to needs-owner.`,
+                          disable_web_page_preview: true,
+                        }),
+                      });
+                    } catch (e) { core.info(`Telegram failed (ignored): ${e.message}`); }
+                  }
+                  core.warning(`PR #${prNumber}: Claude timed out and the Codex backup is disabled — escalated to needs-owner.`);
+                  continue;
+                }
 
                 // 3-attempt cap reached → escalate, do NOT fire Codex.
                 if (maxAttempt >= MAX_ATTEMPTS) {

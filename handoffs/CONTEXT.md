@@ -274,6 +274,22 @@ cannot push).
     MultiEdit) + told the fixer to stay inside the allowlist and treat CI as the
     final validation. The fixer can already commit+push via Edit+git, so a
     broader command allowlist adds little marginal risk.
+13. **OpenAI quota is exhausted → Codex BACKUP is dead → Claude is the sole
+    autonomous fixer.** `openai/codex-action` fails with "Quota exceeded" (see the
+    #49 maiden run), so the watchdog must NOT keep dispatching the dead backup.
+    Fix #8 gates the dispatch on the Actions variable `CODEX_BACKUP_ENABLED`
+    (must be EXACTLY `'true'`; default/unset = disabled): when disabled the
+    watchdog escalates to `needs-owner` on the first timeout instead. Re-enable by
+    restoring OpenAI quota AND setting `CODEX_BACKUP_ENABLED='true'`. NOTE: Codex
+    REVIEW (the GitHub App that posts P1/P2 on PRs) is a SEPARATE OpenAI surface
+    from codex-action; if Codex review also lapses on quota, the Codex Gate would
+    sit pending (fail-closed) — monitor, and use the `codex-p1-acknowledged`
+    override if review stops entirely.
+14. **`IGNORE_WORKFLOWS` (ci-doctor) must list EVERY automation/infra workflow
+    `name:`, not just the loop ones.** Missing `Minutes Guard` / `Bootstrap repos`
+    / `Loop Morning Report` (fix #9) meant their infra failures opened noisy
+    `claude-fix` issues. Match the exact `name:` field, and add any NEW infra
+    workflow to the set when you create it.
 
 ---
 
@@ -287,11 +303,11 @@ consumer of itself).
 | `codex-auto-fix.yml` (Bridge + archive) | ✅ yes | Bridge now triggers on **P1 + P2** (P3 excluded). |
 | `codex-gate.yml` | ✅ yes | Date-only freshness; head-targeted capped self-rerun. |
 | `claude.yml` (Claude Fixer) | ✅ yes | **Paid budget currently exhausted.** Now wakes on `issues.opened` carrying `claude-fix` (not just `labeled`); `automerge` is applied ONLY to a PR Claude CREATES to close a claude-fix Issue (no longer to any PR that @-mentions Claude). |
-| `ci-doctor.yml` | ✅ yes | Escalates to `needs-owner` only. IGNORE_WORKFLOWS now also skips `Codex Backup Fix` + `Claude Fallback Watchdog` (not product CI). |
+| `ci-doctor.yml` | ✅ yes | Escalates to `needs-owner` only. IGNORE_WORKFLOWS skips ALL automation/infra workflows: Codex Backup Fix, Claude Fallback Watchdog, **Minutes Guard, Bootstrap repos, Loop Morning Report** (fix #9) — so their failures don't open noisy claude-fix issues. |
 | `merge-bot.yml` | ✅ yes | Latest-check-run-per-name dedupe; `needs-owner` hard stop; protected-path guard. |
 | `telegram-morning-report.yml` | ✅ yes (PR #31 merged) | Hub-only read-only digest; counts-only public logs; honest Telegram delivery + minutes. |
-| `claude-fallback-watchdog.yml` | ✅ yes (synced) | Fires the Codex backup when Claude times out (20 min); marker-based attempt counting; 3 → `needs-owner` + Telegram. A **blocked dispatch is now loud** (`core.error` + Telegram + a `state=dispatch_failed` marker with NO `attempt=`) and does NOT burn an attempt → auto-retries each tick until the PAT scope is fixed. |
-| `codex-backup-fix.yml` | ✅ yes (synced) | Codex backup fixer via `openai/codex-action@v1`; fork guard + stale-head guard; pushes to the PR head branch (no new PR). |
+| `claude-fallback-watchdog.yml` | ✅ yes (synced) | On Claude timeout: dispatches the Codex backup **only when `vars.CODEX_BACKUP_ENABLED=='true'`** (fix #8; default disabled → escalates to `needs-owner` on first timeout instead). Marker-based attempt counting; 3 → `needs-owner` + Telegram. Blocked dispatch stays loud (`core.error` + Telegram + `state=dispatch_failed` marker, no burned attempt). |
+| `codex-backup-fix.yml` | ⏸️ present but **DORMANT** (synced) | Codex backup fixer via `openai/codex-action@v1`; fork guard + stale-head guard; pushes to the PR head branch. **Disabled by default** — needs OpenAI quota (currently exhausted: "Quota exceeded") AND `CODEX_BACKUP_ENABLED='true'`. Left in place, re-enableable. |
 | `bootstrap.yml` | ✅ yes (hub-only) | Onboards a new repo. |
 | `minutes-guard.yml` | ✅ yes (hub-only) | Actions-minutes guard. |
 
@@ -359,9 +375,20 @@ never exposed).
     churns, no PR). Raised `--max-turns` 20→50 and broadened `--allowedTools`
     (`Bash(git:*)` + interpreters/inspectors + MultiEdit), plus a prompt line to
     stay inside the allowlist and treat CI as final validation. See Lesson 12.
-11. **Next steps:** close #38 (the sync PR that tripped the breaker — its findings
+11. **Fix #8 — DONE (this commit):** OpenAI quota is exhausted → the Codex backup
+    is dead. The watchdog now dispatches it ONLY when `vars.CODEX_BACKUP_ENABLED
+    == 'true'` (default disabled); when disabled it escalates to `needs-owner` on
+    the first timeout instead of dispatching a dead backup. `codex-backup-fix.yml`
+    left in place, dormant + re-enableable. See Lesson 13.
+12. **Fix #9 — DONE (this commit):** added `Minutes Guard`, `Bootstrap repos`,
+    `Loop Morning Report` to ci-doctor's `IGNORE_WORKFLOWS`. See Lesson 14.
+13. **Re-enable Codex backup when OpenAI quota returns:** restore OpenAI billing,
+    then set Actions variable `CODEX_BACKUP_ENABLED='true'`. Until then Claude
+    (Anthropic budget OK) is the sole autonomous fixer; watch that Codex *review*
+    doesn't also lapse on quota (would leave the gate pending).
+14. **Next steps:** close #38 (the sync PR that tripped the breaker — its findings
     belong upstream, now suppressed); run a **fresh sync to downstreams** so they
-    pick up these workflow fixes (fix #6 + fix #7).
+    pick up these workflow fixes (fix #6 + #7 + #8 + #9).
 
 ---
 

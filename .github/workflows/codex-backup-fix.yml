@@ -7,11 +7,19 @@ name: Codex Backup Fix
 # pushes it directly to the EXISTING PR head branch (no new PR; merge-bot needs
 # no change). Codex then auto-reviews the new head and the Codex Gate re-checks.
 #
+# DORMANT BY DEFAULT (fix #8): the watchdog only dispatches this workflow when the
+# Actions variable CODEX_BACKUP_ENABLED is EXACTLY 'true'. It is off by default
+# because the OpenAI quota is currently exhausted (codex-action fails with "Quota
+# exceeded"); while off, the watchdog escalates to needs-owner instead. The file
+# is intentionally LEFT IN PLACE so it can be re-enabled by (a) restoring OpenAI
+# quota and (b) setting CODEX_BACKUP_ENABLED='true'.
+#
 # PREREQUISITES (PER-REPO — `sync` does NOT copy secrets or Actions settings):
-#   - secret OPENAI_API_KEY on the repo.
+#   - secret OPENAI_API_KEY on the repo (WITH available OpenAI quota/billing).
+#   - Actions variable CODEX_BACKUP_ENABLED = 'true' (else the watchdog won't dispatch).
 #   - Settings → Actions → General → Workflow permissions = Read and write.
-# Without these the run fails-soft / cannot push; that is expected on a repo that
-# has not opted into Codex fallback.
+# Without these the run fails-soft / cannot push / is never dispatched; that is
+# expected on a repo that has not opted into Codex fallback.
 #
 # SECURITY (public repo): fork PRs are NEVER run through the agent (secrets must
 # not be exposed to fork code) — Job 1 stops and escalates to needs-owner.

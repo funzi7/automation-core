@@ -71,6 +71,9 @@ jobs:
               'Codex Auto-Fix',
               'Codex Backup Fix',
               'Claude Fallback Watchdog',
+              'Minutes Guard',
+              'Bootstrap repos',
+              'Loop Morning Report',
             ]);
 
             const { data: repoInfo } = await github.rest.repos.get({ owner, repo });

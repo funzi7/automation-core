@@ -17,6 +17,15 @@ Handoff log for the **self-healing-loop build** Claude Chat session. Claude Code
 
 ---
 
+## [2026-06-29 12:00 UTC] fix #8 + #9: gate the dead Codex backup behind CODEX_BACKUP_ENABLED + ci-doctor ignores all infra workflows
+- PR: direct commit to main
+- Branch: main (direct commit)
+- Status: done
+- What changed: **Fix #8 (watchdog):** the Codex backup (`codex-backup-fix.yml`) is dead — OpenAI quota exhausted (maiden run on paywall-bot #49 failed `ERROR: Quota exceeded`). `claude-fallback-watchdog.yml` now reads the Actions variable `CODEX_BACKUP_ENABLED` (passed via step `env`); only EXACTLY `'true'` enables dispatch, anything else (incl. unset) = DISABLED (default). When DISABLED, on the FIRST timeout the watchdog does NOT dispatch the dead backup — it escalates: adds `needs-owner` (deduped against a prior `agent=watchdog state=escalated` marker for the head OR an existing `needs-owner` label), posts the "Claude didn't fix PR #N within the timeout and the autonomous backup is disabled (no OpenAI quota) — needs a manual fix." comment, and sends a counts-only Telegram alert (fail-soft). The ENABLED path (incl. the 3-attempt marker cap and the loud dispatch-failure handling) is unchanged. `codex-backup-fix.yml` is left in place but DORMANT; its top comment now documents it needs OpenAI quota + `CODEX_BACKUP_ENABLED='true'`. **Fix #9 (ci-doctor):** added `Minutes Guard`, `Bootstrap repos`, `Loop Morning Report` to `IGNORE_WORKFLOWS` (verified against each workflow's `name:`), so infra-workflow failures no longer open noisy `claude-fix` issues. Both copies of all three edited workflows kept byte-identical.
+- Validation: actionlint clean on both copies of claude-fallback-watchdog.yml + ci-doctor.yml + codex-backup-fix.yml; node --check on the two touched github-script blocks; a 6-case gate self-test (unset/`false`/`TRUE`/already-escalated → escalate or skip; `true` → dispatch; `true`+3cap → cap-escalate) all pass; `workflows/` ↔ `.github/workflows/` byte-identical (watchdog `f59e015`, ci-doctor `649e23c`, backup `b8f40d8`).
+- needs-from-owner: nothing required to land — live on main in one commit. To re-enable the backup LATER: restore OpenAI quota + set `CODEX_BACKUP_ENABLED='true'`.
+- Next: Claude (Anthropic budget OK, fix #7) is the sole autonomous fixer; the watchdog escalates cleanly when it times out instead of dispatching a dead backup. Watch that Codex *review* doesn't also lapse on OpenAI quota (would leave the gate pending — use `codex-p1-acknowledged` override if so). Remaining: close #38, fresh downstream sync (fixes #6–#9).
+
 ## [2026-06-29 10:00 UTC] fix #7: claude.yml fixer — raise --max-turns 20→50 + broaden allowedTools (stop error_max_turns)
 - PR: direct commit to main
 - Branch: main (direct commit)
