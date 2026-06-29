@@ -123,6 +123,59 @@ jobs:
             If triggered by an @claude mention, follow the request in the
             comment, working on a branch and opening a PR the same way.
 
+      - name: Swap 👀 → 👎 on a failed fix
+        # fix #10: when the Claude step actually RAN but did NOT succeed, change
+        # the triggering comment's reaction from 👀 (eyes = "in progress", added
+        # by claude-code-action) to 👎, so a failed run doesn't look like it's
+        # still checking. Reaction only — no noisy comment. Gated on has_key so a
+        # fail-soft no-ANTHROPIC_API_KEY skip (not a failure) isn't 👎'd. Fully
+        # fail-soft: a reaction error must NEVER fail the job. Skips Issue events
+        # (issues.opened/labeled) that carry no triggering comment id.
+        if: ${{ always() && steps.keycheck.outputs.has_key == 'true' && steps.claude.outcome != 'success' }}
+        uses: actions/github-script@v7
+        with:
+          # Same token the action used to add the 👀, so the bot actor matches.
+          github-token: ${{ secrets.AUTOMATION_PAT || github.token }}
+          script: |
+            try {
+              const commentId = context.payload.comment && context.payload.comment.id;
+              if (!commentId) {
+                core.info('No triggering comment id (Issue event) — nothing to react on.');
+                return;
+              }
+              const owner = context.repo.owner;
+              const repo = context.repo.repo;
+              // issue_comment and pull_request_review_comment use DIFFERENT
+              // reaction endpoints — pick by the event name.
+              const isReviewComment = context.eventName === 'pull_request_review_comment';
+              const listReactions = isReviewComment
+                ? github.rest.reactions.listForPullRequestReviewComment
+                : github.rest.reactions.listForIssueComment;
+              const deleteReaction = isReviewComment
+                ? github.rest.reactions.deleteForPullRequestComment
+                : github.rest.reactions.deleteForIssueComment;
+              const createReaction = isReviewComment
+                ? github.rest.reactions.createForPullRequestReviewComment
+                : github.rest.reactions.createForIssueComment;
+              // Remove the bot's own existing 👀, then add 👎.
+              const me = await github.rest.users.getAuthenticated()
+                .then((r) => r.data.login).catch(() => null);
+              const reactions = await github.paginate(listReactions, {
+                owner, repo, comment_id: commentId, per_page: 100,
+              });
+              for (const rx of reactions) {
+                if (rx.content === 'eyes' && (!me || (rx.user && rx.user.login === me))) {
+                  try {
+                    await deleteReaction({ owner, repo, comment_id: commentId, reaction_id: rx.id });
+                  } catch (e) { core.info(`delete 👀 failed (ignored): ${e.message}`); }
+                }
+              }
+              await createReaction({ owner, repo, comment_id: commentId, content: '-1' });
+              core.info(`Swapped 👀 → 👎 on comment ${commentId} (failed fix).`);
+            } catch (e) {
+              core.info(`reaction swap failed (ignored): ${e.message}`);
+            }
+
       - name: Label Claude's PR for auto-merge
         # P1 fix: only label when Claude Code actually RAN AND SUCCEEDED. With
         # always() this labeled PRs even on a failed/cancelled run, so a PR

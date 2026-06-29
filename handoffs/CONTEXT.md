@@ -386,9 +386,16 @@ never exposed).
     then set Actions variable `CODEX_BACKUP_ENABLED='true'`. Until then Claude
     (Anthropic budget OK) is the sole autonomous fixer; watch that Codex *review*
     doesn't also lapse on quota (would leave the gate pending).
-14. **Next steps:** close #38 (the sync PR that tripped the breaker — its findings
+14. **Fix #10 — DONE (this commit):** when `claude.yml`'s fixer RAN but did not
+    succeed, a new fail-soft step swaps the triggering comment's reaction from 👀
+    (eyes, "in progress") to 👎, so a failed run no longer looks like it's still
+    checking. github-script, gated `always() && has_key=='true' && claude.outcome
+    != 'success'`; picks the issue- vs review-comment reaction endpoint by event
+    name; deletes the bot's 👀 then adds 👎; no-ops on Issue events with no
+    comment id; never fails the job.
+15. **Next steps:** close #38 (the sync PR that tripped the breaker — its findings
     belong upstream, now suppressed); run a **fresh sync to downstreams** so they
-    pick up these workflow fixes (fix #6 + #7 + #8 + #9).
+    pick up these workflow fixes (fix #6 + #7 + #8 + #9 + #10).
 
 ---
 

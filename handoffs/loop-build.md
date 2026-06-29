@@ -17,6 +17,15 @@ Handoff log for the **self-healing-loop build** Claude Chat session. Claude Code
 
 ---
 
+## [2026-06-29 13:00 UTC] fix #10: claude.yml swaps the triggering comment's 👀 → 👎 on a failed fix
+- PR: direct commit to main
+- Branch: main (direct commit)
+- Status: done
+- What changed: Added a fail-soft github-script step to `claude.yml` AFTER the `claude` step that runs when the fixer RAN but did not succeed (`if: always() && steps.keycheck.outputs.has_key == 'true' && steps.claude.outcome != 'success'` — the `has_key` guard keeps a fail-soft no-ANTHROPIC_API_KEY skip, which isn't a failure, from being 👎'd). It reads `context.payload.comment.id` (present for `issue_comment` AND `pull_request_review_comment`; absent on `issues.opened/labeled` → no-op), picks the correct reaction endpoint by `context.eventName` (issue-comment vs PR-review-comment list/delete/create differ), deletes the bot-authored `eyes` reaction (matched via `users.getAuthenticated`, falling back to any `eyes` if that lookup fails), then adds a `-1` (👎). Uses the same `AUTOMATION_PAT || github.token` the action used to add the 👀, so the bot actor matches. Whole thing wrapped in try/catch — a reaction error NEVER fails the job; no extra comment is posted. Both copies byte-identical.
+- Validation: actionlint clean on both copies; node --check on the new github-script block (and the existing label block); `workflows/` ↔ `.github/workflows/` byte-identical (blob `ed6dc67`).
+- needs-from-owner: nothing — live on main in one commit. Propagates to downstreams on the next daily sync.
+- Next: a failed autonomous fix now reads as 👎 on the triggering comment instead of a stale 👀; combined with fix #8 the watchdog also escalates to `needs-owner` on timeout. Remaining: close #38, fresh downstream sync (fixes #6–#10).
+
 ## [2026-06-29 12:00 UTC] fix #8 + #9: gate the dead Codex backup behind CODEX_BACKUP_ENABLED + ci-doctor ignores all infra workflows
 - PR: direct commit to main
 - Branch: main (direct commit)
