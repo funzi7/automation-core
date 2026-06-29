@@ -264,6 +264,16 @@ cannot push).
     mirrors `p1Pattern` against the same `P2-yellow` badge the bridge keys on, so
     the two always agree on "what is an active P2". Rule of thumb: any severity
     the bridge auto-fixes, the gate must also block on.
+12. **`error_max_turns` + a high `permission_denials_count` in claude-code-action's
+    result = the allowlist is too narrow and/or `--max-turns` is too low.** On
+    paywall-bot #49 the fixer spent $0.77 over 21 turns with **11 permission
+    denials** — it kept trying tools OUTSIDE its narrow `--allowedTools` list,
+    burned the 20-turn cap on denial churn, and never opened a fix PR. Fix #7
+    raised `--max-turns` 20→50 and broadened the allowlist (`Bash(git:*)`,
+    python/python3/pytest/pip/node/npm, ls/cat/find/head/tail/sed/mkdir/cp/mv,
+    MultiEdit) + told the fixer to stay inside the allowlist and treat CI as the
+    final validation. The fixer can already commit+push via Edit+git, so a
+    broader command allowlist adds little marginal risk.
 
 ---
 
@@ -344,9 +354,14 @@ never exposed).
    gate-block severity now matches the bridge-trigger severity. Closes Codex #48.
 9. **paywall-bot Quality Monitor pileup — DONE** (rolling Issue + cleanup; PR #49,
    Issue #50). Owner-driven by default (`ROUTE_FINDINGS_TO_AUTOFIX=False`).
-10. **Next steps:** close #38 (the sync PR that tripped the breaker — its findings
+10. **Fix #7 — DONE (this commit):** `claude.yml`'s fixer was failing
+    `error_max_turns` (paywall-bot #49: 20-turn cap exhausted by 11 tool-denial
+    churns, no PR). Raised `--max-turns` 20→50 and broadened `--allowedTools`
+    (`Bash(git:*)` + interpreters/inspectors + MultiEdit), plus a prompt line to
+    stay inside the allowlist and treat CI as final validation. See Lesson 12.
+11. **Next steps:** close #38 (the sync PR that tripped the breaker — its findings
     belong upstream, now suppressed); run a **fresh sync to downstreams** so they
-    pick up these workflow fixes.
+    pick up these workflow fixes (fix #6 + fix #7).
 
 ---
 

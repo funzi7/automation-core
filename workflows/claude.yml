@@ -82,20 +82,20 @@ jobs:
           github_token: ${{ secrets.AUTOMATION_PAT || github.token }}
           trigger_phrase: "@claude"
           label_trigger: "claude-fix"
-          # --max-turns 20 caps cost (most fixes need far fewer than 35).
-          # FINAL, minimal allowlist — this is intentionally the smallest set
-          # that still lets the fixer diagnose, edit, run actionlint, and push
-          # its branch / open a PR. Deliberately EXCLUDED to stop the
-          # shrink-the-allowlist loop and close prompt-injection vectors: bare
-          # `Bash`, broad `Bash(git:*)`, arbitrary interpreters / script
-          # runners (python/node/npm/pnpm/yarn/pip/make/go/cargo), and
-          # `gh api`. git scoped per-subcommand; `git push` is kept because the
-          # fixer must push its own branch. gh limited to pr/issue. If the
-          # fixer needs something not listed it will fail and land on
-          # needs-owner — preferable to an endless allowlist loop.
+          # --max-turns 50 + a BROAD allowlist (fix #7). The previous
+          # --max-turns 20 + narrow per-subcommand list caused error_max_turns
+          # on paywall-bot #49: the fixer kept trying tools OUTSIDE the allowlist
+          # (11 permission_denials), burning all 20 turns on denial churn without
+          # opening a fix PR. Now: 50 turns; broad `Bash(git:*)`; the common
+          # interpreters/inspectors a fix needs (python/python3/pytest/pip/node/
+          # npm + ls/cat/find/head/tail/sed/mkdir/cp/mv); plus MultiEdit. gh
+          # stays limited to pr/issue. SECURITY: the fixer can already commit +
+          # push code via Edit + git, so a broader COMMAND allowlist adds little
+          # marginal risk; tighten if desired. The PR's CI (codex-gate) remains
+          # the real validation gate.
           claude_args: |
-            --max-turns 20
-            --allowedTools "Read,Glob,Grep,Edit,Write,Bash(git status),Bash(git diff),Bash(git log),Bash(git add:*),Bash(git commit:*),Bash(git checkout:*),Bash(git branch:*),Bash(git fetch:*),Bash(git push:*),Bash(gh pr:*),Bash(gh issue:*),Bash(actionlint)"
+            --max-turns 50
+            --allowedTools "Read,Glob,Grep,Edit,Write,MultiEdit,Bash(git:*),Bash(python:*),Bash(python3:*),Bash(pytest:*),Bash(pip:*),Bash(node:*),Bash(npm:*),Bash(ls:*),Bash(cat:*),Bash(find:*),Bash(head:*),Bash(tail:*),Bash(sed:*),Bash(mkdir:*),Bash(cp:*),Bash(mv:*),Bash(gh pr:*),Bash(gh issue:*),Bash(actionlint)"
           additional_permissions: |
             actions: read
           prompt: |
@@ -117,6 +117,8 @@ jobs:
                  explains the root cause and the fix.
               5. Do NOT merge the PR yourself — codex-gate reviews it and
                  merge-bot merges once everything is green.
+
+            Prefer the allowed tools and do NOT attempt tools outside the allowlist (denied calls waste your turn budget); the PR's CI (codex-gate) is the final validation, so do not block on running the full suite locally if the sandbox can't.
 
             If triggered by an @claude mention, follow the request in the
             comment, working on a branch and opening a PR the same way.

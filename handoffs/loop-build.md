@@ -17,6 +17,15 @@ Handoff log for the **self-healing-loop build** Claude Chat session. Claude Code
 
 ---
 
+## [2026-06-29 10:00 UTC] fix #7: claude.yml fixer — raise --max-turns 20→50 + broaden allowedTools (stop error_max_turns)
+- PR: direct commit to main
+- Branch: main (direct commit)
+- Status: done
+- What changed: `claude.yml`'s autonomous fixer was failing with **`error_max_turns`** — confirmed on paywall-bot #49: $0.77 spent over 21 turns with **11 permission_denials**, the fixer repeatedly tried tools OUTSIDE its narrow `--allowedTools` allowlist, burned the 20-turn cap on denial churn, and never opened a fix PR (budget was NOT the problem; ANTHROPIC_API_KEY set, token had write). Two root causes: turn cap too low AND allowlist too narrow. Fix: (1) `--max-turns 20 → 50`; (2) broadened `--allowedTools` — kept `Read,Glob,Grep,Edit,Write`, **added `MultiEdit`**, replaced the per-subcommand `Bash(git ...)` entries with broad **`Bash(git:*)`**, and added `Bash(python:*)`/`python3`/`pytest`/`pip`/`node`/`npm` + `ls`/`cat`/`find`/`head`/`tail`/`sed`/`mkdir`/`cp`/`mv`, keeping `Bash(gh pr:*)`/`Bash(gh issue:*)`/`Bash(actionlint)`; (3) added a prompt line: prefer the allowed tools, don't attempt tools outside the allowlist (denied calls waste turns), and treat the PR's CI (codex-gate) as the final validation rather than blocking on a local full-suite run; (4) rewrote the comment block above `claude_args` to explain the new cap + allowlist + WHY (the #49 denial-churn), with a one-line security note (the fixer can already commit+push via Edit+git, so a broader command allowlist adds little marginal risk). Both copies byte-identical.
+- Validation: actionlint clean on both copies; YAML parse confirms `claude_args` quoting/escaping is clean and `--allowedTools` is a single well-formed quoted string (`--max-turns 50` present; MultiEdit + `Bash(git:*)` + interpreters present; old per-subcommand git entries removed); `workflows/` ↔ `.github/workflows/` byte-identical (blob `c6533d3`).
+- needs-from-owner: nothing — live on main in one commit (handoff + LOOP_STATE + CONTEXT in the same commit). Propagates to downstreams on the next daily sync.
+- Next: with 50 turns + a broad allowlist, the fixer should land real fix PRs instead of dying on denial churn; combined with fix #6 (gate blocks P1+P2) and fix #4 (loud watchdog) the loop can self-heal once `AUTOMATION_PAT` has `Actions: write`. Remaining: close #38, fresh downstream sync.
+
 ## [2026-06-29 09:00 UTC] fix #6: Codex Gate blocks on active P2 too (closes Codex #48 merge-before-fix race)
 - PR: direct commit to main
 - Branch: main (direct commit)
