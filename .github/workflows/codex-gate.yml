@@ -238,10 +238,17 @@ jobs:
 
             // fix #11: publish the `check-codex-status` check-run WITH output text
             // so a red gate shows WHY (the empty-output blank-red-square problem).
-            // The JOB is now `codex-gate`; this explicit check-run keeps the exact
-            // name merge-bot reads (checks.listForRef → 'check-codex-status').
-            // Find-and-update keeps one per head. FAIL-SOFT: a publish error is
-            // purely cosmetic and must NEVER change the job's own verdict/conclusion.
+            // The JOB is `codex-gate` (NO `name: check-codex-status` — that would
+            // create a SECOND, same-named job-status check; fix #14). This explicit
+            // check-run is the ONLY one named `check-codex-status` — the exact name
+            // merge-bot reads (checks.listForRef). Find-and-update keeps one per head.
+            // fix #14: the publish is NO LONGER "cosmetic". On a downgraded
+            // checks:write token (forked / Dependabot runs) the create/update FAILS,
+            // leaving NO `check-codex-status` while merge-bot still requires it — a
+            // silently-unmergeable PR. So a failure is recorded in `publishFailed`
+            // and fails the `codex-gate` JOB CLOSED + VISIBLE (red) below, rather
+            // than passing green with the required check missing.
+            let publishFailed = false;
             async function publishGateCheck(headSha, conclusion, title, summary) {
               try {
                 const existing = await github.paginate(github.rest.checks.listForRef, {
@@ -258,7 +265,9 @@ jobs:
                   await github.rest.checks.create({ ...body, name: 'check-codex-status', head_sha: headSha });
                 }
               } catch (e) {
-                core.info(`publishGateCheck failed (ignored, cosmetic): ${e.message}`);
+                // fix #14: do NOT silently pass — record it so the job fails closed.
+                publishFailed = true;
+                core.error(`explicit check-codex-status publish failed (downgraded checks:write?): ${e.message}`);
               }
             }
 
@@ -481,14 +490,26 @@ jobs:
             core.summary.addHeading('Codex Gate Results').addList(results).write();
             results.forEach(r => core.info(r));
 
-            if (anyBlocked) {
-              core.setFailed(
-                'Blocked by Codex Gate: an active P1 or P2 is unresolved, or Codex has not reviewed the current head yet.\n' +
-                'Resolve by one of:\n' +
-                '  1. Wait — Codex reviews automatically on every push; the gate self-reruns on the head (max 5 attempts, ~90s apart) and goes green once Codex posts any signal with no active P1/P2.\n' +
-                '  2. Push a fix commit — P1/P2s raised before it become stale and clear automatically.\n' +
-                '  3. Add label "codex-p1-acknowledged" to override.'
-              );
+            // fix #14: fail the `codex-gate` job CLOSED when the verdict blocks
+            // OR the explicit `check-codex-status` publish failed. Succeed only
+            // when the verdict is clear AND the check actually published — so a
+            // downgraded-token run (missing required check) is a VISIBLE red
+            // `codex-gate`, never a green job hiding an unmergeable PR.
+            if (anyBlocked || publishFailed) {
+              let msg = '';
+              if (anyBlocked) {
+                msg +=
+                  'Blocked by Codex Gate: an active P1 or P2 is unresolved, or Codex has not reviewed the current head yet.\n' +
+                  'Resolve by one of:\n' +
+                  '  1. Wait — Codex reviews automatically on every push; the gate self-reruns on the head (max 3 attempts, ~90s apart) and goes green once Codex posts any signal with no active P1/P2.\n' +
+                  '  2. Push a fix commit — P1/P2s raised before it become stale and clear automatically.\n' +
+                  '  3. Add label "codex-p1-acknowledged" to override.\n';
+              }
+              if (publishFailed) {
+                msg +=
+                  'The explicit `check-codex-status` check could not be published (downgraded checks:write on a forked/Dependabot run?). Failing `codex-gate` CLOSED so the missing required check is visibly red, not a silent green pass.';
+              }
+              core.setFailed(msg);
             }
 
       # always(): the evaluate step calls core.setFailed() whenever it blocks,

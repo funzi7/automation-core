@@ -102,9 +102,20 @@ merged → (sync propagates updated workflows to ~14 downstream repos daily)
   on the PR head, find-and-update so there's one per head) carrying
   `output.title`/`summary` — so a red gate shows WHY instead of a blank red
   square: 🟡 "Waiting for Codex review" (pending), 🔴 "Active Codex P1/P2"
-  (blocked), 🟢 "Reviewed — clear" (green). The GREEN/RED **logic is unchanged**;
-  publishing is fail-soft (a cosmetic output error never flips the verdict). The
-  check NAME stays exactly `check-codex-status` (merge-bot reads it).
+  (blocked), 🟢 "Reviewed — clear" (green). The GREEN/RED verdict **logic is
+  unchanged**. The check NAME stays exactly `check-codex-status` (merge-bot reads
+  it). **(fix #14) Single producer + fail-closed publish:** the job has **no
+  `name: check-codex-status`** line (that would make the job-status check ALSO
+  `check-codex-status` — a duplicate; a downstream copy had wrongly added it), so
+  the job-status check is `codex-gate` and the EXPLICIT publish is the ONLY
+  `check-codex-status` on the head. The publish is **no longer treated as cosmetic**:
+  if `checks.create`/`update` throws (a downgraded `checks:write` token on a
+  forked/Dependabot run leaves no required check while merge-bot still needs it),
+  the job records `publishFailed` and **`codex-gate` fails CLOSED + VISIBLE
+  (red)** — `core.setFailed` fires when the verdict blocks OR the publish failed,
+  so the job goes green only when the verdict is clear AND the check actually
+  published. This resolves Codex's sync-PR "Restore the fallback gate check name"
+  finding WITHOUT re-adding the duplicate name.
 - **GREEN requires BOTH:** (a) Codex has **reviewed the current head**, and
   (b) there is **no ACTIVE P1 and no ACTIVE P2** (matching the bridge's
   trigger severity — see fix #6 / Hard-Won Lesson 11). P3 never blocks.

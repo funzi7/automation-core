@@ -17,6 +17,15 @@ Handoff log for the **self-healing-loop build** Claude Chat session. Claude Code
 
 ---
 
+## [2026-06-30 11:00 UTC] fix #14: kill the duplicate check-codex-status + make the explicit publish fail closed
+- PR: direct commit to main
+- Branch: main (direct commit)
+- Status: done
+- What changed: Resolves the verification caveat (two `check-codex-status` check-runs per head) AND Codex's sync-PR finding "Restore the fallback gate check name". **STEP 1 (report):** in automation-core the codex-gate job KEY is `codex-gate` with **NO `name: check-codex-status`** line — the duplicate `name:` was a DOWNSTREAM-only divergence (paywall-bot's sync PR added it to "restore the fallback name", which created the duplicate). Repo-wide grep confirms **nothing references the job by `check-codex-status` via `needs:`/required-checks** — every hit is the CHECK name via `checks.listForRef` (merge-bot / telegram-morning-report) or doc comments. So removal/keeping-clean is safe; the sync will overwrite the downstream `name:` hack. **STEP 2:** no `name:` line to remove upstream (already single-producer); confirmed the job-status check is `codex-gate`, leaving the explicit publish as the ONLY `check-codex-status`. **STEP 3 (the real change — fail closed + visible):** `publishGateCheck` no longer swallows errors as "cosmetic" — on a thrown create/update (downgraded `checks:write` on forked/Dependabot runs) it sets `publishFailed=true` + `core.error(...)`; the final block now `core.setFailed(...)` when **the verdict blocks OR `publishFailed`**, so the job is green only when the verdict is clear AND the check actually published. A downgraded run (missing required check merge-bot needs) is now a VISIBLE red `codex-gate` instead of a green job hiding an unmergeable PR. The explicit check's own conclusion still equals the verdict (🟢/🔴/🟡). Also corrected a stale "max 5 attempts" → "max 3" in the blocked message. Did NOT change the freshness rule, P1/P2 detection, concurrency, or MAX_ATTEMPTS. Both copies byte-identical.
+- Validation: actionlint clean on both copies; node --check on all 3 github-script blocks; a 4-case fail-closed self-test (green+published→pass; blocked→fail; green+publish-FAILED→fail; blocked+publish-FAILED→fail); confirmed exactly one explicit `check-codex-status` producer + the job has no `name:` line; `workflows/` ↔ `.github/workflows/` byte-identical (blob `fc48ba2`).
+- needs-from-owner: nothing — live on main in one commit. Propagates to downstreams on the next daily sync (which also removes paywall-bot's downstream `name:` duplicate hack).
+- Next: exactly one `check-codex-status` per head (the explicit one) + a separate `codex-gate` job-status check; a downgraded-token publish failure fails the gate visibly red. Remaining: nothing outstanding in the loop.
+
 ## [2026-06-29 16:00 UTC] fix #13: bridge inlines the Codex P1/P2 finding text into the @claude fix comment
 - PR: direct commit to main
 - Branch: main (direct commit)
