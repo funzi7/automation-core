@@ -305,16 +305,58 @@ jobs:
             const headSha = prCommits.length
               ? prCommits[prCommits.length - 1].sha
               : "";
+
+            // fix #13: build a SELF-CONTAINED findings digest from the
+            // already-fetched Codex notes. Claude's run context CANNOT read inline
+            // review threads (gh/GraphQL fail on a statusCheckRollup perm error),
+            // so inline the actual P1/P2 text into the @claude fix comment. Reuse
+            // the same P1/P2 substring + freshness (onHead) — no new severity logic.
+            const onHeadDate = (d) => !!d && new Date(d) > latestCommitDate;
+            const isP12 = (b) => !!b && (b.includes("P1") || b.includes("P2"));
+            const digestBullets = [];
+            for (const c of reviewComments) {
+              if (c.user?.login === CODEX && isP12(c.body) && onHeadDate(c.created_at)) {
+                const loc = `${c.path || "?"}:${c.line || c.original_line || "?"}`;
+                digestBullets.push(`- \`${loc}\` — ${(c.body || "").trim()}`);
+              }
+            }
+            for (const r of reviews) {
+              if (r.user?.login === CODEX && isP12(r.body) && onHeadDate(r.submitted_at)) {
+                digestBullets.push(`- ${(r.body || "").trim()}`);
+              }
+            }
+            // Cap the WHOLE digest at ~6000 chars; include whole findings, note the rest.
+            const DIGEST_CAP = 6000;
+            let digest = "";
+            let includedFindings = 0;
+            for (const bullet of digestBullets) {
+              if ((digest + bullet + "\n").length > DIGEST_CAP) break;
+              digest += bullet + "\n";
+              includedFindings++;
+            }
+            digest = digest.replace(/\s+$/, "");
+            const omitted = digestBullets.length - includedFindings;
+            if (omitted > 0) {
+              digest += `\n- …(${omitted} more truncated; see the Codex review on this PR)`;
+            }
+
             core.setOutput("should_trigger", "true");
             core.setOutput("pr_number", prNumber.toString());
             core.setOutput("severity_label", sevLabel);
-            core.setOutput("finding_count", String(findingN));
+            // N in the comment = the digest bullet count (the inlined findings);
+            // fall back to the badge-count findingN if the digest is empty.
+            core.setOutput("finding_count", String(digestBullets.length || findingN));
+            core.setOutput("findings_digest", digest);
             core.setOutput("attempt", String(nextAttempt));
             core.setOutput("head_sha", headSha);
 
       - name: Comment on PR to trigger Claude fix
         if: steps.check_review.outputs.should_trigger == 'true'
         uses: actions/github-script@v7
+        env:
+          # fix #13: pass the Codex P1/P2 finding digest via env — SAFE for
+          # arbitrary markdown (no ${{ }} interpolation into the JS string).
+          FINDINGS_DIGEST: ${{ steps.check_review.outputs.findings_digest }}
         with:
           # AUTOMATION_PAT so the posted @claude comment actually triggers
           # claude.yml (GITHUB_TOKEN-authored comments don't start workflows).
@@ -340,8 +382,13 @@ jobs:
             // the circuit-breaker counts both stay byte-exact.
             const sevLabel = "${{ steps.check_review.outputs.severity_label }}" || "P1/P2";
             const findingCount = "${{ steps.check_review.outputs.finding_count }}" || "1";
-            const triggerNote =
-              `Auto-requested by the bridge: Codex flagged ${findingCount} active ${sevLabel} finding(s) on the current head.`;
+            // fix #13: inline the actual Codex P1/P2 finding text (read via env,
+            // safe for arbitrary markdown) so Claude — which CANNOT read inline
+            // review threads from its run context — has the specifics to act on.
+            const digest = (process.env.FINDINGS_DIGEST || "").trim();
+            const triggerNote = digest
+              ? `Auto-requested by the bridge: Codex flagged ${findingCount} active ${sevLabel} finding(s) on the current head. The inline review threads are NOT readable from your run context, so the findings are inlined below — apply a fix for each:\n\n---\n${digest}\n---`
+              : `Auto-requested by the bridge: Codex flagged ${findingCount} active ${sevLabel} finding(s) on the current head. Codex's findings are in this PR's review — read the review body/threads on the PR.`;
             // Structured loop marker for the claude-fallback watchdog (Part 1).
             // PREPENDED on its own line (an invisible HTML comment — it does NOT
             // disturb the "@claude fix" mention parser or the [auto-triggered]

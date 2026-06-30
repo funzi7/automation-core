@@ -17,6 +17,15 @@ Handoff log for the **self-healing-loop build** Claude Chat session. Claude Code
 
 ---
 
+## [2026-06-29 16:00 UTC] fix #13: bridge inlines the Codex P1/P2 finding text into the @claude fix comment
+- PR: direct commit to main
+- Branch: main (direct commit)
+- Status: done
+- What changed: The bridge pinged "@claude fix … Codex flagged N active P1/P2 finding(s)" but WITHOUT the finding text. Codex posts the specifics as INLINE review comments, and claude.yml's run context CANNOT read inline review threads (`gh pr view --comments` / `gh api` / GraphQL `reviewThreads` all 403 on `statusCheckRollup`), so Claude was pinged with no actionable content and replied "restate it as a top-level comment". Fix #13 makes the bridge self-contained. **Check step (already had `reviews`/`reviewComments`/`latestCommitDate`):** builds a markdown digest reusing the existing P1/P2 substring + `onHead` freshness — from `reviewComments` (Codex + P1/P2 + dated > latestCommitDate → `` - `path:line` — <body> ``, line falls back to `original_line`) and `reviews` (→ `- <body>`); caps the WHOLE digest at ~6000 chars (includes whole findings, appends "(N more truncated; see the Codex review on this PR)"); outputs it via `findings_digest` and sets `finding_count` = the digest bullet count. **Comment step:** reads the digest via an **env var** `FINDINGS_DIGEST` (safe for arbitrary markdown — no `${{ }}` interpolation into the JS string literal) and embeds it: `@claude fix` / `[auto-triggered]` marker / "…the inline review threads are NOT readable from your run context, so the findings are inlined below — apply a fix for each:\n\n---\n<digest>\n---". FALLBACK (empty digest, guarded): the prior generic message + "Codex's findings are in this PR's review — read the review body/threads on the PR." Did NOT change the token (AUTOMATION_PAT), concurrency group, circuit breaker, or freshness rule — only enriched the body. Both copies byte-identical.
+- Validation: actionlint clean on both copies; node --check on all 3 github-script blocks; a digest self-test passes (inline `path:line` formatting; excludes P3-only, non-Codex, and stale notes; ~6000-char truncation with the "more truncated" note; empty→fallback); `workflows/` ↔ `.github/workflows/` byte-identical (blob `b7d9513`).
+- needs-from-owner: nothing — live on main in one commit. Propagates to downstreams on the next daily sync.
+- Next: Claude now receives the actual Codex P1/P2 text inline and can act without needing the inline threads it can't read. Remaining: close #38 if still open; fresh downstream sync (fixes #6–#13).
+
 ## [2026-06-29 15:00 UTC] fix #12: collapse codex-gate's duplicate runs (concurrency) + MAX_ATTEMPTS 5→3
 - PR: direct commit to main
 - Branch: main (direct commit)

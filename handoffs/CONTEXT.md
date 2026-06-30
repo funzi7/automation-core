@@ -172,6 +172,19 @@ merged → (sync propagates updated workflows to ~14 downstream repos daily)
   paid run.
 - **Freshness:** only Codex bodies dated after the latest commit count (same rule
   as the gate).
+- **Self-contained @claude fix comment (fix #13):** Codex posts the specifics as
+  INLINE review comments, but **claude.yml's run context CANNOT read inline review
+  threads** (`gh pr view --comments` / `gh api` / GraphQL `reviewThreads` all fail
+  on a `statusCheckRollup` permission error), so Claude was pinged with the count
+  but no actionable text and replied "restate it as a top-level comment". The
+  bridge now **inlines the actual Codex P1/P2 finding text** into the comment: from
+  the already-fetched `reviewComments` (inline → `` - `path:line` — <body> ``) and
+  `reviews` (review body → `- <body>`), filtered to Codex + P1/P2 + onHead, capped
+  at ~6000 chars (whole findings, "(N more truncated…)" note). Passed from the
+  check step to the comment step via an **env var** (safe for arbitrary markdown —
+  no `${{ }}` interpolation into a JS string). Empty-digest fallback: the prior
+  generic message + "read the review body/threads on the PR." The MARKER,
+  `@claude fix` phrase, token, concurrency, breaker, and freshness are unchanged.
 - **Idempotency:** if a `@claude fix` marker (`[auto-triggered]`) already exists
   for the current head in any channel, it does not post again (collapses a
   multi-note review wave into one trigger).
