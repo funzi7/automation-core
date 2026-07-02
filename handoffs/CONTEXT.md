@@ -97,25 +97,34 @@ merged → (sync propagates updated workflows to ~14 downstream repos daily)
 
 ### codex-gate.yml — the blocking gate
 - Publishes the `check-codex-status` check; **fail-closed** (red until proven
-  green). **(fix #11)** The job is named **`codex-gate`** and it publishes
-  `check-codex-status` as an EXPLICIT check-run (octokit `checks.create`/`update`
-  on the PR head, find-and-update so there's one per head) carrying
-  `output.title`/`summary` — so a red gate shows WHY instead of a blank red
-  square: 🟡 "Waiting for Codex review" (pending), 🔴 "Active Codex P1/P2"
-  (blocked), 🟢 "Reviewed — clear" (green). The GREEN/RED verdict **logic is
-  unchanged**. The check NAME stays exactly `check-codex-status` (merge-bot reads
-  it). **(fix #14) Single producer + fail-closed publish:** the job has **no
-  `name: check-codex-status`** line (that would make the job-status check ALSO
-  `check-codex-status` — a duplicate; a downstream copy had wrongly added it), so
-  the job-status check is `codex-gate` and the EXPLICIT publish is the ONLY
-  `check-codex-status` on the head. The publish is **no longer treated as cosmetic**:
-  if `checks.create`/`update` throws (a downgraded `checks:write` token on a
-  forked/Dependabot run leaves no required check while merge-bot still needs it),
-  the job records `publishFailed` and **`codex-gate` fails CLOSED + VISIBLE
-  (red)** — `core.setFailed` fires when the verdict blocks OR the publish failed,
-  so the job goes green only when the verdict is clear AND the check actually
-  published. This resolves Codex's sync-PR "Restore the fallback gate check name"
-  finding WITHOUT re-adding the duplicate name.
+  green). **Two-check architecture (fix #15 — supersedes #11/#14):**
+  - **GitHub policy (2025-03-31):** a workflow's `GITHUB_TOKEN` can no longer
+    UPDATE the status/conclusion of a check-run created by a *different* Actions
+    run ("Check run status and conclusions can only be updated internally by
+    GitHub Actions"). So the fix-#11/#14 `checks.update` design is impossible: on
+    the **2nd** gate run for a head (🟡 first, then Codex reviews → the update)
+    the API rejects it — which would jam the gate permanently red on the normal
+    path.
+  - **Authoritative check = the ACTIONS-OWNED job-status check.** The job carries
+    `name: check-codex-status`, and its conclusion is driven ONLY by the verdict
+    via `core.setFailed` (fires iff `anyBlocked`). Actions owns/updates it
+    internally, immune to the policy and to token downgrades. The head-targeted
+    self-rerun (`ref = pr.head.ref`) lands it on `pr.head.sha` where merge-bot
+    reads it (unchanged). Consumers (merge-bot `CODEX_CHECK`, telegram report
+    `GATE_CHECK`) read `check-codex-status` **by name** via `checks.listForRef`,
+    so the job-status check satisfies them all; **nothing keys on the job via
+    `needs:`/required-checks**.
+  - **Rich output = a cosmetic, CREATE-ONLY companion** named `codex-gate-verdict`
+    (never `check-codex-status`). `publishGateCheck` always `checks.create`s a
+    fresh completed check-run with 🟡 "Waiting for Codex review" / 🔴 "Active
+    Codex P1/P2" / 🟢 "Reviewed — clear" + summary — **no list/find/update** (the
+    exact op the policy blocks). Runs accumulate; latest-per-name surfaces the
+    newest. A create failure (downgraded `checks:write` on forked/Dependabot runs)
+    is a `core.warning` and **never fails the job** — the verdict lives on the
+    authoritative job check. This also permanently resolves Codex's "Restore the
+    fallback gate check name" finding.
+  - Verdict LOGIC, freshness rule, P1/P2 detection, concurrency, `MAX_ATTEMPTS`,
+    and the override label are all unchanged.
 - **GREEN requires BOTH:** (a) Codex has **reviewed the current head**, and
   (b) there is **no ACTIVE P1 and no ACTIVE P2** (matching the bridge's
   trigger severity — see fix #6 / Hard-Won Lesson 11). P3 never blocks.

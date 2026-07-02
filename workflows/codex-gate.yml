@@ -104,10 +104,19 @@ permissions:
   checks: write
 
 jobs:
-  # fix #11: the JOB is `codex-gate` (its job-status check is cosmetic); the
-  # blocking `check-codex-status` check merge-bot reads is published EXPLICITLY
-  # below via checks.create/update so it carries a human-readable reason.
+  # fix #15: GitHub's 2025-03-31 policy forbids a workflow's GITHUB_TOKEN from
+  # UPDATING the status/conclusion of a check-run created by a DIFFERENT Actions
+  # run ("Check run status and conclusions can only be updated internally by
+  # GitHub Actions"). So find→update publishing jams the gate red on the 2nd run
+  # for a head (🟡 first, then Codex reviews → the update is rejected). The
+  # authoritative `check-codex-status` is therefore the ACTIONS-OWNED job-status
+  # check (this job's `name:`), driven ONLY by the verdict via core.setFailed;
+  # the head-targeted self-rerun lands it on pr.head.sha where merge-bot reads it.
+  # The rich 🟢/🔴/🟡 output lives on a SEPARATE, cosmetic, CREATE-ONLY check
+  # `codex-gate-verdict` (publishGateCheck below) — never updated, so the policy
+  # can't jam it, and nothing keys on that name.
   codex-gate:
+    name: check-codex-status
     runs-on: ubuntu-latest
     steps:
       - name: Resolve PR number(s) to check
@@ -236,38 +245,27 @@ jobs:
               }
             }
 
-            // fix #11: publish the `check-codex-status` check-run WITH output text
-            // so a red gate shows WHY (the empty-output blank-red-square problem).
-            // The JOB is `codex-gate` (NO `name: check-codex-status` — that would
-            // create a SECOND, same-named job-status check; fix #14). This explicit
-            // check-run is the ONLY one named `check-codex-status` — the exact name
-            // merge-bot reads (checks.listForRef). Find-and-update keeps one per head.
-            // fix #14: the publish is NO LONGER "cosmetic". On a downgraded
-            // checks:write token (forked / Dependabot runs) the create/update FAILS,
-            // leaving NO `check-codex-status` while merge-bot still requires it — a
-            // silently-unmergeable PR. So a failure is recorded in `publishFailed`
-            // and fails the `codex-gate` JOB CLOSED + VISIBLE (red) below, rather
-            // than passing green with the required check missing.
-            let publishFailed = false;
+            // fix #15: publish the rich 🟢/🔴/🟡 output as a COSMETIC, CREATE-ONLY
+            // check named `codex-gate-verdict` (NOT `check-codex-status` — that is
+            // the Actions-owned job-status check now). CREATE-ONLY on purpose: the
+            // 2025-03-31 policy blocks a token from UPDATING another run's check
+            // ("...can only be updated internally by GitHub Actions"), so we never
+            // list/find/update — each run just creates a fresh completed check-run.
+            // Multiple runs accumulate check-runs of this name; the UI and any
+            // latest-per-name reader surface the newest, and merge-bot doesn't key
+            // on this name (it reads `check-codex-status`). Purely informational, so
+            // a create failure (e.g. downgraded checks:write on forked/Dependabot
+            // runs) is logged and NEVER fails the job — the authoritative verdict
+            // is the job-status check driven by core.setFailed.
             async function publishGateCheck(headSha, conclusion, title, summary) {
               try {
-                const existing = await github.paginate(github.rest.checks.listForRef, {
-                  owner, repo, ref: headSha, per_page: 100,
-                });
-                const mine = existing.find((c) => c.name === 'check-codex-status');
-                const body = {
-                  owner, repo, status: 'completed', conclusion,
+                await github.rest.checks.create({
+                  owner, repo, name: 'codex-gate-verdict', head_sha: headSha,
+                  status: 'completed', conclusion,
                   output: { title, summary },
-                };
-                if (mine) {
-                  await github.rest.checks.update({ ...body, check_run_id: mine.id });
-                } else {
-                  await github.rest.checks.create({ ...body, name: 'check-codex-status', head_sha: headSha });
-                }
+                });
               } catch (e) {
-                // fix #14: do NOT silently pass — record it so the job fails closed.
-                publishFailed = true;
-                core.error(`explicit check-codex-status publish failed (downgraded checks:write?): ${e.message}`);
+                core.warning(`codex-gate-verdict publish failed (cosmetic, ignored): ${e.message}`);
               }
             }
 
@@ -495,21 +493,17 @@ jobs:
             // when the verdict is clear AND the check actually published — so a
             // downgraded-token run (missing required check) is a VISIBLE red
             // `codex-gate`, never a green job hiding an unmergeable PR.
-            if (anyBlocked || publishFailed) {
-              let msg = '';
-              if (anyBlocked) {
-                msg +=
-                  'Blocked by Codex Gate: an active P1 or P2 is unresolved, or Codex has not reviewed the current head yet.\n' +
-                  'Resolve by one of:\n' +
-                  '  1. Wait — Codex reviews automatically on every push; the gate self-reruns on the head (max 3 attempts, ~90s apart) and goes green once Codex posts any signal with no active P1/P2.\n' +
-                  '  2. Push a fix commit — P1/P2s raised before it become stale and clear automatically.\n' +
-                  '  3. Add label "codex-p1-acknowledged" to override.\n';
-              }
-              if (publishFailed) {
-                msg +=
-                  'The explicit `check-codex-status` check could not be published (downgraded checks:write on a forked/Dependabot run?). Failing `codex-gate` CLOSED so the missing required check is visibly red, not a silent green pass.';
-              }
-              core.setFailed(msg);
+            // fix #15: the job conclusion IS the authoritative `check-codex-status`
+            // (this job's name), so it must equal the VERDICT only — never coupled
+            // to the cosmetic `codex-gate-verdict` publish.
+            if (anyBlocked) {
+              core.setFailed(
+                'Blocked by Codex Gate: an active P1 or P2 is unresolved, or Codex has not reviewed the current head yet.\n' +
+                'Resolve by one of:\n' +
+                '  1. Wait — Codex reviews automatically on every push; the gate self-reruns on the head (max 3 attempts, ~90s apart) and goes green once Codex posts any signal with no active P1/P2.\n' +
+                '  2. Push a fix commit — P1/P2s raised before it become stale and clear automatically.\n' +
+                '  3. Add label "codex-p1-acknowledged" to override.'
+              );
             }
 
       # always(): the evaluate step calls core.setFailed() whenever it blocks,
