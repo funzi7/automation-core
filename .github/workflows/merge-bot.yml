@@ -67,7 +67,7 @@ jobs:
 
       - name: Evaluate and merge eligible PRs
         if: steps.patcheck.outputs.has_pat == 'true'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -88,7 +88,9 @@ jobs:
             const repo = context.repo.repo;
             // fix #17 Part C: reads go through GITHUB_TOKEN (fine-grained PATs
             // can't hold Checks perm); mutations stay on the PAT (`github`).
-            const readonly = require('@actions/github').getOctokit(process.env.GH_READONLY_TOKEN);
+            + const { getOctokit } = __original_require__('@actions/github');
+const { getOctokit } = __original_require__('@actions/github');
+const readonly = getOctokit(process.env.GH_READONLY_TOKEN);
             const CODEX_CHECK = 'check-codex-status';
             const LABEL_AUTOMERGE = 'automerge';
             const LABEL_ESCALATE = 'needs-owner';
