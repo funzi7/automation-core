@@ -71,11 +71,24 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # fix #17 Part C: read-only client token for the checks/statuses reads.
+          # Fine-grained PATs CANNOT be granted the Checks permission at all (no
+          # such option exists in the PAT UI), so checks.listForRef on the PAT
+          # crashes with "Resource not accessible by personal access token"
+          # (INCIDENT 2). GITHUB_TOKEN carries this workflow's declared
+          # `checks: read` + `statuses: read`, so the reads run on it instead.
+          GH_READONLY_TOKEN: ${{ github.token }}
         with:
+          # AUTOMATION_PAT stays the step token: every MUTATION (merge/label/
+          # comment/deleteRef/issue-close) must run on it — pulls.merge must be
+          # PAT-authored so the push to main triggers downstream workflows.
           github-token: ${{ secrets.AUTOMATION_PAT }}
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
+            // fix #17 Part C: reads go through GITHUB_TOKEN (fine-grained PATs
+            // can't hold Checks perm); mutations stay on the PAT (`github`).
+            const readonly = require('@actions/github').getOctokit(process.env.GH_READONLY_TOKEN);
             const CODEX_CHECK = 'check-codex-status';
             const LABEL_AUTOMERGE = 'automerge';
             const LABEL_ESCALATE = 'needs-owner';
@@ -187,12 +200,24 @@ jobs:
 
               const headSha = pr.head.sha;
 
-              // All check runs on the head sha (paginate).
-              const checkRuns = await github.paginate(github.rest.checks.listForRef, {
+              // All check runs on the head sha (paginate). READ → GITHUB_TOKEN
+              // (fix #17 Part C): a fine-grained PAT can't hold Checks perm.
+              const checkRunsAll = await readonly.paginate(readonly.rest.checks.listForRef, {
                 owner, repo, ref: headSha, per_page: 100,
               });
-              // All commit statuses on the head sha (paginate).
-              const statuses = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
+              // fix #17 Part B: DROP concurrency-cancelled check-runs — a gate run
+              // that read Codex's 👍 and created the green verdict tile, then got
+              // cancelled mid-verdict by cancel-in-progress, left a `cancelled`
+              // authoritative check-codex-status that stranded a green PR
+              // (INCIDENT 1). Cancelled runs are noise, never a verdict. Keep
+              // in-progress runs (conclusion null) so anyRunning still works; an
+              // older SUCCESS on the same head (checks are pinned to the head SHA)
+              // stays authoritative past the cancelled tail. If EVERY
+              // check-codex-status on the head is cancelled, the CODEX_CHECK lookup
+              // finds nothing → fail-closed skip (unchanged).
+              const checkRuns = checkRunsAll.filter((c) => c.conclusion !== 'cancelled');
+              // All commit statuses on the head sha (paginate). READ → GITHUB_TOKEN.
+              const statuses = await readonly.paginate(readonly.rest.repos.listCommitStatusesForRef, {
                 owner, repo, ref: headSha, per_page: 100,
               });
 

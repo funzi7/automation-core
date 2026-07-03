@@ -79,19 +79,24 @@ on:
         required: false
         type: string
 
-# fix #12: collapse the burst of redundant gate runs per PR. A Codex review fires
-# pull_request_review AND pull_request_review_comment (one per inline note), and a
-# push fires a pull_request run + its head-targeted self-rerun — ~4 runs per wave.
-# This cancels OVERLAPPING runs for the SAME PR, leaving only the latest
-# authoritative one. Sequential self-rerun attempts (~90s apart) don't overlap, so
-# concurrency leaves them alone (intended). Safe: every run publishes
-# check-codex-status on the PR HEAD sha (fix #11), so the surviving run's
-# find-and-update lands the check on the head — a canceled/superseded run never
-# leaves a stale or half check. The `|| github.run_id` fallback guarantees a
-# non-empty group key.
+# fix #12/#17: collapse the burst of redundant gate runs per PR without ever
+# killing a run mid-verdict. A Codex review fires pull_request_review AND
+# pull_request_review_comment (one per inline note), and a push fires a
+# pull_request run + its head-targeted self-rerun — ~4 runs per wave.
+# cancel-in-progress is FALSE (fix #17): an IN-PROGRESS run always runs to
+# completion. Under cancel-in-progress: true a run that had already read Codex's
+# 👍 and CREATED the green codex-gate-verdict tile got cancelled by a newer event
+# BEFORE the job concluded — leaving the authoritative `check-codex-status` job
+# check as `cancelled` on the head, which merge-bot treated as failed and stranded
+# a green PR (INCIDENT 1). Letting runs finish removes that half-run strand.
+# GitHub still collapses the QUEUE per group (at most one pending run; a superseded
+# pending run is dropped before it starts), so event bursts don't storm — they just
+# don't cancel the run already executing. Any `cancelled` check-runs left behind by
+# a superseded QUEUED run are ignored by merge-bot (fix #17 Part B filters them).
+# The `|| github.run_id` fallback guarantees a non-empty group key.
 concurrency:
   group: codex-gate-pr-${{ github.event.pull_request.number || github.event.inputs.pr_number || github.event.issue.number || github.run_id }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: read

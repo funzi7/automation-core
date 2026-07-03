@@ -148,17 +148,21 @@ merged → (sync propagates updated workflows to ~14 downstream repos daily)
   lowered **5→3** — since fix #11 lands the check on the head from every run, the
   poll's only remaining job is catching a 👍 reaction (which fires no event), so
   3 polls suffice. The poll is kept (not removed).
-- **Run-collapsing concurrency (fix #12):** a top-level `concurrency` block
+- **Run-collapsing concurrency (fix #12 + #17):** a top-level `concurrency` block
   (`group: codex-gate-pr-<pr#||inputs.pr_number||issue#||run_id>`,
-  `cancel-in-progress: true`) cancels OVERLAPPING gate runs for the SAME PR,
-  leaving only the latest authoritative run. A Codex review fires both
+  **`cancel-in-progress: false`**). A Codex review fires both
   `pull_request_review` and `pull_request_review_comment` (one per inline note)
-  and a push fires a `pull_request` run + its self-rerun — ~4 runs/wave; this
-  collapses the simultaneous burst to one. Sequential self-reruns (~90s apart)
-  don't overlap, so they're untouched. Safe because every run publishes
-  `check-codex-status` on the PR HEAD sha (fix #11), so the surviving run's
-  find-and-update lands the check on the head — a canceled run leaves no stale
-  check. The `|| github.run_id` fallback guarantees a non-empty group key.
+  and a push fires a `pull_request` run + its self-rerun — ~4 runs/wave.
+  **fix #17:** an IN-PROGRESS run now always **runs to completion** — GitHub only
+  collapses the QUEUE per group (at most one pending run; a superseded pending run
+  is dropped before it starts). Under the old `cancel-in-progress: true` a run that
+  had already read Codex's 👍 and CREATED the green `codex-gate-verdict` tile got
+  cancelled mid-verdict, leaving the authoritative `check-codex-status` job check as
+  **`cancelled`** on the head → merge-bot treated it as failed → a green PR was
+  stranded (INCIDENT 1). Letting runs finish removes that half-run strand; any
+  `cancelled` check-runs left by a superseded QUEUED run are ignored by merge-bot
+  (fix #17 cancelled-filter). The `|| github.run_id` fallback guarantees a non-empty
+  group key.
 - **Triggers** on `push` + review + comment events so it re-evaluates whenever
   the head or the review state changes.
 - Manual override label: `codex-p1-acknowledged`.
@@ -178,7 +182,26 @@ merged → (sync propagates updated workflows to ~14 downstream repos daily)
   manual merge.
 - **Head-SHA-pinned squash:** merges with `sha: headSha` so it can only merge the
   exact commit it evaluated (no race with a newer push).
-- **Requires AUTOMATION_PAT** (fail-soft skip if absent).
+- **Requires AUTOMATION_PAT** (fail-soft skip if absent) — but only for
+  **MUTATIONS**. **Two-token split (fix #17 Part C):** fine-grained PATs CANNOT be
+  granted the Checks permission at all (no such option in the PAT UI), so
+  `checks.listForRef` on the PAT crashes `Resource not accessible by personal
+  access token` (INCIDENT 2). So the step keeps `github-token: AUTOMATION_PAT`
+  (every mutation — `pulls.merge`, labels, comments, `deleteRef`, issue-close —
+  stays PAT-authored; `pulls.merge` MUST be PAT-authored so the push to `main`
+  triggers downstream workflows), and a `readonly = getOctokit(github.token)`
+  client (built from `env.GH_READONLY_TOKEN`) runs **exactly the two reads**
+  (`checks.listForRef` + `repos.listCommitStatusesForRef`) on `GITHUB_TOKEN`,
+  which carries the workflow's declared `checks: read` + `statuses: read`.
+- **Drops concurrency-cancelled check-runs (fix #17 Part B).** Before the
+  latest-per-name dedupe, `checkRuns` is filtered `conclusion !== 'cancelled'`
+  (in-progress runs — `conclusion: null` — are kept so `anyRunning` still works).
+  A gate run cancelled mid-verdict (fix #17 Part A history) can leave a
+  `cancelled` `check-codex-status` tail on the head; treating it as failed
+  stranded a green PR (INCIDENT 1). An older SUCCESS on the same head stays
+  authoritative past the cancelled tail (checks are pinned to the head SHA); if
+  EVERY `check-codex-status` on the head is cancelled, the `CODEX_CHECK` lookup
+  finds nothing → fail-closed skip (unchanged).
 - **Evaluates only the LATEST check run per name (dedupe).** GitHub emits
   **multiple** `check-codex-status` runs on one head over a PR's life — an early
   pending/red run when the PR opens, then a success run after Codex reviews.

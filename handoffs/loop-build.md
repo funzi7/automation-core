@@ -17,6 +17,17 @@ Handoff log for the **self-healing-loop build** Claude Chat session. Claude Code
 
 ---
 
+## [2026-07-03 14:10 UTC] fix #17: gate never dies mid-verdict + merge-bot ignores cancelled checks + reads on GITHUB_TOKEN
+- PR: direct commit to main
+- Branch: main (direct commit)
+- Status: done
+- What changed (two live failures from today, three parts):
+  - **INCIDENT 1 (stranded green PR):** a codex-gate run read Codex's 👍, CREATED the green `codex-gate-verdict` tile, then got CANCELLED mid-run by the workflow's own `cancel-in-progress: true` before the job concluded — leaving the authoritative `check-codex-status` job check `cancelled` on the head. merge-bot treats cancelled as failed → green PR stranded. **Part A:** `codex-gate.yml` `cancel-in-progress: true → false` (group key unchanged). In-progress runs now always complete; GitHub still collapses the QUEUE per group so bursts don't storm. **Part B:** `merge-bot.yml` filters `conclusion === 'cancelled'` out of `checkRuns` BEFORE latest-per-name (keeps in-progress/null so `anyRunning` works); an older SUCCESS on the head stays authoritative past a cancelled tail; all-cancelled → fail-closed skip.
+  - **INCIDENT 2 (merge-bot crash):** merge-bot hit its checks read on the first real candidate and died `Unhandled error: HttpError: Resource not accessible by personal access token`. The whole github-script step is bound to `AUTOMATION_PAT`, and fine-grained PATs CANNOT be granted the Checks permission at all (no such option in the PAT UI). **Part C:** added `env: GH_READONLY_TOKEN: ${{ github.token }}`, built `readonly = getOctokit(GH_READONLY_TOKEN)`, and switched ONLY the two reads (`checks.listForRef` + `repos.listCommitStatusesForRef`) to it. `github-token` stays `AUTOMATION_PAT` — every mutation (merge/label/comment/deleteRef/issue-close) unchanged; `pulls.merge` must stay PAT-authored to trigger downstream. Permissions block already declared `checks: read` + `statuses: read` for GITHUB_TOKEN.
+- Validation: actionlint clean on both copies of `codex-gate.yml` AND `merge-bot.yml`; `node --check` on merge-bot's github-script body OK; `git hash-object` equal per file across `workflows/` and `.github/workflows/` (codex-gate `140e929`, merge-bot `f08ea09`); grep-confirmed: no `cancel-in-progress: true` directive remains, cancelled filter precedes latest-per-name, `readonly` used for exactly the two reads (no other `readonly.rest.`), `github-token` still `AUTOMATION_PAT`.
+- Needs from the owner: nothing — live on main in one commit; propagates downstream on the next daily sync.
+- Next: watch the next real green candidate merge cleanly (no cancelled-tail strand, no PAT-Checks crash).
+
 ## [2026-07-03 11:30 UTC] fix #16: claude.yml — opt-in SDK transcript to enumerate permission denials
 - PR: direct commit to main
 - Branch: main (direct commit)
