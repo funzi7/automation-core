@@ -17,6 +17,15 @@ Handoff log for the **self-healing-loop build** Claude Chat session. Claude Code
 
 ---
 
+## [2026-07-03 19:30 UTC] fix #20: Link-header pagination in the readonly fetch helpers (50-page ceiling)
+- PR: direct commit to main
+- Branch: main (direct commit)
+- Status: done
+- What changed: replaced fix #19's fixed 10-page valve (`for (let page = 1; page <= 10; page++)` + `&page=${page}`) in the built-in-`fetch` readonly helpers with TRUE pagination — `roPage(url)` reads the `Link` header for `rel="next"`, `roPaged(path, extract)` follows it until absent with a **50-page** safety ceiling; `roCheckRuns`/`roStatuses` are now one-liners over `roPaged`. Applied to BOTH `merge-bot.yml` (roPage + roPaged + roCheckRuns + roStatuses) and `claude-fallback-watchdog.yml` (roPage + roPaged + roCheckRuns only — the sweep reads no statuses). Call sites unchanged (`await roCheckRuns(headSha)` / `await roStatuses(headSha)`); the now-unused `roGet` (no callers outside the paged loops) removed. Still ZERO modules — the hard rule stands (never `require` anything in github-script; built-in `fetch` only). Origin: Codex flagged the 10-page cap on a downstream sync PR and produced a downstream fix, which can't be merged there (the next sync overwrites synced workflows, and it missed the watchdog's copy of the same helper) → adopted upstream here.
+- Validation: `yaml.safe_load` on both copies of both files; actionlint clean on all four; `node --check` on each script body; greps — ZERO `page <= 10`, ZERO `&page=${page}`, `rel="next"` regex present in both files, call sites untouched, and regression guard ZERO `require('@actions/github')` / `__original_require__` / `getOctokit` in workflows; `git hash-object` equal per file (merge-bot `2d80ab2`, watchdog `12a2fbb`).
+- Needs from the owner: nothing — live on main in one commit; propagates downstream on the next daily sync (which also overwrites Codex's un-mergeable downstream edit with the correct upstream one).
+- Next: a very chatty head (>1000 check-runs/statuses) now paginates fully instead of silently truncating at page 10.
+
 ## [2026-07-03 18:05 UTC] fix #19: kill in-script module loading — raw REST via built-in fetch
 - PR: direct commit to main
 - Branch: main (direct commit)

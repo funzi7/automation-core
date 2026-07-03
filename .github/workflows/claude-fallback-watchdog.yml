@@ -326,20 +326,25 @@ jobs:
             // (ncc bundle, no node_modules). The Checks read uses the built-in global
             // fetch (raw REST), zero modules.
             const GH_RO = process.env.GH_READONLY_TOKEN;
-            async function roGet(path) {
-              const res = await fetch(`https://api.github.com${path}`, { headers: { Authorization: `Bearer ${GH_RO}`, Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' } });
-              if (!res.ok) throw new Error(`GET ${path} -> ${res.status}: ${(await res.text()).slice(0, 200)}`);
-              return res.json();
+            // fix #20: follow the Link rel="next" header until absent (50-page
+            // safety ceiling) — true pagination, replacing the fixed 10-page valve.
+            async function roPage(url) {
+              const res = await fetch(url, { headers: { Authorization: `Bearer ${GH_RO}`, Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' } });
+              if (!res.ok) throw new Error(`GET ${url} -> ${res.status}: ${(await res.text()).slice(0, 200)}`);
+              const m = (res.headers.get('link') || '').match(/<([^>]+)>;\s*rel="next"/);
+              return { data: await res.json(), next: m ? m[1] : null };
             }
-            async function roCheckRuns(ref) {
+            async function roPaged(path, extract) {
               const out = [];
-              for (let page = 1; page <= 10; page++) {
-                const d = await roGet(`/repos/${owner}/${repo}/commits/${encodeURIComponent(ref)}/check-runs?per_page=100&page=${page}`);
-                out.push(...(d.check_runs || []));
-                if ((d.check_runs || []).length === 0 || out.length >= (d.total_count || 0)) break;
+              let url = `https://api.github.com${path}`;
+              for (let i = 0; i < 50 && url; i++) {
+                const { data, next } = await roPage(url);
+                out.push(...extract(data));
+                url = next;
               }
               return out;
             }
+            const roCheckRuns = (ref) => roPaged(`/repos/${owner}/${repo}/commits/${encodeURIComponent(ref)}/check-runs?per_page=100`, (d) => d.check_runs || []);
             // Verbatim from codex-gate.yml's pending publish call.
             const PENDING_TITLE = '🟡 Waiting for Codex review';
             const GATE_WORKFLOW = 'codex-gate.yml';

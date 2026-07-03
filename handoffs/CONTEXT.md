@@ -216,13 +216,16 @@ merged → (sync propagates updated workflows to ~14 downstream repos daily)
   `__original_require__('@actions/github')` (v8) crashed this step in production
   with `Cannot find module .../dist/index.js` (ncc bundle, no `node_modules`; see
   the HARD RULE in §7). The two-token read/mutation split (fix #17 Part C) now
-  does its GITHUB_TOKEN reads with the built-in global `fetch`: helpers `roGet`
-  (Bearer + `X-GitHub-Api-Version: 2022-11-28`), `roCheckRuns(ref)` → GET
-  `/repos/{o}/{r}/commits/{ref}/check-runs`, `roStatuses(ref)` → GET `.../statuses`,
-  each looping `?per_page=100&page=`. Payload fields are identical to octokit's
-  (check runs: `name`/`status`/`conclusion`/`started_at`/`completed_at`/`output`;
-  statuses: `state`/`context`/`created_at`), so every downstream consumer is
-  unchanged. `github-token` stays `AUTOMATION_PAT` for all mutations.
+  does its GITHUB_TOKEN reads with the built-in global `fetch`: `roPage(url)`
+  (Bearer + `X-GitHub-Api-Version: 2022-11-28`; parses the `Link` header for
+  `rel="next"`), `roPaged(path, extract)` follows `rel="next"` until absent with a
+  **50-page safety ceiling** (fix #20 — replaced the fixed 10-page valve), and
+  `roCheckRuns(ref)` / `roStatuses(ref)` are one-liners over `roPaged`. Payload
+  fields are identical to octokit's (check runs:
+  `name`/`status`/`conclusion`/`started_at`/`completed_at`/`output`; statuses:
+  `state`/`context`/`created_at`), so every downstream consumer is unchanged.
+  `github-token` stays `AUTOMATION_PAT` for all mutations. (The watchdog sweep
+  carries the same `roPage`/`roPaged`/`roCheckRuns` — no `roStatuses`.)
 - **Manual-edit rules for a `script: |` block (a bad paste already jammed main).**
   A hand-applied diff once pasted a literal `+ ` diff-artifact line plus two JS
   lines at **column 0** inside the block scalar; a column-0 line **terminates**
@@ -549,8 +552,13 @@ never exposed).
   (e.g. a GITHUB_TOKEN read client because the step's `github-token` is a
   fine-grained PAT that can't hold Checks), the ONLY sanctioned pattern is **raw
   REST via the built-in global `fetch`** (Node 20/24 both have it) — the
-  `roGet` / `roCheckRuns` / `roStatuses` helpers (a `Bearer` header +
-  `Accept: application/vnd.github+json` + `X-GitHub-Api-Version: 2022-11-28`,
-  manual `?per_page=100&page=` loop). Zero modules, zero dependencies. Grep must
+  `roPage` / `roPaged` / `roCheckRuns` / `roStatuses` helpers (a `Bearer` header +
+  `Accept: application/vnd.github+json` + `X-GitHub-Api-Version: 2022-11-28`).
+  **Pagination follows the `Link` `rel="next"` header until absent, with a 50-page
+  safety ceiling** (fix #20 — the earlier fixed 10-page valve could silently drop
+  runs on a very chatty head; Codex flagged the cap on a downstream sync PR, but a
+  downstream workflow edit is always overwritten by the next sync — and misses the
+  watchdog's copy — so the fix was adopted HERE upstream, still zero-module).
+  Zero modules, zero dependencies. Grep must
   stay clean of `require('@actions/github')`, `__original_require__`, and
   `getOctokit`.
