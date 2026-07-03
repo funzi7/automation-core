@@ -349,6 +349,21 @@ jobs:
             const PENDING_TITLE = '🟡 Waiting for Codex review';
             const GATE_WORKFLOW = 'codex-gate.yml';
             const VERDICT_CHECK = 'codex-gate-verdict';
+            // fix #21: trusted-sync grace window (must EQUAL codex-gate.yml's).
+            const SYNC_GRACE_MINUTES = 30;
+            // Trusted-sync predicate — must match merge-bot.yml / codex-gate.yml — keep in sync.
+            const SYNC_TITLE_PREFIX = 'chore(automation): sync from automation-core';
+            const SYNC_BRANCH = 'chore/sync-automation-core';   // branch the sync workflow opens
+            const OWNER_LOGIN = 'funzi7';
+            const isTrustedSync = (pr) => {
+              const titleIsSync = (pr.title || '').startsWith(SYNC_TITLE_PREFIX);
+              const sameRepo = !!(pr.head && pr.head.repo && pr.head.repo.full_name === `${owner}/${repo}`);
+              return titleIsSync && (
+                (pr.user && pr.user.login === OWNER_LOGIN) ||
+                ((pr.head && pr.head.ref === SYNC_BRANCH) && sameRepo)
+              );
+            };
+            const OVERRIDE_LABEL = 'codex-p1-acknowledged';
 
             // EXACT Codex-author matcher the gate uses for reviews + reactions.
             const isCodex = (user) =>
@@ -373,6 +388,19 @@ jobs:
               const prs = await github.paginate(github.rest.pulls.list, {
                 owner, repo, state: 'open', per_page: 100,
               });
+
+              // fix #21 Part C: ensure the override label the gate's own 🟡 summary
+              // tells humans to add actually EXISTS in this repo — it did NOT
+              // downstream (the incident). Upsert once per tick; 422 = already
+              // present (fine). Mirrors the needs-owner upsert pattern.
+              try {
+                await github.rest.issues.createLabel({
+                  owner, repo, name: OVERRIDE_LABEL, color: '0e8a16',
+                  description: 'Override: acknowledge Codex P1/P2 findings and let the Codex Gate pass',
+                });
+              } catch (e) {
+                if (e.status !== 422) core.info(`createLabel ${OVERRIDE_LABEL} failed (ignored): ${e.message}`);
+              }
 
               for (const pr of prs) {
                 try {
@@ -421,22 +449,35 @@ jobs:
                     (r) => isCodex(r.user) && r.content === '+1' &&
                            new Date(r.created_at) > latestCommitDate
                   );
-                  if (!freshReview && !freshThumbs) continue;
+                  const freshSignal = freshReview || freshThumbs;
 
-                  // A fresh signal exists but the gate is still pending — the
-                  // late-signal gap. Re-dispatch the gate on the head BRANCH,
-                  // exactly as scheduleRerun does (dispatch run's head_sha ==
-                  // pr.head.sha, so the check lands on the head).
+                  // fix #21 Part B: two dispatch classes for a 🟡-pending/no-verdict
+                  // candidate — (1) a FRESH Codex signal the gate's own poll missed
+                  // (late-👍/review), or (2) a TRUSTED SYNC that has stayed SILENT past
+                  // the grace window (Codex never engaged), so the gate's grace-green
+                  // needs a run to land on the head. Neither → skip.
+                  const graceMs = SYNC_GRACE_MINUTES * 60 * 1000;
+                  const headAgeMs = Date.now() - latestCommitDate.getTime();
+                  const silentSyncStale = isTrustedSync(pr) && headAgeMs > graceMs;
+                  if (!freshSignal && !silentSyncStale) continue;
+                  const logMsg = freshSignal
+                    ? `late-signal sweep: dispatching gate for PR #${prNumber} @ ${head7}`
+                    : `silent-sync grace: dispatching gate for PR #${prNumber} @ ${head7}`;
+
+                  // Re-dispatch the gate on the head BRANCH, exactly as scheduleRerun
+                  // does (dispatch run's head_sha == pr.head.sha, so the check lands on
+                  // the head). Self-limiting: the dispatched run flips the verdict
+                  // 🟡→🟢, so the PR stops matching next tick.
                   try {
                     await github.rest.actions.createWorkflowDispatch({
                       owner, repo, workflow_id: GATE_WORKFLOW, ref: pr.head.ref,
                       inputs: { pr_number: String(prNumber) },
                     });
-                    core.info(`late-signal sweep: dispatching gate for PR #${prNumber} @ ${head7}`);
+                    core.info(logMsg);
                   } catch (e) {
                     // fix #4 loud-fail: annotate + Telegram; never crash the sweep.
-                    core.error(`late-signal sweep: gate dispatch failed for PR #${prNumber} @ ${head7} — ${e.message}`);
-                    await telegram(`⚠️ ${repo} PR #${prNumber}: late-signal gate dispatch failed — ${e.message}`);
+                    core.error(`sweep: gate dispatch failed for PR #${prNumber} @ ${head7} — ${e.message}`);
+                    await telegram(`⚠️ ${repo} PR #${prNumber}: sweep gate dispatch failed — ${e.message}`);
                   }
                 } catch (e) {
                   core.info(`late-signal sweep: PR #${pr.number} error (ignored): ${e.message}`);

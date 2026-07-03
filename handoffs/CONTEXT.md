@@ -166,6 +166,23 @@ merged → (sync propagates updated workflows to ~14 downstream repos daily)
 - **Triggers** on `push` + review + comment events so it re-evaluates whenever
   the head or the review state changes.
 - Manual override label: `codex-p1-acknowledged`.
+- **Trusted-sync grace-green (fix #21).** A sync PR is a byte-copy of an upstream
+  automation-core `main` that already passed our full validation, and Codex
+  engages on syncs inconsistently — **silence is not a finding**, yet the
+  fail-closed gate would strand a zero-signal sync 🟡-pending forever (and the
+  override label the summary points to did not even exist downstream). So: ONLY
+  inside the existing zero-signal 🟡 branch, if the PR is a **trusted sync**
+  (`isTrustedSync(pr)` — the SAME title-prefix + owner/same-repo-branch predicate
+  as merge-bot; the three copies carry a "keep in sync" comment), it has **ZERO
+  Codex signals of any kind** (`codexSignalCount === 0`: reviews + review comments
+  + issue comments + issue-level reactions), AND the head is older than
+  `SYNC_GRACE_MINUTES` (= 30), the gate returns **GREEN** with the cosmetic title
+  **`🟢 Trusted sync — no Codex findings within grace window`**. **ANY Codex signal
+  of any kind → `codexSignalCount > 0` → this never fires** and the full normal
+  rules apply (active P1/P2 still blocks; a clean review/👍 still greens; a
+  younger-than-grace silent sync stays 🟡 with a "auto-clears at <UTC>" line
+  appended). The gate's own poll (MAX_ATTEMPTS 3, ~4.5 min) can't wait out the 30
+  min, so the watchdog sweep lands the grace-green after the window (below).
 
 ### merge-bot.yml — the merger
 - **Candidate = any of:** a bot-authored PR, **OR** an `automerge`-labelled PR,
@@ -315,6 +332,17 @@ cannot push).
     after the run the verdict is 🟢 (candidate clears) or 🔴 (skipped thereafter) —
     at most one extra gate run per stuck head per tick. Own step, whole body +
     per-PR `try/catch`, so it never blocks the timeout logic.
+    - **Silent-sync class + label bootstrap (fix #21).** A SECOND dispatch class on
+      the same 🟡/no-verdict candidate: `isTrustedSync(pr)` (same mirrored predicate,
+      "keep in sync" comment) AND head older than `SYNC_GRACE_MINUTES` (= 30, equal
+      to the gate's) → dispatch the gate too (log `silent-sync grace: dispatching
+      gate for PR #N @ <head7>`), so the gate's trusted-sync grace-green actually
+      lands on the head after the window (the gate's own poll can't wait 30 min).
+      Self-limiting: the dispatched run flips 🟡→🟢. And ONCE PER TICK before the PR
+      loop, the sweep **upserts the `codex-p1-acknowledged` label** (`createLabel`,
+      green `0e8a16`, catch/ignore 422) — the incident was that the very override
+      label the gate's 🟡 summary tells humans to add did not exist in the downstream
+      repo. Mirrors the `needs-owner` upsert pattern.
 - **`codex-backup-fix.yml`** — `workflow_dispatch` (pr_number, head_sha,
   attempt), two jobs:
   - **`generate-patch`** (`permissions: contents: read` — NO write token):

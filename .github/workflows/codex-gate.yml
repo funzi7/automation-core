@@ -171,6 +171,24 @@ jobs:
             // per-head reset) is enough for that; the poll is kept, just capped lower.
             const MAX_ATTEMPTS = 3;
 
+            // fix #21: trusted-sync grace-green. A sync PR is a byte-copy of an
+            // upstream automation-core main that already passed our full validation;
+            // Codex engages on syncs inconsistently and SILENCE is not a finding, so
+            // a trusted sync with zero Codex signals auto-clears after a grace window.
+            const SYNC_GRACE_MINUTES = 30;
+            // Trusted-sync predicate — must match merge-bot.yml / codex-gate.yml — keep in sync.
+            const SYNC_TITLE_PREFIX = 'chore(automation): sync from automation-core';
+            const SYNC_BRANCH = 'chore/sync-automation-core';   // branch the sync workflow opens
+            const OWNER_LOGIN = 'funzi7';
+            const isTrustedSync = (pr) => {
+              const titleIsSync = (pr.title || '').startsWith(SYNC_TITLE_PREFIX);
+              const sameRepo = !!(pr.head && pr.head.repo && pr.head.repo.full_name === `${owner}/${repo}`);
+              return titleIsSync && (
+                (pr.user && pr.user.login === OWNER_LOGIN) ||
+                ((pr.head && pr.head.ref === SYNC_BRANCH) && sameRepo)
+              );
+            };
+
             const isCodex = (user) =>
               user?.login === 'chatgpt-codex-connector[bot]' ||
               user?.login === 'codex' ||
@@ -332,6 +350,13 @@ jobs:
                 const codexReviews = reviews.filter(r => isCodex(r.user));
                 const codexComments = comments.filter(c => isCodex(c.user));
                 const codexReviewComments = reviewComments.filter(c => isCodex(c.user));
+                // fix #21: total Codex signals of ANY kind (any date) — reviews,
+                // review comments, issue comments, and issue-level reactions. Zero
+                // means Codex never engaged at all (the trusted-sync grace precondition).
+                const codexReactions = reactions.filter(r => isCodex(r.user));
+                const codexSignalCount =
+                  codexReviews.length + codexComments.length +
+                  codexReviewComments.length + codexReactions.length;
 
                 const prCommits = await github.paginate(github.rest.pulls.listCommits, {
                   owner, repo, pull_number: prNumber, per_page: 100,
@@ -436,11 +461,35 @@ jobs:
                 // PENDING block. Poll via a head-targeted rerun so a 👍 reaction
                 // (which fires no event) is still caught on the head (P1 #1).
                 if (!hasCodexSignalOnHead) {
+                  // fix #21: trusted-sync grace-green. Fires ONLY inside this
+                  // zero-signal 🟡 branch, ONLY for a trusted sync with ZERO Codex
+                  // signals of any kind, ONLY once the head is older than the grace
+                  // window. Any Codex signal (even one) → codexSignalCount > 0 → this
+                  // never fires and the normal rules apply (P1/P2 still blocks, a
+                  // clean review / 👍 still greens, a younger-than-grace silent sync
+                  // stays 🟡).
+                  const graceMs = SYNC_GRACE_MINUTES * 60 * 1000;
+                  const headAgeMs = Date.now() - latestCommitDate.getTime();
+                  const silentTrustedSync = isTrustedSync(pr) && codexSignalCount === 0;
+                  if (silentTrustedSync && headAgeMs > graceMs) {
+                    results.push(
+                      `PR #${prNumber}: ✅ trusted sync — no Codex signal within ${SYNC_GRACE_MINUTES}m grace on head ${head7}; auto-cleared`
+                    );
+                    await publishGateCheck(headSha, 'success', '🟢 Trusted sync — no Codex findings within grace window',
+                      `Byte-copy sync from automation-core (validated upstream). Codex posted no signal within ${SYNC_GRACE_MINUTES} min of head ${head7}, so the gate auto-cleared. Any Codex signal of any kind restores normal rules.`);
+                    if (!runningOnHead) await scheduleRerun('trusted-sync grace green — land on head');
+                    continue;
+                  }
+                  // Still-pending. For a silent trusted sync inside the grace window,
+                  // tell the reader exactly when it auto-clears.
+                  const graceLine = silentTrustedSync
+                    ? `\nTrusted sync: auto-clears at ${new Date(latestCommitDate.getTime() + graceMs).toISOString()} if Codex posts nothing.`
+                    : '';
                   results.push(
                     `PR #${prNumber}: ⏳ pending — Codex hasn't reviewed head ${headSha.substring(0, 7)} yet; blocking until it does`
                   );
                   await publishGateCheck(headSha, 'failure', '🟡 Waiting for Codex review',
-                    `Codex hasn't reviewed ${head7} yet (rerun attempt ${attempts}/${MAX_ATTEMPTS}). The gate re-checks automatically; it turns green once Codex reviews with no active P1/P2. Manual override: add the \`codex-p1-acknowledged\` label.`);
+                    `Codex hasn't reviewed ${head7} yet (rerun attempt ${attempts}/${MAX_ATTEMPTS}). The gate re-checks automatically; it turns green once Codex reviews with no active P1/P2. Manual override: add the \`codex-p1-acknowledged\` label.${graceLine}`);
                   anyBlocked = true;
                   await scheduleRerun('pending — poll for first Codex signal on head');
                   continue;

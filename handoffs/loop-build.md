@@ -17,6 +17,18 @@ Handoff log for the **self-healing-loop build** Claude Chat session. Claude Code
 
 ---
 
+## [2026-07-03 21:15 UTC] fix #21: silent-sync grace-green + override-label bootstrap
+- PR: direct commit to main
+- Branch: main (direct commit)
+- Status: done
+- What changed (one incident, three parts): a sync PR received ZERO Codex signal (no review/comment/reaction — Codex simply never engaged), so the fail-closed gate stranded it 🟡-pending forever and required a manual merge; worse, the `codex-p1-acknowledged` override label the gate's own summary tells humans to add **did not exist** in the downstream repo. Sync PRs are byte-copies of an upstream `main` that already passed full validation — Codex silence on them must not need a human.
+  - **Part A — codex-gate.yml trusted-sync grace-green:** added `SYNC_GRACE_MINUTES = 30` + an `isTrustedSync(pr)` predicate textually mirroring merge-bot's (title `chore(automation): sync from automation-core` + owner-or-same-repo-`chore/sync-automation-core`-branch; all three carry a "keep in sync" comment). A new branch INSIDE the existing zero-signal 🟡 block: if `isTrustedSync` AND `codexSignalCount === 0` (reviews + review comments + issue comments + issue-level reactions) AND head older than the grace window → GREEN, title `🟢 Trusted sync — no Codex findings within grace window`. ANY Codex signal → count > 0 → branch never fires (P1/P2 blocks, review/👍 greens, younger-than-grace silent sync stays 🟡 with an "auto-clears at <UTC>" line). Freshness / P1-P2 / ack / concurrency / MAX_ATTEMPTS / two-check publishing untouched.
+  - **Part B — watchdog sweep dispatches stale silent syncs:** a second candidate class — `isTrustedSync(pr)` AND 🟡/no-verdict AND head older than `SYNC_GRACE_MINUTES` → dispatch the gate (log `silent-sync grace: dispatching gate for PR #N @ <head7>`) so the grace-green lands on the head after the window (the gate's own 3-attempt poll can't wait 30 min). Self-limiting (run flips 🟡→🟢).
+  - **Part C — watchdog upserts the override label:** once per tick before the PR loop, `createLabel('codex-p1-acknowledged', 0e8a16, …)` with catch/ignore 422 — mirrors the `needs-owner` upsert; fixes the missing-label incident.
+- Validation: `yaml.safe_load` + actionlint on both copies of both files; `node --check` on the gate Evaluate body + the sweep body; greps — `SYNC_GRACE_MINUTES = 30` in both, `isTrustedSync` predicate in gate + sweep matching merge-bot's `titleIsSync && (…)`, the green title present, the label upsert present, the `silent-sync grace` log present; regression guard ZERO `require('@actions/github')`/`__original_require__`/`getOctokit`; `git hash-object` equal per file (gate `96ed29d`, watchdog `112096e`).
+- Needs from the owner: nothing — live on main in one commit; propagates downstream on the next daily sync (which also bootstraps the label on each repo via the watchdog tick).
+- Next: the next zero-signal sync auto-clears 30 min after its head with no human; the override label exists everywhere the watchdog ticks.
+
 ## [2026-07-03 19:30 UTC] fix #20: Link-header pagination in the readonly fetch helpers (50-page ceiling)
 - PR: direct commit to main
 - Branch: main (direct commit)
