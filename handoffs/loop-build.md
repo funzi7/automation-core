@@ -17,6 +17,17 @@ Handoff log for the **self-healing-loop build** Claude Chat session. Claude Code
 
 ---
 
+## [2026-07-03 16:20 UTC] hotfix: merge-bot YAML broken on main + fix #18: watchdog late-👍 sweep
+- PR: direct commit to main
+- Branch: main (direct commit)
+- Status: done
+- What changed (two parts, one commit):
+  - **PART A — HOTFIX (both copies of `merge-bot.yml` failed YAML parse on main).** A manual paste of the github-script `v8` + `__original_require__` fix landed badly: `.github/workflows/merge-bot.yml` had a stray `+ const { getOctokit } = __original_require__('@actions/github');` diff-artifact line, then the real getOctokit line + `const readonly = ...` at **column 0**; `workflows/` had the getOctokit line indented but `const readonly` at column 0. A col-0 line TERMINATES the `script: |` block scalar → `yaml.safe_load` failed at line 92 col 1 on BOTH copies (and had synced broken to a downstream). Fixed: the block is now the two lines at the 12-space script indent, no col-0 lines; the `github-script@v8` bump itself is CORRECT and stays; every OTHER workflow left on `@v7`. `readonly` still used for exactly the two reads; `github-token` still `AUTOMATION_PAT`.
+  - **PART B — FIX #18 (late-👍 sweep in `claude-fallback-watchdog.yml`).** INCIDENT: Codex's 👍 landed AFTER the gate's 3-attempt poll window (~4.5 min) closed; reactions fire NO webhook event, so nothing re-ran the gate → the PR stranded red-pending. Added a SECOND github-script@v7 step (after the timeout logic, never blocks it; whole-body + per-PR try/catch) that piggybacks the existing 5-min schedule (zero new billed runs): for each open PR it reads the newest `codex-gate-verdict` check-run on the head via a GITHUB_TOKEN readonly client (added `checks: read` to permissions), treats 🟡 `Waiting for Codex review` / absent as a candidate (🟢 skip, 🔴 skip), and if a FRESH Codex signal on the head exists (review `submitted_at` OR issue-level 👍 `created_at` > `latestCommitDate`, gate's exact `isCodex`) re-dispatches the gate on the head branch exactly as `scheduleRerun` (via AUTOMATION_PAT; fix #4 loud-fail on error). Self-limiting: post-run verdict is 🟢 (clears) or 🔴 (skipped) → ≤1 extra gate run per stuck head per tick.
+- Validation: `yaml.safe_load` passes on both copies of `merge-bot.yml` + `claude-fallback-watchdog.yml`; actionlint clean on all four; `node --check` on the merge-bot body + the new sweep body; `git hash-object` equal per file across `workflows/` ↔ `.github/workflows/` (merge-bot `8811de6`, watchdog `9cb7d42`); no `cancel-in-progress` regressions; sweep dispatch on `github`(PAT), Checks read on `readonly`(GITHUB_TOKEN).
+- Needs from the owner: nothing — live on main in one commit; propagates downstream on the next daily sync.
+- Next: a late Codex 👍 now self-heals within one watchdog tick (≤5 min) instead of stranding until a manual re-run.
+
 ## [2026-07-03 14:10 UTC] fix #17: gate never dies mid-verdict + merge-bot ignores cancelled checks + reads on GITHUB_TOKEN
 - PR: direct commit to main
 - Branch: main (direct commit)

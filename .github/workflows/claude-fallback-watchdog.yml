@@ -22,6 +22,9 @@ permissions:
   contents: read
   pull-requests: write
   issues: write
+  # fix #18: the late-signal sweep reads codex-gate-verdict check-runs on the
+  # GITHUB_TOKEN readonly client (fine-grained PATs can't hold Checks).
+  checks: read
 
 concurrency:
   group: claude-fallback-watchdog-${{ github.repository }}
@@ -287,4 +290,138 @@ jobs:
               } catch (e) {
                 core.info(`PR #${pr.number}: watchdog error (ignored): ${e.message}`);
               }
+            }
+
+      # fix #18 — late-signal sweep. INCIDENT: Codex's 👍 landed AFTER the gate's
+      # 3-attempt poll window (~4.5 min) closed. A reaction fires NO webhook event,
+      # so nothing re-runs the gate and the PR strands red-pending forever (until a
+      # manual re-run). This piggybacks on the EXISTING hourly-ish watchdog schedule
+      # (zero new billed workflow runs): for each open PR whose codex-gate-verdict is
+      # 🟡-pending (or absent) on the head, if a FRESH Codex signal exists on the head
+      # it re-dispatches the gate on the head branch — exactly as the gate's own
+      # scheduleRerun does. Self-limiting: after the dispatched run the verdict is 🟢
+      # (candidate condition clears) or 🔴 (skipped thereafter) — at most one extra
+      # gate run per stuck head per tick. Runs AFTER the timeout logic; never blocks
+      # it (own step, whole body try/catch, each PR its own try/catch).
+      - name: Late-signal sweep — re-dispatch stuck gates on a fresh Codex signal
+        if: steps.patcheck.outputs.ok == 'true'
+        uses: actions/github-script@v7
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # fix #18: Checks read runs on GITHUB_TOKEN — fine-grained PATs cannot
+          # hold the Checks permission (see merge-bot fix #17 Part C). The gate
+          # dispatch (a mutation) stays on AUTOMATION_PAT, the token the watchdog
+          # already dispatches with (has actions: write; GITHUB_TOKEN-authored
+          # events don't reliably start workflows).
+          GH_READONLY_TOKEN: ${{ github.token }}
+        with:
+          github-token: ${{ secrets.AUTOMATION_PAT }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            // Reads (Checks) on GITHUB_TOKEN; mutations/dispatch on the PAT (`github`).
+            // v7 exposes `require` for bundled modules (no __original_require__ here).
+            const readonly = require('@actions/github').getOctokit(process.env.GH_READONLY_TOKEN);
+            // Verbatim from codex-gate.yml's pending publish call.
+            const PENDING_TITLE = '🟡 Waiting for Codex review';
+            const GATE_WORKFLOW = 'codex-gate.yml';
+            const VERDICT_CHECK = 'codex-gate-verdict';
+
+            // EXACT Codex-author matcher the gate uses for reviews + reactions.
+            const isCodex = (user) =>
+              user?.login === 'chatgpt-codex-connector[bot]' ||
+              user?.login === 'codex' ||
+              (user?.type === 'Bot' && user?.login?.toLowerCase().includes('codex'));
+
+            async function telegram(text) {
+              const tgToken = process.env.TELEGRAM_BOT_TOKEN;
+              const tgChat = process.env.TELEGRAM_CHAT_ID;
+              if (!tgToken || !tgChat) return;
+              try {
+                await fetch(`https://api.telegram.org/bot${tgToken}/sendMessage`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ chat_id: tgChat, text, disable_web_page_preview: true }),
+                });
+              } catch (e) { core.info(`Telegram failed (ignored): ${e.message}`); }
+            }
+
+            try {
+              const prs = await github.paginate(github.rest.pulls.list, {
+                owner, repo, state: 'open', per_page: 100,
+              });
+
+              for (const pr of prs) {
+                try {
+                  const prNumber = pr.number;
+                  const headSha = pr.head.sha;
+                  const head7 = headSha.substring(0, 7);
+
+                  // latestCommitDate — computed EXACTLY as the gate does: the MAX
+                  // committer date across the PR's commits (else pr.created_at).
+                  const prCommits = await github.paginate(github.rest.pulls.listCommits, {
+                    owner, repo, pull_number: prNumber, per_page: 100,
+                  });
+                  const latestCommitDate = prCommits.length > 0
+                    ? new Date(Math.max(...prCommits.map(c => new Date(c.commit.committer.date).getTime())))
+                    : new Date(pr.created_at);
+
+                  // Newest codex-gate-verdict check-run on the head (READ → GITHUB_TOKEN).
+                  const checkRuns = await readonly.paginate(readonly.rest.checks.listForRef, {
+                    owner, repo, ref: headSha, per_page: 100,
+                  });
+                  const recency = (c) => new Date(c.completed_at || c.started_at || 0).getTime();
+                  const newestVerdict = checkRuns
+                    .filter((c) => c.name === VERDICT_CHECK)
+                    .sort((a, b) => recency(b) - recency(a))[0];
+                  const title = newestVerdict && newestVerdict.output && newestVerdict.output.title;
+                  // Candidate iff 🟡 pending OR no verdict on the head at all. A 🟢
+                  // needs nothing; a 🔴 (active P1/P2) is the bridge's job — re-
+                  // dispatching would change nothing.
+                  const isCandidate = !newestVerdict || title === PENDING_TITLE;
+                  if (!isCandidate) continue;
+
+                  // FRESH Codex signal on the head, mirroring the gate's matchers:
+                  // a Codex review submitted_at > latestCommitDate, OR a Codex-
+                  // authored issue-level 👍 created_at > latestCommitDate.
+                  const [reviews, reactions] = await Promise.all([
+                    github.paginate(github.rest.pulls.listReviews, {
+                      owner, repo, pull_number: prNumber, per_page: 100,
+                    }),
+                    github.paginate(github.rest.reactions.listForIssue, {
+                      owner, repo, issue_number: prNumber, per_page: 100,
+                    }),
+                  ]);
+                  const freshReview = reviews.some(
+                    (r) => isCodex(r.user) && r.submitted_at &&
+                           new Date(r.submitted_at) > latestCommitDate
+                  );
+                  const freshThumbs = reactions.some(
+                    (r) => isCodex(r.user) && r.content === '+1' &&
+                           new Date(r.created_at) > latestCommitDate
+                  );
+                  if (!freshReview && !freshThumbs) continue;
+
+                  // A fresh signal exists but the gate is still pending — the
+                  // late-signal gap. Re-dispatch the gate on the head BRANCH,
+                  // exactly as scheduleRerun does (dispatch run's head_sha ==
+                  // pr.head.sha, so the check lands on the head).
+                  try {
+                    await github.rest.actions.createWorkflowDispatch({
+                      owner, repo, workflow_id: GATE_WORKFLOW, ref: pr.head.ref,
+                      inputs: { pr_number: String(prNumber) },
+                    });
+                    core.info(`late-signal sweep: dispatching gate for PR #${prNumber} @ ${head7}`);
+                  } catch (e) {
+                    // fix #4 loud-fail: annotate + Telegram; never crash the sweep.
+                    core.error(`late-signal sweep: gate dispatch failed for PR #${prNumber} @ ${head7} — ${e.message}`);
+                    await telegram(`⚠️ ${repo} PR #${prNumber}: late-signal gate dispatch failed — ${e.message}`);
+                  }
+                } catch (e) {
+                  core.info(`late-signal sweep: PR #${pr.number} error (ignored): ${e.message}`);
+                }
+              }
+            } catch (e) {
+              core.error(`late-signal sweep failed (ignored): ${e.message}`);
             }

@@ -210,6 +210,23 @@ merged → (sync propagates updated workflows to ~14 downstream repos daily)
   failures and before the codex-gate lookup, matching GitHub's own gating. (See
   Hard-Won Lessons — scanning every run is what kept merge-bot from ever
   merging.)
+- **`require` lesson + github-script v8 (READ before editing the script).**
+  `merge-bot.yml` uses `actions/github-script@v8`. **v8 sandboxes `require`**, so
+  the ONLY way to load a bundled module is
+  `const { getOctokit } = __original_require__('@actions/github');` — plain
+  `require('@actions/github')` throws at runtime. (On the **v7** steps everywhere
+  else — watchdog, gate, ci-doctor, bridge — use plain `require`; do NOT copy
+  `__original_require__` into a v7 step.) The two-token readonly client
+  (fix #17 Part C) is built from this.
+- **Manual-edit rules for a `script: |` block (a bad paste already jammed main).**
+  A hand-applied diff once pasted a literal `+ ` diff-artifact line plus two JS
+  lines at **column 0** inside the block scalar; a column-0 line **terminates**
+  `script: |`, so the whole file failed YAML parse (`yaml.safe_load` errored at the
+  first col-0 line) and, synced, broke a downstream too. RULES: every script line
+  is indented to the block's column (12 spaces here); **no column-0 lines** anywhere
+  in the block; **before pushing**, run `python3 -c "import yaml; yaml.safe_load(...)"`
+  on BOTH copies + `actionlint` + `node --check` on the extracted body; and keep
+  `workflows/` ↔ `.github/workflows/` **byte-identical** (`git hash-object` both).
 
 ### The Bridge (inside codex-auto-fix.yml)
 - **Triggers on P1 + P2, excludes P3.** Codex tags each finding with a
@@ -270,6 +287,25 @@ cannot push).
   `attempt=max+1`) and posts a `agent=codex state=requested` marker so the
   attempt is counted and never re-fired. At 3 attempts it adds `needs-owner` +
   a counts-only Telegram alert instead of firing Codex.
+  - **Late-signal sweep (fix #18) — a SECOND step in this same workflow.** Closes
+    the late-👍 gap: Codex's 👍 (or review) can land AFTER the gate's 3-attempt
+    poll window (~4.5 min) closes, and a reaction fires **no webhook event**, so
+    nothing re-runs the gate → the PR strands 🟡-pending forever. Piggybacking on
+    the existing 5-min schedule (**zero new billed runs**), the sweep scans every
+    open PR, reads the newest `codex-gate-verdict` check-run on the head (via the
+    **GITHUB_TOKEN readonly** client — fine-grained PATs can't hold Checks; the
+    permissions block gained `checks: read`), and treats a **🟡 "Waiting for Codex
+    review"** (or absent) verdict as a candidate (🟢 needs nothing; 🔴 is the
+    bridge's job). For a candidate, if a **fresh Codex signal on the head** exists —
+    a Codex review `submitted_at > latestCommitDate` OR a Codex-authored issue-level
+    👍 `created_at > latestCommitDate`, using the gate's EXACT `isCodex` matcher and
+    `latestCommitDate` (max committer date across PR commits) — it re-dispatches the
+    gate on the head branch exactly as `scheduleRerun` does (`codex-gate.yml`,
+    `ref: pr.head.ref`, `inputs.pr_number`), via **AUTOMATION_PAT** (the watchdog's
+    dispatch token; loud-fail = `core.error` + Telegram, fix #4). **Self-limiting:**
+    after the run the verdict is 🟢 (candidate clears) or 🔴 (skipped thereafter) —
+    at most one extra gate run per stuck head per tick. Own step, whole body +
+    per-PR `try/catch`, so it never blocks the timeout logic.
 - **`codex-backup-fix.yml`** — `workflow_dispatch` (pr_number, head_sha,
   attempt), two jobs:
   - **`generate-patch`** (`permissions: contents: read` — NO write token):

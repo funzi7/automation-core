@@ -89,7 +89,7 @@ jobs:
             // fix #17 Part C: reads go through GITHUB_TOKEN (fine-grained PATs
             // can't hold Checks perm); mutations stay on the PAT (`github`).
             const { getOctokit } = __original_require__('@actions/github');
-const readonly = getOctokit(process.env.GH_READONLY_TOKEN);
+            const readonly = getOctokit(process.env.GH_READONLY_TOKEN);
             const CODEX_CHECK = 'check-codex-status';
             const LABEL_AUTOMERGE = 'automerge';
             const LABEL_ESCALATE = 'needs-owner';
