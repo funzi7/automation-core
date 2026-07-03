@@ -82,6 +82,16 @@ jobs:
           github_token: ${{ secrets.AUTOMATION_PAT || github.token }}
           trigger_phrase: "@claude"
           label_trigger: "claude-fix"
+          # fix #16: expose the SDK transcript ONLY when the repo opts in via the
+          # Actions variable CLAUDE_SHOW_FULL_OUTPUT == 'true'. Default (var unset
+          # or any other value) keeps today's hidden output ("full output hidden
+          # for security") — the safe default for PUBLIC downstreams, where the
+          # transcript can echo file contents into world-readable logs. On a
+          # PRIVATE repo, flip the repo Actions var to 'true' temporarily to
+          # enumerate permission denials BY TOOL NAME (an error_max_turns run
+          # reports permission_denials_count but hides WHICH tools were denied, so
+          # the count alone can't tune --allowedTools), then flip it back.
+          show_full_output: ${{ vars.CLAUDE_SHOW_FULL_OUTPUT == 'true' }}
           # --max-turns 50 + a BROAD allowlist (fix #7). The previous
           # --max-turns 20 + narrow per-subcommand list caused error_max_turns
           # on paywall-bot #49: the fixer kept trying tools OUTSIDE the allowlist

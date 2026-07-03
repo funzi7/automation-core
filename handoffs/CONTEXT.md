@@ -79,7 +79,14 @@ merged → (sync propagates updated workflows to ~14 downstream repos daily)
   only once Codex has reviewed the current head and there is no active P1.
 - **`claude.yml`** — **Claude Fixer.** Runs `anthropics/claude-code-action` to
   fix a `claude-fix` Issue or an `@claude` mention, opens a PR, labels it
-  `automerge`.
+  `automerge`. **Debug toggle (fix #16):** the SDK transcript is hidden by
+  default (`show_full_output` defaults false — safe for PUBLIC downstreams, where
+  it could echo file contents into world-readable logs). `show_full_output` is
+  wired to `${{ vars.CLAUDE_SHOW_FULL_OUTPUT == 'true' }}`: on a PRIVATE repo,
+  set the Actions variable `CLAUDE_SHOW_FULL_OUTPUT=true` temporarily to
+  enumerate an `error_max_turns` run's permission denials **by tool name** (the
+  logged `permission_denials_count` alone can't tune `--allowedTools`), then flip
+  it back off.
 - **`ci-doctor.yml`** — **CI Doctor.** Detects failed CI runs, opens (deduped)
   `claude-fix` Issues, escalates to `needs-owner` after repeated failure.
 - **`merge-bot.yml`** — **Merge Bot.** Squash-merges green candidate PRs.

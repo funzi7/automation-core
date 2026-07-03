@@ -17,6 +17,15 @@ Handoff log for the **self-healing-loop build** Claude Chat session. Claude Code
 
 ---
 
+## [2026-07-03 11:30 UTC] fix #16: claude.yml — opt-in SDK transcript to enumerate permission denials
+- PR: direct commit to main
+- Branch: main (direct commit)
+- Status: done
+- What changed: added `show_full_output: ${{ vars.CLAUDE_SHOW_FULL_OUTPUT == 'true' }}` to the `anthropics/claude-code-action@v1` `with:` block. Motivation: **paywall-bot PR #58** the fixer died `error_max_turns` (51 turns, **$2.21**, **permission_denials_count: 21**) but the action hides the SDK output by default ("full output hidden for security" — `show_full_output` defaults false), so the DENIED TOOL NAMES were unrecoverable and `--allowedTools` couldn't be tuned on facts. Now the transcript stays hidden by default (safe for PUBLIC downstreams — it can echo file contents into world-readable logs) and a PRIVATE repo can flip the repo Actions var `CLAUDE_SHOW_FULL_OUTPUT=true` temporarily to enumerate the denials by tool name, then flip it back. `--max-turns` (50), `--allowedTools`, tokens, triggers, concurrency — all untouched.
+- Validation: actionlint clean on both copies of `claude.yml`; `git hash-object` equal between `workflows/claude.yml` and `.github/workflows/claude.yml` (blob `df61a3a`); `show_full_output` present on line 94 of both.
+- Needs from the owner: nothing — live on main in one commit; propagates downstream on the next daily sync. To actually SEE a transcript, set `CLAUDE_SHOW_FULL_OUTPUT=true` on the private repo being debugged.
+- Next: re-run/observe the next `error_max_turns` on a private repo with the var on → read the denied tool names → tighten/loosen `--allowedTools` accordingly.
+
 ## [2026-06-30 13:00 UTC] fix #15: two-check gate architecture — Actions-owned check-codex-status + cosmetic codex-gate-verdict (survive the 2025-03-31 update policy)
 - PR: direct commit to main
 - Branch: main (direct commit)
