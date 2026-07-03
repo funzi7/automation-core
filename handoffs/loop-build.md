@@ -17,6 +17,15 @@ Handoff log for the **self-healing-loop build** Claude Chat session. Claude Code
 
 ---
 
+## [2026-07-03 18:05 UTC] fix #19: kill in-script module loading — raw REST via built-in fetch
+- PR: direct commit to main
+- Branch: main (direct commit)
+- Status: done
+- What changed: empirical record — `require('@actions/github')` crashed merge-bot on github-script **v7** (`Cannot find module …/v7/dist/index.js`) and `__original_require__('@actions/github')` crashed it AGAIN on **v8** (same error, v8/dist in the stack). Root cause: the action ships an **ncc-bundled `dist` with NO `node_modules`** — nothing to resolve, under either require, in either major. The fix #18 watchdog sweep carried the SAME dead construct (plain `require` on v7) so it was dead-on-arrival every tick. Replaced the second-token octokit client in BOTH files with built-in **global `fetch`** helpers (`roGet` + `roCheckRuns` [+ `roStatuses` in merge-bot only]): raw REST to `/repos/{o}/{r}/commits/{ref}/check-runs` and `/statuses`, zero modules. Call sites kept their exact `ref` (`headSha` in both). `@v8` on merge-bot / `@v7` on the watchdog, the env lines, and `github-token: AUTOMATION_PAT` all unchanged. REST payload fields identical to octokit's, so every downstream consumer (cancelled filter, latest-per-name, anyRunning/anyFailed, CODEX_CHECK lookup, status handling, verdict `output.title`) is untouched.
+- Validation: `yaml.safe_load` passes on both copies of both files; actionlint clean on all four; `node --check` on each extracted script body; grep across `workflows/` + `.github/workflows/` returns ZERO hits for `require('@actions/github')`, `__original_require__`, `getOctokit`, and `readonly.`; `git hash-object` equal per file (merge-bot `7563959`, watchdog `b952c9f`).
+- Needs from the owner: nothing — live on main in one commit; propagates downstream on the next daily sync.
+- Next: merge-bot's checks/statuses reads and the watchdog sweep now actually execute (were throwing every run); watch the next green candidate merge + a stuck head self-heal.
+
 ## [2026-07-03 16:20 UTC] hotfix: merge-bot YAML broken on main + fix #18: watchdog late-👍 sweep
 - PR: direct commit to main
 - Branch: main (direct commit)

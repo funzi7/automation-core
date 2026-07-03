@@ -210,14 +210,19 @@ merged → (sync propagates updated workflows to ~14 downstream repos daily)
   failures and before the codex-gate lookup, matching GitHub's own gating. (See
   Hard-Won Lessons — scanning every run is what kept merge-bot from ever
   merging.)
-- **`require` lesson + github-script v8 (READ before editing the script).**
-  `merge-bot.yml` uses `actions/github-script@v8`. **v8 sandboxes `require`**, so
-  the ONLY way to load a bundled module is
-  `const { getOctokit } = __original_require__('@actions/github');` — plain
-  `require('@actions/github')` throws at runtime. (On the **v7** steps everywhere
-  else — watchdog, gate, ci-doctor, bridge — use plain `require`; do NOT copy
-  `__original_require__` into a v7 step.) The two-token readonly client
-  (fix #17 Part C) is built from this.
+- **NO module loading in the script — fetch-based second token (fix #19).**
+  `merge-bot.yml` uses `actions/github-script@v8` (kept). Do NOT try to build an
+  octokit from a module: both `require('@actions/github')` (v7) and
+  `__original_require__('@actions/github')` (v8) crashed this step in production
+  with `Cannot find module .../dist/index.js` (ncc bundle, no `node_modules`; see
+  the HARD RULE in §7). The two-token read/mutation split (fix #17 Part C) now
+  does its GITHUB_TOKEN reads with the built-in global `fetch`: helpers `roGet`
+  (Bearer + `X-GitHub-Api-Version: 2022-11-28`), `roCheckRuns(ref)` → GET
+  `/repos/{o}/{r}/commits/{ref}/check-runs`, `roStatuses(ref)` → GET `.../statuses`,
+  each looping `?per_page=100&page=`. Payload fields are identical to octokit's
+  (check runs: `name`/`status`/`conclusion`/`started_at`/`completed_at`/`output`;
+  statuses: `state`/`context`/`created_at`), so every downstream consumer is
+  unchanged. `github-token` stays `AUTOMATION_PAT` for all mutations.
 - **Manual-edit rules for a `script: |` block (a bad paste already jammed main).**
   A hand-applied diff once pasted a literal `+ ` diff-artifact line plus two JS
   lines at **column 0** inside the block scalar; a column-0 line **terminates**
@@ -293,8 +298,9 @@ cannot push).
     nothing re-runs the gate → the PR strands 🟡-pending forever. Piggybacking on
     the existing 5-min schedule (**zero new billed runs**), the sweep scans every
     open PR, reads the newest `codex-gate-verdict` check-run on the head (via the
-    **GITHUB_TOKEN readonly** client — fine-grained PATs can't hold Checks; the
-    permissions block gained `checks: read`), and treats a **🟡 "Waiting for Codex
+    **GITHUB_TOKEN `roCheckRuns` fetch helper** — fix #19; fine-grained PATs can't
+    hold Checks, and no module can be loaded in-script; the permissions block gained
+    `checks: read`), and treats a **🟡 "Waiting for Codex
     review"** (or absent) verdict as a candidate (🟢 needs nothing; 🔴 is the
     bridge's job). For a candidate, if a **fresh Codex signal on the head** exists —
     a Codex review `submitted_at > latestCommitDate` OR a Codex-authored issue-level
@@ -533,3 +539,18 @@ never exposed).
   named branch (often `main` here, since `main` is unprotected by design).
 - **Validate before commit:** `actionlint` on both workflow copies + `node
   --check` on each `github-script` block.
+- **HARD RULE — never load a module inside `actions/github-script` (fix #19).**
+  BOTH module-loading forms have crashed merge-bot in production with `Cannot
+  find module .../dist/index.js`: the v7 `require('@actions/github')` and the v8
+  `__original_require__('@actions/github')`. Root cause: the action ships an
+  **ncc-bundled `dist` with NO `node_modules`** — there is nothing to resolve,
+  under either require, in either major. The provided `github`/`context`/`core`
+  globals are fine (they're injected, not required). When you need a SECOND token
+  (e.g. a GITHUB_TOKEN read client because the step's `github-token` is a
+  fine-grained PAT that can't hold Checks), the ONLY sanctioned pattern is **raw
+  REST via the built-in global `fetch`** (Node 20/24 both have it) — the
+  `roGet` / `roCheckRuns` / `roStatuses` helpers (a `Bearer` header +
+  `Accept: application/vnd.github+json` + `X-GitHub-Api-Version: 2022-11-28`,
+  manual `?per_page=100&page=` loop). Zero modules, zero dependencies. Grep must
+  stay clean of `require('@actions/github')`, `__original_require__`, and
+  `getOctokit`.

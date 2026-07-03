@@ -88,8 +88,35 @@ jobs:
             const repo = context.repo.repo;
             // fix #17 Part C: reads go through GITHUB_TOKEN (fine-grained PATs
             // can't hold Checks perm); mutations stay on the PAT (`github`).
-            const { getOctokit } = __original_require__('@actions/github');
-            const readonly = getOctokit(process.env.GH_READONLY_TOKEN);
+            // fix #19: NO module loading inside github-script — both the v7 and the v8
+            // forms of loading the @actions/github module crash "Cannot find module"
+            // (the action ships an ncc bundle with no node_modules to resolve). Do the
+            // two GITHUB_TOKEN reads with the built-in global fetch (raw REST), zero
+            // modules.
+            const GH_RO = process.env.GH_READONLY_TOKEN;
+            async function roGet(path) {
+              const res = await fetch(`https://api.github.com${path}`, { headers: { Authorization: `Bearer ${GH_RO}`, Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' } });
+              if (!res.ok) throw new Error(`GET ${path} -> ${res.status}: ${(await res.text()).slice(0, 200)}`);
+              return res.json();
+            }
+            async function roCheckRuns(ref) {
+              const out = [];
+              for (let page = 1; page <= 10; page++) {
+                const d = await roGet(`/repos/${owner}/${repo}/commits/${encodeURIComponent(ref)}/check-runs?per_page=100&page=${page}`);
+                out.push(...(d.check_runs || []));
+                if ((d.check_runs || []).length === 0 || out.length >= (d.total_count || 0)) break;
+              }
+              return out;
+            }
+            async function roStatuses(ref) {
+              const out = [];
+              for (let page = 1; page <= 10; page++) {
+                const d = await roGet(`/repos/${owner}/${repo}/commits/${encodeURIComponent(ref)}/statuses?per_page=100&page=${page}`);
+                out.push(...d);
+                if (d.length < 100) break;
+              }
+              return out;
+            }
             const CODEX_CHECK = 'check-codex-status';
             const LABEL_AUTOMERGE = 'automerge';
             const LABEL_ESCALATE = 'needs-owner';
@@ -203,9 +230,7 @@ jobs:
 
               // All check runs on the head sha (paginate). READ → GITHUB_TOKEN
               // (fix #17 Part C): a fine-grained PAT can't hold Checks perm.
-              const checkRunsAll = await readonly.paginate(readonly.rest.checks.listForRef, {
-                owner, repo, ref: headSha, per_page: 100,
-              });
+              const checkRunsAll = await roCheckRuns(headSha);
               // fix #17 Part B: DROP concurrency-cancelled check-runs — a gate run
               // that read Codex's 👍 and created the green verdict tile, then got
               // cancelled mid-verdict by cancel-in-progress, left a `cancelled`
@@ -218,9 +243,7 @@ jobs:
               // finds nothing → fail-closed skip (unchanged).
               const checkRuns = checkRunsAll.filter((c) => c.conclusion !== 'cancelled');
               // All commit statuses on the head sha (paginate). READ → GITHUB_TOKEN.
-              const statuses = await readonly.paginate(readonly.rest.repos.listCommitStatusesForRef, {
-                owner, repo, ref: headSha, per_page: 100,
-              });
+              const statuses = await roStatuses(headSha);
 
               // Keep ONLY the latest check run per name. The Codex gate emits
               // multiple `check-codex-status` runs on the same head over a PR's
