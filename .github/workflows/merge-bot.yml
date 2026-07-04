@@ -342,7 +342,14 @@ jobs:
                   core.info(`#${prNumber}: head moved / already merged / not mergeable (${e.status}), skip`);
                   continue;
                 }
-                throw e;
+                // fail-soft: an unexpected merge error on ONE PR must not crash
+                // the whole merge-bot job — a `throw` here reds the workflow and
+                // blocks every OTHER candidate PR, contradicting the fail-soft
+                // design ("missing PAT → GREEN"). The merge is idempotent and
+                // re-evaluated on the next Codex Gate success, so losing this
+                // pass costs nothing. Surface it as a warning and move on.
+                core.warning(`#${prNumber}: unexpected merge error (${e.status || '?'}), skipping this PR: ${e.message}`);
+                continue;
               }
 
               // Delete the head branch (same-repo branches only, best-effort).
