@@ -19,31 +19,18 @@ name: Codex Gate
 # clean review / 👍 / P3 are all green. `codex-p1-acknowledged` label = manual
 # override.
 #
-# HEAD-TARGETED SELF-RERUN (restored — this is the fix for the two P1s Codex
-# raised on PR #25):
-#   merge-bot reads `check-codex-status` via checks.listForRef(pr.head.sha),
-#   i.e. it only sees a check that landed on the HEAD commit. Two clean
-#   signals don't naturally land there:
-#     - a 👍 reaction fires NO workflow event at all, so the head's failed
-#       opened/synchronize run is never recomputed;
-#     - a top-level issue_comment (or a fix-Summary comment) runs on the
-#       DEFAULT branch SHA, so its check never attaches to the head.
-#   So whenever the gate is in a non-green-on-head state — pending (waiting
-#   for the first signal, incl. the 👍 poll) OR a clean verdict computed on a
-#   run that is NOT on the head — it re-dispatches itself via
-#   createWorkflowDispatch against the PR HEAD BRANCH (ref = pr.head.ref). A
-#   dispatch run's head_sha == pr.head.sha, so its check lands on the head
-#   where merge-bot looks. Capped at MAX_ATTEMPTS (3) per head SHA with ~90s
-#   spacing. A new push changes the head SHA and resets the cap. (Since fix #11
-#   the check is published on the head from every run, so this poll now mainly
-#   covers the 👍-reaction case, which fires no event.)
-#
-# Why it can't wedge red forever: it waits for the FIRST post-commit signal,
-# not an approval; the 👍 reaction and an empty review object both count.
-# Codex reviews automatically on every push and the poll catches a reaction
-# within the window, so pending → green resolves on its own. If Codex
-# genuinely never reviews, the escape is the override label (no fail-open-
-# merge at timeout — we never merge unreviewed).
+# RE-CHECK MODEL (fix #25 — the head-targeted self-rerun POLL was DELETED):
+#   merge-bot reads `check-codex-status` via checks.listForRef(pr.head.sha), so
+#   the verdict must land on the HEAD commit. The gate re-evaluates on Codex
+#   activity (pull_request_review / issue_comment) and on `pull_request`
+#   opened/synchronize — those run against the head, so the check lands there.
+#   The two cases that don't fire a head-run on their own — a late 👍 reaction
+#   (no event) and a silent trusted sync — are covered elsewhere now: the
+#   watchdog SWEEP (fix #18) re-dispatches the gate on the head branch (≤~1h) and
+#   the trusted-sync GRACE-GREEN (fix #21) auto-clears. Manual re-check: Actions →
+#   Codex Gate → Run workflow with the PR number, or add the
+#   `codex-p1-acknowledged` label. The old in-run 90s `sleep` + createWorkflowDispatch
+#   poll — the single biggest per-wave cost (TRF #88: ~10-12 of ~15 runner-min) — is gone.
 #
 # Why a re-pointed commit_id can't cause a premature green: "has reviewed" is
 # date-only, so an old inline comment whose commit_id GitHub re-pointed to the
@@ -64,25 +51,27 @@ on:
     types: [opened, synchronize, reopened]
   pull_request_review:
     types: [submitted, edited, dismissed]
-  pull_request_review_comment:
-    types: [created, edited, deleted]
   issue_comment:
     types: [created, edited, deleted]
-  # Self-rerun / manual re-check entry point. The Trigger step calls
-  # createWorkflowDispatch with this workflow_id + a pr_number input and
-  # ref = the PR head branch, so the fresh run's head_sha == pr.head.sha and
-  # its check lands on the head where merge-bot looks.
+  # fix #25: `pull_request_review_comment` was REMOVED. The verdict is evaluated
+  # against the WHOLE head every run; a Codex review already fires
+  # `pull_request_review`, and each of its N inline notes ADDITIONALLY fired a
+  # gate run that concurrency mostly cancelled after the runner had started — pure
+  # cost. Manual re-check / external-dispatch entry point below: the watchdog
+  # sweep and the silent-sync grace DISPATCH INTO this with a `pr_number` input +
+  # ref = the PR head branch, so the fresh run's head_sha == pr.head.sha and its
+  # check lands on the head where merge-bot looks.
   workflow_dispatch:
     inputs:
       pr_number:
-        description: 'PR number to check (used by the head-targeted self-rerun)'
+        description: 'PR number to check (used by the watchdog sweep + manual re-check)'
         required: false
         type: string
 
-# fix #12/#17: collapse the burst of redundant gate runs per PR without ever
-# killing a run mid-verdict. A Codex review fires pull_request_review AND
-# pull_request_review_comment (one per inline note), and a push fires a
-# pull_request run + its head-targeted self-rerun — ~4 runs per wave.
+# fix #12/#17/#25: collapse the burst of redundant gate runs per PR without ever
+# killing a run mid-verdict. Post-#25 a Codex review fires ONE pull_request_review
+# and a push fires ONE pull_request run — the per-inline-note trigger AND the
+# in-run self-rerun poll are gone, so a wave is far smaller than the old ~4 runs.
 # cancel-in-progress is FALSE (fix #17): an IN-PROGRESS run always runs to
 # completion. Under cancel-in-progress: true a run that had already read Codex's
 # 👍 and CREATED the green codex-gate-verdict tile got cancelled by a newer event
@@ -102,9 +91,8 @@ permissions:
   contents: read
   pull-requests: read
   issues: read
-  # Needed for the head-targeted self-rerun: getWorkflowRun +
-  # listWorkflowRunsForRepo (read) and createWorkflowDispatch (write).
-  actions: write
+  # fix #25: `actions:` dropped — the only consumer was the deleted self-rerun
+  # poll (getWorkflowRun/listWorkflowRuns read + createWorkflowDispatch write).
   # fix #11: publish the explicit `check-codex-status` check-run with output text.
   checks: write
 
@@ -116,7 +104,7 @@ jobs:
   # for a head (🟡 first, then Codex reviews → the update is rejected). The
   # authoritative `check-codex-status` is therefore the ACTIONS-OWNED job-status
   # check (this job's `name:`), driven ONLY by the verdict via core.setFailed;
-  # the head-targeted self-rerun lands it on pr.head.sha where merge-bot reads it.
+  # it lands on pr.head.sha (where merge-bot reads it) on every head-run.
   # The rich 🟢/🔴/🟡 output lives on a SEPARATE, cosmetic, CREATE-ONLY check
   # `codex-gate-verdict` (publishGateCheck below) — never updated, so the policy
   # can't jam it, and nothing keys on that name.
@@ -165,11 +153,6 @@ jobs:
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const prNumbers = JSON.parse('${{ steps.prs.outputs.numbers }}');
-            // fix #12: lowered 5→3. Since fix #11 lands the check on the head
-            // from EVERY run, the head-targeted self-rerun's only remaining job is
-            // catching a 👍 reaction (which fires no event). 3 polls (~90s apart,
-            // per-head reset) is enough for that; the poll is kept, just capped lower.
-            const MAX_ATTEMPTS = 3;
 
             // fix #21: trusted-sync grace-green. A sync PR is a byte-copy of an
             // upstream automation-core main that already passed our full validation;
@@ -227,46 +210,8 @@ jobs:
                 .replace(/(?:^|\n)#{2,3}\s+Testing[\s\S]*?(?=\n#{2,3}\s|\n---|$)/gi, '');
             }
 
-            // The check this run produces attaches to the run's head_sha.
-            // merge-bot only reads check-codex-status on pr.head.sha, so a
-            // run whose head_sha != pr.head.sha (issue_comment/issues run on
-            // the default branch) does NOT land where merge-bot looks — we
-            // must re-dispatch on the head branch in that case.
-            let runHeadSha = process.env.GITHUB_SHA;
-            try {
-              const { data: thisRun } = await github.rest.actions.getWorkflowRun({
-                owner, repo, run_id: context.runId,
-              });
-              runHeadSha = thisRun.head_sha || runHeadSha;
-            } catch (e) {
-              core.info(`getWorkflowRun failed (using GITHUB_SHA): ${e.message}`);
-            }
-
             let anyBlocked = false;
             const results = [];
-            // Only one head-targeted rerun is dispatched per job (env-file
-            // carries a single PR); prNumbers is effectively always length 1.
-            let rerun = null;
-
-            // Count prior Codex Gate runs recorded against this head SHA, to
-            // cap the rerun loop. Use the workflow-SPECIFIC endpoint
-            // (actions.listWorkflowRuns, GET /actions/workflows/{id}/runs):
-            // the repo-level listWorkflowRunsForRepo IGNORES workflow_id, so it
-            // would count UNRELATED workflows' runs on the same head SHA and
-            // trip MAX_ATTEMPTS early. Dispatch runs (ref = head branch) and
-            // pull_request runs both carry head_sha == pr.head.sha; default-
-            // branch issue_comment runs do not, so they don't burn the cap.
-            async function attemptsOnHead(headSha) {
-              try {
-                const runs = await github.rest.actions.listWorkflowRuns({
-                  owner, repo, workflow_id: 'codex-gate.yml', head_sha: headSha, per_page: 30,
-                });
-                return runs.data.workflow_runs.filter((r) => r.head_sha === headSha).length;
-              } catch (e) {
-                core.info(`listWorkflowRuns failed (assuming 0 attempts): ${e.message}`);
-                return 0;
-              }
-            }
 
             // fix #15: publish the rich 🟢/🔴/🟡 output as a COSMETIC, CREATE-ONLY
             // check named `codex-gate-verdict` (NOT `check-codex-status` — that is
@@ -299,31 +244,12 @@ jobs:
                 });
                 const headSha = pr.head.sha;
                 const head7 = headSha.substring(0, 7);
-                const attempts = await attemptsOnHead(headSha);
-                const headRef = pr.head.ref;
-                const runningOnHead = runHeadSha === headSha;
-
-                // Schedule a head-targeted rerun (capped). Reason is logged.
-                async function scheduleRerun(reason) {
-                  const attempts = await attemptsOnHead(headSha);
-                  if (attempts >= MAX_ATTEMPTS) {
-                    core.info(
-                      `PR #${prNumber}: rerun cap reached (${attempts}/${MAX_ATTEMPTS}) — not re-dispatching (${reason}).`,
-                    );
-                    return;
-                  }
-                  rerun = { pr: prNumber, branch: headRef };
-                  core.info(
-                    `PR #${prNumber}: scheduling head-targeted rerun (attempt ${attempts + 1}/${MAX_ATTEMPTS}; ${reason}).`,
-                  );
-                }
 
                 // Manual override — admin force-merge.
                 if (pr.labels.some(l => l.name === 'codex-p1-acknowledged')) {
                   results.push(`PR #${prNumber}: ✅ override label present`);
                   await publishGateCheck(headSha, 'success', '🟢 Reviewed — clear',
                     `Override label \`codex-p1-acknowledged\` is set on ${head7} — gate forced green.`);
-                  if (!runningOnHead) await scheduleRerun('override — land green on head');
                   continue;
                 }
 
@@ -342,7 +268,8 @@ jobs:
                 // PR-level reactions — Codex leaves a 👍 here when it has no
                 // issues, sometimes WITHOUT any review body. That 👍 is a valid
                 // "reviewed, nothing to fix" signal, so it counts. The 👍 fires
-                // no event, so only the rerun poll catches it (see scheduleRerun).
+                // no event, so the watchdog sweep (fix #18) is what re-dispatches
+                // the gate to catch it on the head (fix #25 removed the in-run poll).
                 const reactions = await github.paginate(github.rest.reactions.listForIssue, {
                   owner, repo, issue_number: prNumber, per_page: 100,
                 });
@@ -406,7 +333,7 @@ jobs:
 
                 // A 👍 reaction counts as "reviewed, no issues" ONLY if it is
                 // dated after the latest commit (Codex must react on the NEW
-                // head). The 👍 fires no event, so the rerun poll catches it.
+                // head). The 👍 fires no event, so the watchdog sweep catches it.
                 const codexThumbsUpOnHead = reactions.some(
                   r => isCodex(r.user) && r.content === '+1' &&
                        new Date(r.created_at) > latestCommitDate
@@ -442,10 +369,6 @@ jobs:
                     results.push(`PR #${prNumber}: ✅ active Codex P1/P2 followed by a fix Summary`);
                     await publishGateCheck(headSha, 'success', '🟢 Reviewed — clear',
                       `Codex's P1/P2 on ${head7} was followed by a fix Summary — resolved, no active P1/P2.`);
-                    // Clean verdict — make sure it lands on the head. The fix
-                    // Summary usually arrives as an issue_comment (default-branch
-                    // run), so without this the head stays red (P1 #2).
-                    if (!runningOnHead) await scheduleRerun('P1/P2-then-Summary green — land on head');
                     continue;
                   }
                   results.push(
@@ -458,8 +381,8 @@ jobs:
                 }
 
                 // 2) No active P1, but Codex hasn't reviewed the head yet →
-                // PENDING block. Poll via a head-targeted rerun so a 👍 reaction
-                // (which fires no event) is still caught on the head (P1 #1).
+                // PENDING block. (fix #25: no in-run poll — a late 👍 is caught by
+                // the watchdog sweep, a silent trusted sync by grace-green below.)
                 if (!hasCodexSignalOnHead) {
                   // fix #21: trusted-sync grace-green. Fires ONLY inside this
                   // zero-signal 🟡 branch, ONLY for a trusted sync with ZERO Codex
@@ -477,7 +400,6 @@ jobs:
                     );
                     await publishGateCheck(headSha, 'success', '🟢 Trusted sync — no Codex findings within grace window',
                       `Byte-copy sync from automation-core (validated upstream). Codex posted no signal within ${SYNC_GRACE_MINUTES} min of head ${head7}, so the gate auto-cleared. Any Codex signal of any kind restores normal rules.`);
-                    if (!runningOnHead) await scheduleRerun('trusted-sync grace green — land on head');
                     continue;
                   }
                   // Still-pending. For a silent trusted sync inside the grace window,
@@ -489,9 +411,8 @@ jobs:
                     `PR #${prNumber}: ⏳ pending — Codex hasn't reviewed head ${headSha.substring(0, 7)} yet; blocking until it does`
                   );
                   await publishGateCheck(headSha, 'failure', '🟡 Waiting for Codex review',
-                    `Codex hasn't reviewed ${head7} yet (rerun attempt ${attempts}/${MAX_ATTEMPTS}). The gate re-checks automatically; it turns green once Codex reviews with no active P1/P2. Manual override: add the \`codex-p1-acknowledged\` label.${graceLine}`);
+                    `Codex hasn't reviewed ${head7} yet. The gate re-checks on Codex activity and on the watchdog sweep (≤~1h); manual re-check: Actions → Codex Gate → Run workflow with this PR number, or add the \`codex-p1-acknowledged\` label.${graceLine}`);
                   anyBlocked = true;
-                  await scheduleRerun('pending — poll for first Codex signal on head');
                   continue;
                 }
 
@@ -507,11 +428,6 @@ jobs:
                 }
                 await publishGateCheck(headSha, 'success', '🟢 Reviewed — clear',
                   `Codex reviewed ${head7} with no active P1/P2.`);
-                // GREEN. If this run isn't on the head (e.g. an issue_comment
-                // run on the default branch, or a 👍 caught by a default-branch
-                // run), re-dispatch on the head branch so the green check lands
-                // on pr.head.sha where merge-bot looks (P1 #2).
-                if (!runningOnHead) await scheduleRerun('clean review green — land on head');
               } catch (err) {
                 // fail-soft: a TECHNICAL failure (API hiccup, rate limit, etc.)
                 // must NEVER wedge a PR red forever. We did not detect a P1
@@ -522,20 +438,6 @@ jobs:
                   `PR #${prNumber}: ⚠️ gate errored technically — not blocking (fail-soft): ${err.message}`
                 );
                 core.warning(`Codex Gate technical error on PR #${prNumber}: ${err.stack || err.message}`);
-              }
-            }
-
-            // Hand the rerun decision to the Sleep + Trigger steps via env.
-            if (rerun) {
-              const fs = require('fs');
-              const envFile = process.env.GITHUB_ENV;
-              if (envFile) {
-                fs.appendFileSync(envFile, `NEEDS_RERUN=true\n`);
-                fs.appendFileSync(envFile, `RERUN_PR=${rerun.pr}\n`);
-                // RERUN_BRANCH must be a branch name — workflow_dispatch rejects
-                // a raw SHA with 422. The PR head branch's tip is pr.head.sha,
-                // so dispatching against it lands the check on the head.
-                fs.appendFileSync(envFile, `RERUN_BRANCH=${rerun.branch}\n`);
               }
             }
 
@@ -554,50 +456,8 @@ jobs:
               core.setFailed(
                 'Blocked by Codex Gate: an active P1 or P2 is unresolved, or Codex has not reviewed the current head yet.\n' +
                 'Resolve by one of:\n' +
-                '  1. Wait — Codex reviews automatically on every push; the gate self-reruns on the head (max 3 attempts, ~90s apart) and goes green once Codex posts any signal with no active P1/P2.\n' +
+                '  1. Wait — Codex reviews automatically on every push; the gate re-checks on Codex activity and on the watchdog sweep (≤~1h), and goes green once Codex posts any signal with no active P1/P2.\n' +
                 '  2. Push a fix commit — P1/P2s raised before it become stale and clear automatically.\n' +
                 '  3. Add label "codex-p1-acknowledged" to override.'
               );
-            }
-
-      # always(): the evaluate step calls core.setFailed() whenever it blocks,
-      # which sets the step outcome to failure. Without always(), GitHub
-      # implicitly wraps the if as `success() && <expr>` and SKIPS these steps —
-      # exactly the no-op where the rerun never fires. Both rerun steps must run
-      # even when the gate is currently red (that's the whole point: re-evaluate
-      # the head until a clean signal lands green there).
-      - name: Sleep before head-targeted rerun
-        if: always() && env.NEEDS_RERUN == 'true'
-        run: |
-          echo "Waiting 90 seconds before re-dispatching the gate on the PR head..."
-          sleep 90
-
-      # createWorkflowDispatch (not reRunWorkflow): reRun 403s with "already
-      # running" while this run is active. Dispatching a fresh run against the
-      # PR HEAD BRANCH (RERUN_BRANCH) makes the new run's head_sha == pr.head.sha,
-      # so its check-codex-status lands on the head commit where merge-bot reads
-      # it. ref MUST be a branch/tag name (a raw SHA 422s). The workflow file
-      # loads from that ref, so a PR editing codex-gate.yml self-tests its change.
-      - name: Trigger head-targeted self-rerun via workflow_dispatch
-        if: always() && env.NEEDS_RERUN == 'true'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const prNumber = process.env.RERUN_PR;
-            const ref = process.env.RERUN_BRANCH;
-            if (!ref) {
-              core.info('No RERUN_BRANCH set; skipping self-rerun.');
-              return;
-            }
-            core.info(`Dispatching head-targeted gate run for PR #${prNumber} at ref ${ref}`);
-            try {
-              await github.rest.actions.createWorkflowDispatch({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                workflow_id: 'codex-gate.yml',
-                ref,
-                inputs: { pr_number: String(prNumber) },
-              });
-            } catch (e) {
-              core.info(`createWorkflowDispatch failed (ignored): ${e.message}`);
             }

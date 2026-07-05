@@ -194,15 +194,33 @@ jobs:
                   (Date.now() - claudeReq.at >= TIMEOUT_MS);
                 if (!claudeFailed) continue;       // still within Claude's window
 
-                // Findings digest for a Codex-cloud comment: copy the body of the
-                // bridge's most recent @claude fix comment on this PR (its ai-loop
-                // marker locates it); if none, point at the Codex review.
+                // Findings digest for a Codex-cloud comment: copy ONLY the findings
+                // section of the bridge's most recent @claude fix comment, sanitized.
+                // fix #25: the bridge body embeds an @claude mention + its own ai-loop
+                // marker; copied verbatim into the cloud comment the mention
+                // RE-TRIGGERED the Claude fixer on the cloud ping (observed live) and
+                // the copied `state=requested` marker poisons watchdog marker-parsing.
                 function findingsDigest() {
                   const src = [...issueComments, ...reviewComments]
                     .filter((c) => /agent=claude\s+state=requested/.test(c.body || '') || /@claude fix/i.test(c.body || ''))
                     .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))[0];
-                  if (src && src.body) return src.body.replace(/<!--\s*ai-loop:v1[^>]*-->/g, '').trim();
-                  return `Codex flagged findings on this PR — see the Codex review on PR #${prNumber}.`;
+                  const fallback = `Codex flagged findings on this PR — see the Codex review on PR #${prNumber}.`;
+                  if (!src || !src.body) return fallback;
+                  let body = src.body;
+                  // Slice: after the bridge's fixed lead-in ("apply a fix for each:"),
+                  // else after the first `---` line, else the whole body.
+                  const lead = body.match(/apply a fix for each:[^\n]*\n?/i);
+                  if (lead) {
+                    body = body.slice(lead.index + lead[0].length);
+                  } else {
+                    const dash = body.match(/^[ \t]*---[ \t]*$/m);
+                    if (dash) body = body.slice(dash.index + dash[0].length);
+                  }
+                  // Sanitize: strip EVERY ai-loop marker (must never ride inside the
+                  // cloud comment) and neutralize @claude mentions (they re-trigger the
+                  // fixer). The cloud comment keeps exactly ONE mention — its own @codex.
+                  body = body.replace(/<!--\s*ai-loop:v1[^>]*-->/g, '').replace(/@claude/gi, 'claude').trim();
+                  return body || fallback;
                 }
 
                 // ---- STAGE codex-api (only when the OpenAI-quota backup is ENABLED) ----

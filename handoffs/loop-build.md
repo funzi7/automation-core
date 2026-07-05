@@ -17,6 +17,19 @@ Handoff log for the **self-healing-loop build** Claude Chat session. Claude Code
 
 ---
 
+## [2026-07-05 19:20 UTC] fix #25: cost trim (drop the gate self-rerun poll + per-note trigger) + cloud-ping sanitize
+- PR: direct commit to main
+- Branch: main (direct commit)
+- Status: done
+- Measured on TRF PR #88: 30 runs ≈ 15 real runner-min, of which the Codex Gate burned ~10–12 — mostly runs that slept 90s inside the self-rerun poll or got cancelled after starting. Separately, the codex-cloud ping COPIED the bridge's full `@claude fix` body, and that embedded `@claude` mention RE-TRIGGERED the Claude fixer on the cloud ping itself (observed: claude[bot] 👀 + a no-op + a 👎 on the `@codex` comment).
+- What changed (2 files; codex-auto-fix.yml deliberately UNTOUCHED — its `pull_request_review_comment` trigger is load-bearing):
+  - **Part A — codex-gate.yml `on:`:** removed `pull_request_review_comment` (kept `pull_request`, `pull_request_review`, `issue_comment`, `workflow_dispatch`+`pr_number`). The verdict evaluates the whole head; a review already fires `pull_request_review`; each inline note fired an extra gate run concurrency mostly cancelled after the runner started.
+  - **Part B — codex-gate.yml self-rerun poll DELETED:** removed `MAX_ATTEMPTS`, `attemptsOnHead`/`listWorkflowRuns`, `scheduleRerun` + all 5 call sites, the `runHeadSha`/`runningOnHead`/`getWorkflowRun` logic, the `NEEDS_RERUN` env plumbing, and BOTH shell steps (the 90s `sleep` + the dispatch). Dropped the `actions:` permission (its only consumer). 🟡 pending summary rewritten to point at the watchdog sweep + manual dispatch + override label. The `workflow_dispatch` ENTRY stays (the sweep/grace/manual dispatch into it). Coverage: late 👍 → watchdog sweep (fix #18); silent trusted sync → grace-green (fix #21).
+  - **Part C — claude-fallback-watchdog.yml `findingsDigest()`:** now slices to the findings section (after "apply a fix for each:", else after the first `---`) and sanitizes — strips every ai-loop marker + replaces `/@claude/gi` → `claude`. Final cloud comment: exactly one `@codex`, zero `@claude`, only its own codex-cloud marker.
+- Validation: `yaml.safe_load` + actionlint on both copies of both files; `node --check` on all 4 script bodies; greps — gate `on:` has NO `pull_request_review_comment` but DOES have pull_request/pull_request_review/issue_comment/workflow_dispatch; ZERO `MAX_ATTEMPTS`/`scheduleRerun`/"Sleep before head-targeted rerun"; the digest has the marker-strip + `@claude/gi` replace; codex-auto-fix.yml untouched (git status = only the 2 workflows + handoffs); ZERO `require('@actions/github')`/`__original_require__`/`getOctokit`; `git hash-object` equal per file (gate `25197d6`, watchdog `57907a1`).
+- Needs from the owner: nothing — live on main in one commit; propagates downstream on the next daily sync. Expected downstream wave cost ~15 → ~4–6 runner-min.
+- Next: watch the next wave — no 90s sleeps, fewer gate runs, and the cloud ping no longer wakes the Claude fixer.
+
 ## [2026-07-05 12:40 UTC] fix #24: honesty + push-instruction hardening on the fixer chain
 - PR: direct commit to main
 - Branch: main (direct commit)

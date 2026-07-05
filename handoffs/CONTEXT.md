@@ -151,17 +151,30 @@ merged → (sync propagates updated workflows to ~14 downstream repos daily)
   `commit_id` for freshness — GitHub re-points a still-applicable inline
   comment's `commit_id` to the new head, so `commit_id == head` does not prove a
   fresh review.
-- **Head-targeted self-rerun (capped):** re-runs itself so a clean verdict lands
-  on `pr.head.sha`; the rerun count is capped (via a workflow-specific
-  `listWorkflowRuns` lookup) so it can't loop forever. **(fix #12)** `MAX_ATTEMPTS`
-  lowered **5→3** — since fix #11 lands the check on the head from every run, the
-  poll's only remaining job is catching a 👍 reaction (which fires no event), so
-  3 polls suffice. The poll is kept (not removed).
+- **Re-check model — the self-rerun poll is GONE (fix #25).** The old head-targeted
+  self-rerun (`sleep 90` + `createWorkflowDispatch` on the head branch, capped at
+  `MAX_ATTEMPTS`) was the single biggest per-wave cost (TRF #88: ~10–12 of ~15
+  runner-min). **Deleted.** The verdict lands on the head on every head-run
+  (`pull_request` opened/synchronize, `pull_request_review`, `workflow_dispatch`
+  from the watchdog). Its two historical jobs are covered elsewhere: a **late 👍**
+  (no event) → the **watchdog sweep** (fix #18, ≤~1h re-dispatches the gate on the
+  head branch); a **silent trusted sync** → **grace-green** (fix #21). Manual
+  re-check: Actions → Codex Gate → Run workflow with the PR number, or the
+  `codex-p1-acknowledged` label. `actions:` permission dropped (its only consumer
+  was the poll). The `workflow_dispatch` entry + `pr_number` input STAY (the sweep +
+  grace dispatch into it).
+- **Triggers narrowed (fix #25):** `on:` is now `pull_request` (opened/synchronize/
+  reopened) + `pull_request_review` + `issue_comment` (fix-Summary must re-trigger)
+  + `workflow_dispatch`. **`pull_request_review_comment` was REMOVED** — the verdict
+  is evaluated against the WHOLE head every run, a review already fires
+  `pull_request_review`, and each of its N inline notes additionally fired a gate run
+  that concurrency mostly cancelled after the runner had started (pure cost). Expected
+  wave cost **~15 → ~4–6 runner-min**.
 - **Run-collapsing concurrency (fix #12 + #17):** a top-level `concurrency` block
   (`group: codex-gate-pr-<pr#||inputs.pr_number||issue#||run_id>`,
-  **`cancel-in-progress: false`**). A Codex review fires both
-  `pull_request_review` and `pull_request_review_comment` (one per inline note)
-  and a push fires a `pull_request` run + its self-rerun — ~4 runs/wave.
+  **`cancel-in-progress: false`**). (Post-#25 a Codex review fires ONE
+  `pull_request_review` and a push ONE `pull_request` run — far fewer than the old
+  ~4/wave.)
   **fix #17:** an IN-PROGRESS run now always **runs to completion** — GitHub only
   collapses the QUEUE per group (at most one pending run; a superseded pending run
   is dropped before it starts). Under the old `cancel-in-progress: true` a run that
@@ -340,9 +353,15 @@ chain looked healthy while delivering nothing.
      write permission) — do not leave the diff waiting in the task."** (the Codex
      Connector app is CONFIRMED to hold Read&Write on code+workflows across all repos,
      so Cloud CAN push autonomously — whether it does is a product-behavior question,
-     not a permissions one) + the findings digest COPIED from the bridge's most recent
-     `@claude fix` comment (located by its ai-loop marker; else "see the Codex review")
-     + marker `agent=codex-cloud state=requested`. **HARD LIMIT: ONE codex-cloud attempt
+     not a permissions one) + the findings digest from the bridge's most recent
+     `@claude fix` comment — **sliced + SANITIZED (fix #25):** `findingsDigest()` takes
+     only the section after "apply a fix for each:" (else after the first `---`),
+     strips every `<!-- ai-loop:v1 … -->` marker, and replaces `@claude` → `claude`.
+     WHY: the raw bridge body embeds an `@claude` mention that **re-triggered the Claude
+     fixer on the cloud ping** (observed live — claude[bot] 👀 + a no-op + a 👎 on the
+     `@codex` comment) and a copied `state=requested` marker that poisons marker-parsing.
+     The final cloud comment has exactly ONE mention (`@codex`), zero `@claude`, and only
+     its own `agent=codex-cloud state=requested` marker. **HARD LIMIT: ONE codex-cloud attempt
      per head** (dedupe via the marker). **fix #24 fork guard: a fork-headed PR is NEVER
      pinged** (untrusted code; mirrors codex-backup-fix's same-repo guard) — it falls
      through to escalate. Then a 20-min window.
