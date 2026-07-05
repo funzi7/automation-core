@@ -15,9 +15,17 @@ name: Minutes Guard
 # whole account quota as exhausted (minutes are shared across all
 # of funzi7's repos) and pause cron workflows in EVERY target.
 #
-# Re-enable: a separate cron at 00:05 UTC on the 1st of every month
+# Re-enable: a separate cron at 02:23 UTC on the 1st of every month
 # (just after the typical billing reset), and force_enable=true via
 # workflow_dispatch as the manual escape hatch.
+# fix #22: the tick was moved OFF the top-of-hour window on the 1st —
+# GitHub silently drops congested scheduled ticks and dropped exactly
+# that window on 2026-07-01 (run gap 2026-06-30T23:04Z → 2026-07-01T01:37Z),
+# so the old 00:05-on-the-1st tick never fired. Two defenses now: (1) the tick
+# runs at 02:23 UTC (off-peak, less likely to be dropped); (2) a date-based
+# FALLBACK — on the 1st or 2nd, any '*/30' detect tick whose guard state is
+# still holding disabled workflows switches itself to re-enable, so a dropped
+# monthly tick can never skip a re-enable for a whole month.
 #
 # Safety:
 #   - Only workflows whose source file declares an `on.schedule`
@@ -50,7 +58,7 @@ name: Minutes Guard
 on:
   schedule:
     - cron: '*/30 * * * *'   # detection sweep
-    - cron: '5 0 1 * *'      # monthly re-enable: 00:05 UTC on the 1st
+    - cron: '23 2 1 * *'     # monthly re-enable: 02:23 UTC on the 1st (off-peak; fix #22)
   workflow_dispatch:
     inputs:
       force_enable:
@@ -94,7 +102,7 @@ env:
   # crosses the threshold because the every-2h poll alone produces
   # ~12 billing-killed runs/day. Widening is safe: detection only
   # needs to fire ONCE — disabling is sticky until the monthly
-  # 00:05 re-enable — and the H2 effectiveCutoffMs clamp to
+  # 02:23 re-enable (fix #22) — and the H2 effectiveCutoffMs clamp to
   # last_enable_at + the 90min cooldown already prevent re-counting
   # pre-reset failures after a re-enable.
   PAUSE_LOOKBACK_HOURS: '24'
@@ -103,7 +111,7 @@ env:
   # repo can exceed 15 runs in a day; fetch 30 so the window isn't
   # silently truncated before 3 billing-kills are counted.
   RUNS_PER_REPO: '30'
-  MONTHLY_REENABLE_CRON: '5 0 1 * *'
+  MONTHLY_REENABLE_CRON: '23 2 1 * *'
   # H2: after a re-enable, skip detection entirely for this many
   # minutes so we don't immediately re-pause on pre-reset stale
   # failures that are still inside the runs window. 90min covers
@@ -305,6 +313,27 @@ jobs:
               fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2) + '\n');
             }
             const state = loadState();
+
+            // fix #22: date-based fallback so a DROPPED monthly tick can never
+            // skip a re-enable for a whole month. GitHub silently drops congested
+            // scheduled ticks — the top-of-hour window on the 1st was dropped on
+            // 2026-07-01 (run gap 06-30T23:04Z → 07-01T01:37Z), so a monthly tick
+            // there would have been missed entirely. Placed HERE — the earliest
+            // point where BOTH `mode` (set above) and the loaded `state` exist,
+            // before any mode-dependent branching. If we resolved to 'detect' but
+            // it is the 1st or 2nd of the month AND the guard is still holding
+            // disabled workflows, switch to 're-enable'. Idempotent: re-enable
+            // empties disabled_by_guard, so later day-1/2 detect ticks stay detect.
+            let modeFromFallback = false;
+            if (mode === 'detect') {
+              const dom = new Date().getUTCDate();
+              if (dom <= 2 && Object.keys(state.disabled_by_guard || {}).length > 0) {
+                mode = 're-enable';
+                modeFromFallback = true;
+                core.info('Day-1/2 fallback: guard state non-empty and the monthly tick may have been dropped — switching to re-enable.');
+              }
+            }
+
             let stateChanged = false;
 
             // ---- Helpers ----
@@ -515,7 +544,9 @@ jobs:
                 core.setOutput('state_changed', 'false');
                 return;
               }
-              const trigger = inputs.force_enable ? 'force_enable=true' : `cron ${triggeredSchedule}`;
+              const trigger = inputs.force_enable
+                ? 'force_enable=true'
+                : (modeFromFallback ? 'day-1/2 fallback (monthly tick likely dropped)' : `cron ${triggeredSchedule}`);
               summary.addRaw(`**Trigger:** ${trigger}\n\n`);
               const lines = [];
               let anyEnabled = false;

@@ -96,7 +96,14 @@ merged → (sync propagates updated workflows to ~14 downstream repos daily)
 - **`telegram-morning-report.yml`** — once-daily **read-only** Telegram digest of
   the loop's state across all of the owner's repos (dynamically discovered).
 - **`bootstrap.yml`** — onboards a new repo into the loop.
-- **`minutes-guard.yml`** — guards Actions-minutes spend across repos.
+- **`minutes-guard.yml`** — guards Actions-minutes spend across repos. Monthly
+  re-enable runs at **02:23 UTC on the 1st** (`23 2 1 * *`, moved off the
+  congested top-of-hour window — fix #22, after GitHub dropped the old
+  `00:05`-on-the-1st tick on 2026-07-01, run gap 06-30T23:04Z → 07-01T01:37Z).
+  Belt-and-suspenders: a **day-1/2 fallback** — any `*/30` detect tick on the 1st
+  or 2nd whose guard state still holds disabled workflows switches itself to
+  re-enable, so a dropped monthly tick can never skip a month (idempotent —
+  re-enable empties the state).
 
 ---
 

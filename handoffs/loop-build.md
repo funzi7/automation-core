@@ -17,6 +17,15 @@ Handoff log for the **self-healing-loop build** Claude Chat session. Claude Code
 
 ---
 
+## [2026-07-04 08:10 UTC] fix #22: minutes-guard monthly re-enable — off-peak tick + day-1/2 fallback
+- PR: direct commit to main
+- Branch: main (direct commit)
+- Status: done
+- What changed: the monthly re-enable depended on a SINGLE `5 0 1 * *` (00:05 UTC) cron tick — GitHub's most congested window — and it was empirically DROPPED on 2026-07-01 (minutes-guard run gap 2026-06-30T23:04Z → 2026-07-01T01:37Z; the 01:37 run was a `*/30` detect tick, Mode: detect). Had the guard been holding disabled workflows, re-enable would have been missed for the whole month. Two changes: **(1)** replaced `5 0 1 * *` with `23 2 1 * *` (02:23 UTC, off-peak) in BOTH `on.schedule` and the `MONTHLY_REENABLE_CRON` env (kept equal); updated the header + inline comments. **(2)** a date-based fallback placed right after `const state = loadState();` (earliest point where both `mode` and `state` exist, before any mode-dependent branch): `if (mode === 'detect') { const dom = new Date().getUTCDate(); if (dom <= 2 && Object.keys(state.disabled_by_guard||{}).length > 0) { mode = 're-enable'; modeFromFallback = true; core.info('Day-1/2 fallback…'); } }`. Idempotent (re-enable empties the state → later day-1/2 detect ticks stay detect). Trigger label at the summary now names the `day-1/2 fallback` case. Preserved: H1 non-main dry-run, dry_run semantics, H2 cooldown (`last_enable_at`), H3 confirmed-enable-only removal.
+- Validation: `yaml.safe_load` + actionlint on `.github/workflows/minutes-guard.yml`; `node --check` on the guard script body; greps — ZERO `5 0 1 * *` anywhere, `23 2 1 * *` present in exactly the cron + env (equal), fallback block present after state load. **minutes-guard is HUB-ONLY (single copy in `.github/workflows/`, not in `sync-config.synced_workflows`) so there is no `workflows/` copy — the byte-identical-across-dirs check is N/A;** did NOT create a spurious sync-source copy.
+- Needs from the owner: nothing — live on main in one commit. (No downstream sync — hub-only workflow.)
+- Next: on 2026-08-01 the re-enable fires at 02:23 UTC; if that tick is dropped, the first day-1/2 `*/30` detect tick with non-empty guard state re-enables instead.
+
 ## [2026-07-03 21:15 UTC] fix #21: silent-sync grace-green + override-label bootstrap
 - PR: direct commit to main
 - Branch: main (direct commit)
