@@ -133,57 +133,111 @@ jobs:
             If triggered by an @claude mention, follow the request in the
             comment, working on a branch and opening a PR the same way.
 
-      - name: Swap 👀 → 👎 on a failed fix
-        # fix #10: when the Claude step actually RAN but did NOT succeed, change
-        # the triggering comment's reaction from 👀 (eyes = "in progress", added
-        # by claude-code-action) to 👎, so a failed run doesn't look like it's
-        # still checking. Reaction only — no noisy comment. Gated on has_key so a
-        # fail-soft no-ANTHROPIC_API_KEY skip (not a failure) isn't 👎'd. Fully
-        # fail-soft: a reaction error must NEVER fail the job. Skips Issue events
-        # (issues.opened/labeled) that carry no triggering comment id.
-        if: ${{ always() && steps.keycheck.outputs.has_key == 'true' && steps.claude.outcome != 'success' }}
+      - name: Delivery check — did a fix land on the head?
+        id: delivery
+        # fix #23: judge Claude by DELIVERY, not by the action's conclusion.
+        # claude-code-action returns `success` on a 15s no-op with zero commits
+        # (TRF #84), so the conclusion is meaningless. DELIVERED = at least one new
+        # commit on the PR head ref since the trigger comment's timestamp. Runs
+        # whenever the key is present (independent of the Claude step's outcome).
+        if: always() && steps.keycheck.outputs.has_key == 'true'
         uses: actions/github-script@v7
         with:
-          # Same token the action used to add the 👀, so the bot actor matches.
+          github-token: ${{ secrets.AUTOMATION_PAT || github.token }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const comment = context.payload.comment;
+            if (!comment) {
+              core.info('No trigger comment (Issue/label event) — delivery check N/A, treat as delivered.');
+              core.setOutput('delivered', 'true');
+              return;
+            }
+            const since = comment.created_at;
+            let pr = context.payload.pull_request;
+            if (!pr && context.payload.issue && context.payload.issue.pull_request) {
+              try { pr = (await github.rest.pulls.get({ owner, repo, pull_number: context.payload.issue.number })).data; }
+              catch (e) { core.info(`pulls.get failed: ${e.message}`); }
+            }
+            if (!pr || !pr.head || !pr.head.ref) {
+              core.info('No PR head resolvable — delivery check N/A, treat as delivered.');
+              core.setOutput('delivered', 'true');
+              return;
+            }
+            const sinceMs = new Date(since).getTime();
+            let delivered = false;
+            try {
+              const commits = await github.paginate(github.rest.repos.listCommits, {
+                owner, repo, sha: pr.head.ref, since, per_page: 100,
+              });
+              delivered = commits.some((c) => new Date(c.commit.committer.date).getTime() > sinceMs);
+              core.info(`Delivery check: ${commits.length} commit(s) on ${pr.head.ref} since ${since} → delivered=${delivered}`);
+            } catch (e) {
+              // fail-soft: if we can't tell, do NOT falsely mark undelivered (a wrong
+              // 👎). The watchdog's own delivery window still catches a real no-op.
+              core.info(`listCommits failed (treat as delivered, fail-soft): ${e.message}`);
+              delivered = true;
+            }
+            core.setOutput('delivered', delivered ? 'true' : 'false');
+
+      - name: Mark a no-delivery fix (👎 + ladder handoff)
+        # fix #23: fire when the Claude step DID NOT SUCCEED **OR** succeeded but
+        # DELIVERED NOTHING (no new commit on the head — the TRF #84 no-op-success
+        # trap that the old `outcome != 'success'` guard missed). Gated on has_key
+        # so a fail-soft no-key skip isn't 👎'd. Fully fail-soft: an error here must
+        # NEVER fail the job.
+        if: ${{ always() && steps.keycheck.outputs.has_key == 'true' && (steps.claude.outcome != 'success' || steps.delivery.outputs.delivered != 'true') }}
+        uses: actions/github-script@v7
+        with:
           github-token: ${{ secrets.AUTOMATION_PAT || github.token }}
           script: |
             try {
-              const commentId = context.payload.comment && context.payload.comment.id;
-              if (!commentId) {
-                core.info('No triggering comment id (Issue event) — nothing to react on.');
-                return;
-              }
               const owner = context.repo.owner;
               const repo = context.repo.repo;
-              // issue_comment and pull_request_review_comment use DIFFERENT
-              // reaction endpoints — pick by the event name.
-              const isReviewComment = context.eventName === 'pull_request_review_comment';
-              const listReactions = isReviewComment
-                ? github.rest.reactions.listForPullRequestReviewComment
-                : github.rest.reactions.listForIssueComment;
-              const deleteReaction = isReviewComment
-                ? github.rest.reactions.deleteForPullRequestComment
-                : github.rest.reactions.deleteForIssueComment;
-              const createReaction = isReviewComment
-                ? github.rest.reactions.createForPullRequestReviewComment
-                : github.rest.reactions.createForIssueComment;
-              // Remove the bot's own existing 👀, then add 👎.
-              const me = await github.rest.users.getAuthenticated()
-                .then((r) => r.data.login).catch(() => null);
-              const reactions = await github.paginate(listReactions, {
-                owner, repo, comment_id: commentId, per_page: 100,
-              });
-              for (const rx of reactions) {
-                if (rx.content === 'eyes' && (!me || (rx.user && rx.user.login === me))) {
+              const comment = context.payload.comment;
+              const commentId = comment && comment.id;
+              // ADD-ONLY 👎 (fix #23): the 👀 on the trigger is placed by the hosted
+              // `claude[bot]` App — a DIFFERENT identity whose reactions we cannot
+              // delete (cross-identity deletion is forbidden), and our own 👀 may not
+              // exist. So we NEVER "swap"; we ADD a 👎 to signal the no-delivery.
+              if (commentId) {
+                const isReviewComment = context.eventName === 'pull_request_review_comment';
+                const createReaction = isReviewComment
+                  ? github.rest.reactions.createForPullRequestReviewComment
+                  : github.rest.reactions.createForIssueComment;
+                try {
+                  await createReaction({ owner, repo, comment_id: commentId, content: '-1' });
+                  core.info(`Added 👎 on comment ${commentId} (Claude delivered no fix).`);
+                } catch (e) { core.info(`add 👎 failed (ignored): ${e.message}`); }
+              } else {
+                core.info('No triggering comment id (Issue event) — no reaction to add.');
+              }
+              // UPSERT an ai-loop marker so the watchdog can advance the fixer ladder
+              // WITHOUT waiting the full 20-min timeout. state=no_delivery on the head.
+              let pr = context.payload.pull_request;
+              if (!pr && context.payload.issue && context.payload.issue.pull_request) {
+                try { pr = (await github.rest.pulls.get({ owner, repo, pull_number: context.payload.issue.number })).data; } catch (e) { core.info(`pulls.get failed: ${e.message}`); }
+              }
+              if (pr && pr.head) {
+                const headSha = pr.head.sha;
+                const prNumber = pr.number;
+                let attempt = 1;
+                const mm = (comment && comment.body || '').match(/ai-loop:v1[^>]*\battempt=(\d+)/);
+                if (mm) attempt = parseInt(mm[1], 10);
+                let exists = false;
+                try {
+                  const ic = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number: prNumber, per_page: 100 });
+                  exists = ic.some((c) => { const b = c.body || ''; return b.includes('agent=claude') && b.includes('state=no_delivery') && b.includes(`head=${headSha}`); });
+                } catch (e) { core.info(`listComments failed (ignored): ${e.message}`); }
+                if (!exists) {
                   try {
-                    await deleteReaction({ owner, repo, comment_id: commentId, reaction_id: rx.id });
-                  } catch (e) { core.info(`delete 👀 failed (ignored): ${e.message}`); }
+                    await github.rest.issues.createComment({ owner, repo, issue_number: prNumber, body: `<!-- ai-loop:v1 root_pr=${prNumber} head=${headSha} attempt=${attempt} agent=claude state=no_delivery -->\nClaude Code ran but delivered no commit on this head — handing off to the fixer ladder (watchdog).` });
+                    core.info(`Posted claude/no_delivery marker for PR #${prNumber} head ${headSha}.`);
+                  } catch (e) { core.info(`no_delivery marker failed (ignored): ${e.message}`); }
                 }
               }
-              await createReaction({ owner, repo, comment_id: commentId, content: '-1' });
-              core.info(`Swapped 👀 → 👎 on comment ${commentId} (failed fix).`);
             } catch (e) {
-              core.info(`reaction swap failed (ignored): ${e.message}`);
+              core.info(`no-delivery handling failed (ignored): ${e.message}`);
             }
 
       - name: Label Claude's PR for auto-merge

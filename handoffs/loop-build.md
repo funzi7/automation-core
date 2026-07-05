@@ -17,6 +17,19 @@ Handoff log for the **self-healing-loop build** Claude Chat session. Claude Code
 
 ---
 
+## [2026-07-05 10:30 UTC] fix #23: the full fixer ladder (Claude→Codex-API→Codex-Cloud→needs-owner), delivery-judged + auto update-branch
+- PR: direct commit to main
+- Branch: main (direct commit)
+- Status: done
+- Forensic inputs (TRF PR #84): (1) `claude-code-action` concluded **success in 15s with ZERO commits** — a no-op success — so fix #10's `outcome != 'success'` guard skipped the 👎 and the chain looked healthy while delivering nothing; (2) the 👀 was placed by the **hosted `claude[bot]` App** — a different identity whose reactions we can't delete — so the 👎 must be ADDED, never "swapped"; (3) the chain only advanced because the owner manually commented `@codex fix` (waking subscription-billed Codex Cloud) and manually clicked Update branch.
+- What changed:
+  - **Part A — claude.yml:** added a **Delivery check** step (`id: delivery`, `always() && has_key`) — commits on the PR head ref since the trigger comment → `delivered`. Rewrote the fix-#10 step: guard now `… && (steps.claude.outcome != 'success' || steps.delivery.outputs.delivered != 'true')`; it **ADDS** a 👎 (deleted the cross-identity delete-eyes logic) and upserts a `agent=claude state=no_delivery head=<sha>` marker so the watchdog advances without waiting the timeout.
+  - **Part B — claude-fallback-watchdog.yml:** restructured the per-PR decision into a LADDER judged only by `deliveredSince(pingTime)` (injected octokit, zero modules): claude → [codex-api if `CODEX_BACKUP_ENABLED`] → **codex-cloud (NEW: top-level `@codex fix` via AUTOMATION_PAT + findings digest copied from the bridge's `@claude fix`, ONE per head)** → escalate (only after every enabled stage failed; existing needs-owner + Telegram, chain-named). Removed the fixed 3-attempt cap + the backup-disabled-first-timeout escalate; dropped unused `MAX_ATTEMPTS`/`CLAUDE_APP`.
+  - **Part C — sweep:** auto update-branch for any loop PR (ai-loop marker OR `claude/*` OR trusted sync) that is `mergeable_state == 'behind'` and not `needs-owner` → `pulls.updateBranch(expected_head_sha)` via AUTOMATION_PAT; NEVER for `'dirty'`; loud-fail; ≤1/PR/tick.
+- Validation: `yaml.safe_load` + actionlint on both copies of both files; `node --check` on all 5 script bodies (3 in claude.yml, 2 in the watchdog); greps — claude.yml guard references `steps.delivery.outputs.delivered`; `state=no_delivery` / `agent=codex-cloud` / `updateBranch` present; one-cloud-per-head dedupe (`newestMarker('codex-cloud','requested')`) present; ZERO `require('@actions/github')`/`__original_require__`/`getOctokit`; `git hash-object` equal per file (claude.yml `d69cae3`, watchdog `1b59163`).
+- Needs from the owner: nothing — live on main in one commit; propagates downstream on the next daily sync. Optional: set `CLAUDE_SHOW_FULL_OUTPUT=true` on a private repo to see WHY a run is a no-op.
+- Next: the next `@claude` no-op no longer looks healthy — 👎 + `no_delivery` marker fire, the watchdog climbs to Codex Cloud, and a stale head is auto-updated.
+
 ## [2026-07-04 08:10 UTC] fix #22: minutes-guard monthly re-enable — off-peak tick + day-1/2 fallback
 - PR: direct commit to main
 - Branch: main (direct commit)

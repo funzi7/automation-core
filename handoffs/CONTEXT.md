@@ -86,7 +86,9 @@ merged → (sync propagates updated workflows to ~14 downstream repos daily)
   set the Actions variable `CLAUDE_SHOW_FULL_OUTPUT=true` temporarily to
   enumerate an `error_max_turns` run's permission denials **by tool name** (the
   logged `permission_denials_count` alone can't tune `--allowedTools`), then flip
-  it back off.
+  it back off. **Delivery-aware (fix #23):** a Delivery-check step + the
+  add-only-👎 / `no_delivery`-marker handoff (see "The fixer LADDER" in §3) — a
+  no-op "success" no longer looks healthy.
 - **`ci-doctor.yml`** — **CI Doctor.** Detects failed CI runs, opens (deduped)
   `claude-fix` Issues, escalates to `needs-owner` after repeated failure.
 - **`merge-bot.yml`** — **Merge Bot.** Squash-merges green candidate PRs.
@@ -303,22 +305,45 @@ merged → (sync propagates updated workflows to ~14 downstream repos daily)
   notes, commits, watchdog re-runs on the same marker, debounced duplicate
   `@claude fix`, or an un-pushed patch. Next attempt = max(attempt)+1.
 
-### Codex backup fixer + watchdog (Claude is first, Codex is backup)
-Claude is the FIRST fixer; Codex is a BACKUP fixer that runs **in GitHub
-Actions** (NOT Codex Cloud — Cloud strips secrets before its agent phase, so it
-cannot push).
+### The fixer LADDER (fix #23) — Claude → Codex-API → Codex-Cloud → needs-owner
+**Judged ONLY by DELIVERY** (a new commit on the PR head after the relevant ping),
+never by a workflow conclusion. **Success ≠ delivery** — the TRF #84 lesson:
+`claude-code-action` returned `success` in 15 s with **zero commits** (a no-op
+success), so the old fix-#10 `outcome != 'success'` guard skipped the 👎 and the
+chain looked healthy while delivering nothing.
 
-- **`claude-fallback-watchdog.yml`** — schedule `2-59/5 * * * *` (every 5 min) +
-  `workflow_dispatch`. For each open PR with a `state=requested agent=claude`
-  ai-loop marker on the current head, it fires the Codex backup ONLY when ALL
-  hold: PR still open; the marker's `head` still equals the PR head SHA; Claude
-  has not delivered (no Claude-app commit on the head after the marker); ≥ the
-  **20-minute** timeout has elapsed since the marker's comment; no `agent=codex`
-  marker already exists for this head; and cumulative attempts < 3. It then
-  `workflow_dispatch`-es `codex-backup-fix.yml` (inputs `pr_number`, `head_sha`,
-  `attempt=max+1`) and posts a `agent=codex state=requested` marker so the
-  attempt is counted and never re-fired. At 3 attempts it adds `needs-owner` +
-  a counts-only Telegram alert instead of firing Codex.
+- **`claude.yml` delivery-aware verdict (fix #23 Part A):** a **Delivery check** step
+  (`id: delivery`, `always() && has_key`) lists commits on the PR head ref since the
+  trigger comment's time — `delivered = ≥1 new commit`. The reaction step now fires on
+  `outcome != 'success' **OR** delivered != 'true'`, and it **ADDS** a 👎 (never
+  "swaps"): the 👀 on the trigger is placed by the hosted **`claude[bot]` App**, a
+  DIFFERENT identity whose reactions we cannot delete — so the old delete-eyes logic is
+  gone. It also upserts a `agent=claude state=no_delivery head=<sha>` ai-loop marker so
+  the watchdog advances the ladder WITHOUT waiting the full timeout. Fail-soft: if
+  delivery can't be determined, treat as delivered (avoid a false 👎).
+- **`claude-fallback-watchdog.yml` ladder (fix #23 Part B)** — schedule `2-59/5 * * * *`
+  + `workflow_dispatch`. Per open PR with an unanswered `agent=claude state=requested`
+  marker on the current head, it climbs a ladder, each stage judged by a
+  `deliveredSince(pingTime)` helper (commits on the head ref, injected octokit, zero
+  modules) and firing **at most once per head** (marker dedupe):
+  1. **claude** — failed = a `claude/no_delivery` marker exists OR the 20-min window
+     elapsed with no delivery.
+  2. **codex-api** — ONLY if `vars.CODEX_BACKUP_ENABLED == 'true'`: the existing
+     `codex-backup-fix.yml` dispatch (unchanged, runs Codex IN GitHub Actions — Cloud
+     strips secrets so it can't push), then its own 20-min delivery window
+     (`agent=codex state=requested`). **Skipped entirely when the var is unset** (today's
+     reality — dead OpenAI quota).
+  3. **codex-cloud (NEW)** — posts a TOP-LEVEL `@codex fix` issue comment via
+     AUTOMATION_PAT (a PAT/owner-authored comment provably wakes subscription-billed
+     Codex Cloud — TRF #84), with `[auto-triggered]` + the findings digest COPIED from
+     the bridge's most recent `@claude fix` comment (located by its ai-loop marker; else
+     "see the Codex review") + marker `agent=codex-cloud state=requested`. **HARD LIMIT:
+     ONE codex-cloud attempt per head** (dedupe via the marker). Then a 20-min window.
+  4. **escalate** — only after every ENABLED stage failed delivery: the existing
+     `needs-owner` upsert (fix #14B) + Telegram, message naming the chain ("Claude[, the
+     Codex API backup,] and Codex Cloud didn't deliver — escalated to needs-owner").
+  Each advance sends a Telegram info line (existing plumbing). The old fixed 3-attempt cap
+  is REPLACED by this per-head stage ladder (each stage ≤1/head; escalate terminal/head).
   - **Late-signal sweep (fix #18) — a SECOND step in this same workflow.** Closes
     the late-👍 gap: Codex's 👍 (or review) can land AFTER the gate's 3-attempt
     poll window (~4.5 min) closes, and a reaction fires **no webhook event**, so
@@ -350,6 +375,15 @@ cannot push).
       green `0e8a16`, catch/ignore 422) — the incident was that the very override
       label the gate's 🟡 summary tells humans to add did not exist in the downstream
       repo. Mirrors the `needs-owner` upsert pattern.
+    - **Auto update-branch (fix #23 Part C).** For each open **loop PR** (carries an
+      ai-loop marker OR a `claude/*` head ref OR a trusted sync) that is
+      `mergeable_state == 'behind'` and NOT `needs-owner`, the sweep calls
+      `pulls.updateBranch` (PUT update-branch, `expected_head_sha` = current head) via
+      AUTOMATION_PAT — the owner used to click "Update branch" by hand (TRF #84).
+      **NEVER for `'dirty'`** (real conflicts stay a human's job). Log `auto
+      update-branch: PR #N`, loud-fail (`core.error` + Telegram), at most once per PR
+      per tick. The update advances the head → the gate re-runs → the fixer ladder
+      continues on the fresh head.
 - **`codex-backup-fix.yml`** — `workflow_dispatch` (pr_number, head_sha,
   attempt), two jobs:
   - **`generate-patch`** (`permissions: contents: read` — NO write token):

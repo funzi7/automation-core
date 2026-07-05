@@ -65,9 +65,7 @@ jobs:
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const LABEL_ESCALATE = 'needs-owner';
-            const TIMEOUT_MS = 20 * 60 * 1000;   // 20 minutes (scheduled runs lag)
-            const MAX_ATTEMPTS = 3;
-            const CLAUDE_APP = 'claude[bot]';     // Claude fixer commit author login
+            const TIMEOUT_MS = 20 * 60 * 1000;   // 20 minutes per ladder stage (scheduled runs lag)
             const BACKUP_WORKFLOW = 'codex-backup-fix.yml';
             // fix #8: only dispatch the (OpenAI-quota-dependent) Codex backup
             // when CODEX_BACKUP_ENABLED is EXACTLY 'true'; otherwise escalate.
@@ -126,167 +124,141 @@ jobs:
                   .filter((n) => Number.isFinite(n));
                 const maxAttempt = attemptNums.length ? Math.max(...attemptNums) : 0;
 
+                // ---- fix #23: the fixer LADDER, judged ONLY by DELIVERY ----
+                // Delivery = a new commit on the PR head ref dated AFTER a ping's
+                // timestamp. NEVER judged by a workflow conclusion — claude-code-action
+                // reports `success` on a 15s no-op with zero commits (TRF #84), so a
+                // conclusion is meaningless. Stages per head: claude → [codex-api if
+                // enabled] → codex-cloud → escalate. Each stage fires AT MOST once per
+                // head (marker dedupe); escalate is terminal per head.
+
                 // Newest Claude request marker for the CURRENT head.
                 const claudeReq = marked
                   .filter((a) => a.agent === 'claude' && a.state === 'requested' && a.head === headSha)
                   .sort((x, y) => y.at - x.at)[0];
                 if (!claudeReq) continue;          // nothing waiting on Claude for this head
 
-                // If the head moved since the marker, a fresh review cycle will
-                // start cleanly — do nothing. (head match is implied above, but
-                // keep explicit for clarity.)
-                if (claudeReq.head !== headSha) continue;
+                const attempt = maxAttempt + 1;
 
-                // Already fired Codex for this exact head? Match only a codex
-                // requested/pushed marker — a watchdog dispatch_failed marker must
-                // NOT be read as "already fired" (that would block the auto-retry).
-                if (marked.some((a) => a.agent === 'codex' && (a.state === 'requested' || a.state === 'pushed') && a.head === headSha)) continue;
-
-                // Has Claude already delivered for this head? A commit on the head
-                // authored by the Claude app AFTER the request marker. (A linked
-                // claude/* result branch would also count; best-effort, skipped
-                // if not determinable from commits.)
-                let claudeDelivered = false;
-                try {
-                  const commits = await github.paginate(github.rest.pulls.listCommits, {
-                    owner, repo, pull_number: prNumber, per_page: 100,
-                  });
-                  claudeDelivered = commits.some((c) => {
-                    const login = (c.author && c.author.login) || "";
-                    const aname = (c.commit && c.commit.author && c.commit.author.name) || "";
-                    const cdate = new Date(c.commit.author.date).getTime();
-                    return (login === CLAUDE_APP || /claude/i.test(aname)) && cdate > claudeReq.at;
-                  });
-                } catch (e) { /* best-effort */ }
-                if (claudeDelivered) continue;
-
-                // Timeout elapsed since the request?
-                if (Date.now() - claudeReq.at < TIMEOUT_MS) continue;
-
-                // fix #8: the Codex backup fixer needs OpenAI quota (currently
-                // exhausted), so it's gated OFF by default. When disabled, do NOT
-                // dispatch the dead backup — escalate to a human on the FIRST
-                // timeout instead. Re-enableable: set Actions variable
-                // CODEX_BACKUP_ENABLED='true' to restore the dispatch path.
-                if (!codexBackupEnabled) {
-                  // Escalate once per head: skip if already escalated by the
-                  // watchdog for this head, or needs-owner is already on the PR.
+                // DELIVERY HELPER (Part B STEP 3): any commit on the head ref dated
+                // strictly AFTER `sinceMs`. Uses the injected octokit (zero modules —
+                // the hard rule forbids loading a module, not the injected `github.rest`).
+                async function deliveredSince(sinceMs) {
+                  try {
+                    const cs = await github.paginate(github.rest.repos.listCommits, {
+                      owner, repo, sha: pr.head.ref, since: new Date(sinceMs).toISOString(), per_page: 100,
+                    });
+                    return cs.some((c) => new Date(c.commit.committer.date).getTime() > sinceMs);
+                  } catch (e) { core.info(`deliveredSince failed (assume not delivered): ${e.message}`); return false; }
+                }
+                const newestMarker = (agent, state) => marked
+                  .filter((a) => a.agent === agent && a.state === state && a.head === headSha)
+                  .sort((x, y) => y.at - x.at)[0];
+                async function notify(text) {
+                  const tgToken = process.env.TELEGRAM_BOT_TOKEN;
+                  const tgChat = process.env.TELEGRAM_CHAT_ID;
+                  if (!tgToken || !tgChat) return;
+                  try {
+                    await fetch(`https://api.telegram.org/bot${tgToken}/sendMessage`, {
+                      method: 'POST', headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ chat_id: tgChat, text, disable_web_page_preview: true }),
+                    });
+                  } catch (e) { core.info(`Telegram failed (ignored): ${e.message}`); }
+                }
+                async function escalate(reasonText, tgText) {
                   const alreadyEscalated =
                     marked.some((a) => a.agent === 'watchdog' && a.state === 'escalated' && a.head === headSha) ||
                     (pr.labels || []).some((l) => (l.name || l) === LABEL_ESCALATE);
-                  if (alreadyEscalated) continue;
+                  if (alreadyEscalated) return;
+                  // fix #14B: upsert the label then attach it.
                   try {
-                    await github.rest.issues.addLabels({
-                      owner, repo, issue_number: prNumber, labels: [LABEL_ESCALATE],
-                    });
+                    await github.rest.issues.createLabel({ owner, repo, name: LABEL_ESCALATE, color: 'd93f0b', description: 'Escalation — automation stopped, human needed' });
+                  } catch (e) { if (e.status !== 422) core.info(`createLabel ${LABEL_ESCALATE} failed (ignored): ${e.message}`); }
+                  try {
+                    await github.rest.issues.addLabels({ owner, repo, issue_number: prNumber, labels: [LABEL_ESCALATE] });
                   } catch (e) { core.info(`addLabel failed (ignored): ${e.message}`); }
+                  try {
+                    await github.rest.issues.createComment({ owner, repo, issue_number: prNumber, body: `<!-- ai-loop:v1 root_pr=${prNumber} head=${headSha} agent=watchdog state=escalated -->\n${reasonText}` });
+                  } catch (e) { core.info(`escalation comment failed (ignored): ${e.message}`); }
+                  await notify(tgText);
+                  core.warning(`PR #${prNumber}: ${reasonText}`);
+                }
+
+                // ---- STAGE claude ----
+                // Claude delivered? (a commit on the head after its ping) → done.
+                if (await deliveredSince(claudeReq.at)) continue;
+                // Claude FAILED iff a claude/no_delivery marker exists (claude.yml's
+                // delivery check, fix #23 Part A) OR the 20-min window elapsed.
+                const claudeFailed =
+                  !!newestMarker('claude', 'no_delivery') ||
+                  (Date.now() - claudeReq.at >= TIMEOUT_MS);
+                if (!claudeFailed) continue;       // still within Claude's window
+
+                // Findings digest for a Codex-cloud comment: copy the body of the
+                // bridge's most recent @claude fix comment on this PR (its ai-loop
+                // marker locates it); if none, point at the Codex review.
+                function findingsDigest() {
+                  const src = [...issueComments, ...reviewComments]
+                    .filter((c) => /agent=claude\s+state=requested/.test(c.body || '') || /@claude fix/i.test(c.body || ''))
+                    .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))[0];
+                  if (src && src.body) return src.body.replace(/<!--\s*ai-loop:v1[^>]*-->/g, '').trim();
+                  return `Codex flagged findings on this PR — see the Codex review on PR #${prNumber}.`;
+                }
+
+                // ---- STAGE codex-api (only when the OpenAI-quota backup is ENABLED) ----
+                if (codexBackupEnabled) {
+                  const codexReq = newestMarker('codex', 'requested');
+                  if (!codexReq) {
+                    // Not yet dispatched for this head → dispatch the CI backup.
+                    try {
+                      await github.rest.actions.createWorkflowDispatch({
+                        owner, repo, workflow_id: BACKUP_WORKFLOW, ref: dispatchRef,
+                        inputs: { pr_number: String(prNumber), head_sha: headSha, attempt: String(attempt) },
+                      });
+                    } catch (e) {
+                      // Loud-fail (unchanged): dispatch_failed marker, NO burned attempt.
+                      core.error(`PR #${prNumber}: codex-api dispatch failed — ${e.message}`);
+                      await notify(`⚠️ ${repo} PR #${prNumber}: codex-api dispatch failed — ${e.message}`);
+                      const alreadyFlagged = marked.some((a) => a.agent === 'watchdog' && a.state === 'dispatch_failed' && a.head === headSha);
+                      if (!alreadyFlagged) {
+                        try { await github.rest.issues.createComment({ owner, repo, issue_number: prNumber, body: `<!-- ai-loop:v1 root_pr=${prNumber} head=${headSha} agent=watchdog state=dispatch_failed -->\nBackup dispatch was blocked (see run logs / annotations). The watchdog will retry automatically once resolved; no attempt was consumed.` }); } catch (e2) { core.info(`marker comment failed (ignored): ${e2.message}`); }
+                      }
+                      continue;
+                    }
+                    try { await github.rest.issues.createComment({ owner, repo, issue_number: prNumber, body: `<!-- ai-loop:v1 root_pr=${prNumber} head=${headSha} attempt=${attempt} agent=codex state=requested -->\nClaude didn't deliver on the current head — dispatched the Codex API backup fixer (attempt ${attempt}).` }); } catch (e) { core.info(`marker comment failed (ignored): ${e.message}`); }
+                    await notify(`ℹ️ ${repo} PR #${prNumber}: Claude didn't deliver → dispatched Codex API backup (attempt ${attempt}).`);
+                    core.info(`PR #${prNumber}: STAGE codex-api dispatched (attempt ${attempt}).`);
+                    continue;                       // wait its 20-min delivery window
+                  }
+                  if (await deliveredSince(codexReq.at)) continue;   // Codex API delivered
+                  if (Date.now() - codexReq.at < TIMEOUT_MS) continue;   // still within its window
+                  // codex-api failed delivery → fall through to codex-cloud
+                }
+
+                // ---- STAGE codex-cloud (NEW) — subscription-billed Codex Cloud ----
+                // A PAT/owner-authored `@codex fix` top-level comment provably wakes
+                // it (TRF #84). HARD LIMIT: at most ONE codex-cloud attempt per head.
+                const cloudReq = newestMarker('codex-cloud', 'requested');
+                if (!cloudReq) {
+                  const digest = findingsDigest();
                   try {
                     await github.rest.issues.createComment({
                       owner, repo, issue_number: prNumber,
-                      body: `<!-- ai-loop:v1 root_pr=${prNumber} head=${headSha} agent=watchdog state=escalated -->\nClaude didn't fix PR #${prNumber} within the timeout and the autonomous backup is disabled (no OpenAI quota) — needs a manual fix.`,
+                      body: `<!-- ai-loop:v1 root_pr=${prNumber} head=${headSha} attempt=${attempt} agent=codex-cloud state=requested -->\n@codex fix\n\n[auto-triggered]\n\nClaude did not deliver a fix for the findings below — apply a fix for each:\n\n${digest}`,
                     });
-                  } catch (e) { core.info(`escalation comment failed (ignored): ${e.message}`); }
-                  const tgToken = process.env.TELEGRAM_BOT_TOKEN;
-                  const tgChat = process.env.TELEGRAM_CHAT_ID;
-                  if (tgToken && tgChat) {
-                    try {
-                      await fetch(`https://api.telegram.org/bot${tgToken}/sendMessage`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                          chat_id: tgChat,
-                          text: `🚨 ${repo} PR #${prNumber}: Claude didn't fix in time and the backup is disabled — escalated to needs-owner.`,
-                          disable_web_page_preview: true,
-                        }),
-                      });
-                    } catch (e) { core.info(`Telegram failed (ignored): ${e.message}`); }
-                  }
-                  core.warning(`PR #${prNumber}: Claude timed out and the Codex backup is disabled — escalated to needs-owner.`);
-                  continue;
+                  } catch (e) { core.info(`codex-cloud comment failed (ignored): ${e.message}`); continue; }
+                  await notify(`ℹ️ ${repo} PR #${prNumber}: Claude${codexBackupEnabled ? '/Codex-API' : ''} didn't deliver → asked Codex Cloud (@codex fix, attempt ${attempt}).`);
+                  core.info(`PR #${prNumber}: STAGE codex-cloud requested (attempt ${attempt}).`);
+                  continue;                         // wait its 20-min delivery window
                 }
+                if (await deliveredSince(cloudReq.at)) continue;   // Codex Cloud delivered
+                if (Date.now() - cloudReq.at < TIMEOUT_MS) continue;   // still within its window
 
-                // 3-attempt cap reached → escalate, do NOT fire Codex.
-                if (maxAttempt >= MAX_ATTEMPTS) {
-                  try {
-                    await github.rest.issues.addLabels({
-                      owner, repo, issue_number: prNumber, labels: [LABEL_ESCALATE],
-                    });
-                  } catch (e) { core.info(`addLabel failed (ignored): ${e.message}`); }
-                  const tgToken = process.env.TELEGRAM_BOT_TOKEN;
-                  const tgChat = process.env.TELEGRAM_CHAT_ID;
-                  if (tgToken && tgChat) {
-                    try {
-                      await fetch(`https://api.telegram.org/bot${tgToken}/sendMessage`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                          chat_id: tgChat,
-                          text: `🚨 ${repo} PR #${prNumber}: ${maxAttempt} fix attempts didn't converge — escalated to needs-owner.`,
-                          disable_web_page_preview: true,
-                        }),
-                      });
-                    } catch (e) { core.info(`Telegram failed (ignored): ${e.message}`); }
-                  }
-                  core.warning(`PR #${prNumber}: ${maxAttempt} attempts without converging — escalated to needs-owner.`);
-                  continue;
-                }
-
-                // Time for the Codex backup. Dispatch the CI fixer for this head.
-                const attempt = maxAttempt + 1;
-                try {
-                  await github.rest.actions.createWorkflowDispatch({
-                    owner, repo, workflow_id: BACKUP_WORKFLOW, ref: dispatchRef,
-                    inputs: {
-                      pr_number: String(prNumber),
-                      head_sha: headSha,
-                      attempt: String(attempt),
-                    },
-                  });
-                } catch (e) {
-                  // Make a blocked dispatch LOUD (root cause: createWorkflowDispatch
-                  // 403 when AUTOMATION_PAT lacks Actions: write). Do NOT burn an
-                  // attempt or escalate — leave the attempt un-marked so the watchdog
-                  // retries each tick and self-heals once the PAT scope is fixed.
-                  core.error(`PR #${prNumber}: backup dispatch failed — ${e.message}`);
-                  const tgToken = process.env.TELEGRAM_BOT_TOKEN;
-                  const tgChat = process.env.TELEGRAM_CHAT_ID;
-                  if (tgToken && tgChat) {
-                    try {
-                      await fetch(`https://api.telegram.org/bot${tgToken}/sendMessage`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                          chat_id: tgChat,
-                          text: `⚠️ ${repo} PR #${prNumber}: backup dispatch failed — ${e.message}`,
-                          disable_web_page_preview: true,
-                        }),
-                      });
-                    } catch (e2) { core.info(`Telegram failed (ignored): ${e2.message}`); }
-                  }
-                  // Dedupe the failure flag to once per head — NO attempt= field, so
-                  // it never burns an attempt and never trips the attempt counter.
-                  const alreadyFlagged = marked.some(
-                    (a) => a.agent === 'watchdog' && a.state === 'dispatch_failed' && a.head === headSha,
-                  );
-                  if (!alreadyFlagged) {
-                    try {
-                      await github.rest.issues.createComment({
-                        owner, repo, issue_number: prNumber,
-                        body: `<!-- ai-loop:v1 root_pr=${prNumber} head=${headSha} agent=watchdog state=dispatch_failed -->\nBackup dispatch was blocked (see run logs / annotations). The watchdog will retry automatically once resolved; no attempt was consumed.`,
-                      });
-                    } catch (e2) { core.info(`marker comment failed (ignored): ${e2.message}`); }
-                  }
-                  continue;
-                }
-                // Record a codex/requested marker so the attempt is counted and
-                // the watchdog won't re-fire on the next 5-minute tick.
-                try {
-                  await github.rest.issues.createComment({
-                    owner, repo, issue_number: prNumber,
-                    body: `<!-- ai-loop:v1 root_pr=${prNumber} head=${headSha} attempt=${attempt} agent=codex state=requested -->\nClaude fix timed out (>20m) on the current head — dispatched the Codex backup fixer (attempt ${attempt}).`,
-                  });
-                } catch (e) { core.info(`marker comment failed (ignored): ${e.message}`); }
-                core.info(`PR #${prNumber}: fired Codex backup (attempt ${attempt}) for head ${headSha}.`);
+                // ---- STAGE escalate — every enabled stage failed delivery ----
+                await escalate(
+                  `Claude${codexBackupEnabled ? ', the Codex API backup,' : ''} and Codex Cloud didn't deliver a fix for the current head — escalated to needs-owner.`,
+                  `🚨 ${repo} PR #${prNumber}: Claude${codexBackupEnabled ? ' + Codex API' : ''} + Codex Cloud didn't deliver — escalated to needs-owner.`,
+                );
               } catch (e) {
                 core.info(`PR #${pr.number}: watchdog error (ignored): ${e.message}`);
               }
@@ -407,6 +379,38 @@ jobs:
                   const prNumber = pr.number;
                   const headSha = pr.head.sha;
                   const head7 = headSha.substring(0, 7);
+
+                  // fix #23 Part C: auto update-branch for a STALE loop PR so the
+                  // fixer AND the gate always work the CURRENT head — the update
+                  // advances the head, which re-runs the gate and lets the fixer
+                  // ladder continue on the fresh head. Loop PR = carries an ai-loop
+                  // marker OR a `claude/*` head ref OR a trusted sync. Only when the
+                  // base has moved (mergeable_state 'behind') and NOT escalated;
+                  // NEVER for 'dirty' — real conflicts stay a human's job. Mutation
+                  // → AUTOMATION_PAT (`github`). At most once per PR per tick.
+                  try {
+                    const hasNeedsOwner = (pr.labels || []).some((l) => (l.name || l) === 'needs-owner');
+                    let loopPr = (!!(pr.head && pr.head.ref && pr.head.ref.startsWith('claude/'))) || isTrustedSync(pr);
+                    if (!loopPr) {
+                      const [ic, rc] = await Promise.all([
+                        github.paginate(github.rest.issues.listComments, { owner, repo, issue_number: prNumber, per_page: 100 }),
+                        github.paginate(github.rest.pulls.listReviewComments, { owner, repo, pull_number: prNumber, per_page: 100 }),
+                      ]);
+                      loopPr = [...ic, ...rc].some((c) => /ai-loop:v1/.test(c.body || ''));
+                    }
+                    if (loopPr && !hasNeedsOwner) {
+                      const { data: full } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+                      if (full.mergeable_state === 'behind') {
+                        try {
+                          await github.rest.pulls.updateBranch({ owner, repo, pull_number: prNumber, expected_head_sha: headSha });
+                          core.info(`auto update-branch: PR #${prNumber}`);
+                        } catch (e) {
+                          core.error(`auto update-branch failed for PR #${prNumber} — ${e.message}`);
+                          await telegram(`⚠️ ${repo} PR #${prNumber}: auto update-branch failed — ${e.message}`);
+                        }
+                      }
+                    }
+                  } catch (e) { core.info(`update-branch check PR #${prNumber} (ignored): ${e.message}`); }
 
                   // latestCommitDate — computed EXACTLY as the gate does: the MAX
                   // committer date across the PR's commits (else pr.created_at).
