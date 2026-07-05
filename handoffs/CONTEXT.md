@@ -335,13 +335,23 @@ chain looked healthy while delivering nothing.
      reality — dead OpenAI quota).
   3. **codex-cloud (NEW)** — posts a TOP-LEVEL `@codex fix` issue comment via
      AUTOMATION_PAT (a PAT/owner-authored comment provably wakes subscription-billed
-     Codex Cloud — TRF #84), with `[auto-triggered]` + the findings digest COPIED from
-     the bridge's most recent `@claude fix` comment (located by its ai-loop marker; else
-     "see the Codex review") + marker `agent=codex-cloud state=requested`. **HARD LIMIT:
-     ONE codex-cloud attempt per head** (dedupe via the marker). Then a 20-min window.
+     Codex Cloud — TRF #84), with `[auto-triggered]` + **an explicit push instruction
+     (fix #24): "Commit and push your fix directly to this PR's head branch (you have
+     write permission) — do not leave the diff waiting in the task."** (the Codex
+     Connector app is CONFIRMED to hold Read&Write on code+workflows across all repos,
+     so Cloud CAN push autonomously — whether it does is a product-behavior question,
+     not a permissions one) + the findings digest COPIED from the bridge's most recent
+     `@claude fix` comment (located by its ai-loop marker; else "see the Codex review")
+     + marker `agent=codex-cloud state=requested`. **HARD LIMIT: ONE codex-cloud attempt
+     per head** (dedupe via the marker). **fix #24 fork guard: a fork-headed PR is NEVER
+     pinged** (untrusted code; mirrors codex-backup-fix's same-repo guard) — it falls
+     through to escalate. Then a 20-min window.
   4. **escalate** — only after every ENABLED stage failed delivery: the existing
      `needs-owner` upsert (fix #14B) + Telegram, message naming the chain ("Claude[, the
      Codex API backup,] and Codex Cloud didn't deliver — escalated to needs-owner").
+     **fix #24:** when a codex-cloud attempt was made for this head, the comment also
+     appends "A Codex Cloud task may have completed with a ready diff — open the task
+     (View task) and apply it / Update branch."
   Each advance sends a Telegram info line (existing plumbing). The old fixed 3-attempt cap
   is REPLACED by this per-head stage ladder (each stage ≤1/head; escalate terminal/head).
   - **Late-signal sweep (fix #18) — a SECOND step in this same workflow.** Closes
@@ -380,28 +390,38 @@ chain looked healthy while delivering nothing.
       `mergeable_state == 'behind'` and NOT `needs-owner`, the sweep calls
       `pulls.updateBranch` (PUT update-branch, `expected_head_sha` = current head) via
       AUTOMATION_PAT — the owner used to click "Update branch" by hand (TRF #84).
-      **NEVER for `'dirty'`** (real conflicts stay a human's job). Log `auto
-      update-branch: PR #N`, loud-fail (`core.error` + Telegram), at most once per PR
-      per tick. The update advances the head → the gate re-runs → the fixer ladder
-      continues on the fresh head.
+      **NEVER for `'dirty'`** (real conflicts stay a human's job) and **NEVER for a
+      fork-headed PR (fix #24 same-repo guard)**. Log `auto update-branch: PR #N`,
+      loud-fail (`core.error` + Telegram), at most once per PR per tick. The update
+      advances the head → the gate re-runs → the fixer ladder continues on the fresh
+      head.
 - **`codex-backup-fix.yml`** — `workflow_dispatch` (pr_number, head_sha,
   attempt), two jobs:
   - **`generate-patch`** (`permissions: contents: read` — NO write token):
     fork-PR security guard FIRST (if head repo ≠ this repo → add `needs-owner`
     and stop the whole workflow; never run the agent or expose secrets on fork
-    code); checkout the exact `head_sha` (`persist-credentials: false`); run
-    `openai/codex-action@v1` (`openai-api-key: OPENAI_API_KEY`, `sandbox:
-    workspace-write`, `safety-strategy: drop-sudo`) with a prompt pointing the
-    agent at the active Codex finding; capture `git diff --binary HEAD >
-    codex.patch` and upload it as an artifact. Does NOT push.
+    code); checkout the exact `head_sha` (`persist-credentials: false`); gather the
+    active Codex finding **filtered for FRESHNESS (fix #24)** — mirrors codex-gate's
+    date-only model: keep a review COMMENT only if `created_at > latestCommitDate`
+    and a review BODY only if `submitted_at > latestCommitDate` (`latestCommitDate` =
+    MAX committer date across the PR's commits, else `pr.created_at`), so stale,
+    already-addressed P1/P2s are NOT fed to the agent; run `openai/codex-action@v1`
+    (`sandbox: workspace-write`, `safety-strategy: drop-sudo`); capture `git diff
+    --binary HEAD > codex.patch` and upload it. Does NOT push.
   - **`apply-and-push`** (`permissions: contents/pull-requests/issues: write`):
     download the patch; **stale-head guard** — re-read the PR head SHA and if it
-    moved since `head_sha`, do NOT apply the stale patch (post a counts-only note
-    and exit; a fresh review on the new head starts a new cycle); otherwise
-    `git apply --index`, commit, and **push directly to the PR head branch**
-    (`git push origin HEAD:<head_ref>`). Posts a `agent=codex state=pushed`
-    marker. Net: the existing PR gets a new commit → Codex auto-reviews → Codex
-    Gate re-checks → merge-bot proceeds. **No new PR is created.**
+    moved, do NOT apply the stale patch. Otherwise `git apply --index`, commit, push.
+    **Honest end states (fix #24):** the apply step sets a `pushed` output — `'false'`
+    on the empty-patch no-op, `'true'` ONLY after `git push` succeeds — and the marker
+    is split by outcome: `pushed=='true'` → `agent=codex state=pushed` (as before);
+    `pushed=='false'` → `agent=codex state=no_change` (+ `core.notice`, "empty patch —
+    not counted as a fix"); the apply step FAILED → `agent=codex state=patch_failed`
+    (`if: failure()`, + `core.error`). Previously it posted `state=pushed` even on an
+    empty patch (a LIE). The fix #23 watchdog judges the codex-api stage by
+    `deliveredSince` (real commits) — it reads only `agent=codex state=requested` and
+    NEVER treats `no_change`/`patch_failed`/`pushed` as delivered, so the markers just
+    can't lie. Net on a real push: new commit → Codex re-reviews → gate re-checks →
+    merge-bot. **No new PR is created.**
 - **Claude-reviews-Codex is best-effort, NOT a gate.** No required check depends
   on Claude reviewing Codex's fix — Claude being unavailable (no budget) is a
   known-normal state, and gating on it would deadlock exactly when Codex is the

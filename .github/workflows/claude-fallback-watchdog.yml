@@ -238,25 +238,42 @@ jobs:
                 // ---- STAGE codex-cloud (NEW) — subscription-billed Codex Cloud ----
                 // A PAT/owner-authored `@codex fix` top-level comment provably wakes
                 // it (TRF #84). HARD LIMIT: at most ONE codex-cloud attempt per head.
+                // fix #24 fork guard: NEVER ping Codex Cloud on a fork-headed PR —
+                // fork code is untrusted (mirrors codex-backup-fix's same-repo guard).
+                const sameRepo = !!(pr.head && pr.head.repo && pr.head.repo.full_name === `${owner}/${repo}`);
                 const cloudReq = newestMarker('codex-cloud', 'requested');
                 if (!cloudReq) {
-                  const digest = findingsDigest();
-                  try {
-                    await github.rest.issues.createComment({
-                      owner, repo, issue_number: prNumber,
-                      body: `<!-- ai-loop:v1 root_pr=${prNumber} head=${headSha} attempt=${attempt} agent=codex-cloud state=requested -->\n@codex fix\n\n[auto-triggered]\n\nClaude did not deliver a fix for the findings below — apply a fix for each:\n\n${digest}`,
-                    });
-                  } catch (e) { core.info(`codex-cloud comment failed (ignored): ${e.message}`); continue; }
-                  await notify(`ℹ️ ${repo} PR #${prNumber}: Claude${codexBackupEnabled ? '/Codex-API' : ''} didn't deliver → asked Codex Cloud (@codex fix, attempt ${attempt}).`);
-                  core.info(`PR #${prNumber}: STAGE codex-cloud requested (attempt ${attempt}).`);
-                  continue;                         // wait its 20-min delivery window
+                  if (sameRepo) {
+                    const digest = findingsDigest();
+                    try {
+                      await github.rest.issues.createComment({
+                        owner, repo, issue_number: prNumber,
+                        // fix #24: the Connector app holds Read&Write on code+workflows,
+                        // so Cloud CAN push autonomously — instruct it to, explicitly.
+                        body: `<!-- ai-loop:v1 root_pr=${prNumber} head=${headSha} attempt=${attempt} agent=codex-cloud state=requested -->\n@codex fix\n\n[auto-triggered]\n\nCommit and push your fix directly to this PR's head branch (you have write permission) — do not leave the diff waiting in the task.\n\nClaude did not deliver a fix for the findings below — apply a fix for each:\n\n${digest}`,
+                      });
+                    } catch (e) { core.info(`codex-cloud comment failed (ignored): ${e.message}`); continue; }
+                    await notify(`ℹ️ ${repo} PR #${prNumber}: Claude${codexBackupEnabled ? '/Codex-API' : ''} didn't deliver → asked Codex Cloud (@codex fix, attempt ${attempt}).`);
+                    core.info(`PR #${prNumber}: STAGE codex-cloud requested (attempt ${attempt}).`);
+                    continue;                       // wait its 20-min delivery window
+                  }
+                  core.info(`PR #${prNumber}: fork-headed — never ping Codex Cloud on untrusted fork code; escalating.`);
+                  // fall through to escalate
+                } else {
+                  if (await deliveredSince(cloudReq.at)) continue;   // Codex Cloud delivered
+                  if (Date.now() - cloudReq.at < TIMEOUT_MS) continue;   // still within its window
+                  // fall through to escalate
                 }
-                if (await deliveredSince(cloudReq.at)) continue;   // Codex Cloud delivered
-                if (Date.now() - cloudReq.at < TIMEOUT_MS) continue;   // still within its window
 
                 // ---- STAGE escalate — every enabled stage failed delivery ----
+                // fix #24: if a Codex Cloud task WAS asked for this head, its diff may
+                // be sitting ready in the task — point the owner at it.
+                const cloudTried = !!newestMarker('codex-cloud', 'requested');
+                const viewTaskHint = cloudTried
+                  ? '\nA Codex Cloud task may have completed with a ready diff — open the task (View task) and apply it / Update branch.'
+                  : '';
                 await escalate(
-                  `Claude${codexBackupEnabled ? ', the Codex API backup,' : ''} and Codex Cloud didn't deliver a fix for the current head — escalated to needs-owner.`,
+                  `Claude${codexBackupEnabled ? ', the Codex API backup,' : ''} and Codex Cloud didn't deliver a fix for the current head — escalated to needs-owner.${viewTaskHint}`,
                   `🚨 ${repo} PR #${prNumber}: Claude${codexBackupEnabled ? ' + Codex API' : ''} + Codex Cloud didn't deliver — escalated to needs-owner.`,
                 );
               } catch (e) {
@@ -388,8 +405,11 @@ jobs:
                   // base has moved (mergeable_state 'behind') and NOT escalated;
                   // NEVER for 'dirty' — real conflicts stay a human's job. Mutation
                   // → AUTOMATION_PAT (`github`). At most once per PR per tick.
+                  // fix #24 fork guard: NEVER auto-update-branch a fork-headed PR —
+                  // fork code is untrusted (mirrors codex-backup-fix's same-repo guard).
                   try {
                     const hasNeedsOwner = (pr.labels || []).some((l) => (l.name || l) === 'needs-owner');
+                    const sameRepo = !!(pr.head && pr.head.repo && pr.head.repo.full_name === `${owner}/${repo}`);
                     let loopPr = (!!(pr.head && pr.head.ref && pr.head.ref.startsWith('claude/'))) || isTrustedSync(pr);
                     if (!loopPr) {
                       const [ic, rc] = await Promise.all([
@@ -398,7 +418,7 @@ jobs:
                       ]);
                       loopPr = [...ic, ...rc].some((c) => /ai-loop:v1/.test(c.body || ''));
                     }
-                    if (loopPr && !hasNeedsOwner) {
+                    if (loopPr && !hasNeedsOwner && sameRepo) {
                       const { data: full } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
                       if (full.mergeable_state === 'behind') {
                         try {

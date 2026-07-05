@@ -17,6 +17,20 @@ Handoff log for the **self-healing-loop build** Claude Chat session. Claude Code
 
 ---
 
+## [2026-07-05 12:40 UTC] fix #24: honesty + push-instruction hardening on the fixer chain
+- PR: direct commit to main
+- Branch: main (direct commit)
+- Status: done
+- Context facts: (1) codex-backup-fix collected findings with NO freshness filter — stale, already-addressed P1/P2s got fed to the agent; (2) its "Post pushed marker" step posted `state=pushed` even when the patch was EMPTY (apply exits 0 "nothing to push"); (3) the Codex Connector app is confirmed Read&Write on code+workflows, so Cloud CAN push autonomously — the auto `@codex fix` ping must say so; (4) fix #23's codex-cloud stage + auto-update-branch had no fork guard.
+- What changed (2 files):
+  - **codex-backup-fix.yml Part A (freshness):** findings gather now computes `latestCommitDate` (MAX committer date across PR commits, else `pr.created_at` — codex-gate's date-only model) and keeps a review COMMENT only if `created_at > latestCommitDate`, a review BODY only if `submitted_at > latestCommitDate`. Generic fallback stays for the empty case.
+  - **codex-backup-fix.yml Part B (honest states):** the apply/push bash step gains `id: apply` + a `pushed` output (`false` on empty-patch exit, `true` only after `git push`). The single marker step is split by outcome (all under `stale=='false'`): `pushed=='true'` → `state=pushed` (unchanged); `pushed=='false'` → `state=no_change` (+ core.notice); `if: failure()` → `state=patch_failed` (+ core.error). Verified the fix #23 watchdog judges by `deliveredSince` and reads only `agent=codex state=requested` — it never treats `no_change`/`patch_failed`/`pushed` as delivered, so the markers can't lie.
+  - **claude-fallback-watchdog.yml Part C (cloud texts):** the codex-cloud `@codex fix` body appends (after `[auto-triggered]`) "Commit and push your fix directly to this PR's head branch (you have write permission) — do not leave the diff waiting in the task."; the final escalation comment appends a View-task hint when a codex-cloud marker exists.
+  - **claude-fallback-watchdog.yml Part D (fork guards):** the same-repo guard (`pr.head.repo.full_name === owner/repo`) added to BOTH new paths — a fork-headed PR is never pinged for a cloud fix (falls through to escalate) and never auto-update-branched.
+- Validation: `yaml.safe_load` + actionlint on both copies of both files; `node --check` on all 9 script bodies; greps — `latestCommitDate` present in codex-backup-fix, `state=no_change` + `state=patch_failed` present, the pushed-marker gated on `steps.apply.outputs.pushed == 'true'`, the push-instruction line in the cloud ping, the `full_name` guard in both new watchdog paths, "View task" present; regression guard ZERO `require('@actions/github')`/`__original_require__`/`getOctokit`; `git hash-object` equal per file (codex-backup-fix `efad70a`, watchdog `6b0a06d`).
+- Needs from the owner: nothing — live on main in one commit; propagates downstream on the next daily sync.
+- Next: the codex-api backup no longer claims a fix it didn't make; the Cloud ping tells Codex to push; forks are guarded on the new paths.
+
 ## [2026-07-05 10:30 UTC] fix #23: the full fixer ladder (Claude→Codex-API→Codex-Cloud→needs-owner), delivery-judged + auto update-branch
 - PR: direct commit to main
 - Branch: main (direct commit)
