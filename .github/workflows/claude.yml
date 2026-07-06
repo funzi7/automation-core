@@ -46,12 +46,17 @@ jobs:
   claude:
     # Trigger on: @claude mention in a comment, an assigned Issue, or an
     # Issue labeled `claude-fix` (the label_trigger path ci-doctor uses).
+    # fix #26 kill-switch: flip the repo Actions var CLAUDE_ENABLED=false while the
+    # Anthropic credit is exhausted to skip even the ~17s billing bounce (absent
+    # var = enabled). Wraps the existing trigger condition, never replaces it.
     if: |
-      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'issues' && github.event.action == 'assigned') ||
-      (github.event_name == 'issues' && github.event.action == 'labeled' && github.event.label.name == 'claude-fix') ||
-      (github.event_name == 'issues' && github.event.action == 'opened' && contains(join(github.event.issue.labels.*.name, ','), 'claude-fix'))
+      vars.CLAUDE_ENABLED != 'false' && (
+        (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+        (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
+        (github.event_name == 'issues' && github.event.action == 'assigned') ||
+        (github.event_name == 'issues' && github.event.action == 'labeled' && github.event.label.name == 'claude-fix') ||
+        (github.event_name == 'issues' && github.event.action == 'opened' && contains(join(github.event.issue.labels.*.name, ','), 'claude-fix'))
+      )
     runs-on: ubuntu-latest
     steps:
       - name: Fail-soft check for ANTHROPIC_API_KEY
@@ -142,6 +147,11 @@ jobs:
         # whenever the key is present (independent of the Claude step's outcome).
         if: always() && steps.keycheck.outputs.has_key == 'true'
         uses: actions/github-script@v7
+        env:
+          # fix #26: the action's SDK writes a terminal result JSON here. Prefer the
+          # step output if the action declares one; else the delivery step finds it
+          # under RUNNER_TEMP. Used to CLASSIFY a non-delivery (billing/error/no-op).
+          EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
         with:
           github-token: ${{ secrets.AUTOMATION_PAT || github.token }}
           script: |
@@ -180,6 +190,49 @@ jobs:
             }
             core.setOutput('delivered', delivered ? 'true' : 'false');
 
+            // fix #26: CLASSIFY a non-delivery from the SDK terminal result. TRF #88
+            // proved the action reports subtype:"success" even when the account is
+            // out of credit (is_error:true, "Credit balance is too low", 0 tokens),
+            // so a dead fixer looked like a mysterious no-op. Only the honest class
+            // lets the watchdog skip the 20-min wait / stop proxying an empty account.
+            let cls = 'no_delivery';   // default when no result file (behavior unchanged)
+            let resultStr = '';
+            if (!delivered) {
+              const fs = require('fs');
+              const cp = require('child_process');
+              let file = process.env.EXECUTION_FILE;
+              if (!file || !fs.existsSync(file)) {
+                try {
+                  const found = cp.execSync(`find "${process.env.RUNNER_TEMP}" -maxdepth 2 -name 'claude-execution-output.json' 2>/dev/null`).toString().trim().split('\n')[0];
+                  if (found && fs.existsSync(found)) file = found;
+                } catch (e) { /* find failed — classification skipped */ }
+              }
+              if (file && fs.existsSync(file)) {
+                try {
+                  const txt = fs.readFileSync(file, 'utf8');
+                  let result = null;
+                  try {
+                    const j = JSON.parse(txt);
+                    const arr = Array.isArray(j) ? j : [j];
+                    result = arr.find((x) => x && x.type === 'result') || null;
+                  } catch (e) {
+                    for (const line of txt.split('\n')) { try { const o = JSON.parse(line); if (o && o.type === 'result') result = o; } catch (e2) {} }
+                  }
+                  const isErr = !!(result && result.is_error);
+                  resultStr = String((result && result.result) || '').slice(0, 200);
+                  const billing = /billing_error/.test(txt) || /Credit balance is too low/i.test(resultStr) || /Credit balance is too low/i.test(txt);
+                  if (isErr && billing) cls = 'billing_error';
+                  else if (isErr) cls = 'fixer_error';
+                  else cls = 'no_delivery';   // ran, no error, no commit → genuine no-op
+                  core.info(`SDK outcome class: ${cls} (is_error=${isErr}) result="${resultStr}" from ${file}`);
+                } catch (e) { core.info(`classify failed (default no_delivery): ${e.message}`); }
+              } else {
+                core.info('No claude-execution-output.json found — classification skipped (default no_delivery).');
+              }
+            }
+            core.setOutput('class', cls);
+            core.setOutput('resultStr', resultStr);
+
       - name: Mark a no-delivery fix (👎 + ladder handoff)
         # fix #23: fire when the Claude step DID NOT SUCCEED **OR** succeeded but
         # DELIVERED NOTHING (no new commit on the head — the TRF #84 no-op-success
@@ -188,6 +241,10 @@ jobs:
         # NEVER fail the job.
         if: ${{ always() && steps.keycheck.outputs.has_key == 'true' && (steps.claude.outcome != 'success' || steps.delivery.outputs.delivered != 'true') }}
         uses: actions/github-script@v7
+        env:
+          # fix #26: the classified outcome from the delivery step.
+          CLAUDE_CLASS: ${{ steps.delivery.outputs.class }}
+          CLAUDE_RESULT: ${{ steps.delivery.outputs.resultStr }}
         with:
           github-token: ${{ secrets.AUTOMATION_PAT || github.token }}
           script: |
@@ -196,6 +253,12 @@ jobs:
               const repo = context.repo.repo;
               const comment = context.payload.comment;
               const commentId = comment && comment.id;
+              // fix #26: honest failure class (billing_error / fixer_error / no_delivery).
+              const cls = (process.env.CLAUDE_CLASS || 'no_delivery').trim() || 'no_delivery';
+              const resultStr = (process.env.CLAUDE_RESULT || '').slice(0, 200);
+              if (cls === 'billing_error' || cls === 'fixer_error') {
+                core.error(`Claude fixer ${cls} — no fix delivered. result="${resultStr || '(none)'}"`);
+              }
               // ADD-ONLY 👎 (fix #23): the 👀 on the trigger is placed by the hosted
               // `claude[bot]` App — a DIFFERENT identity whose reactions we cannot
               // delete (cross-identity deletion is forbidden), and our own 👀 may not
@@ -227,13 +290,18 @@ jobs:
                 let exists = false;
                 try {
                   const ic = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number: prNumber, per_page: 100 });
-                  exists = ic.some((c) => { const b = c.body || ''; return b.includes('agent=claude') && b.includes('state=no_delivery') && b.includes(`head=${headSha}`); });
+                  exists = ic.some((c) => { const b = c.body || ''; return b.includes('agent=claude ') && b.includes(`state=${cls}`) && b.includes(`head=${headSha}`); });
                 } catch (e) { core.info(`listComments failed (ignored): ${e.message}`); }
                 if (!exists) {
+                  const note = cls === 'billing_error'
+                    ? 'Claude fixer hit a billing_error (Anthropic credit exhausted) — no inference ran (0 tokens). Handing off to the fixer ladder (watchdog).'
+                    : cls === 'fixer_error'
+                    ? `Claude fixer errored — no commit delivered ("${resultStr}"). Handing off to the fixer ladder (watchdog).`
+                    : 'Claude Code ran but delivered no commit on this head — handing off to the fixer ladder (watchdog).';
                   try {
-                    await github.rest.issues.createComment({ owner, repo, issue_number: prNumber, body: `<!-- ai-loop:v1 root_pr=${prNumber} head=${headSha} attempt=${attempt} agent=claude state=no_delivery -->\nClaude Code ran but delivered no commit on this head — handing off to the fixer ladder (watchdog).` });
-                    core.info(`Posted claude/no_delivery marker for PR #${prNumber} head ${headSha}.`);
-                  } catch (e) { core.info(`no_delivery marker failed (ignored): ${e.message}`); }
+                    await github.rest.issues.createComment({ owner, repo, issue_number: prNumber, body: `<!-- ai-loop:v1 root_pr=${prNumber} head=${headSha} attempt=${attempt} agent=claude state=${cls} -->\n${note}` });
+                    core.info(`Posted claude/${cls} marker for PR #${prNumber} head ${headSha}.`);
+                  } catch (e) { core.info(`${cls} marker failed (ignored): ${e.message}`); }
                 }
               }
             } catch (e) {

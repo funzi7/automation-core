@@ -318,12 +318,27 @@ merged → (sync propagates updated workflows to ~14 downstream repos daily)
   notes, commits, watchdog re-runs on the same marker, debounced duplicate
   `@claude fix`, or an un-pushed patch. Next attempt = max(attempt)+1.
 
-### The fixer LADDER (fix #23) — Claude → Codex-API → Codex-Cloud → needs-owner
+### The fixer LADDER (fix #23 + #26) — Claude → Codex-API → Codex-Cloud → Claude-proxy → owner
 **Judged ONLY by DELIVERY** (a new commit on the PR head after the relevant ping),
-never by a workflow conclusion. **Success ≠ delivery** — the TRF #84 lesson:
-`claude-code-action` returned `success` in 15 s with **zero commits** (a no-op
-success), so the old fix-#10 `outcome != 'success'` guard skipped the 👎 and the
-chain looked healthy while delivering nothing.
+never by a workflow conclusion. **Success ≠ delivery ≠ ran** — the TRF #84/#88 lessons:
+`claude-code-action` returns `success` on a no-op with **zero commits**, AND it
+returns `subtype:"success"` even when the account is **out of credit**
+(`is_error:true`, `"Credit balance is too low"`, 0 tokens — TRF #88). So a
+non-delivery is now CLASSIFIED (fix #26).
+- **Honest failure classes (fix #26).** claude.yml's delivery step reads the SDK
+  terminal result JSON (`steps.claude.outputs.execution_file`, else
+  `find $RUNNER_TEMP -maxdepth 2 -name claude-execution-output.json`) and classifies a
+  non-delivery: **`billing_error`** (`is_error` + "Credit balance is too low" / the
+  `billing_error` error — Anthropic credit dry), **`fixer_error`** (`is_error`
+  otherwise; the result string rides in the marker), **`no_delivery`** (ran clean, no
+  commit — a GENUINE model no-op). The 👎 is added for all non-delivered classes; the
+  marker becomes `agent=claude state=<class>`; billing/fixer also `core.error` a loud
+  line. Only the honest class lets the watchdog skip the 20-min wait and stop
+  proxying an empty account.
+- **CLAUDE_ENABLED kill-switch (fix #26).** The claude job `if:` is wrapped with
+  `vars.CLAUDE_ENABLED != 'false'` (absent = enabled) — flip it off while Anthropic
+  credit is exhausted to skip even the ~17s billing bounce. The watchdog reads the
+  same var and pre-skips stage 1 (no window) for every PR.
 
 - **`claude.yml` delivery-aware verdict (fix #23 Part A):** a **Delivery check** step
   (`id: delivery`, `always() && has_key`) lists commits on the PR head ref since the
@@ -339,8 +354,11 @@ chain looked healthy while delivering nothing.
   marker on the current head, it climbs a ladder, each stage judged by a
   `deliveredSince(pingTime)` helper (commits on the head ref, injected octokit, zero
   modules) and firing **at most once per head** (marker dedupe):
-  1. **claude** — failed = a `claude/no_delivery` marker exists OR the 20-min window
-     elapsed with no delivery.
+  1. **claude** — failed = a `claude/no_delivery` marker OR the 20-min window elapsed.
+     **fix #26 instant skip:** a `claude/billing_error` or `claude/fixer_error` marker
+     (Claude RAN AND DIED) makes stage 1 **terminal immediately** — no window — with a
+     once-per-head `🚨 … Claude fixer dead (<class>) — fund Anthropic` notify (deduped
+     via a `watchdog/claude_dead` marker); `CLAUDE_ENABLED=false` also pre-skips it.
   2. **codex-api** — ONLY if `vars.CODEX_BACKUP_ENABLED == 'true'`: the existing
      `codex-backup-fix.yml` dispatch (unchanged, runs Codex IN GitHub Actions — Cloud
      strips secrets so it can't push), then its own 20-min delivery window
@@ -364,13 +382,28 @@ chain looked healthy while delivering nothing.
      its own `agent=codex-cloud state=requested` marker. **HARD LIMIT: ONE codex-cloud attempt
      per head** (dedupe via the marker). **fix #24 fork guard: a fork-headed PR is NEVER
      pinged** (untrusted code; mirrors codex-backup-fix's same-repo guard) — it falls
-     through to escalate. Then a 20-min window.
-  4. **escalate** — only after every ENABLED stage failed delivery: the existing
-     `needs-owner` upsert (fix #14B) + Telegram, message naming the chain ("Claude[, the
-     Codex API backup,] and Codex Cloud didn't deliver — escalated to needs-owner").
-     **fix #24:** when a codex-cloud attempt was made for this head, the comment also
-     appends "A Codex Cloud task may have completed with a ready diff — open the task
-     (View task) and apply it / Update branch."
+     through to escalate. Then a 20-min window. **Terminal-summary detection (fix #26):**
+     Codex Cloud's sandbox has **no push remote** — instead of pushing it posts a
+     TERMINAL summary comment ("View task", sometimes "Created commit `sha` (msg)"). When
+     a `/codex/i`-authored comment dated after the ping contains "View task", the stage is
+     terminal — do NOT wait the window, go straight to the proxy/escalate path (and parse
+     `Created commit \`sha\` (msg)` for the ready-diff hint).
+  4. **claude-proxy (NEW, fix #26)** — between codex-cloud and escalate. When the cloud
+     stage ended without delivery **AND the original Claude failure was a GENUINE no-op**
+     (`claude/no_delivery` — NEVER billing/fixer: a recipe can't fix an empty account) AND
+     Claude is enabled AND same-repo AND no proxy attempt exists yet (one/head): post a
+     `@claude fix` comment (`agent=claude-proxy state=requested`) telling Claude to
+     **implement EXACTLY** Codex Cloud's summary (the `<EMBED>` = the terminal summary body,
+     else the findings digest) on the head branch — sanitized per fix #25 **plus**
+     `@codex`→`codex`. Then a delivery window. `findingsDigest()` EXCLUDES `claude-proxy`
+     comments so it never re-embeds itself; stage 1's `agent==='claude'` filter can't match
+     `claude-proxy`.
+  5. **escalate** — only after every ENABLED stage failed delivery: the existing
+     `needs-owner` upsert (fix #14B) + Telegram, chain-named ("Claude[, the Codex API
+     backup,], Codex Cloud[, and the Claude apply-by-proxy] didn't deliver"). **fix #26
+     enriched hint:** with a detected commit → "A ready diff waits in the Codex Cloud task
+     — commit `sha` (msg). Open the task (View task) → Update branch to apply."; else the
+     generic View-task hint.
   Each advance sends a Telegram info line (existing plumbing). The old fixed 3-attempt cap
   is REPLACED by this per-head stage ladder (each stage ≤1/head; escalate terminal/head).
   - **Late-signal sweep (fix #18) — a SECOND step in this same workflow.** Closes
@@ -414,6 +447,14 @@ chain looked healthy while delivering nothing.
       loud-fail (`core.error` + Telegram), at most once per PR per tick. The update
       advances the head → the gate re-runs → the fixer ladder continues on the fresh
       head.
+    - **Override-label sweep (fix #26 Part G).** Adding `codex-p1-acknowledged` fires no
+      workflow, so a 🔴 PR the owner acknowledged stayed red until a manual head-run
+      (TRF #88). The sweep now treats any open PR carrying `codex-p1-acknowledged` whose
+      newest `codex-gate-verdict` on the head is **NOT 🟢** as a candidate (regardless of
+      the pending check) and dispatches the gate **head-targeted** (`ref: pr.head.ref`,
+      the shared helper), log `override-label sweep: dispatching gate for PR #N @ <head7>`,
+      loud-fail, once/PR/tick. Self-limiting: the dispatched run sees the label → 🟢 on the
+      head → the PR stops matching.
 - **`codex-backup-fix.yml`** — `workflow_dispatch` (pr_number, head_sha,
   attempt), two jobs:
   - **`generate-patch`** (`permissions: contents: read` — NO write token):

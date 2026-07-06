@@ -17,6 +17,18 @@ Handoff log for the **self-healing-loop build** Claude Chat session. Claude Code
 
 ---
 
+## [2026-07-06 09:00 UTC] fix #26: honest failure classes + instant stage-skips + cloud-terminal + apply-by-proxy + override sweep
+- PR: direct commit to main
+- Branch: main (direct commit)
+- Status: done
+- The #88 saga drove every part: (1) the Anthropic account ran dry — the SDK returned `{"is_error":true,"api_error_status":400,"result":"Credit balance is too low","usage":{"input_tokens":0}}` yet claude-code-action reported `subtype:"success"` and exited 0, so a dead fixer looked like a mysterious no-op and the ladder burned a full 20-min window per PR (exposed only because fix #16's CLAUDE_SHOW_FULL_OUTPUT was on); (2) Codex Cloud fixed but its sandbox has no push remote — it posts a terminal SUMMARY ("View task", "Created commit `sha` (msg)") and the ladder waited another pointless window; (3) the `codex-p1-acknowledged` label was added but nothing runs on the labeled event → the PR stayed red until a manual head-run.
+- What changed (2 files):
+  - **claude.yml — Part A (classify):** the fix #23 Delivery step now reads the SDK terminal result (`steps.claude.outputs.execution_file`, else `find $RUNNER_TEMP …`) and outputs `class` = `billing_error` / `fixer_error` / `no_delivery` (+ `resultStr`); the 👎/marker step writes `agent=claude state=<class>` (dedupe on `agent=claude ` so it can't collide with `claude-proxy`) and loud-errors on billing/fixer. **Part B (kill-switch):** job `if:` wrapped `vars.CLAUDE_ENABLED != 'false' && (…)`.
+  - **claude-fallback-watchdog.yml — Part C (instant skip):** `billing_error`/`fixer_error` → stage 1 terminal this tick (no window) + once-per-head `claude_dead` notify; `CLAUDE_ENABLED=false` pre-skips. **Part D (cloud terminal):** detect a `/codex/i` "View task" comment after the ping → don't wait the window; parse `Created commit`. **Part E (claude-proxy):** new stage — genuine-no-op only, one/head, posts `@claude fix` to implement Cloud's exact summary; `findingsDigest()` excludes `claude-proxy`. **Part F:** enriched escalation with the ready-diff commit hint + chain naming the proxy. **Part G:** override-label sweep candidate (non-🟢 verdict + `codex-p1-acknowledged` → head-targeted gate dispatch).
+- Validation: `yaml.safe_load` + actionlint on both copies of both files; `node --check` on all 5 script bodies; greps — billing_error/fixer_error/no_delivery in claude.yml, `CLAUDE_ENABLED` in both, `claude_dead` dedupe, "View task" + `Created commit` regex, `claude-proxy` post+read with the genuine-no-op entry, `findingsDigest` excludes claude-proxy, override-label sweep using `ref: pr.head.ref`; a node regex test confirms stage-1's `agent==='claude'` filter cannot match `claude-proxy`; ZERO `require('@actions/github')`/`__original_require__`/`getOctokit`; `git hash-object` equal per file (claude.yml `76bdee7`, watchdog `13afcaf`).
+- Needs from the owner: **fund the Anthropic account** (the actual root of #88; until then every Claude call 402s at 0 tokens — set `CLAUDE_ENABLED=false` to skip the bounce). Otherwise nothing; live on main, propagates on the next daily sync.
+- Next: a credit-dry Claude now escalates instantly (no 20-min wait), a Cloud "View task" fix is proxied to Claude to apply, and an acknowledged 🔴 PR goes green on the next sweep tick.
+
 ## [2026-07-05 19:20 UTC] fix #25: cost trim (drop the gate self-rerun poll + per-note trigger) + cloud-ping sanitize
 - PR: direct commit to main
 - Branch: main (direct commit)

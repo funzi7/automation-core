@@ -57,6 +57,10 @@ jobs:
           # quota, which is exhausted (fix #8); flip the repo/Org Actions variable
           # CODEX_BACKUP_ENABLED to 'true' to re-enable once quota is restored.
           CODEX_BACKUP_ENABLED: ${{ vars.CODEX_BACKUP_ENABLED }}
+          # fix #26: Claude kill-switch. Absent var = ENABLED. When 'false' (Anthropic
+          # credit exhausted) the claude.yml job is skipped, so the watchdog pre-skips
+          # stage 1 (no ping, no window) and advances the ladder instantly.
+          CLAUDE_ENABLED: ${{ vars.CLAUDE_ENABLED }}
         with:
           # AUTOMATION_PAT so the dispatch + marker comment can trigger and
           # cross repos; GITHUB_TOKEN-authored events don't start workflows.
@@ -70,6 +74,9 @@ jobs:
             // fix #8: only dispatch the (OpenAI-quota-dependent) Codex backup
             // when CODEX_BACKUP_ENABLED is EXACTLY 'true'; otherwise escalate.
             const codexBackupEnabled = process.env.CODEX_BACKUP_ENABLED === 'true';
+            // fix #26: CLAUDE_ENABLED != 'false' (absent = enabled).
+            const claudeEnabled = process.env.CLAUDE_ENABLED !== 'false';
+            if (!claudeEnabled) core.info('CLAUDE_ENABLED=false — Claude stage pre-skipped this tick (no ping/window).');
             const dispatchRef =
               (context.payload.repository && context.payload.repository.default_branch) || 'main';
 
@@ -187,11 +194,35 @@ jobs:
                 // ---- STAGE claude ----
                 // Claude delivered? (a commit on the head after its ping) → done.
                 if (await deliveredSince(claudeReq.at)) continue;
-                // Claude FAILED iff a claude/no_delivery marker exists (claude.yml's
-                // delivery check, fix #23 Part A) OR the 20-min window elapsed.
-                const claudeFailed =
-                  !!newestMarker('claude', 'no_delivery') ||
-                  (Date.now() - claudeReq.at >= TIMEOUT_MS);
+                // fix #26: honest-failure classes from claude.yml. billing_error /
+                // fixer_error = Claude RAN AND DIED — stage 1 is TERMINAL immediately
+                // (no 20-min wait). A genuine no-op = state=no_delivery (Claude ran,
+                // chose no change); only that qualifies for the apply-by-proxy stage.
+                const claudeDead =
+                  !!newestMarker('claude', 'billing_error') ||
+                  !!newestMarker('claude', 'fixer_error');
+                const deadClass = newestMarker('claude', 'billing_error') ? 'billing_error'
+                  : (newestMarker('claude', 'fixer_error') ? 'fixer_error' : (!claudeEnabled ? 'disabled' : null));
+                let claudeFailed;
+                if (claudeDead || !claudeEnabled) {
+                  claudeFailed = true;   // TERMINAL — advance the ladder THIS tick, no window.
+                  // Notify ONCE PER HEAD (dedupe via a claude_dead marker) — only for a
+                  // real dead-fixer class (a plain CLAUDE_ENABLED=false skip is quiet).
+                  if (claudeDead) {
+                    const flagged = marked.some((a) => a.agent === 'watchdog' && a.state === 'claude_dead' && a.head === headSha);
+                    if (!flagged) {
+                      try { await github.rest.issues.createComment({ owner, repo, issue_number: prNumber, body: `<!-- ai-loop:v1 root_pr=${prNumber} head=${headSha} agent=watchdog state=claude_dead -->\nClaude fixer dead (${deadClass}) — fund Anthropic to restore; advancing the ladder.` }); } catch (e) { core.info(`claude_dead marker failed (ignored): ${e.message}`); }
+                      await notify(`🚨 ${repo} PR #${prNumber}: Claude fixer dead (${deadClass}) — fund Anthropic to restore; advancing the ladder.`);
+                      core.warning(`PR #${prNumber}: Claude fixer dead (${deadClass}) — advancing the ladder.`);
+                    }
+                  }
+                } else {
+                  // Claude FAILED iff a claude/no_delivery marker exists (claude.yml's
+                  // delivery check) OR the 20-min window elapsed.
+                  claudeFailed =
+                    !!newestMarker('claude', 'no_delivery') ||
+                    (Date.now() - claudeReq.at >= TIMEOUT_MS);
+                }
                 if (!claudeFailed) continue;       // still within Claude's window
 
                 // Findings digest for a Codex-cloud comment: copy ONLY the findings
@@ -202,7 +233,11 @@ jobs:
                 // the copied `state=requested` marker poisons watchdog marker-parsing.
                 function findingsDigest() {
                   const src = [...issueComments, ...reviewComments]
-                    .filter((c) => /agent=claude\s+state=requested/.test(c.body || '') || /@claude fix/i.test(c.body || ''))
+                    // fix #26: EXCLUDE a claude-proxy comment — its body carries
+                    // "@claude fix" and would otherwise be mistaken for the bridge ping
+                    // in a future wave (and re-embed itself).
+                    .filter((c) => !/agent=claude-proxy/.test(c.body || '') &&
+                      (/agent=claude\s+state=requested/.test(c.body || '') || /@claude fix/i.test(c.body || '')))
                     .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))[0];
                   const fallback = `Codex flagged findings on this PR — see the Codex review on PR #${prNumber}.`;
                   if (!src || !src.body) return fallback;
@@ -260,6 +295,10 @@ jobs:
                 // fork code is untrusted (mirrors codex-backup-fix's same-repo guard).
                 const sameRepo = !!(pr.head && pr.head.repo && pr.head.repo.full_name === `${owner}/${repo}`);
                 const cloudReq = newestMarker('codex-cloud', 'requested');
+                // fix #26 Part D: cloud terminal-summary state (set in the else-branch).
+                let cloudTerminal = false;
+                let cloudCommit = null;      // { sha, msg } if "Created commit" found
+                let cloudSummaryBody = '';   // the terminal summary body, for the proxy embed
                 if (!cloudReq) {
                   if (sameRepo) {
                     const digest = findingsDigest();
@@ -279,20 +318,64 @@ jobs:
                   // fall through to escalate
                 } else {
                   if (await deliveredSince(cloudReq.at)) continue;   // Codex Cloud delivered
-                  if (Date.now() - cloudReq.at < TIMEOUT_MS) continue;   // still within its window
-                  // fall through to escalate
+                  // fix #26 Part D: Codex Cloud's sandbox has NO push remote — instead
+                  // of pushing it posts a TERMINAL summary comment ("View task", maybe
+                  // "Created commit `sha` (msg)"). When that exists, don't wait out the
+                  // 20-min window — go straight to the proxy/escalate path this tick.
+                  const cloudSummary = issueComments
+                    .filter((c) => c.user && /codex/i.test(c.user.login) && new Date(c.created_at) > new Date(cloudReq.at) && /View task/i.test(c.body || ''))
+                    .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))[0];
+                  if (cloudSummary) {
+                    cloudTerminal = true;
+                    cloudSummaryBody = cloudSummary.body || '';
+                    const m = cloudSummaryBody.match(/Created commit\s+`?([0-9a-f]{7,40})`?(?:\s*\(([^)]*)\))?/i);
+                    if (m) cloudCommit = { sha: m[1], msg: m[2] || '' };
+                    core.info(`PR #${prNumber}: Codex Cloud posted a terminal summary${cloudCommit ? ` (commit ${cloudCommit.sha})` : ''} — not waiting the window.`);
+                  }
+                  if (!cloudTerminal && Date.now() - cloudReq.at < TIMEOUT_MS) continue;   // still within window, no terminal summary
+                  // terminal summary OR window elapsed → fall through to the proxy stage
                 }
 
-                // ---- STAGE escalate — every enabled stage failed delivery ----
-                // fix #24: if a Codex Cloud task WAS asked for this head, its diff may
-                // be sitting ready in the task — point the owner at it.
+                // ---- STAGE claude-proxy (fix #26 Part E) — Claude APPLIES Codex Cloud's fix ----
+                // Cloud produced the exact fix but its sandbox can't push; ask Claude to
+                // apply it. ONLY when the original Claude failure was a GENUINE no-op
+                // (a recipe can't fix an empty account — never billing_error/fixer_error),
+                // Claude is enabled, same-repo, and no proxy attempt exists yet (one/head).
+                const genuineNoOp = !!newestMarker('claude', 'no_delivery') && !claudeDead;
+                const proxyReq = newestMarker('claude-proxy', 'requested');
+                if (genuineNoOp && claudeEnabled && sameRepo && !proxyReq) {
+                  let embed = cloudSummaryBody
+                    ? cloudSummaryBody
+                    : `Codex Cloud attempted a fix but pushed nothing; the original findings:\n\n${findingsDigest()}`;
+                  // Sanitize per fix #25 + neutralize @codex too (the ping's own top
+                  // "@claude fix" is the trigger and stays outside <EMBED>).
+                  embed = embed.replace(/<!--\s*ai-loop:v1[^>]*-->/g, '').replace(/@claude/gi, 'claude').replace(/@codex/gi, 'codex').trim();
+                  try {
+                    await github.rest.issues.createComment({
+                      owner, repo, issue_number: prNumber,
+                      body: `<!-- ai-loop:v1 root_pr=${prNumber} head=${headSha} attempt=${attempt} agent=claude-proxy state=requested -->\n@claude fix\n\n[auto-triggered]\n\nCodex Cloud already produced the exact fix for this PR but its sandbox cannot push. Implement EXACTLY the changes described below on this PR's head branch and push — do not redesign:\n\n${embed}`,
+                    });
+                  } catch (e) { core.info(`claude-proxy comment failed (ignored): ${e.message}`); continue; }
+                  await notify(`ℹ️ ${repo} PR #${prNumber}: Codex Cloud finished without pushing → asked Claude to apply its fix (proxy).`);
+                  core.info(`PR #${prNumber}: STAGE claude-proxy requested (attempt ${attempt}).`);
+                  continue;                         // wait its delivery window
+                }
+                if (proxyReq) {
+                  if (await deliveredSince(proxyReq.at)) continue;   // proxy delivered
+                  if (Date.now() - proxyReq.at < TIMEOUT_MS) continue;   // still within its window
+                  // proxy failed delivery → escalate
+                }
+
+                // ---- STAGE escalate (fix #26 Part F) — every enabled stage failed ----
                 const cloudTried = !!newestMarker('codex-cloud', 'requested');
-                const viewTaskHint = cloudTried
-                  ? '\nA Codex Cloud task may have completed with a ready diff — open the task (View task) and apply it / Update branch.'
-                  : '';
+                const proxyTried = !!proxyReq;
+                const readyDiff = cloudCommit
+                  ? `\nA ready diff waits in the Codex Cloud task — commit \`${cloudCommit.sha}\`${cloudCommit.msg ? ` (${cloudCommit.msg})` : ''}. Open the task (View task) → Update branch to apply.`
+                  : (cloudTried ? '\nA Codex Cloud task may have completed with a ready diff — open the task (View task) and apply it / Update branch.' : '');
+                const chain = `Claude${codexBackupEnabled ? ', the Codex API backup,' : ''}, Codex Cloud${proxyTried ? ', and the Claude apply-by-proxy' : ''} didn't deliver a fix for the current head`;
                 await escalate(
-                  `Claude${codexBackupEnabled ? ', the Codex API backup,' : ''} and Codex Cloud didn't deliver a fix for the current head — escalated to needs-owner.${viewTaskHint}`,
-                  `🚨 ${repo} PR #${prNumber}: Claude${codexBackupEnabled ? ' + Codex API' : ''} + Codex Cloud didn't deliver — escalated to needs-owner.`,
+                  `${chain} — escalated to needs-owner.${readyDiff}`,
+                  `🚨 ${repo} PR #${prNumber}: ${chain} — escalated to needs-owner.`,
                 );
               } catch (e) {
                 core.info(`PR #${pr.number}: watchdog error (ignored): ${e.message}`);
@@ -466,10 +549,17 @@ jobs:
                     .filter((c) => c.name === VERDICT_CHECK)
                     .sort((a, b) => recency(b) - recency(a))[0];
                   const title = newestVerdict && newestVerdict.output && newestVerdict.output.title;
-                  // Candidate iff 🟡 pending OR no verdict on the head at all. A 🟢
-                  // needs nothing; a 🔴 (active P1/P2) is the bridge's job — re-
-                  // dispatching would change nothing.
-                  const isCandidate = !newestVerdict || title === PENDING_TITLE;
+                  // fix #26 Part G: the override-label lesson (TRF #88). Adding
+                  // `codex-p1-acknowledged` fires no workflow, so a 🔴 PR the owner
+                  // acknowledged stayed red until a manual head-run. So a labeled PR
+                  // whose head verdict is NOT 🟢 is a candidate regardless of pending.
+                  const hasOverride = (pr.labels || []).some((l) => (l.name || l) === OVERRIDE_LABEL);
+                  const verdictGreen = !!(title && title.startsWith('🟢'));
+                  const overrideCandidate = hasOverride && !verdictGreen;
+                  // Candidate iff 🟡 pending OR no verdict on the head OR override-labeled
+                  // not-yet-green. A plain 🟢 needs nothing; a 🔴 without the override
+                  // label is the bridge's job — re-dispatching would change nothing.
+                  const isCandidate = !newestVerdict || title === PENDING_TITLE || overrideCandidate;
                   if (!isCandidate) continue;
 
                   // FRESH Codex signal on the head, mirroring the gate's matchers:
@@ -501,8 +591,10 @@ jobs:
                   const graceMs = SYNC_GRACE_MINUTES * 60 * 1000;
                   const headAgeMs = Date.now() - latestCommitDate.getTime();
                   const silentSyncStale = isTrustedSync(pr) && headAgeMs > graceMs;
-                  if (!freshSignal && !silentSyncStale) continue;
-                  const logMsg = freshSignal
+                  if (!freshSignal && !silentSyncStale && !overrideCandidate) continue;
+                  const logMsg = overrideCandidate
+                    ? `override-label sweep: dispatching gate for PR #${prNumber} @ ${head7}`
+                    : freshSignal
                     ? `late-signal sweep: dispatching gate for PR #${prNumber} @ ${head7}`
                     : `silent-sync grace: dispatching gate for PR #${prNumber} @ ${head7}`;
 
