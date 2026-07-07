@@ -58,7 +58,7 @@ jobs:
 
       - name: Compose and send the morning report
         if: steps.patcheck.outputs.has_pat == 'true'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         env:
           AUTOMATION_PAT: ${{ secrets.AUTOMATION_PAT }}
           CROSS_REPO_PAT: ${{ secrets.CROSS_REPO_PAT }}

@@ -48,7 +48,7 @@ jobs:
 
       - name: Scan open PRs and fire the Codex backup on Claude timeout
         if: steps.patcheck.outputs.ok == 'true'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -57,6 +57,9 @@ jobs:
           # quota, which is exhausted (fix #8); flip the repo/Org Actions variable
           # CODEX_BACKUP_ENABLED to 'true' to re-enable once quota is restored.
           CODEX_BACKUP_ENABLED: ${{ vars.CODEX_BACKUP_ENABLED }}
+          # Codex Cloud is default-ON / opt-out: unset = enabled, literal 'false' = disabled.
+          # Actions variables are per-repo and are not synced by workflow sync.
+          CODEX_CLOUD_ENABLED: ${{ vars.CODEX_CLOUD_ENABLED }}
           # fix #26: Claude kill-switch. Absent var = ENABLED. When 'false' (Anthropic
           # credit exhausted) the claude.yml job is skipped, so the watchdog pre-skips
           # stage 1 (no ping, no window) and advances the ladder instantly.
@@ -72,11 +75,17 @@ jobs:
             const TIMEOUT_MS = 20 * 60 * 1000;   // 20 minutes per ladder stage (scheduled runs lag)
             const BACKUP_WORKFLOW = 'codex-backup-fix.yml';
             // fix #8: only dispatch the (OpenAI-quota-dependent) Codex backup
-            // when CODEX_BACKUP_ENABLED is EXACTLY 'true'; otherwise escalate.
+            // when CODEX_BACKUP_ENABLED is EXACTLY 'true'; otherwise skip that stage.
             const codexBackupEnabled = process.env.CODEX_BACKUP_ENABLED === 'true';
+            // CODEX_CLOUD_ENABLED is default-ON / opt-out: only literal 'false' disables it.
+            const codexCloudEnabled = process.env.CODEX_CLOUD_ENABLED !== 'false';
+            if (!codexCloudEnabled) core.info('CODEX_CLOUD_ENABLED=false — Codex Cloud stage disabled; no @codex fix comments will be posted.');
             // fix #26: CLAUDE_ENABLED != 'false' (absent = enabled).
             const claudeEnabled = process.env.CLAUDE_ENABLED !== 'false';
             if (!claudeEnabled) core.info('CLAUDE_ENABLED=false — Claude stage pre-skipped this tick (no ping/window).');
+            // Strict Codex actor allowlist — must match codex-gate.yml — keep in sync.
+            const TRUSTED_CODEX_LOGINS = new Set(['chatgpt-codex-connector[bot]']);
+            const isTrustedCodexUser = (user) => !!user?.login && TRUSTED_CODEX_LOGINS.has(user.login);
             const dispatchRef =
               (context.payload.repository && context.payload.repository.default_branch) || 'main';
 
@@ -160,6 +169,9 @@ jobs:
                 }
                 const newestMarker = (agent, state) => marked
                   .filter((a) => a.agent === agent && a.state === state && a.head === headSha)
+                  .sort((x, y) => y.at - x.at)[0];
+                const newestMarkerInStates = (agent, states, sinceAt = 0) => marked
+                  .filter((a) => a.agent === agent && states.has(a.state) && a.head === headSha && a.at >= sinceAt)
                   .sort((x, y) => y.at - x.at)[0];
                 async function notify(text) {
                   const tgToken = process.env.TELEGRAM_BOT_TOKEN;
@@ -283,18 +295,40 @@ jobs:
                     core.info(`PR #${prNumber}: STAGE codex-api dispatched (attempt ${attempt}).`);
                     continue;                       // wait its 20-min delivery window
                   }
-                  if (await deliveredSince(codexReq.at)) continue;   // Codex API delivered
-                  if (Date.now() - codexReq.at < TIMEOUT_MS) continue;   // still within its window
-                  // codex-api failed delivery → fall through to codex-cloud
+                  const codexTerminal = newestMarkerInStates(
+                    'codex',
+                    new Set(['api_error', 'fixer_error', 'no_change', 'patch_failed', 'stale']),
+                    codexReq.at,
+                  );
+                  if (codexTerminal) {
+                    if (codexTerminal.state === 'stale') {
+                      core.info(`PR #${prNumber}: Codex API ended state=stale for ${headSha}; not advancing to Codex Cloud on a stale cycle.`);
+                      continue;
+                    }
+                    core.warning(`PR #${prNumber}: Codex API terminal state=${codexTerminal.state}; skipping remaining API wait and advancing the ladder.`);
+                  } else {
+                    if (await deliveredSince(codexReq.at)) continue;   // Codex API delivered
+                    if (Date.now() - codexReq.at < TIMEOUT_MS) continue;   // still within its window
+                    core.warning(`PR #${prNumber}: Codex API timed out without branch delivery; advancing the ladder.`);
+                  }
+                  // codex-api failed delivery or terminal non-delivery → fall through to codex-cloud
                 }
 
-                // ---- STAGE codex-cloud (NEW) — subscription-billed Codex Cloud ----
+                // ---- STAGE codex-cloud (subscription-billed Codex Cloud) ----
                 // A PAT/owner-authored `@codex fix` top-level comment provably wakes
                 // it (TRF #84). HARD LIMIT: at most ONE codex-cloud attempt per head.
                 // fix #24 fork guard: NEVER ping Codex Cloud on a fork-headed PR —
                 // fork code is untrusted (mirrors codex-backup-fix's same-repo guard).
                 const sameRepo = !!(pr.head && pr.head.repo && pr.head.repo.full_name === `${owner}/${repo}`);
                 const cloudReq = newestMarker('codex-cloud', 'requested');
+                if (!codexCloudEnabled && !cloudReq) {
+                  core.info(`PR #${prNumber}: CODEX_CLOUD_ENABLED=false — not posting @codex fix and not claiming a Cloud repair attempt.`);
+                  await escalate(
+                    `Claude${codexBackupEnabled ? ' and the Codex API backup' : ''} did not deliver a fix for the current head, and Codex Cloud is disabled (CODEX_CLOUD_ENABLED=false). No @codex fix was posted — escalated to needs-owner.`,
+                    `🚨 ${repo} PR #${prNumber}: fixer ladder reached escalation; Codex Cloud disabled.`,
+                  );
+                  continue;
+                }
                 // fix #26 Part D: cloud terminal-summary state (set in the else-branch).
                 let cloudTerminal = false;
                 let cloudCommit = null;      // { sha, msg } if "Created commit" found
@@ -305,8 +339,8 @@ jobs:
                     try {
                       await github.rest.issues.createComment({
                         owner, repo, issue_number: prNumber,
-                        // fix #24: the Connector app holds Read&Write on code+workflows,
-                        // so Cloud CAN push autonomously — instruct it to, explicitly.
+                        // Ask Cloud to push, but success is still verified only by
+                        // a real new commit on the PR head branch after this marker.
                         body: `<!-- ai-loop:v1 root_pr=${prNumber} head=${headSha} attempt=${attempt} agent=codex-cloud state=requested -->\n@codex fix\n\n[auto-triggered]\n\nCommit and push your fix directly to this PR's head branch (you have write permission) — do not leave the diff waiting in the task.\n\nClaude did not deliver a fix for the findings below — apply a fix for each:\n\n${digest}`,
                       });
                     } catch (e) { core.info(`codex-cloud comment failed (ignored): ${e.message}`); continue; }
@@ -323,7 +357,7 @@ jobs:
                   // "Created commit `sha` (msg)"). When that exists, don't wait out the
                   // 20-min window — go straight to the proxy/escalate path this tick.
                   const cloudSummary = issueComments
-                    .filter((c) => c.user && /codex/i.test(c.user.login) && new Date(c.created_at) > new Date(cloudReq.at) && /View task/i.test(c.body || ''))
+                    .filter((c) => isTrustedCodexUser(c.user) && new Date(c.created_at) > new Date(cloudReq.at) && /View task/i.test(c.body || ''))
                     .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))[0];
                   if (cloudSummary) {
                     cloudTerminal = true;
@@ -353,7 +387,7 @@ jobs:
                   try {
                     await github.rest.issues.createComment({
                       owner, repo, issue_number: prNumber,
-                      body: `<!-- ai-loop:v1 root_pr=${prNumber} head=${headSha} attempt=${attempt} agent=claude-proxy state=requested -->\n@claude fix\n\n[auto-triggered]\n\nCodex Cloud already produced the exact fix for this PR but its sandbox cannot push. Implement EXACTLY the changes described below on this PR's head branch and push — do not redesign:\n\n${embed}`,
+                      body: `<!-- ai-loop:v1 root_pr=${prNumber} head=${headSha} attempt=${attempt} agent=claude-proxy state=requested -->\n@claude fix\n\n[auto-triggered]\n\nCodex Cloud prepared a diff, but it did not reach the PR branch. Implement EXACTLY the changes described below on this PR's existing head branch and push. Do NOT create a new branch. Do NOT open a new PR. Do not redesign:\n\n${embed}`,
                     });
                   } catch (e) { core.info(`claude-proxy comment failed (ignored): ${e.message}`); continue; }
                   await notify(`ℹ️ ${repo} PR #${prNumber}: Codex Cloud finished without pushing → asked Claude to apply its fix (proxy).`);
@@ -369,9 +403,9 @@ jobs:
                 // ---- STAGE escalate (fix #26 Part F) — every enabled stage failed ----
                 const cloudTried = !!newestMarker('codex-cloud', 'requested');
                 const proxyTried = !!proxyReq;
-                const readyDiff = cloudCommit
-                  ? `\nA ready diff waits in the Codex Cloud task — commit \`${cloudCommit.sha}\`${cloudCommit.msg ? ` (${cloudCommit.msg})` : ''}. Open the task (View task) → Update branch to apply.`
-                  : (cloudTried ? '\nA Codex Cloud task may have completed with a ready diff — open the task (View task) and apply it / Update branch.' : '');
+                const readyDiff = cloudTried
+                  ? '\nCodex Cloud prepared a diff, but it did not reach the PR branch. Open View task → Update branch to apply it manually.'
+                  : '';
                 const chain = `Claude${codexBackupEnabled ? ', the Codex API backup,' : ''}, Codex Cloud${proxyTried ? ', and the Claude apply-by-proxy' : ''} didn't deliver a fix for the current head`;
                 await escalate(
                   `${chain} — escalated to needs-owner.${readyDiff}`,
@@ -395,7 +429,7 @@ jobs:
       # it (own step, whole body try/catch, each PR its own try/catch).
       - name: Late-signal sweep — re-dispatch stuck gates on a fresh Codex signal
         if: steps.patcheck.outputs.ok == 'true'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -455,11 +489,9 @@ jobs:
             };
             const OVERRIDE_LABEL = 'codex-p1-acknowledged';
 
-            // EXACT Codex-author matcher the gate uses for reviews + reactions.
-            const isCodex = (user) =>
-              user?.login === 'chatgpt-codex-connector[bot]' ||
-              user?.login === 'codex' ||
-              (user?.type === 'Bot' && user?.login?.toLowerCase().includes('codex'));
+            // Strict Codex actor allowlist — must match codex-gate.yml — keep in sync.
+            const TRUSTED_CODEX_LOGINS = new Set(['chatgpt-codex-connector[bot]']);
+            const isCodex = (user) => !!user?.login && TRUSTED_CODEX_LOGINS.has(user.login);
 
             async function telegram(text) {
               const tgToken = process.env.TELEGRAM_BOT_TOKEN;

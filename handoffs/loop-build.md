@@ -17,6 +17,19 @@ Handoff log for the **self-healing-loop build** Claude Chat session. Claude Code
 
 ---
 
+## [2026-07-07 12:26 UTC] fix #27: original-PR-head delivery, Cloud switch, strict Codex identity, API terminal states
+- PR: direct commit to main
+- Branch: main (direct commit)
+- Status: done
+- What changed:
+  - **Claude PR path:** owner-authored comment guard added for public repos; PR comments now resolve the PR, skip fork heads safely, and for same-repo heads check out the original head SHA/branch before running Claude. The PR prompt says to commit and push only to that existing branch, with no new branch and no new PR. Issue-triggered `claude-fix` work still creates a new branch and PR with `Fixes #N`.
+  - **Fixer ladder:** `CODEX_CLOUD_ENABLED` is wired as default-on/opt-out (`!= 'false'`); Codex API `api_error`/`fixer_error`/`no_change`/`patch_failed` now terminally advance without waiting, while `stale` stops that stale cycle. Cloud ready diffs are documented as non-delivery and manual View task → Update branch remains explicit.
+  - **Security/trust:** `codex-gate.yml` and `claude-fallback-watchdog.yml` now share the same strict Codex allowlist (`chatgpt-codex-connector[bot]`) with no substring/regex identity matching. Codex API secret scope was tightened so the agent job is read-only and the write-capable job alone labels/comments/applies/pushes.
+  - **Maintenance:** all remaining `actions/github-script@v7` uses migrated to `@v8`; bridge `@claude fix` comments now tell Claude to apply fixes on the existing PR head branch and not open a new PR; docs/handoffs reconciled with fix #27.
+- Validation: completed pre-commit in this task — YAML parse, actionlint, node --check, mirror hash, and required greps are recorded in `agent-memory/automation-core/cc-latest.md`.
+- Needs from the owner: set per-repo switches/secrets as needed (`CLAUDE_ENABLED`, `CODEX_BACKUP_ENABLED`, `CODEX_CLOUD_ENABLED`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `AUTOMATION_PAT`). A real same-repo PR test is still useful once Claude budget is available.
+- Next: downstream repos receive the synced workflow changes on the next sync; Cloud Update branch remains manual if Cloud does not push.
+
 ## [2026-07-06 09:00 UTC] fix #26: honest failure classes + instant stage-skips + cloud-terminal + apply-by-proxy + override sweep
 - PR: direct commit to main
 - Branch: main (direct commit)

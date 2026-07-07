@@ -114,7 +114,7 @@ jobs:
     steps:
       - name: Resolve PR number(s) to check
         id: prs
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             // pull_request → the PR being opened/synced
@@ -147,7 +147,7 @@ jobs:
 
       - name: Evaluate Codex P1 status for each PR
         if: steps.prs.outputs.numbers != '[]'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const owner = context.repo.owner;
@@ -172,10 +172,9 @@ jobs:
               );
             };
 
-            const isCodex = (user) =>
-              user?.login === 'chatgpt-codex-connector[bot]' ||
-              user?.login === 'codex' ||
-              (user?.type === 'Bot' && user?.login?.toLowerCase().includes('codex'));
+            // Strict Codex actor allowlist — must match claude-fallback-watchdog.yml — keep in sync.
+            const TRUSTED_CODEX_LOGINS = new Set(['chatgpt-codex-connector[bot]']);
+            const isCodex = (user) => !!user?.login && TRUSTED_CODEX_LOGINS.has(user.login);
 
             // Codex marks P1 findings exactly two ways (SAME detection as
             // the bridge — do not invent a new pattern):

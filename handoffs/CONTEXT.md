@@ -13,6 +13,60 @@
 
 ---
 
+
+## Fix #27 Current Architecture Snapshot (2026-07-07 12:26 UTC)
+
+This section is the authoritative current snapshot after fix #27. Older incident notes below are historical when they describe earlier ladder behavior.
+
+```text
+Codex auto-review
+  → Claude
+  → Codex API when CODEX_BACKUP_ENABLED=true
+  → Codex Cloud when CODEX_CLOUD_ENABLED is not false
+  → optional Claude proxy, verified to deliver to the original PR head
+  → needs-owner
+  → Codex Gate
+  → Merge Bot
+```
+
+**Delivery definition:** a fix is delivered only when a real commit actually reaches the relevant PR head branch. Action success, a task page, a task diff, a "Created commit" hint, or a View task link is not delivery unless the PR head branch receives a newer commit after the request marker.
+
+**Per-repo, non-synced switches:**
+
+| Switch | Default | Literal value that changes behavior |
+|---|---:|---|
+| `CLAUDE_ENABLED` | enabled | `false` disables Claude runs and lets the watchdog pre-skip the Claude stage. |
+| `CODEX_BACKUP_ENABLED` | disabled | only `true` enables the OpenAI/Codex API backup workflow. |
+| `CODEX_CLOUD_ENABLED` | enabled | `false` disables Codex Cloud; unset stays enabled because Actions variables are per repository and are not synced. |
+
+**Claude PR-head delivery:** `anthropics/claude-code-action@v1` runs in the caller's GitHub Actions workspace. The upstream docs warn that if a workflow checks out a PR head into `$GITHUB_WORKSPACE`, the action and Claude run with that checkout as the working directory; the v1 source also shows its tag mode can fetch and check out an open PR branch, while explicit-prompt agent mode uses the existing checkout plus `CLAUDE_BRANCH`/GitHub ref context. This workflow uses explicit prompts, so fix #27 resolves PR comments through the GitHub API first. Same-repo PR comments are checked out at the exact original head SHA, attached to the existing head branch, and then Claude is instructed to commit and push directly to that branch. Claude is explicitly told not to create a branch and not to open a second PR. Fork-headed PR comments are skipped before writable checkout or Claude execution, labeled `needs-owner`, and marked with `agent=claude state=fixer_error`.
+
+**Issue path:** `claude-fix` Issues and non-PR Issue `@claude` comments still use the Issue/new-PR prompt: create a new branch, apply the fix, open a PR with `Fixes #<issue-number>`, and do not merge it.
+
+**Codex identity trust model:** `codex-gate.yml` and `claude-fallback-watchdog.yml` use the same strict allowlist and keep-in-sync comment: `new Set(['chatgpt-codex-connector[bot]'])`. No substring or regex Codex identity matching remains in those trusted-identity paths.
+
+**State glossary:**
+
+| State | Meaning |
+|---|---|
+| `requested` | A valid stage request marker was posted for a head. If it includes `attempt=`, it is an attempt marker. |
+| `pushed` | The stage actually pushed a commit to the PR head branch. This is delivery only when the branch commit is newer than the request marker. |
+| `no_change` | The Codex API backup ran and produced an empty patch; terminal non-delivery for that API request. |
+| `no_delivery` | Claude ran cleanly but no commit reached the PR head; terminal non-delivery for that Claude request. |
+| `billing_error` | Claude hit a billing/credit failure; terminal non-delivery and immediate ladder advance. |
+| `api_error` | `openai/codex-action@v1` started and failed before producing a patch; terminal non-delivery and immediate ladder advance. |
+| `fixer_error` | A fixer failed or was safely skipped before delivery, such as Claude error or fork security skip; terminal non-delivery. |
+| `dispatch_failed` | Watchdog could not dispatch the Codex API workflow before the agent started; non-attempt-consuming and retryable. |
+| `patch_failed` | Codex API produced a patch path but apply/commit/push failed; terminal non-delivery and immediate ladder advance. |
+| `stale` | PR head changed while Codex API worked; not delivery and does not advance to Codex Cloud on that stale cycle. The new head starts a fresh review/fixer cycle. |
+| `escalated` | Watchdog added `needs-owner`; automation stops touching the PR. |
+
+**Attempt accounting:** attempts come only from valid `ai-loop:v1` markers that include `attempt=`. Reviews, ordinary comments, watchdog ticks, technical retries, and pre-start dispatch failures do not count. A Codex Cloud ready diff without branch delivery is never success; it consumes the one Cloud stage for that head because Cloud already spent the stage and produced a terminal task outcome, but it must escalate honestly if no legitimate delivery mechanism can apply it.
+
+**Codex Cloud truthfulness:** Cloud success means a real new commit lands on the actual PR head branch and is newer than the Cloud request marker. View task, a task diff, "Created commit", or Cloud-side commit hints are not pushed branch delivery. If Cloud prepares a diff but does not push, owner-facing output says: "Codex Cloud prepared a diff, but it did not reach the PR branch. Open View task → Update branch to apply it manually." No browser automation, Playwright, session cookies, UI-click automation, or fake API Update branch path exists.
+
+**Security:** comment-triggered Claude runs (`issue_comment`, `pull_request_review_comment`) require `github.event.comment.user.login == github.repository_owner`, so arbitrary public comments cannot spend paid fixer capacity. The Codex API agent job is read-only, checks out with `persist-credentials: false`, and the OpenAI agent step receives only `OPENAI_API_KEY`; the write-capable `apply-and-push` job has no `OPENAI_API_KEY`. Fork PR code never receives agent secrets or writable fixer checkout.
+
 ## 1. PURPOSE
 
 `funzi7/automation-core` is a **public hub repo** for an autonomous, self-healing
@@ -38,32 +92,15 @@ no human has to type anything between a Codex finding and a merged fix.
 
 ## 2. ARCHITECTURE — the full loop, step by step
 
-```
-push to a PR branch
-   │
-   ▼
-Codex reviews the PR automatically        (GitHub App; fires on every push — not a workflow in this repo)
-   │   leaves findings tagged P1 / P2 / P3 (severity badges)
-   ▼
-The Bridge  (the `trigger_codex_fix` job INSIDE codex-auto-fix.yml)
-   │   on an ACTIVE P1 or P2 finding (NEVER P3), posts ONE "@claude fix"
-   │   comment per review wave (via AUTOMATION_PAT)
-   ▼
-Claude Fixer  (claude.yml)
-   │   runs anthropics/claude-code-action, fixes on a `claude/*` branch,
-   │   opens a PR ("Fixes #N") and labels it `automerge`
-   ▼
-Codex re-reviews the new commit
-   │   3-round circuit breaker: after 3 non-converging @claude-fix rounds →
-   │   add `needs-owner` + Telegram alert, stop auto-triggering
-   ▼
-Codex Gate  (codex-gate.yml — the `check-codex-status` blocking check)
-   │   stays red until Codex has reviewed the CURRENT head with no active P1
-   ▼
-Merge Bot  (merge-bot.yml)
-   │   squash-merges a candidate PR once the gate is green
-   ▼
-merged → (sync propagates updated workflows to ~14 downstream repos daily)
+```text
+Codex auto-review
+  → Claude
+  → Codex API when CODEX_BACKUP_ENABLED=true
+  → Codex Cloud when CODEX_CLOUD_ENABLED is not false
+  → optional Claude proxy, verified to deliver to the original PR head
+  → needs-owner
+  → Codex Gate
+  → Merge Bot
 ```
 
 ### Workflow files and what each does
@@ -76,10 +113,11 @@ merged → (sync propagates updated workflows to ~14 downstream repos daily)
   archives Codex post-fix summaries to `funzi7/agent-memory` (fail-soft if the
   archive PAT is absent).
 - **`codex-gate.yml`** — The `check-codex-status` **blocking check**. Goes green
-  only once Codex has reviewed the current head and there is no active P1.
+  only once Codex has reviewed the current head and there is no active P1/P2.
 - **`claude.yml`** — **Claude Fixer.** Runs `anthropics/claude-code-action` to
-  fix a `claude-fix` Issue or an `@claude` mention, opens a PR, labels it
-  `automerge`. **Debug toggle (fix #16):** the SDK transcript is hidden by
+  fix a `claude-fix` Issue by opening a new PR, or to fix an existing same-repo
+  PR by committing directly to that PR's head branch. Only Claude-created
+  issue-fix PRs are labeled `automerge`. **Debug toggle (fix #16):** the SDK transcript is hidden by
   default (`show_full_output` defaults false — safe for PUBLIC downstreams, where
   it could echo file contents into world-readable logs). `show_full_output` is
   wired to `${{ vars.CLAUDE_SHOW_FULL_OUTPUT == 'true' }}`: on a PRIVATE repo,

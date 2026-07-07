@@ -44,15 +44,21 @@ permissions:
 
 jobs:
   claude:
-    # Trigger on: @claude mention in a comment, an assigned Issue, or an
-    # Issue labeled `claude-fix` (the label_trigger path ci-doctor uses).
+    # Trigger on: owner-authored @claude mention in a comment, an assigned Issue,
+    # or an Issue labeled `claude-fix` (the label_trigger path ci-doctor uses).
     # fix #26 kill-switch: flip the repo Actions var CLAUDE_ENABLED=false while the
     # Anthropic credit is exhausted to skip even the ~17s billing bounce (absent
     # var = enabled). Wraps the existing trigger condition, never replaces it.
+    # Public-repo cost guard: arbitrary external @claude comments must not consume
+    # paid fixer capacity. Internal loop comments use AUTOMATION_PAT and are owner-authored.
     if: |
       vars.CLAUDE_ENABLED != 'false' && (
-        (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
-        (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
+        (github.event_name == 'issue_comment' &&
+         github.event.comment.user.login == github.repository_owner &&
+         contains(github.event.comment.body, '@claude')) ||
+        (github.event_name == 'pull_request_review_comment' &&
+         github.event.comment.user.login == github.repository_owner &&
+         contains(github.event.comment.body, '@claude')) ||
         (github.event_name == 'issues' && github.event.action == 'assigned') ||
         (github.event_name == 'issues' && github.event.action == 'labeled' && github.event.label.name == 'claude-fix') ||
         (github.event_name == 'issues' && github.event.action == 'opened' && contains(join(github.event.issue.labels.*.name, ','), 'claude-fix'))
@@ -71,15 +77,112 @@ jobs:
             echo "has_key=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Checkout repository
+      - name: Resolve PR target for comment triggers
+        id: pr_context
         if: steps.keycheck.outputs.has_key == 'true'
+        uses: actions/github-script@v8
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            let prNumber = null;
+            if (context.eventName === 'issue_comment' && context.payload.issue?.pull_request) {
+              prNumber = context.payload.issue.number;
+            } else if (context.eventName === 'pull_request_review_comment' && context.payload.pull_request) {
+              prNumber = context.payload.pull_request.number;
+            }
+
+            core.setOutput('is_pr_comment', prNumber ? 'true' : 'false');
+            if (!prNumber) {
+              core.info('No PR target for this event; using Issue/new-branch path.');
+              return;
+            }
+
+            const { data: pr } = await github.rest.pulls.get({
+              owner, repo, pull_number: prNumber,
+            });
+            const sameRepo =
+              !!(pr.head && pr.head.repo && pr.head.repo.full_name === `${owner}/${repo}`);
+            core.setOutput('pr_number', String(prNumber));
+            core.setOutput('same_repo_pr', sameRepo ? 'true' : 'false');
+            core.setOutput('head_ref', pr.head.ref || '');
+            core.setOutput('head_sha', pr.head.sha || '');
+            core.setOutput('head_repo', pr.head.repo?.full_name || '');
+            core.setOutput('base_ref', pr.base?.ref || '');
+            if (sameRepo) {
+              core.info(`PR #${prNumber}: same-repository head ${pr.head.ref} @ ${pr.head.sha}; Claude may write to the original head branch.`);
+            } else {
+              core.warning(`PR #${prNumber}: fork head ${pr.head.repo?.full_name || '(unknown)'}/${pr.head.ref}; skipping Claude writable checkout/run.`);
+            }
+
+      - name: Skip fork-headed PR safely
+        if: steps.keycheck.outputs.has_key == 'true' && steps.pr_context.outputs.is_pr_comment == 'true' && steps.pr_context.outputs.same_repo_pr != 'true'
+        uses: actions/github-script@v8
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const prNumber = parseInt('${{ steps.pr_context.outputs.pr_number }}', 10);
+            const headSha = '${{ steps.pr_context.outputs.head_sha }}';
+            const headRepo = '${{ steps.pr_context.outputs.head_repo }}';
+            const comment = context.payload.comment;
+            const attemptMatch = String(comment?.body || '').match(/ai-loop:v1[^>]*\battempt=(\d+)/);
+            const attemptAttr = attemptMatch ? ` attempt=${parseInt(attemptMatch[1], 10)}` : '';
+            try {
+              await github.rest.issues.createLabel({
+                owner, repo, name: 'needs-owner', color: 'd93f0b',
+                description: 'Escalation — automation stopped, human needed',
+              });
+            } catch (e) { if (e.status !== 422) core.info(`createLabel needs-owner failed (ignored): ${e.message}`); }
+            try {
+              await github.rest.issues.addLabels({
+                owner, repo, issue_number: prNumber, labels: ['needs-owner'],
+              });
+            } catch (e) { core.info(`addLabel needs-owner failed (ignored): ${e.message}`); }
+            try {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: prNumber,
+                body: `<!-- ai-loop:v1 root_pr=${prNumber} head=${headSha}${attemptAttr} agent=claude state=fixer_error -->\nClaude skipped this fork-headed PR (${headRepo}) for security: writable fixer credentials are not used on fork code. Escalated to needs-owner.`,
+              });
+            } catch (e) { core.info(`fork-skip marker failed (ignored): ${e.message}`); }
+            core.warning(`PR #${prNumber}: fork-headed PR skipped before checkout/Claude run; no writable credentials were exposed.`);
+
+      - name: Checkout repository for Issue/new-PR path
+        if: steps.keycheck.outputs.has_key == 'true' && steps.pr_context.outputs.is_pr_comment != 'true'
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
+          token: ${{ secrets.AUTOMATION_PAT || github.token }}
 
-      - name: Run Claude Code
-        id: claude
-        if: steps.keycheck.outputs.has_key == 'true'
+      - name: Checkout existing PR head branch
+        if: steps.keycheck.outputs.has_key == 'true' && steps.pr_context.outputs.same_repo_pr == 'true'
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.pr_context.outputs.head_sha }}
+          token: ${{ secrets.AUTOMATION_PAT || github.token }}
+          fetch-depth: 0
+
+      - name: Attach checkout to original PR head branch
+        if: steps.keycheck.outputs.has_key == 'true' && steps.pr_context.outputs.same_repo_pr == 'true'
+        env:
+          HEAD_REF: ${{ steps.pr_context.outputs.head_ref }}
+          HEAD_SHA: ${{ steps.pr_context.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          git checkout -B "${HEAD_REF}" "${HEAD_SHA}"
+          git branch --set-upstream-to="origin/${HEAD_REF}" "${HEAD_REF}" 2>/dev/null || true
+          current="$(git rev-parse HEAD)"
+          if [ "${current}" != "${HEAD_SHA}" ]; then
+            echo "::error::Checked out ${current}, expected PR head ${HEAD_SHA}."
+            exit 1
+          fi
+          echo "Checked out original PR head branch ${HEAD_REF} at ${HEAD_SHA}."
+
+      - name: Run Claude Code (Issue/new-PR path)
+        id: claude_issue
+        if: steps.keycheck.outputs.has_key == 'true' && steps.pr_context.outputs.is_pr_comment != 'true'
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -115,7 +218,7 @@ jobs:
             actions: read
           prompt: |
             You are the autonomous fixer in a self-healing CI loop. You were
-            invoked on a GitHub Issue or PR in this repository.
+            invoked on a GitHub Issue in this repository.
 
             If triggered by a `claude-fix` Issue (opened by ci-doctor):
               1. Read the Issue body: it has the failed workflow name, the
@@ -135,8 +238,46 @@ jobs:
 
             Prefer the allowed tools and do NOT attempt tools outside the allowlist (denied calls waste your turn budget); the PR's CI (codex-gate) is the final validation, so do not block on running the full suite locally if the sandbox can't.
 
-            If triggered by an @claude mention, follow the request in the
-            comment, working on a branch and opening a PR the same way.
+            If triggered by an @claude mention on an Issue, follow the request
+            in the comment, working on a new branch and opening a PR the same
+            way. Use `Fixes #<N>` for the Issue number. Do not merge it yourself.
+
+      - name: Run Claude Code (existing PR head path)
+        id: claude_pr
+        if: steps.keycheck.outputs.has_key == 'true' && steps.pr_context.outputs.same_repo_pr == 'true'
+        uses: anthropics/claude-code-action@v1
+        env:
+          CLAUDE_BRANCH: ${{ steps.pr_context.outputs.head_ref }}
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # PAT so Claude's push triggers codex-gate; default token fallback.
+          github_token: ${{ secrets.AUTOMATION_PAT || github.token }}
+          trigger_phrase: "@claude"
+          label_trigger: "claude-fix"
+          show_full_output: ${{ vars.CLAUDE_SHOW_FULL_OUTPUT == 'true' }}
+          claude_args: |
+            --max-turns 50
+            --allowedTools "Read,Glob,Grep,Edit,Write,MultiEdit,Bash(git:*),Bash(python:*),Bash(python3:*),Bash(pytest:*),Bash(pip:*),Bash(node:*),Bash(npm:*),Bash(ls:*),Bash(cat:*),Bash(find:*),Bash(head:*),Bash(tail:*),Bash(sed:*),Bash(mkdir:*),Bash(cp:*),Bash(mv:*),Bash(gh pr:*),Bash(gh issue:*),Bash(actionlint)"
+          additional_permissions: |
+            actions: read
+          prompt: |
+            You are fixing an EXISTING pull request in this repository.
+
+            Pull request: #${{ steps.pr_context.outputs.pr_number }}
+            Existing head branch: ${{ steps.pr_context.outputs.head_ref }}
+            Head SHA at checkout: ${{ steps.pr_context.outputs.head_sha }}
+
+            Work only on the currently checked-out existing PR head branch.
+            Commit and push directly to that branch.
+            Do NOT create a new branch.
+            Do NOT open a new pull request.
+            Do NOT merge the pull request yourself.
+
+            Follow the @claude request and apply the minimal fix for the active
+            review findings on this PR. Prefer the allowed tools and do NOT
+            attempt tools outside the allowlist; the PR's CI (codex-gate) is the
+            final validation, so do not block on running the full suite locally
+            if the sandbox can't.
 
       - name: Delivery check — did a fix land on the head?
         id: delivery
@@ -145,13 +286,13 @@ jobs:
         # (TRF #84), so the conclusion is meaningless. DELIVERED = at least one new
         # commit on the PR head ref since the trigger comment's timestamp. Runs
         # whenever the key is present (independent of the Claude step's outcome).
-        if: always() && steps.keycheck.outputs.has_key == 'true'
-        uses: actions/github-script@v7
+        if: always() && steps.keycheck.outputs.has_key == 'true' && !(steps.pr_context.outputs.is_pr_comment == 'true' && steps.pr_context.outputs.same_repo_pr != 'true')
+        uses: actions/github-script@v8
         env:
           # fix #26: the action's SDK writes a terminal result JSON here. Prefer the
           # step output if the action declares one; else the delivery step finds it
           # under RUNNER_TEMP. Used to CLASSIFY a non-delivery (billing/error/no-op).
-          EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
+          EXECUTION_FILE: ${{ steps.claude_pr.outputs.execution_file || steps.claude_issue.outputs.execution_file }}
         with:
           github-token: ${{ secrets.AUTOMATION_PAT || github.token }}
           script: |
@@ -239,8 +380,8 @@ jobs:
         # trap that the old `outcome != 'success'` guard missed). Gated on has_key
         # so a fail-soft no-key skip isn't 👎'd. Fully fail-soft: an error here must
         # NEVER fail the job.
-        if: ${{ always() && steps.keycheck.outputs.has_key == 'true' && (steps.claude.outcome != 'success' || steps.delivery.outputs.delivered != 'true') }}
-        uses: actions/github-script@v7
+        if: ${{ always() && steps.keycheck.outputs.has_key == 'true' && !(steps.pr_context.outputs.is_pr_comment == 'true' && steps.pr_context.outputs.same_repo_pr != 'true') && (((steps.pr_context.outputs.same_repo_pr == 'true') && steps.claude_pr.outcome != 'success') || ((steps.pr_context.outputs.is_pr_comment != 'true') && steps.claude_issue.outcome != 'success') || steps.delivery.outputs.delivered != 'true') }}
+        uses: actions/github-script@v8
         env:
           # fix #26: the classified outcome from the delivery step.
           CLAUDE_CLASS: ${{ steps.delivery.outputs.class }}
@@ -312,11 +453,11 @@ jobs:
         # P1 fix: only label when Claude Code actually RAN AND SUCCEEDED. With
         # always() this labeled PRs even on a failed/cancelled run, so a PR
         # Claude did NOT fix could pick up `automerge` and auto-merge.
-        # steps.claude.outcome is 'success' only on a real success; it is
+        # steps.claude_issue.outcome is 'success' only on a real success; it is
         # 'failure'/'cancelled' on a bad run and 'skipped' in the
         # fail-soft (no ANTHROPIC_API_KEY) path — none of which should label.
-        if: steps.claude.outcome == 'success'
-        uses: actions/github-script@v7
+        if: steps.claude_issue.outcome == 'success'
+        uses: actions/github-script@v8
         with:
           # AUTOMATION_PAT (default-token fallback) so merge-bot can pick up the
           # PR. Claude's PRs are authored by the owner (PAT-authed), not a bot,
