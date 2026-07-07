@@ -23,7 +23,7 @@ Codex auto-review
   → Claude
   → Codex API when CODEX_BACKUP_ENABLED=true
   → Codex Cloud when CODEX_CLOUD_ENABLED is not false
-  → optional Claude proxy, verified to deliver to the original PR head
+  → optional Claude proxy (implemented; delivers to the original PR head — runtime-UNVERIFIED, no Claude budget yet)
   → needs-owner
   → Codex Gate
   → Merge Bot
@@ -97,7 +97,7 @@ Codex auto-review
   → Claude
   → Codex API when CODEX_BACKUP_ENABLED=true
   → Codex Cloud when CODEX_CLOUD_ENABLED is not false
-  → optional Claude proxy, verified to deliver to the original PR head
+  → optional Claude proxy (implemented; delivers to the original PR head — runtime-UNVERIFIED, no Claude budget yet)
   → needs-owner
   → Codex Gate
   → Merge Bot
@@ -594,9 +594,12 @@ non-delivery is now CLASSIFIED (fix #26).
     autonomous fixer.** `openai/codex-action` fails with "Quota exceeded" (see the
     #49 maiden run), so the watchdog must NOT keep dispatching the dead backup.
     Fix #8 gates the dispatch on the Actions variable `CODEX_BACKUP_ENABLED`
-    (must be EXACTLY `'true'`; default/unset = disabled): when disabled the
-    watchdog escalates to `needs-owner` on the first timeout instead. Re-enable by
-    restoring OpenAI quota AND setting `CODEX_BACKUP_ENABLED='true'`. NOTE: Codex
+    (must be EXACTLY `'true'`; default/unset = disabled). **HISTORICAL (fix #8):** when
+    disabled the watchdog escalated on the first timeout. **SUPERSEDED by fix #23/#26:**
+    a disabled backup now just SKIPS the codex-api stage and the ladder advances to
+    Codex Cloud (then the Claude proxy), escalating to `needs-owner` only after every
+    ENABLED stage fails delivery. Re-enable the API backup by restoring OpenAI quota
+    AND setting `CODEX_BACKUP_ENABLED='true'`. NOTE: Codex
     REVIEW (the GitHub App that posts P1/P2 on PRs) is a SEPARATE OpenAI surface
     from codex-action; if Codex review also lapses on quota, the Codex Gate would
     sit pending (fail-closed) — monitor, and use the `codex-p1-acknowledged`
@@ -622,7 +625,7 @@ consumer of itself).
 | `ci-doctor.yml` | ✅ yes | Escalates to `needs-owner` only. IGNORE_WORKFLOWS skips ALL automation/infra workflows: Codex Backup Fix, Claude Fallback Watchdog, **Minutes Guard, Bootstrap repos, Loop Morning Report** (fix #9) — so their failures don't open noisy claude-fix issues. |
 | `merge-bot.yml` | ✅ yes | Latest-check-run-per-name dedupe; `needs-owner` hard stop; protected-path guard. |
 | `telegram-morning-report.yml` | ✅ yes (PR #31 merged) | Hub-only read-only digest; counts-only public logs; honest Telegram delivery + minutes. |
-| `claude-fallback-watchdog.yml` | ✅ yes (synced) | On Claude timeout: dispatches the Codex backup **only when `vars.CODEX_BACKUP_ENABLED=='true'`** (fix #8; default disabled → escalates to `needs-owner` on first timeout instead). Marker-based attempt counting; 3 → `needs-owner` + Telegram. Blocked dispatch stays loud (`core.error` + Telegram + `state=dispatch_failed` marker, no burned attempt). |
+| `claude-fallback-watchdog.yml` | ✅ yes (synced) | Runs the **delivery-judged fixer ladder** (fix #23/#26): claude → codex-api (only `vars.CODEX_BACKUP_ENABLED=='true'`, else skipped) → codex-cloud (`CODEX_CLOUD_ENABLED != 'false'`) → claude-proxy (genuine `no_delivery` only) → `needs-owner`. (Fix #8's "disabled backup → escalate on first timeout" is SUPERSEDED — a disabled stage is skipped, not escalated.) Marker-based attempt counting; a `billing_error`/`fixer_error` class advances instantly. Blocked dispatch stays loud (`core.error` + Telegram + `state=dispatch_failed` marker, no burned attempt). |
 | `codex-backup-fix.yml` | ⏸️ present but **DORMANT** (synced) | Codex backup fixer via `openai/codex-action@v1`; fork guard + stale-head guard; pushes to the PR head branch. **Disabled by default** — needs OpenAI quota (currently exhausted: "Quota exceeded") AND `CODEX_BACKUP_ENABLED='true'`. Left in place, re-enableable. |
 | `bootstrap.yml` | ✅ yes (hub-only) | Onboards a new repo. |
 | `minutes-guard.yml` | ✅ yes (hub-only) | Actions-minutes guard. |
@@ -650,6 +653,15 @@ never exposed).
 ---
 
 ## 6. OPEN DECISIONS / TODO
+
+### Current Open TODO (authoritative — post-fix #27 reconciliation, 2026-07-07)
+This is the single prioritized list; the older numbered decisions below are retained for context.
+
+- **A. Done by this task (docs/state reconciliation, no code):** LOOP_STATE snapshot SHA → `93f6acb`; the Claude-proxy/PR-head-delivery claim corrected from "verified" → "implemented, runtime-unverified"; OPT #12 / TRF #80 "awaiting merge" → **MERGED 2026-06-17** (API-verified); fix-#8 "escalate on first timeout" marked SUPERSEDED by the fix #23/#26 ladder; states glossary / variables table / delivery definition / attempt accounting confirmed against current code.
+- **B. Runtime tests blocked on Claude budget (Anthropic credit exhausted):** the fix #27 Claude → **original-PR-head** delivery path is IMPLEMENTED but has NEVER run a real fix (every Claude call currently returns `billing_error`, 0 tokens). Needs ONE real same-repo PR test once budget returns: bridge posts `@claude fix` → Claude checks out the head SHA → commits+pushes to the EXISTING head branch (no new branch/PR) → the watchdog `deliveredSince` sees the commit → gate re-checks → merge. Also unverified: the **claude-proxy** stage (Cloud "View task" summary → Claude applies it).
+- **C. Runtime tests blocked on OpenAI API quota:** the **codex-api** backup stage (`codex-backup-fix.yml`, `openai/codex-action@v1`) is dormant (`CODEX_BACKUP_ENABLED` unset; quota "Quota exceeded"). Its honest end-states (`no_change`/`patch_failed`) and stale-head guard are unverified in production.
+- **D. Downstream sync / secrets / Actions-variable verification:** confirm each participating repo has the required secrets (`AUTOMATION_PAT`, `ANTHROPIC_API_KEY`) and the per-repo Actions variables (`CLAUDE_ENABLED`, `CODEX_BACKUP_ENABLED`, `CODEX_CLOUD_ENABLED`, `CLAUDE_SHOW_FULL_OUTPUT`) — **none are carried by the sync**. Verify the latest `chore(automation): sync` PR merged per repo (paywall-bot #69, TRF #90 confirmed merged 2026-07-06/07). Add OPT (+ paper-trader) to minutes-guard `TARGET_REPOS` (still open).
+- **E. Longer-term:** Telegram control surface (currently notify-only); a possible history rewrite to purge the legacy label (decision below); folding `codex-backup-fix.yml` back in vs leaving dormant.
 
 1. **Legacy label keeps coming back on Codex fixes.** Codex re-adds the legacy
    escalation label on nearly every fix; the root cause is likely the repo's git
@@ -691,11 +703,12 @@ never exposed).
     churns, no PR). Raised `--max-turns` 20→50 and broadened `--allowedTools`
     (`Bash(git:*)` + interpreters/inspectors + MultiEdit), plus a prompt line to
     stay inside the allowlist and treat CI as final validation. See Lesson 12.
-11. **Fix #8 — DONE (this commit):** OpenAI quota is exhausted → the Codex backup
-    is dead. The watchdog now dispatches it ONLY when `vars.CODEX_BACKUP_ENABLED
-    == 'true'` (default disabled); when disabled it escalates to `needs-owner` on
-    the first timeout instead of dispatching a dead backup. `codex-backup-fix.yml`
-    left in place, dormant + re-enableable. See Lesson 13.
+11. **Fix #8 — DONE:** OpenAI quota is exhausted → the Codex backup is dead. The
+    watchdog dispatches it ONLY when `vars.CODEX_BACKUP_ENABLED == 'true'` (default
+    disabled). **HISTORICAL:** fix #8 escalated on the first timeout when disabled;
+    **SUPERSEDED by fix #23/#26** — a disabled codex-api stage is now simply skipped
+    and the ladder advances to Codex Cloud → Claude proxy → `needs-owner`.
+    `codex-backup-fix.yml` left in place, dormant + re-enableable. See Lesson 13.
 12. **Fix #9 — DONE (this commit):** added `Minutes Guard`, `Bootstrap repos`,
     `Loop Morning Report` to ci-doctor's `IGNORE_WORKFLOWS`. See Lesson 14.
 13. **Re-enable Codex backup when OpenAI quota returns:** restore OpenAI billing,

@@ -1,7 +1,7 @@
 # LOOP_STATE.md — Self-Healing Loop: project state
 
 > Source of truth for the autonomous CI self-healing loop across @funzi7's repos.
-> Update this file on every significant change. Snapshot taken against `main` @ `171f33f`.
+> Update this file on every significant change. Snapshot reconciled against `main` @ `93f6acb` (fix #27, 2026-07-07).
 
 **Resume in a new chat:** _"Read LOOP_STATE.md in funzi7/automation-core to see where the self-healing loop project stands, then continue."_
 
@@ -19,7 +19,7 @@ Codex auto-review
   → Claude
   → Codex API when CODEX_BACKUP_ENABLED=true
   → Codex Cloud when CODEX_CLOUD_ENABLED is not false
-  → optional Claude proxy, verified to deliver to the original PR head
+  → optional Claude proxy (implemented; delivers to the original PR head — runtime-UNVERIFIED, no Claude budget yet)
   → needs-owner
   → Codex Gate
   → Merge Bot
@@ -33,7 +33,7 @@ Claude PR comments now resolve the PR through the GitHub API before Claude runs.
 
 State glossary: `requested` = stage requested; `pushed` = branch push marker; `no_change` = Codex API empty patch; `no_delivery` = Claude ran with no PR-head commit; `billing_error` = Anthropic credit/billing failure; `api_error` = Codex API agent step failed before patch; `fixer_error` = fixer failed or was safely skipped; `dispatch_failed` = pre-agent workflow dispatch failure, retryable and non-attempt-consuming; `patch_failed` = apply/commit/push failed; `stale` = head changed while Codex API worked and must not advance to Cloud on that cycle; `escalated` = `needs-owner` added and automation stops.
 
-Attempts come only from valid `ai-loop:v1` markers with `attempt=`. Reviews, ordinary comments, watchdog ticks, technical retries, and dispatch failures before the agent starts do not count. A ready Codex Cloud diff without branch delivery is never success; it consumes the one Cloud stage for that head because Cloud produced a terminal task outcome, then the ladder either uses the verified Claude proxy path or escalates honestly.
+Attempts come only from valid `ai-loop:v1` markers with `attempt=`. Reviews, ordinary comments, watchdog ticks, technical retries, and dispatch failures before the agent starts do not count. A ready Codex Cloud diff without branch delivery is never success; it consumes the one Cloud stage for that head because Cloud produced a terminal task outcome, then the ladder either uses the Claude proxy path (implemented; runtime-unverified) or escalates honestly.
 
 Codex Cloud manual limitation: if Cloud prepares a diff but does not push, the owner-facing text is "Codex Cloud prepared a diff, but it did not reach the PR branch. Open View task → Update branch to apply it manually." No browser automation, Playwright, session cookies, UI-click automation, or fake API Update branch path exists.
 
@@ -46,7 +46,7 @@ Codex auto-review
   → Claude
   → Codex API when CODEX_BACKUP_ENABLED=true
   → Codex Cloud when CODEX_CLOUD_ENABLED is not false
-  → optional Claude proxy, verified to deliver to the original PR head
+  → optional Claude proxy (implemented; delivers to the original PR head — runtime-UNVERIFIED, no Claude budget yet)
   → needs-owner
   → Codex Gate
   → Merge Bot
@@ -188,8 +188,8 @@ Generic loop workflows live in `workflows/` (sync source) and are copied byte-id
 |------|--------|-------|
 | **automation-core** | ✅ loop installed & live | Public → free Actions. Source of truth + test bed. Runs the loop on its own PRs (consumer #12). |
 | **paywall-bot** | 🟡 partial | Has `sync-automation-core.yml` (AUTOMATION_PAT variant) + `codex-gate` + `codex-auto-fix` synced. |
-| **OptionsProfitTracker (OPT)** | 🟡 onboarded — PR #12 awaiting merge | **Stage 2.** Private. PR #12 adds sync (AUTOMATION_PAT), health-check→`claude-fix`, `build-gate` (compileDebugKotlin), `.claude-guard.json`, CLAUDE.md loop section. **Installed-and-waiting** — private Actions quota exhausted → activates after the ~July 1 reset. |
-| **thai-rent-finder (TRF)** | 🟡 onboarded — PR #80 awaiting merge | **Stage 2.** Private. Already had `codex-gate` + `codex-auto-fix`; PR #80 adds the missing sync (AUTOMATION_PAT), site-health→`claude-fix`, `build-gate` (`tsc --noEmit`), `.claude-guard.json` (schema/migrations). |
+| **OptionsProfitTracker (OPT)** | ✅ onboarded — PR #12 **MERGED** 2026-06-17 (API-verified) | **Stage 2.** Private. PR #12 added sync (AUTOMATION_PAT), health-check→`claude-fix`, `build-gate` (compileDebugKotlin), `.claude-guard.json`, CLAUDE.md loop section. Runtime activity gated by private Actions quota. |
+| **thai-rent-finder (TRF)** | ✅ onboarded — PR #80 **MERGED** 2026-06-17 (API-verified); latest sync PR #90 merged 2026-07-07 | **Stage 2.** Private. Had `codex-gate` + `codex-auto-fix`; PR #80 added sync (AUTOMATION_PAT), site-health→`claude-fix`, `build-gate` (`tsc --noEmit`), `.claude-guard.json` (schema/migrations). |
 | 11 other downstream repos | via sync | Receive synced workflows where bootstrapped. fail-soft everywhere → no key/PAT = no red runs, ~0 minutes. |
 
 > Account: GitHub Free, 2000 private-repo Actions min/month, resets the 1st. Public repos (automation-core) are free.
@@ -207,9 +207,9 @@ Generic loop workflows live in `workflows/` (sync source) and are copied byte-id
 
 **All three are live on `main`.** (Other merged loop hardening: head-SHA-pinned merge, 3-round circuit breaker, twice-daily ci-doctor / daily merge-bot crons, success-filtered `workflow_run` trigger, per-wave bridge debounce, `cancel-in-progress: false`, allowlist `--allowedTools`.)
 
-### Stage 2 — onboard OPT + TRF  (onboarding PRs open, awaiting merge)
-- 🟡 **OPT — PR #12 (awaiting merge):** `sync-automation-core.yml` (AUTOMATION_PAT variant); `health-check.yml` now opens `claude-fix` Issues via AUTOMATION_PAT (was the dead `cc @codex`); `pr-build-gate.yml` (`build-gate` = `:app:compileDebugKotlin`, fails on any `^e:` line or non-zero exit); `.claude-guard.json` (`ProfitCalculator` / `StrategicRiskAnalyzer` / `BlackScholesCalculator` / `*Database*` / `*Migration*` / `AppPreferences` / `AvgCostResolver`); CLAUDE.md autonomous-loop section. **Installed-and-waiting** — private quota resets ~July 1.
-- 🟡 **TRF — PR #80 (awaiting merge):** `sync-automation-core.yml` (AUTOMATION_PAT variant); `site-health.yml` now opens `claude-fix` Issues via AUTOMATION_PAT (was `@codex`); `pr-build-gate.yml` (`build-gate` = `tsc --noEmit`; `npm run build` deliberately avoided because it runs `prisma migrate deploy`, which needs a DB); `.claude-guard.json` (`schema.prisma` + `migrations/**`).
+### Stage 2 — onboard OPT + TRF  (✅ both onboarding PRs MERGED 2026-06-17 — API-verified)
+- ✅ **OPT — PR #12 (MERGED 2026-06-17T03:12:10Z):** `sync-automation-core.yml` (AUTOMATION_PAT variant); `health-check.yml` now opens `claude-fix` Issues via AUTOMATION_PAT (was the dead `cc @codex`); `pr-build-gate.yml` (`build-gate` = `:app:compileDebugKotlin`, fails on any `^e:` line or non-zero exit); `.claude-guard.json` (`ProfitCalculator` / `StrategicRiskAnalyzer` / `BlackScholesCalculator` / `*Database*` / `*Migration*` / `AppPreferences` / `AvgCostResolver`); CLAUDE.md autonomous-loop section.
+- ✅ **TRF — PR #80 (MERGED 2026-06-17T03:12:38Z):** `sync-automation-core.yml` (AUTOMATION_PAT variant); `site-health.yml` now opens `claude-fix` Issues via AUTOMATION_PAT (was `@codex`); `pr-build-gate.yml` (`build-gate` = `tsc --noEmit`; `npm run build` deliberately avoided because it runs `prisma migrate deploy`, which needs a DB); `.claude-guard.json` (`schema.prisma` + `migrations/**`). (Latest `chore(automation): sync` PR #90 merged 2026-07-07 — sync flowing.)
 - Bootstrap was **not** used — both PRs add the sync workflow directly. After merge + secrets (`AUTOMATION_PAT`, `ANTHROPIC_API_KEY`, both reportedly already set), the generic loop workflows (`claude`, `codex-auto-fix`, `codex-gate`, `ci-doctor`, `merge-bot`) arrive on the next daily sync.
 - Still TODO: add OPT (+ paper-trader) to minutes-guard `TARGET_REPOS`.
 

@@ -17,6 +17,16 @@ Handoff log for the **self-healing-loop build** Claude Chat session. Claude Code
 
 ---
 
+## [2026-07-07 13:10 UTC] docs/state reconciliation — post-fix #27 (DOCUMENTATION ONLY, no code/workflow change)
+- PR: direct commit to main (docs only — `LOOP_STATE.md`, `handoffs/CONTEXT.md`, `handoffs/loop-build.md`)
+- Branch: main (direct commit)
+- Status: done
+- Verified from live repo/GitHub state (not copied): automation-core `main` HEAD = **`93f6acb`** (fix #27, "deliver PR fixes to original heads"); all six loop workflows byte-identical across `workflows/` ↔ `.github/workflows/`; `TRUSTED_CODEX_LOGINS = new Set(['chatgpt-codex-connector[bot]'])` in BOTH `codex-gate.yml` and `claude-fallback-watchdog.yml`; switches confirmed in code — `CLAUDE_ENABLED != 'false'` (default-ON), `CODEX_BACKUP_ENABLED === 'true'` (default-OFF), `CODEX_CLOUD_ENABLED !== 'false'` (default-ON opt-out); claude.yml resolves the PR head via API and checks out the **exact head SHA** (`ref: steps.pr_context.outputs.head_sha`) on the existing head branch, prompting "commit and push directly to that branch", with fork heads skipped (→ `needs-owner` + `state=fixer_error`) before any writable checkout; the bridge is **P1+P2** (not P1-only). **API-verified downstream:** OPT #12 **MERGED** 2026-06-17T03:12:10Z; TRF #80 **MERGED** 2026-06-17T03:12:38Z; latest `chore(automation): sync` PRs merged — paywall-bot #69 (07-06), TRF #90 (07-07).
+- Stale documentation corrected: LOOP_STATE snapshot SHA `171f33f` → `93f6acb`; three "verified to deliver / verified Claude proxy" claims → "implemented; runtime-UNVERIFIED (no Claude budget)"; OPT #12 / TRF #80 "awaiting merge" (×4 places) → "MERGED 2026-06-17 (API-verified)"; the fix-#8 "disabled backup → escalate on first timeout" (CONTEXT ×3) marked HISTORICAL/SUPERSEDED by the fix #23/#26 ladder (a disabled stage is skipped, not escalated). Added an authoritative "Current Open TODO" (A–E) section to CONTEXT §6.
+- Runtime-UNVERIFIED (documented honestly, NOT claimed): fix #27's Claude direct-to-original-head delivery has never run a real fix — every Claude call returns `billing_error` (0 tokens) until Anthropic credit is funded. **Next live test:** once budget returns, drive ONE real same-repo PR through bridge `@claude fix` → head-SHA checkout → push to the existing head branch → `deliveredSince` sees the commit → gate → merge. The codex-api backup + claude-proxy stages remain unverified (OpenAI quota / Claude budget respectively).
+- Historical mentions intentionally kept: loop-build's OLD dated entries (June) still say "awaiting merge" / "P1-only" — those are accurate as-of-their-date chronological log entries and are NOT rewritten; CONTEXT Lesson #11 keeps "originally P1 only" as the reason fix #6 exists (explicitly historical).
+- Needs from the owner: fund Anthropic (unblocks B); restore OpenAI quota (unblocks C); verify per-repo secrets/vars (D). No code touched — `workflows/` and `.github/workflows/` UNCHANGED.
+
 ## [2026-07-07 12:26 UTC] fix #27: original-PR-head delivery, Cloud switch, strict Codex identity, API terminal states
 - PR: direct commit to main
 - Branch: main (direct commit)
