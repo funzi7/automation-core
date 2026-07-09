@@ -4,6 +4,19 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
 
 ---
 
+## [2026-07-09 09:18 UTC] Fix paywall-bot PR #73 Codex P2 upstream
+- PR: direct commit to automation-core `main`; downstream evidence from `funzi7/paywall-bot` PR #73, Codex P2 "Skip patch download after agent failure".
+- Branch: main
+- Status: done upstream; downstream sync still needed
+- What changed:
+  - Fixed `codex-backup-fix.yml` upstream so `codex_agent_failed` no longer enters the normal patch download/apply path.
+  - Kept `apply-and-push` broad enough for marker-only terminal paths and normal patch application, but added a `normal_patch_path` gate based on `proceed == 'true'`, no fork skip, no agent failure, and successful patch artifact readiness.
+  - Gated PR-head resolve, checkout, `codex-patch` download, apply/push, `pushed`, `no_change`, `patch_failed`, and stale-note steps on the normal patch path. After agent failure, only the intended Codex `api_error` marker path runs.
+  - Updated both mirrored workflow copies byte-identically: `workflows/codex-backup-fix.yml` and `.github/workflows/codex-backup-fix.yml`.
+- Validation: recorded in `/root/work/agent-memory/automation-core/cc-latest.md` for this commit. Local writes and `git pull --ff-only` were blocked by the workspace `bwrap` error, so remote GitHub API readback was used for changed-file validation.
+- Needs from the owner: refresh/sync paywall-bot PR #73 from automation-core, then re-check PR #73 and do not merge it until the refreshed sync includes this fix and Codex Gate is green.
+- Files intentionally not changed: paywall-bot and all downstream repos; workflow logic outside `codex-backup-fix.yml`; browser/UI automation; force-push behavior.
+
 ## [2026-07-07 18:45 UTC] Post-fix #27 final documentation normalization
 - PR: direct commit to main (documentation/state/handoff only)
 - Branch: main

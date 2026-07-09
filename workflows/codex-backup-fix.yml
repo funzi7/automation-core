@@ -10,9 +10,9 @@ name: Codex Backup Fix
 # DORMANT BY DEFAULT (fix #8): the watchdog only dispatches this workflow when the
 # Actions variable CODEX_BACKUP_ENABLED is EXACTLY 'true'. It is off by default
 # because the OpenAI quota is currently exhausted (codex-action fails with "Quota
-# exceeded"); while off, the watchdog escalates to needs-owner instead. The file
-# is intentionally LEFT IN PLACE so it can be re-enabled by (a) restoring OpenAI
-# quota and (b) setting CODEX_BACKUP_ENABLED='true'.
+# exceeded"); while off, the watchdog skips this stage and continues the delivery
+# ladder. The file is intentionally LEFT IN PLACE so it can be re-enabled by (a)
+# restoring OpenAI quota and (b) setting CODEX_BACKUP_ENABLED='true'.
 #
 # PREREQUISITES (PER-REPO — `sync` does NOT copy secrets or Actions settings):
 #   - secret OPENAI_API_KEY on the repo (WITH available OpenAI quota/billing).
@@ -22,7 +22,8 @@ name: Codex Backup Fix
 # expected on a repo that has not opted into Codex fallback.
 #
 # SECURITY (public repo): fork PRs are NEVER run through the agent (secrets must
-# not be exposed to fork code) — Job 1 stops and escalates to needs-owner.
+# not be exposed to fork code) — Job 1 marks the fork and Job 2 escalates to
+# needs-owner without checking out fork code.
 # Read handoffs/CONTEXT.md for the full loop.
 
 on:
@@ -55,6 +56,7 @@ jobs:
       proceed: ${{ steps.guard.outputs.proceed }}
       fork_pr: ${{ steps.guard.outputs.fork_pr }}
       codex_agent_failed: ${{ steps.codex_agent_failure.outputs.failed }}
+      patch_ready: ${{ steps.patch_artifact_ready.outputs.ready }}
     steps:
       - name: Fork-PR security guard (no agent or secrets on forks)
         id: guard
@@ -183,8 +185,21 @@ jobs:
           if-no-files-found: ignore
           retention-days: 1
 
+      - name: Mark patch artifact ready
+        id: patch_artifact_ready
+        if: steps.guard.outputs.proceed == 'true' && steps.codex_agent.outcome == 'success'
+        run: |
+          if [ ! -e codex.patch ]; then
+            echo "::error::codex.patch was not created after a successful Codex agent run."
+            exit 1
+          fi
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+
   apply-and-push:
     needs: generate-patch
+    # This job runs for marker-only terminal paths and for the normal patch path.
+    # Normal patch steps are gated below on agent success plus patch artifact readiness,
+    # not merely on proceed=true.
     if: always() && (needs.generate-patch.outputs.proceed == 'true' || needs.generate-patch.outputs.fork_pr == 'true' || needs.generate-patch.outputs.codex_agent_failed == 'true')
     runs-on: ubuntu-latest
     permissions:
@@ -192,6 +207,19 @@ jobs:
       pull-requests: write
       issues: write
     steps:
+      - name: Classify apply-and-push path
+        id: path
+        run: |
+          normal=false
+          if [ "${{ needs.generate-patch.outputs.proceed }}" = "true" ] && \
+             [ "${{ needs.generate-patch.outputs.fork_pr }}" != "true" ] && \
+             [ "${{ needs.generate-patch.outputs.codex_agent_failed }}" != "true" ] && \
+             [ "${{ needs.generate-patch.outputs.patch_ready }}" = "true" ]; then
+            normal=true
+          fi
+          echo "normal_patch_path=${normal}" >> "$GITHUB_OUTPUT"
+          echo "normal_patch_path=${normal}"
+
       - name: Escalate fork-headed PR skip
         if: needs.generate-patch.outputs.fork_pr == 'true'
         uses: actions/github-script@v8
@@ -245,7 +273,7 @@ jobs:
 
       - name: Resolve PR head ref + stale-head guard
         id: resolve
-        if: needs.generate-patch.outputs.proceed == 'true'
+        if: steps.path.outputs.normal_patch_path == 'true'
         uses: actions/github-script@v8
         env:
           AUTOMATION_PAT: ${{ secrets.AUTOMATION_PAT }}
@@ -265,7 +293,7 @@ jobs:
             core.setOutput("stale", stale ? "true" : "false");
 
       - name: Checkout PR head branch (write creds via AUTOMATION_PAT)
-        if: needs.generate-patch.outputs.proceed == 'true' && steps.resolve.outputs.stale == 'false'
+        if: steps.path.outputs.normal_patch_path == 'true' && steps.resolve.outputs.stale == 'false'
         uses: actions/checkout@v5
         with:
           ref: ${{ steps.resolve.outputs.head_ref }}
@@ -273,7 +301,7 @@ jobs:
           fetch-depth: 0
 
       - name: Download patch artifact
-        if: needs.generate-patch.outputs.proceed == 'true' && steps.resolve.outputs.stale == 'false'
+        if: steps.path.outputs.normal_patch_path == 'true' && steps.resolve.outputs.stale == 'false'
         uses: actions/download-artifact@v4
         with:
           name: codex-patch
@@ -281,7 +309,7 @@ jobs:
 
       - name: Apply patch and push to the PR head branch
         id: apply
-        if: needs.generate-patch.outputs.proceed == 'true' && steps.resolve.outputs.stale == 'false'
+        if: steps.path.outputs.normal_patch_path == 'true' && steps.resolve.outputs.stale == 'false'
         env:
           HEAD_REF: ${{ steps.resolve.outputs.head_ref }}
           PR_NUMBER: ${{ inputs.pr_number }}
@@ -302,7 +330,7 @@ jobs:
 
       - name: Post pushed marker (counts-only)
         # fix #24: ONLY when a push actually happened (pushed=='true').
-        if: needs.generate-patch.outputs.proceed == 'true' && steps.resolve.outputs.stale == 'false' && steps.apply.outputs.pushed == 'true'
+        if: steps.path.outputs.normal_patch_path == 'true' && steps.resolve.outputs.stale == 'false' && steps.apply.outputs.pushed == 'true'
         uses: actions/github-script@v8
         env:
           AUTOMATION_PAT: ${{ secrets.AUTOMATION_PAT }}
@@ -324,7 +352,7 @@ jobs:
         # fix #24: the apply step SUCCEEDED but produced no push (empty patch). Never
         # claim state=pushed. The fix #23 watchdog judges by deliveredSince (real
         # commits) anyway; this marker is honest and informational.
-        if: needs.generate-patch.outputs.proceed == 'true' && steps.resolve.outputs.stale == 'false' && steps.apply.outputs.pushed == 'false'
+        if: steps.path.outputs.normal_patch_path == 'true' && steps.resolve.outputs.stale == 'false' && steps.apply.outputs.pushed == 'false'
         uses: actions/github-script@v8
         env:
           AUTOMATION_PAT: ${{ secrets.AUTOMATION_PAT }}
@@ -346,7 +374,7 @@ jobs:
       - name: Post patch-failed marker (apply/commit/push error)
         # fix #24: the apply step FAILED (git apply/commit/push error) — LOUD, never
         # silent, and never state=pushed.
-        if: needs.generate-patch.outputs.proceed == 'true' && failure() && steps.resolve.outputs.stale == 'false'
+        if: steps.path.outputs.normal_patch_path == 'true' && failure() && steps.resolve.outputs.stale == 'false'
         uses: actions/github-script@v8
         env:
           AUTOMATION_PAT: ${{ secrets.AUTOMATION_PAT }}
@@ -368,7 +396,7 @@ jobs:
             } catch (e) { core.info(`patch_failed marker comment failed (ignored): ${e.message}`); }
 
       - name: Note stale-head skip (no push)
-        if: needs.generate-patch.outputs.proceed == 'true' && steps.resolve.outputs.stale == 'true'
+        if: steps.path.outputs.normal_patch_path == 'true' && steps.resolve.outputs.stale == 'true'
         uses: actions/github-script@v8
         env:
           AUTOMATION_PAT: ${{ secrets.AUTOMATION_PAT }}

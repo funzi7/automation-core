@@ -10,13 +10,13 @@
 
 ---
 
-## Current Snapshot (post-fix #27, normalized 2026-07-07)
+## Current Snapshot (post-fix #27 + Codex API agent-failure path fix, updated 2026-07-09)
 
-Code architecture base: fix #27 implementation commit `93f6acb9d2e0396afad3e10854503024843c32de`.
+Code architecture base: fix #27 implementation commit `93f6acb9d2e0396afad3e10854503024843c32de` plus the 2026-07-09 `codex-backup-fix.yml` agent-failure path hardening.
 
-Documentation base: first reconciliation commit `ff57a73220faa5dbb563edc7b035fc6cc653c509`, plus this final documentation-only normalization.
+Documentation base: final post-fix #27 normalization commit `11ba6a6bf13c91b1be61d4292b853dd15c37063b`, plus this upstream fix record.
 
-Runtime status: workflow code was re-read for this pass. No successful post-fix #27 Claude PR-head run has happened yet. Claude PR-head delivery and Claude proxy are implemented but runtime-unverified. Recent Claude runs return Anthropic `billing_error` / credit exhaustion. Codex API backup is runtime-unverified while OpenAI quota is unavailable.
+Runtime status: workflow code was re-read for this pass. No successful post-fix #27 Claude PR-head run has happened yet. Claude PR-head delivery and Claude proxy are implemented but runtime-unverified. Recent Claude runs return Anthropic `billing_error` / credit exhaustion. Codex API backup is runtime-unverified while OpenAI quota is unavailable; the 2026-07-09 fix hardens the failed-agent marker path before the next live Codex API run.
 
 Current delivery-judged ladder:
 
@@ -48,10 +48,11 @@ Only escalation label: `needs-owner`.
 ## Current Open TODO (authoritative)
 
 1. **Claude-budget-blocked runtime verification:** after Anthropic credit is restored, create one harmless same-repo PR with an active P1 or P2 finding, trigger `@claude fix`, verify a commit reaches the original PR head branch, verify no secondary branch/PR appears, verify the watchdog recognizes delivery, and verify no `no_delivery` marker remains after the successful push.
-2. **OpenAI API quota-blocked verification:** after OpenAI quota is restored, set `CODEX_BACKUP_ENABLED='true'` only on a controlled test repo and verify Codex API `requested` -> real PR-head push and terminal states.
-3. **Downstream audit:** OPT PR #12 and TRF PR #80 are merged. Do not claim downstream workflow sync, secrets, variables, Actions permissions, or runtime health until checked from each repo's latest sync PR/current workflow contents and settings evidence.
-4. **Codex Cloud limitation:** View task, task diff, Created commit hint, or ready diff is not delivery unless the PR branch gets a newer commit after the Cloud marker. No browser/UI automation or fake Update branch API workaround exists.
-5. **Longer-term:** update minutes-guard target coverage after downstream audit; keep direct-to-main and branch-protection decisions explicit.
+2. **OpenAI API quota-blocked verification:** after OpenAI quota is restored, set `CODEX_BACKUP_ENABLED='true'` only on a controlled test repo and verify Codex API `requested` -> real PR-head push and terminal states, including that `codex_agent_failed` posts only the intended `api_error` marker and never enters the normal patch download/apply path.
+3. **paywall-bot PR #73 sync refresh:** this upstream fix addresses the downstream Codex P2 finding, but paywall-bot was not modified directly. Refresh PR #73 through the normal sync, then re-check it before merge.
+4. **Downstream audit:** OPT PR #12 and TRF PR #80 are merged. Do not claim downstream workflow sync, secrets, variables, Actions permissions, or runtime health until checked from each repo's latest sync PR/current workflow contents and settings evidence.
+5. **Codex Cloud limitation:** View task, task diff, Created commit hint, or ready diff is not delivery unless the PR branch gets a newer commit after the Cloud marker. No browser/UI automation or fake Update branch API workaround exists.
+6. **Longer-term:** update minutes-guard target coverage after downstream audit; keep direct-to-main and branch-protection decisions explicit.
 
 Older items below are history. If they conflict with this section, treat them as HISTORICAL or SUPERSEDED and follow this section.
 
@@ -101,6 +102,7 @@ Synced workflows listed in `sync-config.json`: `codex-auto-fix.yml`, `codex-gate
 - Requires `OPENAI_API_KEY`, available quota, and write-capable workflow permissions in the target repo.
 - Agent job is read-only and gets only `OPENAI_API_KEY`; apply-and-push is the write-capable job.
 - Fork PRs are skipped/escalated before agent execution.
+- The 2026-07-09 downstream PR #73 P2 fix splits marker-only terminal paths from the normal patch path: after `codex_agent_failed`, apply-and-push posts only the intended `api_error` marker and does not resolve the PR head, check out, download `codex-patch`, apply, push, or emit `no_change`/`patch_failed` from a missing artifact.
 - Honest terminal states: `api_error`, `fixer_error`, `no_change`, `patch_failed`, `stale`, and `pushed`. Only a real branch commit after the request marker is delivery.
 
 ### `merge-bot.yml` — Merge Bot
@@ -123,7 +125,7 @@ Synced workflows listed in `sync-config.json`: `codex-auto-fix.yml`, `codex-gate
 | Repo | Status | Notes |
 |---|---|---|
 | automation-core | loop installed and live | Public source of truth and test bed. |
-| paywall-bot | partial | Has sync + gate + bridge synced per prior docs; current secrets/variables/runtime not checked in this pass. |
+| paywall-bot | sync refresh needed | PR #73 surfaced the Codex P2 fixed upstream on 2026-07-09; refresh by normal sync before merge. Current secrets/variables/runtime not checked in this pass. |
 | OptionsProfitTracker | onboarding PR #12 merged | Verified fact only. Current sync/secrets/variables/permissions/runtime health not checked in this pass. |
 | thai-rent-finder | onboarding PR #80 merged | Verified fact only. Current sync/secrets/variables/permissions/runtime health not checked in this pass. |
 | other downstream repos | via sync where bootstrapped | Do not claim synced or healthy without checking current evidence. |
