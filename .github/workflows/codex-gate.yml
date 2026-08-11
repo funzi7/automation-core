@@ -11,7 +11,8 @@ name: Codex Gate
 # make a review-thread finding stale. Thread state comes from GitHub GraphQL.
 # The authoritative decision implementation stays inline in this trusted
 # default-branch workflow. PR-controlled workflow, checkout and require paths
-# are forbidden; review events are rechecked by the trusted watchdog.
+# are forbidden; review events are rechecked through a default-branch
+# workflow_run relay, with the watchdog as a bounded fallback.
 # Trusted actor allowlisting, Summary/Testing quote stripping, reaction-based
 # clean signals, trusted-sync grace and intentional technical fail-soft remain.
 #
@@ -25,9 +26,14 @@ on:
   # text is never interpolated into executable script.
   issue_comment:
     types: [created, edited, deleted]
-  # Review/thread-resolution events have no equally trusted immediate trigger.
-  # The existing default-branch watchdog/manual dispatch performs the bounded
-  # re-check after Codex review activity.
+  # A pull_request_review workflow would execute from the untrusted PR merge
+  # ref. Codex Auto-Fix already receives that event (including clean reviews,
+  # whose job is skipped); its completed run relays here, where GitHub loads
+  # this evaluator from the default branch. This path uses GITHUB_TOKEN only,
+  # so clean reviews are rechecked even when AUTOMATION_PAT is unavailable.
+  workflow_run:
+    workflows: ['Codex Auto-Fix']
+    types: [completed]
   workflow_dispatch:
     inputs:
       pr_number:
@@ -72,7 +78,8 @@ jobs:
             //   workflow loaded from the trusted base/default branch
             // issue_comment → context.payload.issue (PRs are issues for
             //   the comments API; workflow ref is the default branch)
-            // workflow_dispatch (self-rerun / manual) → no PR payload at all,
+            // workflow_run → trusted default-branch relay for Codex review
+            //   activity; workflow_dispatch → no PR payload at all,
             //   the PR number comes through as an input; parse it back
             //   into a JS number so downstream filters compare correctly.
             let prNumbers = [];
@@ -81,6 +88,28 @@ jobs:
               prNumbers = [context.payload.pull_request.number];
             } else if (context.payload.issue?.pull_request) {
               prNumbers = [context.payload.issue.number];
+            } else if (context.eventName === 'workflow_run') {
+              const run = context.payload.workflow_run || {};
+              prNumbers = [...new Set(
+                (run.pull_requests || [])
+                  .map((pull) => Number(pull.number))
+                  .filter(Number.isFinite),
+              )];
+              // GitHub can omit workflow_run.pull_requests for some event
+              // shapes. Resolve against the run SHA without trusting a branch
+              // name supplied by PR code.
+              if (!prNumbers.length && run.head_sha) {
+                const associated = await github.paginate(
+                  github.rest.repos.listPullRequestsAssociatedWithCommit,
+                  { owner: context.repo.owner, repo: context.repo.repo, commit_sha: run.head_sha, per_page: 100 },
+                );
+                prNumbers = [...new Set(
+                  associated
+                    .filter((pull) => pull.state === 'open' && pull.base?.repo?.full_name === `${context.repo.owner}/${context.repo.repo}`)
+                    .map((pull) => Number(pull.number))
+                    .filter(Number.isFinite),
+                )];
+              }
             } else if (
               context.eventName === 'workflow_dispatch' &&
               context.payload.inputs?.pr_number

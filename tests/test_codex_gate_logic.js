@@ -198,6 +198,9 @@ test('authoritative workflow keeps gate policy inline', () => {
   );
   assert.match(workflow, /SECURITY: authoritative policy stays inline/);
   assert.match(workflow, /\n  pull_request_target:\n/);
+  assert.match(workflow, /\n  workflow_run:\n/);
+  assert.match(workflow, /workflows: \['Codex Auto-Fix'\]/);
+  assert.match(workflow, /listPullRequestsAssociatedWithCommit/);
   assert.doesNotMatch(workflow, /\n  pull_request:\n/);
   assert.doesNotMatch(workflow, /\n  pull_request_review(?:_comment)?:\n/);
   assert.doesNotMatch(workflow, /uses:\s*actions\/checkout/);
@@ -258,4 +261,17 @@ test('watchdog preserves a concurrently added manual needs-owner stop', () => {
   assert.match(watchdog, /if \(liveLabelNames\.has\(LABEL_ESCALATE\)\)/);
   assert.match(watchdog, /live needs-owner is manual\/unknown/);
   assert.match(watchdog, /could not prove needs-owner was absent/);
+});
+
+test('temporary escalation attaches the hard stop independently of provenance', () => {
+  for (const name of ['codex-auto-fix.yml', 'claude-fallback-watchdog.yml']) {
+    const workflow = fs.readFileSync(
+      path.join(__dirname, '..', '.github', 'workflows', name),
+      'utf8',
+    );
+    assert.match(workflow, /labels: \[hardStop\.name\]/);
+    assert.match(workflow, /hard stop remains without transient provenance/);
+    assert.match(workflow, /labels: \[provenance\.name\]/);
+    assert.doesNotMatch(workflow, /labels: escalationLabels\.map/);
+  }
 });
