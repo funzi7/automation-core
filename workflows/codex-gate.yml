@@ -7,8 +7,9 @@ name: Codex Gate
 # A finding clears only when its thread is resolved, or GitHub marks it outdated
 # and Codex supplies a current-head signal with no active replacement finding,
 # or the explicit `codex-p1-acknowledged` administrator label is present.
-# Commit timestamps establish current-head review freshness only; they never
-# make a review-thread finding stale. Thread state comes from GitHub GraphQL.
+# Current-head review freshness is bound to the review's exact commit marker or
+# to a signal after an Actions-observed head transition; Git commit timestamps
+# are never used. Thread state comes from GitHub GraphQL.
 # The authoritative decision implementation stays inline in this trusted
 # default-branch workflow. PR-controlled workflow, checkout and require paths
 # are forbidden; review events are rechecked through a default-branch
@@ -62,8 +63,9 @@ permissions:
   contents: read
   pull-requests: read
   issues: read
-  # fix #25: `actions:` dropped — the only consumer was the deleted self-rerun
-  # poll (getWorkflowRun/listWorkflowRuns read + createWorkflowDispatch write).
+  # Current-head freshness uses the latest pull_request workflow run for the
+  # exact SHA as the server-observed head-transition floor.
+  actions: read
   # fix #11: publish the explicit `check-codex-status` check-run with output text.
   checks: write
 
@@ -188,6 +190,37 @@ jobs:
               if (P1_PATTERN.test(semantic)) return 'P1';
               if (P2_PATTERN.test(semantic)) return 'P2';
               return null;
+            }
+
+            const REVIEWED_COMMIT_PATTERN = /(?:^|\n)\*\*Reviewed commit:\*\*\s*`([a-f0-9]{10,40})`(?:\s|$)/i;
+            function signalTargetsHead(item, headSha, headObservedAt, dateField = 'created_at') {
+              const exactHead = String(headSha || '').toLowerCase();
+              if (!/^[a-f0-9]{40}$/.test(exactHead)) return false;
+              const originalCommit = String(item?.original_commit_id || '').toLowerCase();
+              if (originalCommit) return originalCommit === exactHead;
+              const commit = String(item?.commit_id || '').toLowerCase();
+              if (commit) return commit === exactHead;
+              const marker = String(item?.body || '').match(REVIEWED_COMMIT_PATTERN)?.[1]?.toLowerCase();
+              if (marker) return exactHead.startsWith(marker);
+              const signalAt = new Date(item?.[dateField] || 0).getTime();
+              const observedAt = new Date(headObservedAt || 0).getTime();
+              return Number.isFinite(signalAt) && Number.isFinite(observedAt) &&
+                observedAt > 0 && signalAt > observedAt;
+            }
+
+            async function observedHeadTransition(prNumber, headSha) {
+              const runs = await github.paginate(
+                github.rest.actions.listWorkflowRunsForRepo,
+                { owner, repo, head_sha: headSha, event: 'pull_request', per_page: 100 },
+              );
+              const observed = runs
+                .filter((run) => (
+                  run.head_sha === headSha &&
+                  (run.pull_requests || []).some((candidate) => candidate.number === prNumber)
+                ))
+                .map((run) => new Date(run.created_at || 0).getTime())
+                .filter((value) => Number.isFinite(value) && value > 0);
+              return observed.length ? new Date(Math.max(...observed)) : null;
             }
 
             function authorLogin(comment) {
@@ -353,6 +386,12 @@ jobs:
                 const reactions = await github.paginate(github.rest.reactions.listForIssue, {
                   owner, repo, issue_number: prNumber, per_page: 100,
                 });
+                let headObservedAt = null;
+                try {
+                  headObservedAt = await observedHeadTransition(prNumber, headSha);
+                } catch (e) {
+                  core.warning(`PR #${prNumber}: exact-head transition lookup failed; unmarked review signals and sync grace stay pending: ${e.message}`);
+                }
 
                 // Inline review-thread state is authoritative for P1/P2
                 // liveness. REST comment timestamps cannot tell whether a
@@ -410,80 +449,64 @@ jobs:
                   codexReviews.length + codexComments.length +
                   codexReviewComments.length + codexReactions.length;
 
-                const prCommits = await github.paginate(github.rest.pulls.listCommits, {
-                  owner, repo, pull_number: prNumber, per_page: 100,
-                });
-                // latestCommitDate = the MAX committer date across the PR's
-                // commits. Don't assume listCommits returns them sorted — take
-                // the max explicitly so a P1's "after the latest commit?" test
-                // is always against the real newest commit.
-                const latestCommitDate = prCommits.length > 0
-                  ? new Date(Math.max(...prCommits.map(c => new Date(c.commit.committer.date).getTime())))
-                  : new Date(pr.created_at);
-
-                // A Codex signal counts as "on the current head" ONLY if it is
-                // DATED AFTER the latest commit. commit_id is deliberately NOT
-                // used for freshness: GitHub RE-POINTS a still-applicable inline
-                // comment's commit_id to the new head, so commit_id == headSha
-                // does NOT mean Codex reviewed the new commit — it can be an old
-                // (stale) comment whose line still exists. Using the SAME
-                // date-after-latest-commit is used ONLY for current-head
-                // signal freshness. Finding liveness comes exclusively from
-                // reviewThreads.isResolved/isOutdated below.
-                const onHead = (date) => !!date && new Date(date) > latestCommitDate;
+                // Exact review.commit_id / Codex's Reviewed commit marker binds
+                // directly to the SHA. Other surfaces (including reactions and
+                // repointed inline comments) count only after GitHub Actions
+                // observed this SHA as this PR's head. Git commit dates are not
+                // push/head-transition timestamps and are never used here.
+                const onHead = (item, dateField) =>
+                  signalTargetsHead(item, headSha, headObservedAt, dateField);
 
                 const allBodies = [
                   ...codexReviews.map(r => ({
                     body: r.body || '',
                     bodyForP1: stripSummarySections(r.body || ''),
                     date: r.submitted_at,
-                    onHead: onHead(r.submitted_at),
+                    onHead: onHead(r, 'submitted_at'),
                   })),
                   ...codexComments.map(c => ({
                     body: c.body || '',
                     bodyForP1: stripSummarySections(c.body || ''),
                     date: c.created_at,
-                    onHead: onHead(c.created_at),
+                    onHead: onHead(c, 'created_at'),
                   })),
                   ...codexReviewComments.map(c => ({
                     body: c.body || '',
                     bodyForP1: stripSummarySections(c.body || ''),
                     date: c.created_at,
-                    onHead: onHead(c.created_at),
+                    onHead: onHead(c, 'created_at'),
                   })),
                 ].sort((a, b) => new Date(a.date) - new Date(b.date));
 
-                // A 👍 reaction counts as "reviewed, no issues" ONLY if it is
-                // dated after the latest commit (Codex must react on the NEW
-                // head). The 👍 fires no event, so the watchdog sweep catches it.
+                // An unmarked 👍 counts only after the server-observed head
+                // transition. The watchdog sweep catches this no-event signal.
                 const codexThumbsUpOnHead = reactions.some(
-                  r => isCodex(r.user) && r.content === '+1' &&
-                       new Date(r.created_at) > latestCommitDate
+                  r => isCodex(r.user) && r.content === '+1' && onHead(r, 'created_at')
                 );
 
                 // Has Codex actually reviewed the CURRENT head? = any Codex
-                // signal (review / comment / inline / 👍) DATED after the latest
-                // commit. This does not stale an active review thread.
+                // signal explicitly bound to the SHA or observed after its
+                // head transition. This does not stale an active review thread.
                 const hasCodexSignalOnHead =
                   allBodies.some(item => item.onHead) || codexThumbsUpOnHead;
 
                 // Review bodies and top-level PR comments can carry trusted
                 // P1/P2 findings without an inline review thread. They remain
-                // active for this head whenever posted after its latest commit;
-                // a later clean signal cannot erase them. A fixing commit makes
-                // them stale and still requires a fresh current-head review.
+                // active only when explicitly bound to this SHA or posted after
+                // its observed head transition; a later clean signal cannot
+                // erase them. A new head still requires a fresh review.
                 const nonInlineFindings = [
                   ...codexReviews.map((review) => ({
                     body: review.body || '',
-                    date: review.submitted_at,
+                    onHead: onHead(review, 'submitted_at'),
                     channel: 'review body',
                   })),
                   ...codexComments.map((comment) => ({
                     body: comment.body || '',
-                    date: comment.created_at,
+                    onHead: onHead(comment, 'created_at'),
                     channel: 'PR comment',
                   })),
-                ].filter((item) => onHead(item.date) && severity(item.body))
+                ].filter((item) => item.onHead && severity(item.body))
                   .map((item) => ({
                     severity: severity(item.body),
                     path: `(${item.channel})`,
@@ -523,7 +546,9 @@ jobs:
                   // A stale/outdated finding is evidence of engagement and
                   // therefore can never take this bypass.
                   const graceMs = SYNC_GRACE_MINUTES * 60 * 1000;
-                  const headAgeMs = Date.now() - latestCommitDate.getTime();
+                  const headAgeMs = headObservedAt
+                    ? Date.now() - headObservedAt.getTime()
+                    : 0;
                   const silentTrustedSync =
                     isTrustedSync(pr) && codexSignalCount === 0 &&
                     gateDecision.reason === 'current_head_review_pending';

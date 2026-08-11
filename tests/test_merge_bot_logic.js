@@ -329,7 +329,10 @@ test('workflow preserves exact-SHA squash merge and same-repo branch deletion', 
   assert.match(workflow, /Number\(root\[1\]\) !== prNumber/);
   assert.match(workflow, /!commitShas\.has\(head\[1\]\)/);
   assert.match(workflow, /marker\.head === currentHead/);
-  assert.match(workflow, /async function hasCurrentHeadCodexSignal\(prNumber\)/);
+  assert.match(workflow, /async function hasCurrentHeadCodexSignal\(prNumber, headSha\)/);
+  assert.match(workflow, /async function observedHeadTransition\(prNumber, headSha\)/);
+  assert.match(workflow, /function signalTargetsHead\(item, headSha, headObservedAt/);
+  assert.doesNotMatch(workflow, /latestCommitDate/);
   assert.match(workflow, /override absent and current-head Codex signal missing/);
   assert.match(workflow, /needsEvent\.actor\?\.login === 'github-actions\[bot\]'/);
   assert.match(workflow, /autoEvent\.actor\?\.login === 'github-actions\[bot\]'/);
@@ -385,4 +388,20 @@ test('only temporary PR automation writers add needs-owner-auto', () => {
   assert.doesNotMatch(read('claude.yml'), /needs-owner-auto/);
   assert.doesNotMatch(read('codex-backup-fix.yml'), /needs-owner-auto/);
   assert.doesNotMatch(read('ci-doctor.yml'), /needs-owner-auto/);
+});
+
+test('synced review freshness never uses the removed latest-commit-date model', () => {
+  for (const name of [
+    'codex-auto-fix.yml',
+    'codex-gate.yml',
+    'merge-bot.yml',
+    'claude-fallback-watchdog.yml',
+    'codex-backup-fix.yml',
+  ]) {
+    const workflow = fs.readFileSync(
+      path.join(__dirname, '..', 'workflows', name),
+      'utf8',
+    );
+    assert.doesNotMatch(workflow, /latestCommitDate/);
+  }
 });

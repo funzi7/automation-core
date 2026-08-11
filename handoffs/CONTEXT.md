@@ -128,7 +128,7 @@ The Codex API backup is dormant by default and requires OpenAI quota plus `CODEX
 
 ### `codex-gate.yml`
 
-The gate blocks until Codex has reviewed the current head and no active P1/P2 remains. It uses date-only freshness against the max commit date and does not trust `commit_id` for freshness. Trusted sync grace-green only applies to zero-signal trusted sync PRs after the grace window.
+The gate blocks until Codex has reviewed the current head and no active P1/P2 remains. Review objects and Codex result comments bind to the exact SHA; unmarked signals must follow an Actions-observed head transition, and Git commit dates are never treated as push times. Repointable inline `commit_id` values alone do not waive review. Trusted sync grace-green only applies to zero-signal trusted sync PRs after the server-observed grace window.
 
 ### `merge-bot.yml`
 

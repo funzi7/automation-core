@@ -4,7 +4,11 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
-const { decideCodexGate, severity } = require('../tools/codex_gate_logic');
+const {
+  decideCodexGate,
+  severity,
+  signalTargetsHead,
+} = require('../tools/codex_gate_logic');
 
 const CODEX = 'chatgpt-codex-connector';
 const CODEX_REST = 'chatgpt-codex-connector[bot]';
@@ -57,6 +61,50 @@ test('current-head non-inline trusted finding blocks despite clean signal', () =
   });
   assert.equal(result.status, 'blocked');
   assert.equal(result.reason, 'active_current_head_non_inline_finding');
+});
+
+test('review freshness is bound to the actual head, not a backdated commit', () => {
+  const oldReview = {
+    submitted_at: '2026-08-11T13:00:00Z',
+    commit_id: 'a'.repeat(40),
+    body: '**Reviewed commit:** `aaaaaaaaaa`',
+  };
+  assert.equal(
+    signalTargetsHead(oldReview, 'b'.repeat(40), '2026-08-11T14:00:00Z', 'submitted_at'),
+    false,
+  );
+  assert.equal(
+    signalTargetsHead(oldReview, 'a'.repeat(40), '2026-08-11T14:00:00Z', 'submitted_at'),
+    true,
+  );
+});
+
+test('unmarked current-head signal must follow the observed head transition', () => {
+  const signal = { created_at: '2026-08-11T15:00:00Z', body: 'clean' };
+  assert.equal(signalTargetsHead(signal, 'c'.repeat(40), '2026-08-11T14:00:00Z'), true);
+  assert.equal(signalTargetsHead(signal, 'c'.repeat(40), '2026-08-11T16:00:00Z'), false);
+  assert.equal(signalTargetsHead(signal, 'c'.repeat(40), null), false);
+});
+
+test('an explicit mismatched commit never falls back to a later timestamp', () => {
+  const delayedOldReview = {
+    submitted_at: '2026-08-11T17:00:00Z',
+    commit_id: 'd'.repeat(40),
+    body: '**Reviewed commit:** `dddddddddd`',
+  };
+  assert.equal(
+    signalTargetsHead(delayedOldReview, 'e'.repeat(40), '2026-08-11T16:00:00Z', 'submitted_at'),
+    false,
+  );
+  const repointedInline = {
+    created_at: '2026-08-11T17:00:00Z',
+    original_commit_id: 'd'.repeat(40),
+    commit_id: 'e'.repeat(40),
+  };
+  assert.equal(
+    signalTargetsHead(repointedInline, 'e'.repeat(40), '2026-08-11T16:00:00Z'),
+    false,
+  );
 });
 
 test('resolved thread clears with a current-head signal', () => {
@@ -205,6 +253,10 @@ test('authoritative workflow keeps gate policy inline', () => {
   assert.match(workflow, /group: codex-gate-\$\{\{ github\.repository \}\}/);
   assert.match(workflow, /cron: '7,22,37,52 \* \* \* \*'/);
   assert.match(workflow, /context\.eventName === 'schedule'/);
+  assert.match(workflow, /async function observedHeadTransition\(prNumber, headSha\)/);
+  assert.match(workflow, /function signalTargetsHead\(item, headSha, headObservedAt/);
+  assert.match(workflow, /actions: read/);
+  assert.doesNotMatch(workflow, /latestCommitDate/);
   assert.doesNotMatch(workflow, /\n  pull_request:\n/);
   assert.doesNotMatch(workflow, /\n  pull_request_review(?:_comment)?:\n/);
   assert.doesNotMatch(workflow, /uses:\s*actions\/checkout/);

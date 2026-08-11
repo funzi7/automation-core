@@ -22,6 +22,7 @@ permissions:
   contents: read
   pull-requests: write
   issues: write
+  actions: read
   # fix #18: the late-signal sweep reads codex-gate-verdict check-runs on the
   # GITHUB_TOKEN readonly client (fine-grained PATs can't hold Checks).
   checks: read
@@ -543,6 +544,7 @@ jobs:
               return out;
             }
             const roCheckRuns = (ref) => roPaged(`/repos/${owner}/${repo}/commits/${encodeURIComponent(ref)}/check-runs?per_page=100`, (d) => d.check_runs || []);
+            const roWorkflowRuns = (ref) => roPaged(`/repos/${owner}/${repo}/actions/runs?head_sha=${encodeURIComponent(ref)}&event=pull_request&per_page=100`, (d) => d.workflow_runs || []);
             // Verbatim from codex-gate.yml's pending publish call.
             const PENDING_TITLE = '🟡 Waiting for Codex review';
             const GATE_WORKFLOW = 'codex-gate.yml';
@@ -578,6 +580,29 @@ jobs:
               const semantic = stripSummarySections(body);
               return P1_PATTERN.test(semantic) || P2_PATTERN.test(semantic);
             };
+            const REVIEWED_COMMIT_PATTERN = /(?:^|\n)\*\*Reviewed commit:\*\*\s*`([a-f0-9]{10,40})`(?:\s|$)/i;
+            const signalTargetsHead = (item, headSha, headObservedAt, dateField = 'created_at') => {
+              const exactHead = String(headSha || '').toLowerCase();
+              const originalCommit = String(item?.original_commit_id || '').toLowerCase();
+              if (originalCommit) return originalCommit === exactHead;
+              const commit = String(item?.commit_id || '').toLowerCase();
+              if (commit) return commit === exactHead;
+              const marker = String(item?.body || '').match(REVIEWED_COMMIT_PATTERN)?.[1]?.toLowerCase();
+              if (marker) return exactHead.startsWith(marker);
+              const signalAt = new Date(item?.[dateField] || 0).getTime();
+              const observedAt = new Date(headObservedAt || 0).getTime();
+              return Number.isFinite(signalAt) && Number.isFinite(observedAt) &&
+                observedAt > 0 && signalAt > observedAt;
+            };
+            async function observedHeadTransition(prNumber, headSha) {
+              const runs = await roWorkflowRuns(headSha);
+              const observed = runs
+                .filter((run) => run.head_sha === headSha &&
+                  (run.pull_requests || []).some((candidate) => candidate.number === prNumber))
+                .map((run) => new Date(run.created_at || 0).getTime())
+                .filter((value) => Number.isFinite(value) && value > 0);
+              return observed.length ? new Date(Math.max(...observed)) : null;
+            }
 
             async function hasActiveTrustedFinding(prNumber) {
               let cursor = null;
@@ -615,7 +640,7 @@ jobs:
               return false;
             }
 
-            async function hasCurrentHeadNonInlineFinding(prNumber, latestCommitDate) {
+            async function hasCurrentHeadNonInlineFinding(prNumber, headSha, headObservedAt) {
               const [reviews, comments] = await Promise.all([
                 github.paginate(github.rest.pulls.listReviews, {
                   owner, repo, pull_number: prNumber, per_page: 100,
@@ -626,13 +651,13 @@ jobs:
               ]);
               return (
                 reviews.some((review) =>
-                  isCodex(review.user) && review.submitted_at &&
-                  new Date(review.submitted_at) > latestCommitDate &&
+                  isCodex(review.user) &&
+                  signalTargetsHead(review, headSha, headObservedAt, 'submitted_at') &&
                   hasSeverity(review.body)
                 ) ||
                 comments.some((comment) =>
-                  isCodex(comment.user) && comment.created_at &&
-                  new Date(comment.created_at) > latestCommitDate &&
+                  isCodex(comment.user) &&
+                  signalTargetsHead(comment, headSha, headObservedAt, 'created_at') &&
                   hasSeverity(comment.body)
                 )
               );
@@ -710,14 +735,12 @@ jobs:
                     }
                   } catch (e) { core.info(`update-branch check PR #${prNumber} (ignored): ${e.message}`); }
 
-                  // latestCommitDate — computed EXACTLY as the gate does: the MAX
-                  // committer date across the PR's commits (else pr.created_at).
-                  const prCommits = await github.paginate(github.rest.pulls.listCommits, {
-                    owner, repo, pull_number: prNumber, per_page: 100,
-                  });
-                  const latestCommitDate = prCommits.length > 0
-                    ? new Date(Math.max(...prCommits.map(c => new Date(c.commit.committer.date).getTime())))
-                    : new Date(pr.created_at);
+                  let headObservedAt = null;
+                  try {
+                    headObservedAt = await observedHeadTransition(prNumber, headSha);
+                  } catch (e) {
+                    core.info(`PR #${prNumber}: head-transition lookup failed; unmarked signals and sync grace remain pending: ${e.message}`);
+                  }
 
                   // Newest authoritative check-codex-status run on the head (READ → GITHUB_TOKEN).
                   const checkRuns = await roCheckRuns(headSha);
@@ -742,7 +765,7 @@ jobs:
                   if (verdictGreen || activeFindingVerdict) {
                     activeFindingNow = (
                       await hasActiveTrustedFinding(prNumber) ||
-                      await hasCurrentHeadNonInlineFinding(prNumber, latestCommitDate)
+                      await hasCurrentHeadNonInlineFinding(prNumber, headSha, headObservedAt)
                     );
                   }
                   // An explicit administrator acknowledgement intentionally
@@ -756,26 +779,29 @@ jobs:
                     greenHeadNewFinding;
                   if (!isCandidate) continue;
 
-                  // FRESH Codex signal on the head, mirroring the gate's matchers:
-                  // a Codex review submitted_at > latestCommitDate, OR a Codex-
-                  // authored issue-level 👍 created_at > latestCommitDate.
-                  const [reviews, reactions] = await Promise.all([
+                  // Current-head Codex signal, mirroring the gate's exact SHA
+                  // marker / observed-transition model across every channel.
+                  const [reviews, comments, reviewComments, reactions] = await Promise.all([
                     github.paginate(github.rest.pulls.listReviews, {
+                      owner, repo, pull_number: prNumber, per_page: 100,
+                    }),
+                    github.paginate(github.rest.issues.listComments, {
+                      owner, repo, issue_number: prNumber, per_page: 100,
+                    }),
+                    github.paginate(github.rest.pulls.listReviewComments, {
                       owner, repo, pull_number: prNumber, per_page: 100,
                     }),
                     github.paginate(github.rest.reactions.listForIssue, {
                       owner, repo, issue_number: prNumber, per_page: 100,
                     }),
                   ]);
-                  const freshReview = reviews.some(
-                    (r) => isCodex(r.user) && r.submitted_at &&
-                           new Date(r.submitted_at) > latestCommitDate
-                  );
-                  const freshThumbs = reactions.some(
-                    (r) => isCodex(r.user) && r.content === '+1' &&
-                           new Date(r.created_at) > latestCommitDate
-                  );
-                  const freshSignal = freshReview || freshThumbs;
+                  const onHead = (item, dateField) =>
+                    isCodex(item.user) && signalTargetsHead(item, headSha, headObservedAt, dateField);
+                  const freshSignal =
+                    reviews.some((item) => onHead(item, 'submitted_at')) ||
+                    comments.some((item) => onHead(item, 'created_at')) ||
+                    reviewComments.some((item) => onHead(item, 'created_at')) ||
+                    reactions.some((item) => item.content === '+1' && onHead(item, 'created_at'));
 
                   // Dispatch a pending/missing verdict for a fresh Codex signal,
                   // a silent trusted-sync after grace, or an explicit override. A
@@ -783,7 +809,9 @@ jobs:
                   // the trusted evaluator then decides clear versus pending from the
                   // authoritative thread state and current-head signal.
                   const graceMs = SYNC_GRACE_MINUTES * 60 * 1000;
-                  const headAgeMs = Date.now() - latestCommitDate.getTime();
+                  const headAgeMs = headObservedAt
+                    ? Date.now() - headObservedAt.getTime()
+                    : 0;
                   const silentSyncStale = isTrustedSync(pr) && headAgeMs > graceMs;
                   if (
                     !freshSignal && !silentSyncStale &&

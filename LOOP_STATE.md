@@ -86,7 +86,7 @@ Synced workflows listed in `sync-config.json`: `codex-auto-fix.yml`, `codex-gate
 ### `codex-auto-fix.yml` — Bridge + Codex summary archive
 
 - Bridge triggers exactly one `@claude fix` per review wave when trusted Codex reports active P1 or P2. P3 is excluded.
-- P1/P2 detection is badge-token based (`P1-orange`, `P2-yellow`) and freshness is date-after-latest-commit.
+- P1/P2 detection is badge-token based (`P1-orange`, `P2-yellow`) and feedback is bound to the exact head through review `commit_id`, Codex's `Reviewed commit` marker, or an authenticated `ai-loop` head marker.
 - The bridge inlines the actual P1/P2 finding text because Claude's run context cannot reliably read inline review threads.
 - Sync PRs are suppressed because findings belong upstream in automation-core, not in downstream copied workflow files.
 - Circuit breaker: 3 rounds -> `needs-owner` + Telegram if configured.
@@ -96,7 +96,7 @@ Synced workflows listed in `sync-config.json`: `codex-auto-fix.yml`, `codex-gate
 - `check-codex-status` is the blocking check.
 - Green requires Codex has reviewed the current head and no active P1/P2 remains.
 - P1 and P2 both block; this must match bridge-trigger severity. Historical P1-only behavior is SUPERSEDED.
-- Freshness is date-only against the max committer date across PR commits; `commit_id` is not trusted for freshness because GitHub can repoint inline comments.
+- Freshness is never inferred from Git author/committer dates. Review objects and Codex result comments bind directly to the exact SHA; unmarked surfaces count only after a GitHub Actions `pull_request` run observed that SHA as this PR's head. Repointable inline `commit_id` values alone do not waive current-head review.
 - Trusted-sync grace-green is limited to zero-Codex-signal sync PRs older than `SYNC_GRACE_MINUTES`.
 - The old in-run self-rerun poll is gone; the watchdog sweep handles late Codex signals and override-label dispatches.
 

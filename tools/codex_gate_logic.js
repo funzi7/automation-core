@@ -18,6 +18,22 @@ const TRUSTED_CODEX_LOGINS = new Set([
 ]);
 const P1_PATTERN = /(?:P1-orange|(?:^|\n)[\s>*\-_#`]*(?:\*\*\s*P1\s*\*\*|\[P1\]|P1:))/i;
 const P2_PATTERN = /(?:P2-yellow|(?:^|\n)[\s>*\-_#`]*(?:\*\*\s*P2\s*\*\*|\[P2\]|P2:))/i;
+const REVIEWED_COMMIT_PATTERN = /(?:^|\n)\*\*Reviewed commit:\*\*\s*`([a-f0-9]{10,40})`(?:\s|$)/i;
+
+function signalTargetsHead(item, headSha, headObservedAt = null, dateField = 'created_at') {
+  const exactHead = String(headSha || '').toLowerCase();
+  if (!/^[a-f0-9]{40}$/.test(exactHead)) return false;
+  const originalCommit = String(item?.original_commit_id || '').toLowerCase();
+  if (originalCommit) return originalCommit === exactHead;
+  const commit = String(item?.commit_id || '').toLowerCase();
+  if (commit) return commit === exactHead;
+  const marker = String(item?.body || '').match(REVIEWED_COMMIT_PATTERN)?.[1]?.toLowerCase();
+  if (marker) return exactHead.startsWith(marker);
+  const signalAt = new Date(item?.[dateField] || 0).getTime();
+  const observedAt = new Date(headObservedAt || 0).getTime();
+  return Number.isFinite(signalAt) && Number.isFinite(observedAt) &&
+    observedAt > 0 && signalAt > observedAt;
+}
 
 function stripSummarySections(body) {
   if (!body) return '';
@@ -137,6 +153,8 @@ module.exports = {
   TRUSTED_CODEX_LOGINS,
   P1_PATTERN,
   P2_PATTERN,
+  REVIEWED_COMMIT_PATTERN,
+  signalTargetsHead,
   stripSummarySections,
   severity,
   findingFromThread,

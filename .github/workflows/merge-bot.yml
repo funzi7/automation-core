@@ -31,6 +31,7 @@ permissions:
   contents: write
   pull-requests: write
   issues: write
+  actions: read
   checks: read
   statuses: read
 
@@ -139,6 +140,7 @@ jobs:
             }
             const roCheckRuns = (ref) => roPaged(`/repos/${owner}/${repo}/commits/${encodeURIComponent(ref)}/check-runs?per_page=100`, (d) => d.check_runs || []);
             const roStatuses = (ref) => roPaged(`/repos/${owner}/${repo}/commits/${encodeURIComponent(ref)}/statuses?per_page=100`, (d) => d);
+            const roWorkflowRuns = (ref) => roPaged(`/repos/${owner}/${repo}/actions/runs?head_sha=${encodeURIComponent(ref)}&event=pull_request&per_page=100`, (d) => d.workflow_runs || []);
             const CODEX_CHECK = 'check-codex-status';
             const LABEL_AUTOMERGE = 'automerge';
             const LABEL_ESCALATE = 'needs-owner';
@@ -201,6 +203,34 @@ jobs:
               return P1_PATTERN.test(semantic) || P2_PATTERN.test(semantic);
             }
 
+            const REVIEWED_COMMIT_PATTERN = /(?:^|\n)\*\*Reviewed commit:\*\*\s*`([a-f0-9]{10,40})`(?:\s|$)/i;
+            function signalTargetsHead(item, headSha, headObservedAt, dateField = 'created_at') {
+              const exactHead = String(headSha || '').toLowerCase();
+              if (!/^[a-f0-9]{40}$/.test(exactHead)) return false;
+              const originalCommit = String(item?.original_commit_id || '').toLowerCase();
+              if (originalCommit) return originalCommit === exactHead;
+              const commit = String(item?.commit_id || '').toLowerCase();
+              if (commit) return commit === exactHead;
+              const marker = String(item?.body || '').match(REVIEWED_COMMIT_PATTERN)?.[1]?.toLowerCase();
+              if (marker) return exactHead.startsWith(marker);
+              const signalAt = new Date(item?.[dateField] || 0).getTime();
+              const observedAt = new Date(headObservedAt || 0).getTime();
+              return Number.isFinite(signalAt) && Number.isFinite(observedAt) &&
+                observedAt > 0 && signalAt > observedAt;
+            }
+
+            async function observedHeadTransition(prNumber, headSha) {
+              const runs = await roWorkflowRuns(headSha);
+              const observed = runs
+                .filter((run) => (
+                  run.head_sha === headSha &&
+                  (run.pull_requests || []).some((candidate) => candidate.number === prNumber)
+                ))
+                .map((run) => new Date(run.created_at || 0).getTime())
+                .filter((value) => Number.isFinite(value) && value > 0);
+              return observed.length ? new Date(Math.max(...observed)) : null;
+            }
+
             async function hasActiveTrustedFinding(prNumber) {
               let cursor = null;
               do {
@@ -238,44 +268,32 @@ jobs:
               return false;
             }
 
-            async function hasCurrentHeadNonInlineFinding(prNumber) {
-              const [commits, reviews, comments] = await Promise.all([
-                github.paginate(github.rest.pulls.listCommits, {
-                  owner, repo, pull_number: prNumber, per_page: 100,
-                }),
+            async function hasCurrentHeadNonInlineFinding(prNumber, headSha) {
+              const [reviews, comments, headObservedAt] = await Promise.all([
                 github.paginate(github.rest.pulls.listReviews, {
                   owner, repo, pull_number: prNumber, per_page: 100,
                 }),
                 github.paginate(github.rest.issues.listComments, {
                   owner, repo, issue_number: prNumber, per_page: 100,
                 }),
+                observedHeadTransition(prNumber, headSha),
               ]);
-              const latestCommitDate = commits.length
-                ? new Date(Math.max(...commits.map((commit) =>
-                  new Date(commit.commit.committer.date).getTime()
-                )))
-                : new Date(0);
               return (
                 reviews.some((review) =>
                   TRUSTED_CODEX_LOGINS.has(review.user?.login || '') &&
-                  review.submitted_at &&
-                  new Date(review.submitted_at) > latestCommitDate &&
+                  signalTargetsHead(review, headSha, headObservedAt, 'submitted_at') &&
                   hasSeverity(review.body)
                 ) ||
                 comments.some((comment) =>
                   TRUSTED_CODEX_LOGINS.has(comment.user?.login || '') &&
-                  comment.created_at &&
-                  new Date(comment.created_at) > latestCommitDate &&
+                  signalTargetsHead(comment, headSha, headObservedAt, 'created_at') &&
                   hasSeverity(comment.body)
                 )
               );
             }
 
-            async function hasCurrentHeadCodexSignal(prNumber) {
-              const [commits, reviews, comments, reviewComments, reactions] = await Promise.all([
-                github.paginate(github.rest.pulls.listCommits, {
-                  owner, repo, pull_number: prNumber, per_page: 100,
-                }),
+            async function hasCurrentHeadCodexSignal(prNumber, headSha) {
+              const [reviews, comments, reviewComments, reactions, headObservedAt] = await Promise.all([
                 github.paginate(github.rest.pulls.listReviews, {
                   owner, repo, pull_number: prNumber, per_page: 100,
                 }),
@@ -288,15 +306,11 @@ jobs:
                 github.paginate(github.rest.reactions.listForIssue, {
                   owner, repo, issue_number: prNumber, per_page: 100,
                 }),
+                observedHeadTransition(prNumber, headSha),
               ]);
-              const latestCommitDate = commits.length
-                ? new Date(Math.max(...commits.map((commit) =>
-                  new Date(commit.commit.committer.date).getTime()
-                )))
-                : new Date(0);
               const trustedAfterHead = (item, dateField) =>
                 TRUSTED_CODEX_LOGINS.has(item.user?.login || '') &&
-                item[dateField] && new Date(item[dateField]) > latestCommitDate;
+                signalTargetsHead(item, headSha, headObservedAt, dateField);
               return (
                 reviews.some((item) => trustedAfterHead(item, 'submitted_at')) ||
                 comments.some((item) => trustedAfterHead(item, 'created_at')) ||
@@ -307,10 +321,10 @@ jobs:
               );
             }
 
-            async function hasActiveTrustedBlocker(prNumber) {
+            async function hasActiveTrustedBlocker(prNumber, headSha) {
               return (
                 await hasActiveTrustedFinding(prNumber) ||
-                await hasCurrentHeadNonInlineFinding(prNumber)
+                await hasCurrentHeadNonInlineFinding(prNumber, headSha)
               );
             }
 
@@ -654,7 +668,7 @@ jobs:
               if (
                 !initialLabels.has(CODEX_OVERRIDE_LABEL) &&
                 !isTrustedSync(pr) &&
-                !(await hasCurrentHeadCodexSignal(prNumber))
+                !(await hasCurrentHeadCodexSignal(prNumber, headSha))
               ) {
                 core.info(`#${prNumber}: no trusted Codex signal on current head, skip`);
                 continue;
@@ -663,7 +677,7 @@ jobs:
               // contain no unresolved, non-outdated trusted P1/P2 finding.
               if (
                 !initialLabels.has(CODEX_OVERRIDE_LABEL) &&
-                await hasActiveTrustedBlocker(prNumber)
+                await hasActiveTrustedBlocker(prNumber, headSha)
               ) {
                 core.info(`#${prNumber}: active trusted Codex P1/P2 finding, skip`);
                 continue;
@@ -732,14 +746,14 @@ jobs:
               if (
                 !finalLabels.has(CODEX_OVERRIDE_LABEL) &&
                 !isTrustedSync(finalPr) &&
-                !(await hasCurrentHeadCodexSignal(prNumber))
+                !(await hasCurrentHeadCodexSignal(prNumber, headSha))
               ) {
                 core.info(`#${prNumber}: override absent and current-head Codex signal missing after validation, skip`);
                 continue;
               }
               if (
                 !finalLabels.has(CODEX_OVERRIDE_LABEL) &&
-                await hasActiveTrustedBlocker(prNumber)
+                await hasActiveTrustedBlocker(prNumber, headSha)
               ) {
                 core.info(`#${prNumber}: trusted P1/P2 appeared after validation, skip`);
                 continue;
