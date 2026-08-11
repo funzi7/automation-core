@@ -198,6 +198,7 @@ test('authoritative workflow keeps gate policy inline', () => {
   );
   assert.match(workflow, /SECURITY: authoritative policy stays inline/);
   assert.match(workflow, /\n  pull_request_target:\n/);
+  assert.match(workflow, /types: \[opened, synchronize, reopened, labeled, unlabeled\]/);
   assert.match(workflow, /\n  workflow_run:\n/);
   assert.match(workflow, /workflows: \['Codex Auto-Fix'\]/);
   assert.match(workflow, /listPullRequestsAssociatedWithCommit/);

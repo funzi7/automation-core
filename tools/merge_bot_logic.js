@@ -194,6 +194,7 @@ function evaluateMergePolicy({
   protectedPathHit = false,
   legacyAutomationProven = false,
   companionAutomationProven = false,
+  currentHeadCodexSignal = true,
   evaluatedHead = pr?.head?.sha,
   currentHead = pr?.head?.sha,
 } = {}) {
@@ -219,6 +220,13 @@ function evaluateMergePolicy({
 
   const checks = evaluateHeadChecks(checkRuns, statuses);
   if (!checks.eligible) return checks;
+  if (
+    !labels.has(CODEX_OVERRIDE_LABEL) &&
+    !isTrustedSync(pr, repositoryFullName) &&
+    !currentHeadCodexSignal
+  ) {
+    return { eligible: false, reason: 'current_head_review_pending' };
+  }
   if (activeTrustedFinding && !labels.has(CODEX_OVERRIDE_LABEL)) {
     return { eligible: false, reason: 'active_trusted_finding' };
   }

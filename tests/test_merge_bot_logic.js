@@ -128,6 +128,12 @@ test('administrator Codex override preserves the established escape hatch', () =
   assert.equal(decide({ pr: overridden, activeTrustedFinding: true }).eligible, true);
 });
 
+test('removing an override cannot reuse its green check without current-head review', () => {
+  assert.equal(decide({ currentHeadCodexSignal: false }).reason, 'current_head_review_pending');
+  const overridden = pr({ labels: [{ name: 'codex-p1-acknowledged' }] });
+  assert.equal(decide({ pr: overridden, currentHeadCodexSignal: false }).eligible, true);
+});
+
 test('head SHA movement after validation blocks merge', () => {
   assert.equal(decide({ currentHead: 'b'.repeat(40) }).reason, 'head_moved');
 });
@@ -308,6 +314,8 @@ test('workflow preserves exact-SHA squash merge and same-repo branch deletion', 
   assert.match(workflow, /Number\(root\[1\]\) !== prNumber/);
   assert.match(workflow, /!commitShas\.has\(head\[1\]\)/);
   assert.match(workflow, /marker\.head === currentHead/);
+  assert.match(workflow, /async function hasCurrentHeadCodexSignal\(prNumber\)/);
+  assert.match(workflow, /override absent and current-head Codex signal missing/);
 });
 
 test('merge-failure restoration preserves a concurrently added manual stop', () => {

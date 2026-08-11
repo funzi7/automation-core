@@ -21,7 +21,7 @@ on:
   # untrusted PR merge ref. pull_request_target executes this workflow from the
   # base default branch. No step checks out or executes PR-controlled code.
   pull_request_target:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
   # issue_comment uses the default-branch ref and is safe here; untrusted body
   # text is never interpolated into executable script.
   issue_comment:

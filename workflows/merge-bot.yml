@@ -247,6 +247,42 @@ jobs:
               );
             }
 
+            async function hasCurrentHeadCodexSignal(prNumber) {
+              const [commits, reviews, comments, reviewComments, reactions] = await Promise.all([
+                github.paginate(github.rest.pulls.listCommits, {
+                  owner, repo, pull_number: prNumber, per_page: 100,
+                }),
+                github.paginate(github.rest.pulls.listReviews, {
+                  owner, repo, pull_number: prNumber, per_page: 100,
+                }),
+                github.paginate(github.rest.issues.listComments, {
+                  owner, repo, issue_number: prNumber, per_page: 100,
+                }),
+                github.paginate(github.rest.pulls.listReviewComments, {
+                  owner, repo, pull_number: prNumber, per_page: 100,
+                }),
+                github.paginate(github.rest.reactions.listForIssue, {
+                  owner, repo, issue_number: prNumber, per_page: 100,
+                }),
+              ]);
+              const latestCommitDate = commits.length
+                ? new Date(Math.max(...commits.map((commit) =>
+                  new Date(commit.commit.committer.date).getTime()
+                )))
+                : new Date(0);
+              const trustedAfterHead = (item, dateField) =>
+                TRUSTED_CODEX_LOGINS.has(item.user?.login || '') &&
+                item[dateField] && new Date(item[dateField]) > latestCommitDate;
+              return (
+                reviews.some((item) => trustedAfterHead(item, 'submitted_at')) ||
+                comments.some((item) => trustedAfterHead(item, 'created_at')) ||
+                reviewComments.some((item) => trustedAfterHead(item, 'created_at')) ||
+                reactions.some((item) =>
+                  item.content === '+1' && trustedAfterHead(item, 'created_at')
+                )
+              );
+            }
+
             async function hasActiveTrustedBlocker(prNumber) {
               return (
                 await hasActiveTrustedFinding(prNumber) ||
@@ -567,8 +603,20 @@ jobs:
               }
 
               // Defense in depth: the exact-head gate must be green AND the
-              // authoritative current review-thread state must contain no
-              // unresolved, non-outdated trusted Codex P1/P2 finding.
+              // current head must have a trusted Codex signal unless this is
+              // the established grace-eligible trusted sync. This prevents a
+              // persisted override-green check from surviving override label
+              // removal before Codex reviews the head.
+              if (
+                !initialLabels.has(CODEX_OVERRIDE_LABEL) &&
+                !isTrustedSync(pr) &&
+                !(await hasCurrentHeadCodexSignal(prNumber))
+              ) {
+                core.info(`#${prNumber}: no trusted Codex signal on current head, skip`);
+                continue;
+              }
+              // The authoritative current review-thread state must also
+              // contain no unresolved, non-outdated trusted P1/P2 finding.
               if (
                 !initialLabels.has(CODEX_OVERRIDE_LABEL) &&
                 await hasActiveTrustedBlocker(prNumber)
@@ -635,6 +683,14 @@ jobs:
               }
               if (finalLabels.has(LABEL_NO_AUTOMERGE)) {
                 core.info(`#${prNumber}: no-automerge appeared after validation, hard stop`);
+                continue;
+              }
+              if (
+                !finalLabels.has(CODEX_OVERRIDE_LABEL) &&
+                !isTrustedSync(finalPr) &&
+                !(await hasCurrentHeadCodexSignal(prNumber))
+              ) {
+                core.info(`#${prNumber}: override absent and current-head Codex signal missing after validation, skip`);
                 continue;
               }
               if (
