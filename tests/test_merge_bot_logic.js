@@ -249,6 +249,19 @@ test('workflow preserves exact-SHA squash merge and same-repo branch deletion', 
   assert.match(workflow, /hasActiveTrustedBlocker/);
 });
 
+test('merge-failure restoration preserves a concurrently added manual stop', () => {
+  const workflow = fs.readFileSync(
+    path.join(__dirname, '..', 'workflows', 'merge-bot.yml'),
+    'utf8',
+  );
+  assert.match(workflow, /async function restoreTransientIfOpen\(prNumber\)/);
+  assert.match(workflow, /const currentLabels = labelNames\(current\)/);
+  assert.match(workflow, /if \(currentLabels\.has\(LABEL_ESCALATE\)\)/);
+  assert.match(workflow, /name: LABEL_ESCALATE_AUTO/);
+  assert.match(workflow, /preserving it as a manual\/unknown hard stop/);
+  assert.doesNotMatch(workflow, /restoreTransientEscalation/);
+});
+
 test('only synced automation infrastructure is in the central allow-list', () => {
   const config = JSON.parse(fs.readFileSync(
     path.join(__dirname, '..', 'sync-config.json'),

@@ -305,7 +305,27 @@ jobs:
               return !protectedReason;
             }
 
-            async function restoreTransientEscalation(prNumber) {
+            async function restoreTransientIfOpen(prNumber) {
+              // Re-read immediately before restoring. A human may add a new
+              // needs-owner after the bot cleared the old transient labels but
+              // before a failed merge returns. Never attach (or leave) auto
+              // provenance beside that new manual stop.
+              const { data: current } = await github.rest.pulls.get({
+                owner, repo, pull_number: prNumber,
+              });
+              if (current.state !== 'open') return;
+              const currentLabels = labelNames(current);
+              if (currentLabels.has(LABEL_ESCALATE)) {
+                if (currentLabels.has(LABEL_ESCALATE_AUTO)) {
+                  await github.rest.issues.removeLabel({
+                    owner, repo, issue_number: prNumber,
+                    name: LABEL_ESCALATE_AUTO,
+                  });
+                }
+                core.warning(`#${prNumber}: live needs-owner appeared before transient restoration; preserving it as a manual/unknown hard stop`);
+                return;
+              }
+
               const definitions = [
                 { name: LABEL_ESCALATE, color: 'd93f0b', description: 'Escalation — automation stopped, human needed' },
                 { name: LABEL_ESCALATE_AUTO, color: 'fbca04', description: 'Provenance: needs-owner was added by temporary PR automation escalation' },
@@ -321,16 +341,7 @@ jobs:
                 owner, repo, issue_number: prNumber,
                 labels: definitions.map((label) => label.name),
               });
-            }
-
-            async function restoreTransientIfOpen(prNumber) {
-              const { data: current } = await github.rest.pulls.get({
-                owner, repo, pull_number: prNumber,
-              });
-              if (current.state === 'open') {
-                await restoreTransientEscalation(prNumber);
-                core.info(`#${prNumber}: restored transient escalation after merge did not complete`);
-              }
+              core.info(`#${prNumber}: restored transient escalation after merge did not complete`);
             }
 
             // minimatch-style glob -> RegExp (supports **, *, ?). Inlined to
@@ -609,7 +620,7 @@ jobs:
                   core.info(`#${prNumber}: cleared transient needs-owner${finalHasAutoProvenance ? ' + needs-owner-auto' : ' (proven legacy automation event)'} after exact-head fully-green validation; continuing to merge`);
                 } catch (e) {
                   try {
-                    await restoreTransientEscalation(prNumber);
+                    await restoreTransientIfOpen(prNumber);
                   } catch (restoreError) {
                     core.warning(`#${prNumber}: transient-label restore failed: ${restoreError.message}`);
                   }
