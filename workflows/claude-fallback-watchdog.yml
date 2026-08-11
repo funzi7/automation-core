@@ -553,6 +553,29 @@ jobs:
               return false;
             }
 
+            async function hasCurrentHeadNonInlineFinding(prNumber, latestCommitDate) {
+              const [reviews, comments] = await Promise.all([
+                github.paginate(github.rest.pulls.listReviews, {
+                  owner, repo, pull_number: prNumber, per_page: 100,
+                }),
+                github.paginate(github.rest.issues.listComments, {
+                  owner, repo, issue_number: prNumber, per_page: 100,
+                }),
+              ]);
+              return (
+                reviews.some((review) =>
+                  isCodex(review.user) && review.submitted_at &&
+                  new Date(review.submitted_at) > latestCommitDate &&
+                  hasSeverity(review.body)
+                ) ||
+                comments.some((comment) =>
+                  isCodex(comment.user) && comment.created_at &&
+                  new Date(comment.created_at) > latestCommitDate &&
+                  hasSeverity(comment.body)
+                )
+              );
+            }
+
             async function telegram(text) {
               const tgToken = process.env.TELEGRAM_BOT_TOKEN;
               const tgChat = process.env.TELEGRAM_CHAT_ID;
@@ -648,16 +671,24 @@ jobs:
                   const hasOverride = (pr.labels || []).some((l) => (l.name || l) === OVERRIDE_LABEL);
                   const verdictGreen = !!(title && title.startsWith('🟢'));
                   const overrideCandidate = hasOverride && !verdictGreen;
-                  // Candidate iff pending/missing/overridden, or a previous 🔴
-                  // finding verdict no longer has an active trusted thread. The last
-                  // case covers resolution/outdating, which has no trusted event.
-                  // An unchanged active 🔴 is deliberately not re-dispatched.
+                  // Recheck both inline thread findings and trusted non-inline
+                  // review/comment findings. A new finding can arrive after a
+                  // green verdict without changing the head; that stale green
+                  // must be replaced by a red exact-head verdict.
                   const activeFindingVerdict = !!(title && title.startsWith('🔴'));
-                  const redThreadStateChanged = activeFindingVerdict &&
-                    !(await hasActiveTrustedFinding(prNumber));
+                  let activeFindingNow = false;
+                  if (verdictGreen || activeFindingVerdict) {
+                    activeFindingNow = (
+                      await hasActiveTrustedFinding(prNumber) ||
+                      await hasCurrentHeadNonInlineFinding(prNumber, latestCommitDate)
+                    );
+                  }
+                  const greenHeadNewFinding = verdictGreen && activeFindingNow;
+                  const redThreadStateChanged = activeFindingVerdict && !activeFindingNow;
                   const isCandidate =
                     !newestVerdict || title === PENDING_TITLE ||
-                    overrideCandidate || redThreadStateChanged;
+                    overrideCandidate || redThreadStateChanged ||
+                    greenHeadNewFinding;
                   if (!isCandidate) continue;
 
                   // FRESH Codex signal on the head, mirroring the gate's matchers:
@@ -691,10 +722,13 @@ jobs:
                   const silentSyncStale = isTrustedSync(pr) && headAgeMs > graceMs;
                   if (
                     !freshSignal && !silentSyncStale &&
-                    !overrideCandidate && !redThreadStateChanged
+                    !overrideCandidate && !redThreadStateChanged &&
+                    !greenHeadNewFinding
                   ) continue;
                   const logMsg = overrideCandidate
                     ? `override-label sweep: dispatching gate for PR #${prNumber} @ ${head7}`
+                    : greenHeadNewFinding
+                    ? `new-finding sweep: dispatching gate for previously green PR #${prNumber} @ ${head7}`
                     : redThreadStateChanged
                     ? `thread-state sweep: dispatching gate for PR #${prNumber} @ ${head7}`
                     : freshSignal

@@ -245,6 +245,8 @@ test('workflow preserves exact-SHA squash merge and same-repo branch deletion', 
   assert.match(workflow, /pr\.head\.repo\.full_name === `\$\{owner\}\/\$\{repo\}`/);
   assert.match(workflow, /await github\.rest\.git\.deleteRef/);
   assert.match(workflow, /unexpected evaluation error; skipping only this PR/);
+  assert.match(workflow, /hasCurrentHeadNonInlineFinding/);
+  assert.match(workflow, /hasActiveTrustedBlocker/);
 });
 
 test('only synced automation infrastructure is in the central allow-list', () => {

@@ -76,6 +76,7 @@ function classifyThreads(threads) {
 
 function decideCodexGate({
   threads = [],
+  nonInlineFindings = [],
   currentHeadSignal = false,
   override = false,
   technicalError = false,
@@ -85,6 +86,14 @@ function decideCodexGate({
   }
   if (technicalError) {
     return { status: 'clear', reason: 'technical_fail_soft', activeFindings: [] };
+  }
+
+  if (nonInlineFindings.length) {
+    return {
+      status: 'blocked',
+      reason: 'active_current_head_non_inline_finding',
+      activeFindings: nonInlineFindings,
+    };
   }
 
   const classified = classifyThreads(threads);

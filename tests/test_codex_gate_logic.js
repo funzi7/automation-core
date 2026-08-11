@@ -44,6 +44,21 @@ test('active P1 remains blocked after docs commit', () => {
   assert.equal(result.status, 'blocked');
 });
 
+test('current-head non-inline trusted finding blocks despite clean signal', () => {
+  const result = decideCodexGate({
+    threads: [],
+    nonInlineFindings: [{
+      severity: 'P1',
+      path: '(review body)',
+      line: null,
+      threadId: '',
+    }],
+    currentHeadSignal: true,
+  });
+  assert.equal(result.status, 'blocked');
+  assert.equal(result.reason, 'active_current_head_non_inline_finding');
+});
+
 test('resolved thread clears with a current-head signal', () => {
   assert.equal(
     decideCodexGate({
@@ -216,6 +231,8 @@ test('watchdog rechecks changed red thread state from the trusted base ref', () 
   assert.match(watchdog, /const VERDICT_CHECK = 'check-codex-status'/);
   assert.match(watchdog, /async function hasActiveTrustedFinding\(prNumber\)/);
   assert.match(watchdog, /redThreadStateChanged/);
+  assert.match(watchdog, /greenHeadNewFinding/);
+  assert.match(watchdog, /hasCurrentHeadNonInlineFinding/);
   assert.match(
     watchdog,
     /!overrideCandidate && !redThreadStateChanged/,

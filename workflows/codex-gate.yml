@@ -189,6 +189,7 @@ jobs:
 
             function decideCodexGate({
               threads = [],
+              nonInlineFindings = [],
               currentHeadSignal = false,
               override = false,
               technicalError = false,
@@ -205,6 +206,13 @@ jobs:
                   status: 'clear',
                   reason: 'technical_fail_soft',
                   activeFindings: [],
+                };
+              }
+              if (nonInlineFindings.length) {
+                return {
+                  status: 'blocked',
+                  reason: 'active_current_head_non_inline_finding',
+                  activeFindings: nonInlineFindings,
                 };
               }
               const classified = classifyThreads(threads);
@@ -415,26 +423,52 @@ jobs:
                 const hasCodexSignalOnHead =
                   allBodies.some(item => item.onHead) || codexThumbsUpOnHead;
 
+                // Review bodies and top-level PR comments can carry trusted
+                // P1/P2 findings without an inline review thread. They remain
+                // active for this head whenever posted after its latest commit;
+                // a later clean signal cannot erase them. A fixing commit makes
+                // them stale and still requires a fresh current-head review.
+                const nonInlineFindings = [
+                  ...codexReviews.map((review) => ({
+                    body: review.body || '',
+                    date: review.submitted_at,
+                    channel: 'review body',
+                  })),
+                  ...codexComments.map((comment) => ({
+                    body: comment.body || '',
+                    date: comment.created_at,
+                    channel: 'PR comment',
+                  })),
+                ].filter((item) => onHead(item.date) && severity(item.body))
+                  .map((item) => ({
+                    severity: severity(item.body),
+                    path: `(${item.channel})`,
+                    line: null,
+                    startLine: null,
+                    threadId: '',
+                  }));
+
                 const gateDecision = decideCodexGate({
                   threads: reviewThreads,
+                  nonInlineFindings,
                   currentHeadSignal: hasCodexSignalOnHead,
                 });
 
-                // Active thread state wins over every newer unrelated commit
-                // and over a current-head thumbs-up.
+                // Active thread/non-inline finding state wins over a clean
+                // signal or current-head thumbs-up.
                 if (gateDecision.status === 'blocked') {
                   const locations = gateDecision.activeFindings
                     .slice(0, 5)
                     .map(f => `${f.severity} ${f.path}:${f.line || f.startLine || '?'}`)
                     .join(', ');
                   results.push(
-                    `PR #${prNumber}: ❌ unresolved non-outdated Codex review thread(s): ${locations}`
+                    `PR #${prNumber}: ❌ active trusted Codex P1/P2 finding(s): ${locations}`
                   );
                   await publishGateCheck(
                     headSha,
                     'failure',
-                    '🔴 Active Codex P1/P2 review thread',
-                    `Resolve or update the active trusted thread(s) on ${head7}: ${locations}.`,
+                    '🔴 Active Codex P1/P2 finding',
+                    `Resolve/update the active trusted finding(s) on ${head7}: ${locations}.`,
                   );
                   anyBlocked = true;
                   continue;

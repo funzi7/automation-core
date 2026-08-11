@@ -213,6 +213,46 @@ jobs:
               return false;
             }
 
+            async function hasCurrentHeadNonInlineFinding(prNumber) {
+              const [commits, reviews, comments] = await Promise.all([
+                github.paginate(github.rest.pulls.listCommits, {
+                  owner, repo, pull_number: prNumber, per_page: 100,
+                }),
+                github.paginate(github.rest.pulls.listReviews, {
+                  owner, repo, pull_number: prNumber, per_page: 100,
+                }),
+                github.paginate(github.rest.issues.listComments, {
+                  owner, repo, issue_number: prNumber, per_page: 100,
+                }),
+              ]);
+              const latestCommitDate = commits.length
+                ? new Date(Math.max(...commits.map((commit) =>
+                  new Date(commit.commit.committer.date).getTime()
+                )))
+                : new Date(0);
+              return (
+                reviews.some((review) =>
+                  TRUSTED_CODEX_LOGINS.has(review.user?.login || '') &&
+                  review.submitted_at &&
+                  new Date(review.submitted_at) > latestCommitDate &&
+                  hasSeverity(review.body)
+                ) ||
+                comments.some((comment) =>
+                  TRUSTED_CODEX_LOGINS.has(comment.user?.login || '') &&
+                  comment.created_at &&
+                  new Date(comment.created_at) > latestCommitDate &&
+                  hasSeverity(comment.body)
+                )
+              );
+            }
+
+            async function hasActiveTrustedBlocker(prNumber) {
+              return (
+                await hasActiveTrustedFinding(prNumber) ||
+                await hasCurrentHeadNonInlineFinding(prNumber)
+              );
+            }
+
             async function isLegacyAutomationEscalation(prNumber) {
               const [events, comments] = await Promise.all([
                 github.paginate(
@@ -468,7 +508,7 @@ jobs:
               // unresolved, non-outdated trusted Codex P1/P2 finding.
               if (
                 !initialLabels.has(CODEX_OVERRIDE_LABEL) &&
-                await hasActiveTrustedFinding(prNumber)
+                await hasActiveTrustedBlocker(prNumber)
               ) {
                 core.info(`#${prNumber}: active trusted Codex P1/P2 finding, skip`);
                 continue;
@@ -536,7 +576,7 @@ jobs:
               }
               if (
                 !finalLabels.has(CODEX_OVERRIDE_LABEL) &&
-                await hasActiveTrustedFinding(prNumber)
+                await hasActiveTrustedBlocker(prNumber)
               ) {
                 core.info(`#${prNumber}: trusted P1/P2 appeared after validation, skip`);
                 continue;
