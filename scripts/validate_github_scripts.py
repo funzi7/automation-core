@@ -67,6 +67,16 @@ for name in config["synced_workflows"]:
     if str(source) in changed or str(mirror) in changed:
         workflow_paths.extend([source, mirror])
 
+# A push on main has no remaining diff against origin/main. Validate every
+# synced source/mirror in that case instead of treating "no changed blocks" as
+# proof, so the post-merge run remains meaningful.
+if not workflow_paths:
+    for name in config["synced_workflows"]:
+        workflow_paths.extend([
+            Path("workflows") / name,
+            Path(".github/workflows") / name,
+        ])
+
 checked = 0
 for workflow_path in workflow_paths:
     workflow = yaml.load(workflow_path.read_text(), Loader=WorkflowLoader)
@@ -85,5 +95,5 @@ for workflow_path in workflow_paths:
         print(f"  syntax ok: {workflow_path}:{location}")
 
 if not checked:
-    raise SystemExit("no changed github-script blocks found")
+    raise SystemExit("no github-script blocks found")
 print(f"Checked {checked} github-script blocks.")
