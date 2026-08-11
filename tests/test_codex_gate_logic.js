@@ -202,8 +202,9 @@ test('authoritative workflow keeps gate policy inline', () => {
   assert.match(workflow, /\n  workflow_run:\n/);
   assert.match(workflow, /workflows: \['Codex Auto-Fix'\]/);
   assert.match(workflow, /listPullRequestsAssociatedWithCommit/);
-  assert.match(workflow, /github\.event\.workflow_run\.pull_requests\[0\]\.number/);
-  assert.match(workflow, /github\.event\.workflow_run\.head_sha/);
+  assert.match(workflow, /group: codex-gate-\$\{\{ github\.repository \}\}/);
+  assert.match(workflow, /cron: '7,22,37,52 \* \* \* \*'/);
+  assert.match(workflow, /context\.eventName === 'schedule'/);
   assert.doesNotMatch(workflow, /\n  pull_request:\n/);
   assert.doesNotMatch(workflow, /\n  pull_request_review(?:_comment)?:\n/);
   assert.doesNotMatch(workflow, /uses:\s*actions\/checkout/);
@@ -279,11 +280,16 @@ test('temporary escalation attaches the hard stop independently of provenance', 
   }
 });
 
-test('review-thread changes have a PAT-independent trusted gate relay', () => {
+test('review-thread changes have a supported PAT-independent gate sweep', () => {
   const bridge = fs.readFileSync(
     path.join(__dirname, '..', '.github', 'workflows', 'codex-auto-fix.yml'),
     'utf8',
   );
-  assert.match(bridge, /\n  pull_request_review_thread:\n    types: \[resolved, unresolved\]/);
-  assert.match(bridge, /they exist only as a trusted-gate relay/);
+  assert.doesNotMatch(bridge, /\n  pull_request_review_thread:/);
+  const gate = fs.readFileSync(
+    path.join(__dirname, '..', '.github', 'workflows', 'codex-gate.yml'),
+    'utf8',
+  );
+  assert.match(gate, /GitHub Actions has no pull_request_review_thread trigger/);
+  assert.match(gate, /state: 'open', per_page: 100/);
 });

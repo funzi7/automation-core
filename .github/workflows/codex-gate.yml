@@ -12,7 +12,8 @@ name: Codex Gate
 # The authoritative decision implementation stays inline in this trusted
 # default-branch workflow. PR-controlled workflow, checkout and require paths
 # are forbidden; review events are rechecked through a default-branch
-# workflow_run relay, with the watchdog as a bounded fallback.
+# workflow_run relay. A PAT-independent scheduled sweep covers thread-state
+# changes and reaction events that have no supported Actions trigger.
 # Trusted actor allowlisting, Summary/Testing quote stripping, reaction-based
 # clean signals, trusted-sync grace and intentional technical fail-soft remain.
 #
@@ -34,6 +35,11 @@ on:
   workflow_run:
     workflows: ['Codex Auto-Fix']
     types: [completed]
+  # GitHub Actions has no pull_request_review_thread trigger. Sweep open PRs
+  # from this trusted default-branch workflow so resolved/reopened thread state
+  # is reflected on the exact head even when AUTOMATION_PAT is unavailable.
+  schedule:
+    - cron: '7,22,37,52 * * * *'
   workflow_dispatch:
     inputs:
       pr_number:
@@ -46,11 +52,10 @@ on:
 # verdict. Each run creates a fresh completed `check-codex-status` check on the
 # exact PR head; no cross-run check update is attempted.
 concurrency:
-  # workflow_run normally carries the associated PR number; head_sha is the
-  # stable fallback when GitHub omits that array. Review relays therefore
-  # serialize with direct evaluations for the same PR instead of publishing
-  # exact-head verdicts in a stale completion order.
-  group: codex-gate-pr-${{ github.event.pull_request.number || github.event.inputs.pr_number || github.event.issue.number || github.event.workflow_run.pull_requests[0].number || github.event.workflow_run.head_sha || github.run_id }}
+  # The scheduled sweep can cover several PRs in one run, so serialize every
+  # evaluator in the repository. This prevents event-driven and scheduled
+  # snapshots from publishing exact-head verdicts in stale completion order.
+  group: codex-gate-${{ github.repository }}
   cancel-in-progress: false
 
 permissions:
@@ -112,8 +117,14 @@ jobs:
                     .filter((pull) => pull.state === 'open' && pull.base?.repo?.full_name === `${context.repo.owner}/${context.repo.repo}`)
                     .map((pull) => Number(pull.number))
                     .filter(Number.isFinite),
-                )];
+                  )];
               }
+            } else if (context.eventName === 'schedule') {
+              const open = await github.paginate(github.rest.pulls.list, {
+                owner: context.repo.owner, repo: context.repo.repo,
+                state: 'open', per_page: 100,
+              });
+              prNumbers = open.map((pull) => pull.number);
             } else if (
               context.eventName === 'workflow_dispatch' &&
               context.payload.inputs?.pr_number

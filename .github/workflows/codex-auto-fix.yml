@@ -41,12 +41,6 @@ name: Codex Auto-Fix
 on:
   pull_request_review:
     types: [submitted]
-  # No job below executes for this event. Its skipped/completed workflow run
-  # is a zero-secret relay into the trusted default-branch Codex Gate via
-  # workflow_run, so resolving the final review thread rechecks the exact head
-  # even when AUTOMATION_PAT is unavailable.
-  pull_request_review_thread:
-    types: [resolved, unresolved]
   # Inline review comments (single line of code, not wrapped in a
   # full PR review). Codex usually batches inline notes into a review
   # event, but occasionally drops one as a standalone comment —
@@ -85,9 +79,7 @@ jobs:
     #
     # Three branches mirror the on: events that can carry actionable
     # bot feedback: PR review, inline review-comment, top-level
-    # issue/PR comment. Review-thread events intentionally match none of
-    # these branches; they exist only as a trusted-gate relay. This workflow
-    # does NOT listen to `issues` events.
+    # issue/PR comment. This workflow does NOT listen to `issues` events.
     if: |
       (github.event_name == 'pull_request_review' &&
        github.event.review.user.login == 'chatgpt-codex-connector[bot]' &&
