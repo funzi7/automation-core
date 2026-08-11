@@ -545,6 +545,11 @@ jobs:
             }
             const roCheckRuns = (ref) => roPaged(`/repos/${owner}/${repo}/commits/${encodeURIComponent(ref)}/check-runs?per_page=100`, (d) => d.check_runs || []);
             const roWorkflowRuns = () => roPaged(`/repos/${owner}/${repo}/actions/runs?event=pull_request&per_page=100`, (d) => d.workflow_runs || []);
+            let prWorkflowRunsPromise = null;
+            const allPrWorkflowRuns = () => {
+              if (!prWorkflowRunsPromise) prWorkflowRunsPromise = roWorkflowRuns();
+              return prWorkflowRunsPromise;
+            };
             // Verbatim from codex-gate.yml's pending publish call.
             const PENDING_TITLE = '🟡 Waiting for Codex review';
             const GATE_WORKFLOW = 'codex-gate.yml';
@@ -595,7 +600,7 @@ jobs:
                 observedAt > 0 && signalAt > observedAt;
             };
             async function observedHeadTransition(prNumber, headSha) {
-              const runs = await roWorkflowRuns();
+              const runs = await allPrWorkflowRuns();
               const timeline = runs
                 .filter((run) =>
                   (run.pull_requests || []).some((candidate) => candidate.number === prNumber))

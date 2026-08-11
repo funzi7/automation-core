@@ -208,11 +208,19 @@ jobs:
                 observedAt > 0 && signalAt > observedAt;
             }
 
+            let prWorkflowRunsPromise = null;
+            function allPrWorkflowRuns() {
+              if (!prWorkflowRunsPromise) {
+                prWorkflowRunsPromise = github.paginate(
+                  github.rest.actions.listWorkflowRunsForRepo,
+                  { owner, repo, event: 'pull_request', per_page: 100 },
+                );
+              }
+              return prWorkflowRunsPromise;
+            }
+
             async function observedHeadTransition(prNumber, headSha) {
-              const runs = await github.paginate(
-                github.rest.actions.listWorkflowRunsForRepo,
-                { owner, repo, event: 'pull_request', per_page: 100 },
-              );
+              const runs = await allPrWorkflowRuns();
               const timeline = runs
                 .filter((run) =>
                   (run.pull_requests || []).some((candidate) => candidate.number === prNumber))

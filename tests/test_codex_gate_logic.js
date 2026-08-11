@@ -278,6 +278,8 @@ test('authoritative workflow keeps gate policy inline', () => {
   assert.match(workflow, /cron: '7,22,37,52 \* \* \* \*'/);
   assert.match(workflow, /context\.eventName === 'schedule'/);
   assert.match(workflow, /async function observedHeadTransition\(prNumber, headSha\)/);
+  assert.match(workflow, /let prWorkflowRunsPromise = null/);
+  assert.match(workflow, /const runs = await allPrWorkflowRuns\(\)/);
   assert.match(workflow, /function signalTargetsHead\(item, headSha, headObservedAt/);
   assert.match(workflow, /actions: read/);
   assert.doesNotMatch(workflow, /latestCommitDate/);
@@ -319,6 +321,8 @@ test('watchdog rechecks changed red thread state from the trusted base ref', () 
     /const greenHeadNewFinding = !hasOverride && verdictGreen && activeFindingNow/,
   );
   assert.match(watchdog, /hasCurrentHeadNonInlineFinding/);
+  assert.match(watchdog, /let prWorkflowRunsPromise = null/);
+  assert.match(watchdog, /const runs = await allPrWorkflowRuns\(\)/);
   assert.match(
     watchdog,
     /!overrideCandidate && !redThreadStateChanged/,

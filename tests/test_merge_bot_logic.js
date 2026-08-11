@@ -331,6 +331,8 @@ test('workflow preserves exact-SHA squash merge and same-repo branch deletion', 
   assert.match(workflow, /marker\.head === currentHead/);
   assert.match(workflow, /async function hasCurrentHeadCodexSignal\(prNumber, headSha\)/);
   assert.match(workflow, /async function observedHeadTransition\(prNumber, headSha\)/);
+  assert.match(workflow, /let prWorkflowRunsPromise = null/);
+  assert.match(workflow, /const runs = await allPrWorkflowRuns\(\)/);
   assert.match(workflow, /function signalTargetsHead\(item, headSha, headObservedAt/);
   assert.doesNotMatch(workflow, /latestCommitDate/);
   assert.match(workflow, /override absent and current-head Codex signal missing/);
