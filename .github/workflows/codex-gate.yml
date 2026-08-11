@@ -63,8 +63,8 @@ permissions:
   contents: read
   pull-requests: read
   issues: read
-  # Current-head freshness uses the first pull_request workflow run for the
-  # exact SHA as the server-observed head-transition floor.
+  # Current-head freshness uses the start of the current contiguous
+  # pull_request-run SHA epoch as the server-observed transition floor.
   actions: read
   # fix #11: publish the explicit `check-codex-status` check-run with output text.
   checks: write
@@ -211,16 +211,21 @@ jobs:
             async function observedHeadTransition(prNumber, headSha) {
               const runs = await github.paginate(
                 github.rest.actions.listWorkflowRunsForRepo,
-                { owner, repo, head_sha: headSha, event: 'pull_request', per_page: 100 },
+                { owner, repo, event: 'pull_request', per_page: 100 },
               );
-              const observed = runs
-                .filter((run) => (
-                  run.head_sha === headSha &&
-                  (run.pull_requests || []).some((candidate) => candidate.number === prNumber)
-                ))
-                .map((run) => new Date(run.created_at || 0).getTime())
-                .filter((value) => Number.isFinite(value) && value > 0);
-              return observed.length ? new Date(Math.min(...observed)) : null;
+              const timeline = runs
+                .filter((run) =>
+                  (run.pull_requests || []).some((candidate) => candidate.number === prNumber))
+                .sort((a, b) =>
+                  new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime());
+              if (!timeline.length || timeline[0].head_sha !== headSha) return null;
+              const currentEpoch = [];
+              for (const run of timeline) {
+                if (run.head_sha !== headSha) break;
+                const observedAt = new Date(run.created_at || 0).getTime();
+                if (Number.isFinite(observedAt) && observedAt > 0) currentEpoch.push(observedAt);
+              }
+              return currentEpoch.length ? new Date(Math.min(...currentEpoch)) : null;
             }
 
             function authorLogin(comment) {

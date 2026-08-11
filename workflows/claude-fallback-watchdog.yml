@@ -544,7 +544,7 @@ jobs:
               return out;
             }
             const roCheckRuns = (ref) => roPaged(`/repos/${owner}/${repo}/commits/${encodeURIComponent(ref)}/check-runs?per_page=100`, (d) => d.check_runs || []);
-            const roWorkflowRuns = (ref) => roPaged(`/repos/${owner}/${repo}/actions/runs?head_sha=${encodeURIComponent(ref)}&event=pull_request&per_page=100`, (d) => d.workflow_runs || []);
+            const roWorkflowRuns = () => roPaged(`/repos/${owner}/${repo}/actions/runs?event=pull_request&per_page=100`, (d) => d.workflow_runs || []);
             // Verbatim from codex-gate.yml's pending publish call.
             const PENDING_TITLE = '🟡 Waiting for Codex review';
             const GATE_WORKFLOW = 'codex-gate.yml';
@@ -595,13 +595,20 @@ jobs:
                 observedAt > 0 && signalAt > observedAt;
             };
             async function observedHeadTransition(prNumber, headSha) {
-              const runs = await roWorkflowRuns(headSha);
-              const observed = runs
-                .filter((run) => run.head_sha === headSha &&
+              const runs = await roWorkflowRuns();
+              const timeline = runs
+                .filter((run) =>
                   (run.pull_requests || []).some((candidate) => candidate.number === prNumber))
-                .map((run) => new Date(run.created_at || 0).getTime())
-                .filter((value) => Number.isFinite(value) && value > 0);
-              return observed.length ? new Date(Math.min(...observed)) : null;
+                .sort((a, b) =>
+                  new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime());
+              if (!timeline.length || timeline[0].head_sha !== headSha) return null;
+              const currentEpoch = [];
+              for (const run of timeline) {
+                if (run.head_sha !== headSha) break;
+                const observedAt = new Date(run.created_at || 0).getTime();
+                if (Number.isFinite(observedAt) && observedAt > 0) currentEpoch.push(observedAt);
+              }
+              return currentEpoch.length ? new Date(Math.min(...currentEpoch)) : null;
             }
 
             async function hasActiveTrustedFinding(prNumber) {

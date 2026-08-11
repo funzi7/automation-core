@@ -35,13 +35,22 @@ function signalTargetsHead(item, headSha, headObservedAt = null, dateField = 'cr
     observedAt > 0 && signalAt > observedAt;
 }
 
-function firstHeadObservation(runs = [], prNumber, headSha) {
-  const observed = runs
-    .filter((run) => String(run?.head_sha || '') === headSha &&
+function currentHeadEpochStart(runs = [], prNumber, headSha) {
+  const timeline = runs
+    .filter((run) =>
       (run?.pull_requests || []).some((candidate) => candidate.number === prNumber))
-    .map((run) => new Date(run?.created_at || 0).getTime())
-    .filter((value) => Number.isFinite(value) && value > 0);
-  return observed.length ? new Date(Math.min(...observed)) : null;
+    .sort((a, b) =>
+      new Date(b?.created_at || 0).getTime() - new Date(a?.created_at || 0).getTime());
+  // If Actions has not observed the live head yet, do not reuse an older
+  // historical epoch for the same SHA.
+  if (!timeline.length || String(timeline[0]?.head_sha || '') !== headSha) return null;
+  const currentEpoch = [];
+  for (const run of timeline) {
+    if (String(run?.head_sha || '') !== headSha) break;
+    const observedAt = new Date(run?.created_at || 0).getTime();
+    if (Number.isFinite(observedAt) && observedAt > 0) currentEpoch.push(observedAt);
+  }
+  return currentEpoch.length ? new Date(Math.min(...currentEpoch)) : null;
 }
 
 function stripSummarySections(body) {
@@ -164,7 +173,7 @@ module.exports = {
   P2_PATTERN,
   REVIEWED_COMMIT_PATTERN,
   signalTargetsHead,
-  firstHeadObservation,
+  currentHeadEpochStart,
   stripSummarySections,
   severity,
   findingFromThread,

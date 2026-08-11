@@ -8,7 +8,7 @@ const {
   decideCodexGate,
   severity,
   signalTargetsHead,
-  firstHeadObservation,
+  currentHeadEpochStart,
 } = require('../tools/codex_gate_logic');
 
 const CODEX = 'chatgpt-codex-connector';
@@ -115,7 +115,20 @@ test('unchanged head uses its first server observation as freshness floor', () =
     { head_sha: head, created_at: '2026-08-11T16:00:00Z', pull_requests: [{ number: 9 }] },
     { head_sha: head, created_at: '2026-08-11T15:00:00Z', pull_requests: [{ number: 10 }] },
   ];
-  assert.equal(firstHeadObservation(runs, 9, head).toISOString(), '2026-08-11T16:00:00.000Z');
+  assert.equal(currentHeadEpochStart(runs, 9, head).toISOString(), '2026-08-11T16:00:00.000Z');
+});
+
+test('A to B to A force-push starts a new current-head epoch', () => {
+  const headA = 'a'.repeat(40);
+  const headB = 'b'.repeat(40);
+  const runs = [
+    { head_sha: headA, created_at: '2026-08-11T20:00:00Z', pull_requests: [{ number: 9 }] },
+    { head_sha: headA, created_at: '2026-08-11T20:00:01Z', pull_requests: [{ number: 9 }] },
+    { head_sha: headB, created_at: '2026-08-11T19:00:00Z', pull_requests: [{ number: 9 }] },
+    { head_sha: headA, created_at: '2026-08-11T18:00:00Z', pull_requests: [{ number: 9 }] },
+  ];
+  assert.equal(currentHeadEpochStart(runs, 9, headA).toISOString(), '2026-08-11T20:00:00.000Z');
+  assert.equal(currentHeadEpochStart(runs, 9, headB), null);
 });
 
 test('resolved thread clears with a current-head signal', () => {
