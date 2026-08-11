@@ -121,6 +121,11 @@ test('red Codex gate or active trusted P1/P2 blocks merge', () => {
   assert.equal(decide({ activeTrustedFinding: true }).reason, 'active_trusted_finding');
 });
 
+test('administrator Codex override preserves the established escape hatch', () => {
+  const overridden = pr({ labels: [{ name: 'codex-p1-acknowledged' }] });
+  assert.equal(decide({ pr: overridden, activeTrustedFinding: true }).eligible, true);
+});
+
 test('head SHA movement after validation blocks merge', () => {
   assert.equal(decide({ currentHead: 'b'.repeat(40) }).reason, 'head_moved');
 });

@@ -14,6 +14,7 @@ const LABEL_AUTOMERGE = 'automerge';
 const LABEL_ESCALATE = 'needs-owner';
 const LABEL_ESCALATE_AUTO = 'needs-owner-auto';
 const LABEL_NO_AUTOMERGE = 'no-automerge';
+const CODEX_OVERRIDE_LABEL = 'codex-p1-acknowledged';
 const SYNC_TITLE_PREFIX = 'chore(automation): sync from automation-core';
 const SYNC_BRANCH = 'chore/sync-automation-core';
 const OK_CONCLUSIONS = new Set(['success', 'neutral', 'skipped']);
@@ -135,7 +136,7 @@ function evaluateMergePolicy({
 
   const checks = evaluateHeadChecks(checkRuns, statuses);
   if (!checks.eligible) return checks;
-  if (activeTrustedFinding) {
+  if (activeTrustedFinding && !labels.has(CODEX_OVERRIDE_LABEL)) {
     return { eligible: false, reason: 'active_trusted_finding' };
   }
   if (protectedPathHit && !isOwnerSameRepo(pr, repositoryFullName)) {
@@ -159,6 +160,7 @@ module.exports = {
   LABEL_ESCALATE,
   LABEL_ESCALATE_AUTO,
   LABEL_NO_AUTOMERGE,
+  CODEX_OVERRIDE_LABEL,
   SYNC_TITLE_PREFIX,
   SYNC_BRANCH,
   labelNames,

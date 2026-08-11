@@ -119,6 +119,7 @@ jobs:
             const LABEL_ESCALATE = 'needs-owner';
             const LABEL_ESCALATE_AUTO = 'needs-owner-auto';
             const LABEL_NO_AUTOMERGE = 'no-automerge';
+            const CODEX_OVERRIDE_LABEL = 'codex-p1-acknowledged';
             const SYNC_TITLE_PREFIX = 'chore(automation): sync from automation-core';
             const SYNC_BRANCH = 'chore/sync-automation-core';   // branch the sync workflow opens
             const OWNER_LOGIN = 'funzi7';
@@ -447,7 +448,10 @@ jobs:
               // Defense in depth: the exact-head gate must be green AND the
               // authoritative current review-thread state must contain no
               // unresolved, non-outdated trusted Codex P1/P2 finding.
-              if (await hasActiveTrustedFinding(prNumber)) {
+              if (
+                !initialLabels.has(CODEX_OVERRIDE_LABEL) &&
+                await hasActiveTrustedFinding(prNumber)
+              ) {
                 core.info(`#${prNumber}: active trusted Codex P1/P2 finding, skip`);
                 continue;
               }
@@ -512,7 +516,10 @@ jobs:
                 core.info(`#${prNumber}: no-automerge appeared after validation, hard stop`);
                 continue;
               }
-              if (await hasActiveTrustedFinding(prNumber)) {
+              if (
+                !finalLabels.has(CODEX_OVERRIDE_LABEL) &&
+                await hasActiveTrustedFinding(prNumber)
+              ) {
                 core.info(`#${prNumber}: trusted P1/P2 appeared after validation, skip`);
                 continue;
               }
