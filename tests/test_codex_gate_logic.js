@@ -292,4 +292,5 @@ test('review-thread changes have a supported PAT-independent gate sweep', () => 
   );
   assert.match(gate, /GitHub Actions has no pull_request_review_thread trigger/);
   assert.match(gate, /state: 'open', per_page: 100/);
+  assert.match(gate, /anyBlocked && context\.eventName !== 'schedule'/);
 });

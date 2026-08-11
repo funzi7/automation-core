@@ -593,11 +593,17 @@ jobs:
             // authoritative. Fail the evaluator when a policy block exists or
             // the required head check could not be published, so failures remain
             // visible even though this job itself is attached to the trusted ref.
-            if (anyBlocked || gatePublishFailed) {
+            // A scheduled run evaluates every open PR. Keep each explicit
+            // head check red/green independently, but do not fail the aggregate
+            // merely because one unrelated PR is blocked: a successful sweep
+            // must wake Merge Bot for another PR that just cleared. A check
+            // publication failure remains loud, and event-driven single-PR
+            // policy blocks remain failed as before.
+            if ((anyBlocked && context.eventName !== 'schedule') || gatePublishFailed) {
               core.setFailed(
                 'Blocked by Codex Gate: an active P1 or P2 is unresolved, or Codex has not reviewed the current head yet.\n' +
                 'Resolve by one of:\n' +
-                '  1. Wait — Codex reviews automatically on every push; the gate re-checks on Codex activity and on the watchdog sweep (≤~1h), and goes green once Codex posts any signal with no active P1/P2.\n' +
+                '  1. Wait — Codex reviews automatically on every push; the gate re-checks on Codex activity and the trusted scheduled sweep (≤15m), and goes green once Codex posts any signal with no active P1/P2.\n' +
                 '  2. Resolve the review thread, or update its relevant diff and wait for GitHub to mark it outdated plus a clean current-head Codex signal.\n' +
                 '  3. Add label "codex-p1-acknowledged" to override.'
               );
