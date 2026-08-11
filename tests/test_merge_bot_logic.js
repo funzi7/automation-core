@@ -346,6 +346,10 @@ test('merge-failure restoration preserves a concurrently added manual stop', () 
   assert.match(workflow, /const currentLabels = labelNames\(current\)/);
   assert.match(workflow, /if \(currentLabels\.has\(LABEL_ESCALATE\)\)/);
   assert.match(workflow, /name: LABEL_ESCALATE_AUTO/);
+  assert.match(workflow, /currentProvenance = await escalationProvenance\(prNumber\)/);
+  assert.match(workflow, /if \(currentProvenance\.companion\)/);
+  assert.match(workflow, /original transient escalation is still intact/);
+  assert.match(workflow, /could not classify live transient pair.*preserving both labels/);
   assert.match(workflow, /preserving it as a manual\/unknown hard stop/);
   assert.doesNotMatch(workflow, /restoreTransientEscalation/);
 });

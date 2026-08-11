@@ -429,6 +429,24 @@ jobs:
               const currentLabels = labelNames(current);
               if (currentLabels.has(LABEL_ESCALATE)) {
                 if (currentLabels.has(LABEL_ESCALATE_AUTO)) {
+                  // The first clear request may have failed without changing
+                  // either label. In that case the original automation-owned
+                  // pair is still valid: leave it intact for the next pass.
+                  // If a human removed/re-added needs-owner in the meantime,
+                  // companion provenance is false and only the stale companion
+                  // is removed. A provenance read failure keeps both labels and
+                  // therefore remains fail-closed.
+                  let currentProvenance;
+                  try {
+                    currentProvenance = await escalationProvenance(prNumber);
+                  } catch (e) {
+                    core.warning(`#${prNumber}: could not classify live transient pair during restoration; preserving both labels: ${e.message}`);
+                    return;
+                  }
+                  if (currentProvenance.companion) {
+                    core.warning(`#${prNumber}: original transient escalation is still intact after failed clear/merge; leaving both labels for retry`);
+                    return;
+                  }
                   await github.rest.issues.removeLabel({
                     owner, repo, issue_number: prNumber,
                     name: LABEL_ESCALATE_AUTO,
