@@ -201,6 +201,8 @@ test('authoritative workflow keeps gate policy inline', () => {
   assert.match(workflow, /\n  workflow_run:\n/);
   assert.match(workflow, /workflows: \['Codex Auto-Fix'\]/);
   assert.match(workflow, /listPullRequestsAssociatedWithCommit/);
+  assert.match(workflow, /github\.event\.workflow_run\.pull_requests\[0\]\.number/);
+  assert.match(workflow, /github\.event\.workflow_run\.head_sha/);
   assert.doesNotMatch(workflow, /\n  pull_request:\n/);
   assert.doesNotMatch(workflow, /\n  pull_request_review(?:_comment)?:\n/);
   assert.doesNotMatch(workflow, /uses:\s*actions\/checkout/);
@@ -274,4 +276,13 @@ test('temporary escalation attaches the hard stop independently of provenance', 
     assert.match(workflow, /labels: \[provenance\.name\]/);
     assert.doesNotMatch(workflow, /labels: escalationLabels\.map/);
   }
+});
+
+test('review-thread changes have a PAT-independent trusted gate relay', () => {
+  const bridge = fs.readFileSync(
+    path.join(__dirname, '..', '.github', 'workflows', 'codex-auto-fix.yml'),
+    'utf8',
+  );
+  assert.match(bridge, /\n  pull_request_review_thread:\n    types: \[resolved, unresolved\]/);
+  assert.match(bridge, /they exist only as a trusted-gate relay/);
 });

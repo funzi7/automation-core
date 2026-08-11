@@ -46,7 +46,11 @@ on:
 # verdict. Each run creates a fresh completed `check-codex-status` check on the
 # exact PR head; no cross-run check update is attempted.
 concurrency:
-  group: codex-gate-pr-${{ github.event.pull_request.number || github.event.inputs.pr_number || github.event.issue.number || github.run_id }}
+  # workflow_run normally carries the associated PR number; head_sha is the
+  # stable fallback when GitHub omits that array. Review relays therefore
+  # serialize with direct evaluations for the same PR instead of publishing
+  # exact-head verdicts in a stale completion order.
+  group: codex-gate-pr-${{ github.event.pull_request.number || github.event.inputs.pr_number || github.event.issue.number || github.event.workflow_run.pull_requests[0].number || github.event.workflow_run.head_sha || github.run_id }}
   cancel-in-progress: false
 
 permissions:
