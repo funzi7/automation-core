@@ -35,6 +35,15 @@ function signalTargetsHead(item, headSha, headObservedAt = null, dateField = 'cr
     observedAt > 0 && signalAt > observedAt;
 }
 
+function firstHeadObservation(runs = [], prNumber, headSha) {
+  const observed = runs
+    .filter((run) => String(run?.head_sha || '') === headSha &&
+      (run?.pull_requests || []).some((candidate) => candidate.number === prNumber))
+    .map((run) => new Date(run?.created_at || 0).getTime())
+    .filter((value) => Number.isFinite(value) && value > 0);
+  return observed.length ? new Date(Math.min(...observed)) : null;
+}
+
 function stripSummarySections(body) {
   if (!body) return '';
   return String(body)
@@ -155,6 +164,7 @@ module.exports = {
   P2_PATTERN,
   REVIEWED_COMMIT_PATTERN,
   signalTargetsHead,
+  firstHeadObservation,
   stripSummarySections,
   severity,
   findingFromThread,

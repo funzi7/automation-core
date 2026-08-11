@@ -8,6 +8,7 @@ const {
   decideCodexGate,
   severity,
   signalTargetsHead,
+  firstHeadObservation,
 } = require('../tools/codex_gate_logic');
 
 const CODEX = 'chatgpt-codex-connector';
@@ -105,6 +106,16 @@ test('an explicit mismatched commit never falls back to a later timestamp', () =
     signalTargetsHead(repointedInline, 'e'.repeat(40), '2026-08-11T16:00:00Z'),
     false,
   );
+});
+
+test('unchanged head uses its first server observation as freshness floor', () => {
+  const head = 'f'.repeat(40);
+  const runs = [
+    { head_sha: head, created_at: '2026-08-11T18:00:00Z', pull_requests: [{ number: 9 }] },
+    { head_sha: head, created_at: '2026-08-11T16:00:00Z', pull_requests: [{ number: 9 }] },
+    { head_sha: head, created_at: '2026-08-11T15:00:00Z', pull_requests: [{ number: 10 }] },
+  ];
+  assert.equal(firstHeadObservation(runs, 9, head).toISOString(), '2026-08-11T16:00:00.000Z');
 });
 
 test('resolved thread clears with a current-head signal', () => {

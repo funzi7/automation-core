@@ -228,7 +228,7 @@ jobs:
                 ))
                 .map((run) => new Date(run.created_at || 0).getTime())
                 .filter((value) => Number.isFinite(value) && value > 0);
-              return observed.length ? new Date(Math.max(...observed)) : null;
+              return observed.length ? new Date(Math.min(...observed)) : null;
             }
 
             async function hasActiveTrustedFinding(prNumber) {

@@ -63,7 +63,7 @@ permissions:
   contents: read
   pull-requests: read
   issues: read
-  # Current-head freshness uses the latest pull_request workflow run for the
+  # Current-head freshness uses the first pull_request workflow run for the
   # exact SHA as the server-observed head-transition floor.
   actions: read
   # fix #11: publish the explicit `check-codex-status` check-run with output text.
@@ -220,7 +220,7 @@ jobs:
                 ))
                 .map((run) => new Date(run.created_at || 0).getTime())
                 .filter((value) => Number.isFinite(value) && value > 0);
-              return observed.length ? new Date(Math.max(...observed)) : null;
+              return observed.length ? new Date(Math.min(...observed)) : null;
             }
 
             function authorLogin(comment) {
