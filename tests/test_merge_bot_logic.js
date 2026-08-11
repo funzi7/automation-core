@@ -193,7 +193,7 @@ test('legacy github-actions label requires positive circuit-breaker evidence', (
     body: `<!-- ai-loop:v1 root_pr=7 head=${HEAD} attempt=${attempt} agent=claude state=requested -->\n[auto-triggered]`,
   }));
   assert.equal(legacyAutomationProvenance(
-    [event], comments, { prNumber: 7, commitShas: [HEAD] },
+    [event], comments, { prNumber: 7, commitShas: [HEAD], currentHead: HEAD },
   ), true);
 });
 
@@ -229,7 +229,7 @@ test('legacy PAT-owner label needs a nearby watchdog marker', () => {
     user: { login: 'funzi7' },
     created_at: '2026-08-11T20:00:02Z',
     body: `<!-- ai-loop:v1 root_pr=7 head=${HEAD} agent=watchdog state=escalated -->`,
-  }], { prNumber: 7, commitShas: [HEAD] }), true);
+  }], { prNumber: 7, commitShas: [HEAD], currentHead: HEAD }), true);
 });
 
 test('watchdog marker must have trusted author and matching PR head', () => {
@@ -242,13 +242,17 @@ test('watchdog marker must have trusted author and matching PR head', () => {
     body: `<!-- ai-loop:v1 root_pr=${root} head=${head} agent=watchdog state=escalated -->`,
   });
   assert.equal(legacyAutomationProvenance(
-    [event], [marker('attacker', 7, HEAD)], { prNumber: 7, commitShas: [HEAD] },
+    [event], [marker('attacker', 7, HEAD)], { prNumber: 7, commitShas: [HEAD], currentHead: HEAD },
   ), false);
   assert.equal(legacyAutomationProvenance(
-    [event], [marker('funzi7', 8, HEAD)], { prNumber: 7, commitShas: [HEAD] },
+    [event], [marker('funzi7', 8, HEAD)], { prNumber: 7, commitShas: [HEAD], currentHead: HEAD },
   ), false);
   assert.equal(legacyAutomationProvenance(
-    [event], [marker('funzi7', 7, 'b'.repeat(40))], { prNumber: 7, commitShas: [HEAD] },
+    [event], [marker('funzi7', 7, 'b'.repeat(40))], { prNumber: 7, commitShas: [HEAD], currentHead: HEAD },
+  ), false);
+  assert.equal(legacyAutomationProvenance(
+    [event], [marker('funzi7', 7, 'b'.repeat(40))],
+    { prNumber: 7, commitShas: [HEAD, 'b'.repeat(40)], currentHead: HEAD },
   ), false);
 });
 
@@ -303,6 +307,7 @@ test('workflow preserves exact-SHA squash merge and same-repo branch deletion', 
   assert.match(workflow, /const trustedLoopMarker = \(comment\) =>/);
   assert.match(workflow, /Number\(root\[1\]\) !== prNumber/);
   assert.match(workflow, /!commitShas\.has\(head\[1\]\)/);
+  assert.match(workflow, /marker\.head === currentHead/);
 });
 
 test('merge-failure restoration preserves a concurrently added manual stop', () => {

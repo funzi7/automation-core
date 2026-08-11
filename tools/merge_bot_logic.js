@@ -103,7 +103,7 @@ function companionAutomationProvenance(events = []) {
 function legacyAutomationProvenance(
   events = [],
   comments = [],
-  { prNumber, commitShas = [] } = {},
+  { prNumber, commitShas = [], currentHead } = {},
 ) {
   const latest = latestLabelEvent(events, LABEL_ESCALATE);
   if (latest?.event !== 'labeled') return false;
@@ -117,13 +117,14 @@ function legacyAutomationProvenance(
     const root = marker[1].match(/\broot_pr=(\d+)\b/i);
     const head = marker[1].match(/\bhead=([a-f0-9]{40})\b/i);
     if (!root || Number(root[1]) !== Number(prNumber) || !head || !knownHeads.has(head[1])) return null;
-    return marker[1];
+    return { attributes: marker[1], head: head[1] };
   };
   const nearbyWatchdogMarker = comments.some((comment) => {
     const marker = trustedLoopMarker(comment);
     const commentAt = new Date(comment?.created_at || 0).getTime();
     return (
-      marker && /\bagent=watchdog\b/i.test(marker) && /\bstate=escalated\b/i.test(marker) &&
+      marker && marker.head === currentHead &&
+      /\bagent=watchdog\b/i.test(marker.attributes) && /\bstate=escalated\b/i.test(marker.attributes) &&
       Number.isFinite(commentAt) && Number.isFinite(latestAt) &&
       Math.abs(commentAt - latestAt) <= 5 * 60 * 1000
     );
@@ -135,7 +136,7 @@ function legacyAutomationProvenance(
     return (
       marker &&
       body.includes('[auto-triggered]') &&
-      /\battempt=\d+\b/i.test(marker) && /\bagent=claude\b/i.test(marker) && /\bstate=requested\b/i.test(marker) &&
+      /\battempt=\d+\b/i.test(marker.attributes) && /\bagent=claude\b/i.test(marker.attributes) && /\bstate=requested\b/i.test(marker.attributes) &&
       Number.isFinite(commentAt) && Number.isFinite(latestAt) &&
       commentAt <= latestAt && latestAt - commentAt <= 6 * 60 * 60 * 1000
     );

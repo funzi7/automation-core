@@ -255,7 +255,7 @@ jobs:
             }
 
             async function escalationProvenance(prNumber) {
-              const [events, issueComments, reviewComments, prCommits] = await Promise.all([
+              const [events, issueComments, reviewComments, prCommits, currentPrResponse] = await Promise.all([
                 github.paginate(
                   'GET /repos/{owner}/{repo}/issues/{issue_number}/events',
                   { owner, repo, issue_number: prNumber, per_page: 100 },
@@ -269,9 +269,11 @@ jobs:
                 github.paginate(github.rest.pulls.listCommits, {
                   owner, repo, pull_number: prNumber, per_page: 100,
                 }),
+                github.rest.pulls.get({ owner, repo, pull_number: prNumber }),
               ]);
               const comments = [...issueComments, ...reviewComments];
               const commitShas = new Set(prCommits.map((commit) => commit.sha));
+              const currentHead = currentPrResponse.data.head.sha;
               const trustedLoopMarker = (comment) => {
                 if (![OWNER_LOGIN, 'github-actions[bot]'].includes(comment.user?.login)) return null;
                 const marker = String(comment.body || '').match(/<!-- ai-loop:v1\b([^>]*)-->/i);
@@ -279,7 +281,7 @@ jobs:
                 const root = marker[1].match(/\broot_pr=(\d+)\b/i);
                 const head = marker[1].match(/\bhead=([a-f0-9]{40})\b/i);
                 if (!root || Number(root[1]) !== prNumber || !head || !commitShas.has(head[1])) return null;
-                return marker[1];
+                return { attributes: marker[1], head: head[1] };
               };
               const latestLabelEvent = (labelName) => events
                 .filter((event) => (
@@ -316,7 +318,8 @@ jobs:
                 const marker = trustedLoopMarker(comment);
                 const commentAt = new Date(comment.created_at || 0).getTime();
                 return (
-                  marker && /\bagent=watchdog\b/i.test(marker) && /\bstate=escalated\b/i.test(marker) &&
+                  marker && marker.head === currentHead &&
+                  /\bagent=watchdog\b/i.test(marker.attributes) && /\bstate=escalated\b/i.test(marker.attributes) &&
                   Number.isFinite(commentAt) && Number.isFinite(needsAt) &&
                   Math.abs(commentAt - needsAt) <= 5 * 60 * 1000
                 );
@@ -328,7 +331,7 @@ jobs:
                 return (
                   marker &&
                   body.includes('[auto-triggered]') &&
-                  /\battempt=\d+\b/i.test(marker) && /\bagent=claude\b/i.test(marker) && /\bstate=requested\b/i.test(marker) &&
+                  /\battempt=\d+\b/i.test(marker.attributes) && /\bagent=claude\b/i.test(marker.attributes) && /\bstate=requested\b/i.test(marker.attributes) &&
                   Number.isFinite(commentAt) && Number.isFinite(needsAt) &&
                   commentAt <= needsAt && needsAt - commentAt <= 6 * 60 * 60 * 1000
                 );
