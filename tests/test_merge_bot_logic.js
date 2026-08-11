@@ -219,6 +219,21 @@ test('companion provenance rejects an orphan before a later manual hold', () => 
     id: 12, event: 'labeled', label: { name: 'needs-owner-auto' },
     actor: { login: 'github-actions[bot]' }, created_at: '2026-08-11T20:10:01Z',
   });
+  assert.equal(companionAutomationProvenance(events), false);
+  events.push(
+    {
+      id: 13, event: 'unlabeled', label: { name: 'needs-owner' },
+      actor: { login: 'funzi7' }, created_at: '2026-08-11T20:11:00Z',
+    },
+    {
+      id: 14, event: 'labeled', label: { name: 'needs-owner' },
+      actor: { login: 'github-actions[bot]' }, created_at: '2026-08-11T20:12:00Z',
+    },
+    {
+      id: 15, event: 'labeled', label: { name: 'needs-owner-auto' },
+      actor: { login: 'github-actions[bot]' }, created_at: '2026-08-11T20:12:01Z',
+    },
+  );
   assert.equal(companionAutomationProvenance(events), true);
 });
 
@@ -316,6 +331,10 @@ test('workflow preserves exact-SHA squash merge and same-repo branch deletion', 
   assert.match(workflow, /marker\.head === currentHead/);
   assert.match(workflow, /async function hasCurrentHeadCodexSignal\(prNumber\)/);
   assert.match(workflow, /override absent and current-head Codex signal missing/);
+  assert.match(workflow, /needsEvent\.actor\?\.login === 'github-actions\[bot\]'/);
+  assert.match(workflow, /autoEvent\.actor\?\.login === 'github-actions\[bot\]'/);
+  assert.match(workflow, /GH_LABEL_TOKEN: \$\{\{ github\.token \}\}/);
+  assert.match(workflow, /async function actionLabelRequest\(method, path, body\)/);
 });
 
 test('merge-failure restoration preserves a concurrently added manual stop', () => {
@@ -357,6 +376,8 @@ test('only temporary PR automation writers add needs-owner-auto', () => {
   assert.match(read('codex-auto-fix.yml'), /pre-existing needs-owner is manual\/unknown/);
   assert.match(read('codex-auto-fix.yml'), /could not prove needs-owner was absent/);
   assert.match(read('claude-fallback-watchdog.yml'), /needs-owner-auto/);
+  assert.match(read('claude-fallback-watchdog.yml'), /GH_LABEL_TOKEN: \$\{\{ github\.token \}\}/);
+  assert.match(read('claude-fallback-watchdog.yml'), /async function actionLabelRequest\(method, path, body\)/);
   assert.doesNotMatch(read('claude.yml'), /needs-owner-auto/);
   assert.doesNotMatch(read('codex-backup-fix.yml'), /needs-owner-auto/);
   assert.doesNotMatch(read('ci-doctor.yml'), /needs-owner-auto/);

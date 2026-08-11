@@ -90,7 +90,9 @@ function companionAutomationProvenance(events = []) {
   const needs = latestLabelEvent(events, LABEL_ESCALATE);
   const auto = latestLabelEvent(events, LABEL_ESCALATE_AUTO);
   if (needs?.event !== 'labeled' || auto?.event !== 'labeled') return false;
-  if (!['github-actions[bot]', OWNER_LOGIN].includes(auto?.actor?.login)) return false;
+  // Both assignments must be automation-owned. If a human wins the race and
+  // adds needs-owner first, the later companion can never bless that stop.
+  if (needs?.actor?.login !== 'github-actions[bot]' || auto?.actor?.login !== 'github-actions[bot]') return false;
   const needsAt = new Date(needs.created_at || 0).getTime();
   const autoAt = new Date(auto.created_at || 0).getTime();
   if (!Number.isFinite(needsAt) || !Number.isFinite(autoAt)) return false;

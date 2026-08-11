@@ -79,10 +79,15 @@ jobs:
           # (INCIDENT 2). GITHUB_TOKEN carries this workflow's declared
           # `checks: read` + `statuses: read`, so the reads run on it instead.
           GH_READONLY_TOKEN: ${{ github.token }}
+          # Transient-provenance labels are deliberately assigned as
+          # github-actions[bot], making their event provenance unambiguous.
+          GH_LABEL_TOKEN: ${{ github.token }}
         with:
-          # AUTOMATION_PAT stays the step token: every MUTATION (merge/label/
-          # comment/deleteRef/issue-close) must run on it — pulls.merge must be
-          # PAT-authored so the push to main triggers downstream workflows.
+          # AUTOMATION_PAT stays the step token for merges, comments, branch
+          # deletion, and other mutations that must trigger downstream work.
+          # Only transient-provenance label assignment uses GH_LABEL_TOKEN.
+          # pulls.merge must remain PAT-authored so the push to main triggers
+          # downstream workflows.
           github-token: ${{ secrets.AUTOMATION_PAT }}
           script: |
             const owner = context.repo.owner;
@@ -95,6 +100,25 @@ jobs:
             // two GITHUB_TOKEN reads with the built-in global fetch (raw REST), zero
             // modules.
             const GH_RO = process.env.GH_READONLY_TOKEN;
+            const GH_LABEL_TOKEN = process.env.GH_LABEL_TOKEN;
+            async function actionLabelRequest(method, path, body) {
+              const res = await fetch(`https://api.github.com${path}`, {
+                method,
+                headers: {
+                  Authorization: `Bearer ${GH_LABEL_TOKEN}`,
+                  Accept: 'application/vnd.github+json',
+                  'X-GitHub-Api-Version': '2022-11-28',
+                  'Content-Type': 'application/json',
+                },
+                body: body === undefined ? undefined : JSON.stringify(body),
+              });
+              if (!res.ok) {
+                const error = new Error(`${method} ${path} -> ${res.status}: ${(await res.text()).slice(0, 200)}`);
+                error.status = res.status;
+                throw error;
+              }
+              return res.status === 204 ? null : res.json();
+            }
             // fix #20: follow the Link rel="next" header until absent (50-page
             // safety ceiling) — true pagination, replacing the fixed 10-page valve.
             async function roPage(url) {
@@ -342,7 +366,8 @@ jobs:
               const companion = (
                 needsEvent?.event === 'labeled' &&
                 autoEvent?.event === 'labeled' &&
-                [OWNER_LOGIN, 'github-actions[bot]'].includes(autoEvent.actor?.login) &&
+                needsEvent.actor?.login === 'github-actions[bot]' &&
+                autoEvent.actor?.login === 'github-actions[bot]' &&
                 Number.isFinite(needsAt) && Number.isFinite(autoAt) &&
                 companionOrdered && autoAt - needsAt <= 5 * 60 * 1000
               );
@@ -419,15 +444,16 @@ jobs:
               ];
               for (const label of definitions) {
                 try {
-                  await github.rest.issues.createLabel({ owner, repo, ...label });
+                  await actionLabelRequest('POST', `/repos/${owner}/${repo}/labels`, label);
                 } catch (e) {
                   if (e.status !== 422) throw e;
                 }
               }
-              await github.rest.issues.addLabels({
-                owner, repo, issue_number: prNumber,
-                labels: definitions.map((label) => label.name),
-              });
+              await actionLabelRequest(
+                'POST',
+                `/repos/${owner}/${repo}/issues/${prNumber}/labels`,
+                { labels: definitions.map((label) => label.name) },
+              );
               core.info(`#${prNumber}: restored transient escalation after merge did not complete`);
             }
 
