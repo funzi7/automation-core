@@ -79,8 +79,7 @@ jobs:
     #
     # Three branches mirror the on: events that can carry actionable
     # bot feedback: PR review, inline review-comment, top-level
-    # issue/PR comment. This workflow does NOT listen to `issues`
-    # events — it only responds to Codex reviews/comments on PRs.
+    # issue/PR comment. This workflow does NOT listen to `issues` events.
     if: |
       (github.event_name == 'pull_request_review' &&
        github.event.review.user.login == 'chatgpt-codex-connector[bot]' &&
@@ -131,10 +130,12 @@ jobs:
             // automation-core upstream — auto-patching the downstream copy would
             // diverge it from upstream and trip the 3-round breaker → needs-owner.
             // Codex still reviews it; only the auto-trigger is suppressed.
+            let prData = null;
             try {
-              const { data: prData } = await github.rest.pulls.get({
+              const response = await github.rest.pulls.get({
                 owner, repo, pull_number: prNumber,
               });
+              prData = response.data;
               const headRef = (prData.head && prData.head.ref) || "";
               const prTitle = prData.title || "";
               if (headRef === 'chore/sync-automation-core' ||
@@ -147,6 +148,23 @@ jobs:
 
             const MARKER = "[auto-triggered]";
             const CODEX = "chatgpt-codex-connector[bot]";
+            const headSha = prData?.head?.sha || context.payload.pull_request?.head?.sha || '';
+            if (!/^[a-f0-9]{40}$/i.test(headSha)) {
+              core.warning(`PR #${prNumber}: current head SHA unavailable; refusing to classify feedback as current.`);
+              core.setOutput("should_trigger", "false");
+              return;
+            }
+            const REVIEWED_COMMIT_PATTERN = /(?:^|\n)\*\*Reviewed commit:\*\*\s*`([a-f0-9]{10,40})`(?:\s|$)/i;
+            const markerHead = (body) => String(body || '').match(/<!--\s*ai-loop:v1\b[^>]*\bhead=([a-f0-9]{40})\b[^>]*-->/i)?.[1];
+            const signalTargetsHead = (item) => {
+              const originalCommit = String(item?.original_commit_id || '').toLowerCase();
+              if (originalCommit) return originalCommit === headSha.toLowerCase();
+              const commit = String(item?.commit_id || '').toLowerCase();
+              if (commit) return commit === headSha.toLowerCase();
+              const reviewed = String(item?.body || '').match(REVIEWED_COMMIT_PATTERN)?.[1]?.toLowerCase();
+              if (reviewed) return headSha.toLowerCase().startsWith(reviewed);
+              return markerHead(item?.body)?.toLowerCase() === headSha.toLowerCase();
+            };
 
             // Pull EVERY feedback channel, fully paginated. Codex inline notes
             // (pull_request_review_comment) live in a DIFFERENT channel from
@@ -167,14 +185,23 @@ jobs:
               }),
             ]);
 
-            // Normalise all three channels to { body, login, date } so the
+            // Normalise all three channels so the
             // marker dedupe AND the P1 scan span every channel at once.
-            // Reviews use submitted_at; comments use created_at.
             const norm = [
-              ...issueComments.map((c) => ({ body: c.body, login: c.user?.login, date: c.created_at })),
-              ...reviewComments.map((c) => ({ body: c.body, login: c.user?.login, date: c.created_at })),
-              ...reviews.map((r) => ({ body: r.body, login: r.user?.login, date: r.submitted_at })),
+              ...issueComments.map((c) => ({ body: c.body, login: c.user?.login, source: c })),
+              ...reviewComments.map((c) => ({ body: c.body, login: c.user?.login, source: c })),
+              ...reviews.map((r) => ({ body: r.body, login: r.user?.login, source: r })),
             ];
+
+            // A delayed webhook for an older head must not trip the current
+            // head's circuit breaker or launch a fixer. The trusted actor gate
+            // above is necessary but not sufficient; bind this event to SHA.
+            const triggeringSignal = context.payload.comment || context.payload.review;
+            if (!signalTargetsHead(triggeringSignal)) {
+              core.info(`PR #${prNumber}: trusted feedback is not bound to current head ${headSha.slice(0, 10)}; skipping stale event.`);
+              core.setOutput("should_trigger", "false");
+              return;
+            }
 
             // Circuit breaker: count auto-trigger markers across ALL channels
             // (now including the inline replies the old code missed). The
@@ -189,19 +216,64 @@ jobs:
               core.warning(
                 `Circuit breaker: ${autoFixCount} @claude fix rounds on PR #${prNumber} without converging; stopping and escalating to needs-owner.`,
               );
-              // Ensure the escalation label exists, then attach it.
-              // createLabel is best-effort (422 = already exists) so
-              // downstream repos that don't have needs-owner yet still get
-              // it created.
+              // Never convert a pre-existing human/unknown stop into a
+              // transient automation escalation. If the live-label lookup
+              // fails, fail closed by adding needs-owner alone; provenance is
+              // attached only when we proved the stop was absent first.
+              let addAutoProvenance = false;
               try {
-                await github.rest.issues.createLabel({ owner, repo, name: 'needs-owner', color: 'd93f0b', description: 'Escalation — automation stopped, human needed' });
-              } catch (e) { if (e.status !== 422) core.info(`createLabel needs-owner failed (ignored): ${e.message}`); }
-              try {
-                await github.rest.issues.addLabels({
-                  owner, repo, issue_number: prNumber, labels: ['needs-owner'],
+                const { data: currentPr } = await github.rest.pulls.get({
+                  owner, repo, pull_number: prNumber,
                 });
+                const currentLabels = new Set(
+                  (currentPr.labels || []).map((label) => label.name || label),
+                );
+                if (currentLabels.has('needs-owner')) {
+                  core.warning(`PR #${prNumber}: pre-existing needs-owner is manual/unknown; leaving it untouched and not adding needs-owner-auto.`);
+                  core.setOutput("should_trigger", "false");
+                  return;
+                }
+                addAutoProvenance = true;
               } catch (e) {
-                core.info(`addLabel needs-owner failed (ignored): ${e.message}`);
+                core.warning(`PR #${prNumber}: could not prove needs-owner was absent; adding hard stop without automation provenance: ${e.message}`);
+              }
+
+              const hardStop = {
+                name: 'needs-owner', color: 'd93f0b',
+                description: 'Escalation — automation stopped, human needed',
+              };
+              try {
+                await github.rest.issues.createLabel({ owner, repo, ...hardStop });
+              } catch (e) { if (e.status !== 422) core.info(`createLabel ${hardStop.name} failed; attempting attachment anyway: ${e.message}`); }
+              // Attach the security stop independently. A missing companion
+              // definition must never reject the hard-stop write as part of a
+              // batch request.
+              await github.rest.issues.addLabels({
+                owner, repo, issue_number: prNumber, labels: [hardStop.name],
+              });
+
+              if (addAutoProvenance) {
+                const provenance = {
+                  name: 'needs-owner-auto', color: 'fbca04',
+                  description: 'Provenance: needs-owner was added by temporary PR automation escalation',
+                };
+                let provenanceReady = false;
+                try {
+                  await github.rest.issues.createLabel({ owner, repo, ...provenance });
+                  provenanceReady = true;
+                } catch (e) {
+                  if (e.status === 422) provenanceReady = true;
+                  else core.warning(`createLabel ${provenance.name} failed; hard stop remains without transient provenance: ${e.message}`);
+                }
+                if (provenanceReady) {
+                  try {
+                    await github.rest.issues.addLabels({
+                      owner, repo, issue_number: prNumber, labels: [provenance.name],
+                    });
+                  } catch (e) {
+                    core.warning(`add ${provenance.name} failed; hard stop remains: ${e.message}`);
+                  }
+                }
               }
               // Telegram escalation (HTML; skip silently if unset).
               const tgToken = process.env.TELEGRAM_BOT_TOKEN;
@@ -226,16 +298,6 @@ jobs:
               return;
             }
 
-            // Head-commit timestamp: anything Codex left AFTER this is feedback
-            // on the current head (Codex re-reviews each push); anything the
-            // bridge posted after this is THIS wave's trigger.
-            const prCommits = await github.paginate(github.rest.pulls.listCommits, {
-              owner, repo, pull_number: prNumber, per_page: 100,
-            });
-            const latestCommitDate = prCommits.length
-              ? new Date(prCommits[prCommits.length - 1].commit.committer.date)
-              : new Date(0);
-
             // P1 + P2 gate (P3 EXCLUDED). Auto-trigger a (paid) Claude run when
             // at least one ACTIVE P1 OR P2 finding exists for the current head.
             // P3 is minor styling/cosmetic and must NEVER start a fix run.
@@ -243,13 +305,11 @@ jobs:
             // with a shields.io severity badge whose label is the literal token
             // — `P1-orange`, `P2-yellow`, `P3-...` — so body.includes("P1") /
             // includes("P2") catch P1/P2 and never match a P3-only finding.
-            // Freshness is unchanged: we scan the triggering body PLUS every
-            // Codex note left AFTER the latest commit, so a finding on a
-            // superseded commit doesn't count (same array the P1 logic used).
-            const currentBody =
-              context.payload.comment?.body || context.payload.review?.body || "";
+            // Only signals explicitly bound to the exact current head count;
+            // commit dates are backdatable and cannot prove a head transition.
+            const currentBody = triggeringSignal?.body || '';
             const codexBodiesThisWave = norm
-              .filter((e) => e.login === CODEX && e.date && new Date(e.date) > latestCommitDate)
+              .filter((e) => e.login === CODEX && signalTargetsHead(e.source))
               .map((e) => e.body || "");
             codexBodiesThisWave.push(currentBody);
             const hasP1 = codexBodiesThisWave.some((b) => b.includes("P1"));
@@ -273,7 +333,7 @@ jobs:
             // every P1 on the PR in a single run, so one trigger per wave is
             // enough. This is what collapses N inline events into ONE trigger.
             const alreadyThisWave = norm.some(
-              (e) => e.body?.includes(MARKER) && e.date && new Date(e.date) > latestCommitDate,
+              (e) => e.body?.includes(MARKER) && markerHead(e.body) === headSha,
             );
             if (alreadyThisWave) {
               core.info(
@@ -302,26 +362,21 @@ jobs:
               }
             }
             const nextAttempt = maxAttempt + 1;
-            const headSha = prCommits.length
-              ? prCommits[prCommits.length - 1].sha
-              : "";
-
             // fix #13: build a SELF-CONTAINED findings digest from the
             // already-fetched Codex notes. Claude's run context CANNOT read inline
             // review threads (gh/GraphQL fail on a statusCheckRollup perm error),
             // so inline the actual P1/P2 text into the @claude fix comment. Reuse
-            // the same P1/P2 substring + freshness (onHead) — no new severity logic.
-            const onHeadDate = (d) => !!d && new Date(d) > latestCommitDate;
+            // the same P1/P2 substring + exact-head binding — no new severity logic.
             const isP12 = (b) => !!b && (b.includes("P1") || b.includes("P2"));
             const digestBullets = [];
             for (const c of reviewComments) {
-              if (c.user?.login === CODEX && isP12(c.body) && onHeadDate(c.created_at)) {
+              if (c.user?.login === CODEX && isP12(c.body) && signalTargetsHead(c)) {
                 const loc = `${c.path || "?"}:${c.line || c.original_line || "?"}`;
                 digestBullets.push(`- \`${loc}\` — ${(c.body || "").trim()}`);
               }
             }
             for (const r of reviews) {
-              if (r.user?.login === CODEX && isP12(r.body) && onHeadDate(r.submitted_at)) {
+              if (r.user?.login === CODEX && isP12(r.body) && signalTargetsHead(r)) {
                 digestBullets.push(`- ${(r.body || "").trim()}`);
               }
             }

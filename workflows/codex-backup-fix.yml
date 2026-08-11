@@ -103,37 +103,38 @@ jobs:
             const repo = context.repo.repo;
             const prNumber = parseInt("${{ inputs.pr_number }}", 10);
             const CODEX = 'chatgpt-codex-connector[bot]';
-            const [rc, rv, prCommits, prData] = await Promise.all([
+            const targetHead = String("${{ inputs.head_sha }}").toLowerCase();
+            const [rc, rv] = await Promise.all([
               github.paginate(github.rest.pulls.listReviewComments, {
                 owner, repo, pull_number: prNumber, per_page: 100,
               }),
               github.paginate(github.rest.pulls.listReviews, {
                 owner, repo, pull_number: prNumber, per_page: 100,
               }),
-              github.paginate(github.rest.pulls.listCommits, {
-                owner, repo, pull_number: prNumber, per_page: 100,
-              }),
-              github.rest.pulls.get({ owner, repo, pull_number: prNumber }),
             ]);
-            // fix #24: FRESHNESS — mirror codex-gate.yml's date-only model. A finding
-            // counts only if dated AFTER latestCommitDate (the MAX committer date
-            // across the PR's commits, else pr.created_at); review COMMENTS by
-            // created_at, review BODIES by submitted_at. Stale, already-addressed
-            // P1/P2s must NOT be fed to the agent.
-            const latestCommitDate = prCommits.length > 0
-              ? new Date(Math.max(...prCommits.map((c) => new Date(c.commit.committer.date).getTime())))
-              : new Date(prData.data.created_at);
+            // Mirror the gate's exact-head model. Review objects bind by exact
+            // commit_id; inline comments bind by original_commit_id so GitHub's
+            // repointing of still-applicable comments cannot revive an old finding.
+            const REVIEWED_COMMIT_PATTERN = /(?:^|\n)\*\*Reviewed commit:\*\*\s*`([a-f0-9]{10,40})`(?:\s|$)/i;
+            const targetsHead = (item) => {
+              const originalCommit = String(item?.original_commit_id || '').toLowerCase();
+              if (originalCommit) return originalCommit === targetHead;
+              const commit = String(item?.commit_id || '').toLowerCase();
+              if (commit) return commit === targetHead;
+              const marker = String(item?.body || '').match(REVIEWED_COMMIT_PATTERN)?.[1]?.toLowerCase();
+              return !!marker && targetHead.startsWith(marker);
+            };
             const isCodex = (c) => (c.user && c.user.login) === CODEX;
             const hasSev = (b) => b.includes("P1") || b.includes("P2");
             const texts = [
-              ...rc.filter((c) => isCodex(c) && c.created_at && new Date(c.created_at) > latestCommitDate && hasSev(c.body || "")),
-              ...rv.filter((c) => isCodex(c) && c.submitted_at && new Date(c.submitted_at) > latestCommitDate && hasSev(c.body || "")),
+              ...rc.filter((c) => isCodex(c) && targetsHead(c) && hasSev(c.body || "")),
+              ...rv.filter((c) => isCodex(c) && targetsHead(c) && hasSev(c.body || "")),
             ].map((c) => c.body || "");
             const fs = require('fs');
             const out = texts.join("\n\n---\n\n").slice(0, 8000) ||
               "No specific Codex finding text was captured; review the PR diff and fix any P1/P2 issues Codex would raise.";
             fs.writeFileSync('codex-finding.txt', out);
-            core.info(`Wrote codex-finding.txt with ${texts.length} fresh finding section(s) (after ${latestCommitDate.toISOString()}).`);
+            core.info(`Wrote codex-finding.txt with ${texts.length} finding section(s) bound to ${targetHead.slice(0, 10)}.`);
 
       - name: Run Codex to fix the finding (CI agent, not Cloud)
         id: codex_agent

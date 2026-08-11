@@ -33,7 +33,8 @@ workflows above plus the existing `codex-gate`:
   codex-gate.yml  check-codex-status must pass (no unresolved P1)
           │
           ▼  (all green)
-  merge-bot.yml   squash-merges, deletes branch, closes the ci-doctor Issue
+  merge-bot.yml   squash-merges the exact checked head, deletes its branch,
+                  closes the ci-doctor Issue
 ```
 
 Every cross-workflow write (Issue create, re-label, merge) uses
@@ -56,7 +57,9 @@ still happen within minutes — the crons are just the backstop.
 |-------|---------|
 | `claude-fix` | "Claude, fix this." Set by ci-doctor; triggers Claude Fixer. |
 | `automerge` | This PR may be auto-merged by Merge Bot once green. |
-| `needs-owner` | Escalation — automation stopped, a human must act. (The single escalation label; the earlier one was fully removed.) |
+| `no-automerge` | Permanent human opt-out. Merge Bot never removes it and never merges while it is present. |
+| `needs-owner` | Human/manual escalation stop. Without proven automation provenance it remains a hard stop. |
+| `needs-owner-auto` | Companion provenance for a temporary PR fixer/watchdog exhaustion. Merge Bot clears it together with `needs-owner` only after the current head is mergeable, fully green, exact-head gated, and free of active trusted P1/P2 findings. |
 | `ci-doctor` | Marks Issues opened by CI Doctor (used for dedup + close). |
 
 ### Secrets
@@ -79,9 +82,29 @@ and burn essentially no Actions minutes.
 ### Protected paths
 
 Drop a `.claude-guard.json` in a repo root (see
-`template/claude-guard.example.json`) to list globs Merge Bot must never
-auto-merge. A PR touching a protected path is escalated to `needs-owner`
-instead of merged.
+`template/claude-guard.example.json`) to list sensitive globs. Forks,
+untrusted authors, and ambiguous/bot-only PRs touching those paths are
+escalated to manual `needs-owner`. A same-repository PR authored by `funzi7`
+may still auto-merge protected workflow changes, but only after the unchanged
+full exact-head CI, trusted Codex review/gate, active-thread, mergeability, and
+SHA-pinned merge requirements pass. Add `no-automerge` for an explicit human
+hold.
+
+### Default merge policy
+
+An open, non-draft PR authored by `funzi7` whose head repository exactly
+matches its base repository is a trusted Merge Bot candidate regardless of a
+normal `fix/*`, `feat/*`, or `chore/*` branch name. Established Claude,
+explicit `automerge`, and trusted automation-core sync candidates remain
+supported. Fork titles and branch names never establish trust.
+
+The candidate is merged only when every latest relevant check/status is
+terminal-green, the authoritative `check-codex-status` success exists on the
+exact current head, no active trusted P1/P2 thread exists, and GitHub reports
+the PR mergeable. The squash call is pinned to that evaluated SHA; a moved
+head fails closed. A successful same-repo merge is followed by branch
+deletion, and the PAT-authored merge continues to trigger downstream
+workflows.
 
 ## How to onboard repos
 
@@ -138,7 +161,9 @@ Each participating repo has `.github/workflows/sync-automation-core.yml` that:
 2. Clones automation-core
 3. Compares files in `.github/workflows/` (matching the allow-list from `automation-core/sync-config.json`) against the local repo
 4. If diffs exist → opens a PR titled `chore(automation): sync from automation-core`
-5. You review and merge
+5. CI and the trusted Codex Gate review the fresh sync head; Merge Bot then
+   auto-merges it when fully green unless `no-automerge` or a manual
+   `needs-owner` stop is present
 
 ## How to add a new workflow to all repos
 

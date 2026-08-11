@@ -10,13 +10,21 @@
 
 ---
 
-## Current Snapshot (post-fix #27 + Codex API agent-failure path fix, updated 2026-07-09)
+## Current Snapshot (owner exact-head auto-merge rollout, updated 2026-08-11)
 
-Code architecture base: fix #27 implementation commit `93f6acb9d2e0396afad3e10854503024843c32de` plus the 2026-07-09 `codex-backup-fix.yml` agent-failure path hardening.
+Code architecture base: fix #27 plus the Codex backup hardening and the
+2026-08-11 reconciliation of paywall-bot's reviewed Codex Gate/watchdog fixes
+back into the central workflow source.
 
 Documentation base: final post-fix #27 normalization commit `11ba6a6bf13c91b1be61d4292b853dd15c37063b`, plus this upstream fix record.
 
-Runtime status: workflow code was re-read for this pass. No successful post-fix #27 Claude PR-head run has happened yet. Claude PR-head delivery and Claude proxy are implemented but runtime-unverified. Recent Claude runs return Anthropic `billing_error` / credit exhaustion. Codex API backup is runtime-unverified while OpenAI quota is unavailable; the 2026-07-09 fix hardens the failed-agent marker path before the next live Codex API run.
+Runtime status: paywall-bot PR #93 proved the failure mode: its exact head was
+fully green and mergeable, but an automation-added `needs-owner` stranded the
+old Merge Bot. PR #89, the stale downstream sync that proposed obsolete gate
+and watchdog files, was closed unmerged and its stale branch deleted. The
+central source now carries the downstream-reviewed thread-state, trusted-base,
+exact-head check publication, and bounded watchdog behavior before the new
+merge policy is rolled out.
 
 Current delivery-judged ladder:
 
@@ -41,9 +49,15 @@ Per-repo switches are not synced:
 | `CODEX_BACKUP_ENABLED` | disabled | only `true` enables the Codex API backup. Disabled means skipped, not immediate escalation. |
 | `CODEX_CLOUD_ENABLED` | enabled | `false` disables Codex Cloud. |
 
-Strict Codex identity: trusted Codex comments are only from exact login `chatgpt-codex-connector[bot]`. No substring or regex identity matcher is trusted.
+Strict Codex identity: trusted REST review/comment surfaces use exact login
+`chatgpt-codex-connector[bot]`; GraphQL review threads expose the same App as
+exact login `chatgpt-codex-connector`. No substring, regex, or other alias is
+trusted.
 
-Only escalation label: `needs-owner`.
+Escalation labels: manual/unknown `needs-owner` is a hard stop;
+`needs-owner-auto` proves temporary PR automation exhaustion and may be cleared
+with `needs-owner` only after exact-head fully-green validation. `no-automerge`
+is the permanent human opt-out and is never removed by automation.
 
 ## Current Open TODO (authoritative)
 
@@ -72,7 +86,7 @@ Synced workflows listed in `sync-config.json`: `codex-auto-fix.yml`, `codex-gate
 ### `codex-auto-fix.yml` — Bridge + Codex summary archive
 
 - Bridge triggers exactly one `@claude fix` per review wave when trusted Codex reports active P1 or P2. P3 is excluded.
-- P1/P2 detection is badge-token based (`P1-orange`, `P2-yellow`) and freshness is date-after-latest-commit.
+- P1/P2 detection is badge-token based (`P1-orange`, `P2-yellow`) and feedback is bound to the exact head through review `commit_id`, Codex's `Reviewed commit` marker, or an authenticated `ai-loop` head marker.
 - The bridge inlines the actual P1/P2 finding text because Claude's run context cannot reliably read inline review threads.
 - Sync PRs are suppressed because findings belong upstream in automation-core, not in downstream copied workflow files.
 - Circuit breaker: 3 rounds -> `needs-owner` + Telegram if configured.
@@ -82,7 +96,7 @@ Synced workflows listed in `sync-config.json`: `codex-auto-fix.yml`, `codex-gate
 - `check-codex-status` is the blocking check.
 - Green requires Codex has reviewed the current head and no active P1/P2 remains.
 - P1 and P2 both block; this must match bridge-trigger severity. Historical P1-only behavior is SUPERSEDED.
-- Freshness is date-only against the max committer date across PR commits; `commit_id` is not trusted for freshness because GitHub can repoint inline comments.
+- Freshness is never inferred from Git author/committer dates. Review objects and Codex result comments bind directly to the exact SHA; unmarked surfaces count only after a GitHub Actions `pull_request` run observed that SHA as this PR's head. Repointable inline `commit_id` values alone do not waive current-head review.
 - Trusted-sync grace-green is limited to zero-Codex-signal sync PRs older than `SYNC_GRACE_MINUTES`.
 - The old in-run self-rerun poll is gone; the watchdog sweep handles late Codex signals and override-label dispatches.
 
@@ -107,11 +121,19 @@ Synced workflows listed in `sync-config.json`: `codex-auto-fix.yml`, `codex-gate
 
 ### `merge-bot.yml` — Merge Bot
 
-- Candidates include bot-authored PRs, `automerge` PRs, trusted sync PRs, and same-repo `claude/*` PRs.
-- `needs-owner` is a hard stop before any candidate acceptance.
-- Requires latest `check-codex-status` on the head to be success.
+- Candidates include normal same-repository PRs authored by `funzi7`, plus
+  established Claude, explicit `automerge`, and trusted sync paths. A fork is
+  never trusted by title/branch naming.
+- `no-automerge` and manual/unknown `needs-owner` are hard stops.
+- Temporary `needs-owner` + `needs-owner-auto` (or a proven legacy
+  GitHub-Actions label event with no human/protected reason) stays in place
+  while anything is red/pending/ambiguous, then both labels clear and the PR
+  merges in the same exact-head evaluation.
+- Requires latest `check-codex-status` on the exact head to be success and
+  independently checks for active trusted P1/P2 review threads.
 - Uses latest check run per name and ignores cancelled tails from superseded queued runs.
-- Protected paths in `.claude-guard.json` escalate instead of merge.
+- Protected paths still escalate untrusted/fork/ambiguous PRs. A fully reviewed
+  same-repo owner PR may merge without a second manual merge step.
 - Squash merge is head-SHA-pinned.
 
 ### Hub-only workflows

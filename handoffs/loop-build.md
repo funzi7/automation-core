@@ -4,6 +4,19 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
 
 ---
 
+## [2026-08-11 UTC] Reconcile gate drift and make exact-head-green owner PRs hands-off
+- PR: current `agent/owner-green-automerge` change; exact PR/merge SHA is recorded by GitHub and agent-memory after bootstrap validation.
+- Branch: `agent/owner-green-automerge`
+- Status: bootstrap validation/rollout in progress at authoring time.
+- What changed:
+  - Closed paywall-bot PR #89 unmerged and deleted only its verified stale sync branch; the obsolete PR was not salvaged.
+  - Ported paywall-bot's current reviewed Codex Gate and watchdog hardening into automation-core source/mirrors before changing merge policy, closing the eight active trusted P1 findings still attached to #89's obsolete versions.
+  - Added default candidacy for open non-draft same-repository PRs authored by `funzi7`, permanent `no-automerge`, transient `needs-owner-auto`, legacy label-event provenance checks, owner-only protected-path continuation after the full gate, direct active-thread defense, and per-PR failure isolation.
+  - Preserved latest-per-context checks, exact-head gate existence/success, affirmative mergeability, SHA-pinned squash, same-repo post-merge branch deletion, PAT-authored downstream triggering, and fail-closed fork handling.
+- Validation: tracked workflow YAML, source/mirror parity, every changed github-script block with `node --check`, 43 deterministic Node policy tests plus static writer guards, `git diff --check`; actionlint is run when installed.
+- Needs from the owner: nothing if exact-head GitHub CI/trusted review/gate completes green; the task authorizes the one-time bootstrap merge and fresh downstream sync rollout.
+- Next: merge only the exact reviewed central head, run the normal paywall-bot sync, and prove the fresh exact-head-green sync closes itself without owner intervention.
+
 ## [2026-07-09 09:18 UTC] Fix paywall-bot PR #73 Codex P2 upstream
 - PR: direct commit to automation-core `main`; downstream evidence from `funzi7/paywall-bot` PR #73, Codex P2 "Skip patch download after agent failure".
 - Branch: main

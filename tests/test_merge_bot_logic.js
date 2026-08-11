@@ -1,0 +1,407 @@
+'use strict';
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const {
+  isAutoMergeCandidate,
+  evaluateMergePolicy,
+  companionAutomationProvenance,
+  legacyAutomationProvenance,
+} = require('../tools/merge_bot_logic');
+
+const REPOSITORY = 'funzi7/example';
+const HEAD = 'a'.repeat(40);
+
+function pr(overrides = {}) {
+  const base = {
+    number: 7,
+    state: 'open',
+    draft: false,
+    mergeable: true,
+    title: 'fix: ordinary development change',
+    user: { login: 'funzi7' },
+    labels: [],
+    head: {
+      sha: HEAD,
+      ref: 'fix/ordinary-development-change',
+      repo: { full_name: REPOSITORY },
+    },
+    base: { ref: 'main', repo: { full_name: REPOSITORY } },
+  };
+  return {
+    ...base,
+    ...overrides,
+    user: overrides.user || base.user,
+    labels: overrides.labels || base.labels,
+    head: { ...base.head, ...(overrides.head || {}) },
+    base: { ...base.base, ...(overrides.base || {}) },
+  };
+}
+
+function check(name, conclusion = 'success', status = 'completed', minute = 1) {
+  return {
+    name,
+    conclusion,
+    status,
+    started_at: `2026-08-11T00:0${minute}:00Z`,
+    completed_at: status === 'completed' ? `2026-08-11T00:0${minute}:30Z` : null,
+  };
+}
+
+function greenChecks() {
+  return [
+    check('ci'),
+    check('check-codex-status', 'success', 'completed', 2),
+  ];
+}
+
+function decide(overrides = {}) {
+  return evaluateMergePolicy({
+    pr: pr(),
+    repositoryFullName: REPOSITORY,
+    checkRuns: greenChecks(),
+    statuses: [],
+    evaluatedHead: HEAD,
+    currentHead: HEAD,
+    ...overrides,
+  });
+}
+
+test('normal same-repo owner fix PR with exact-head green is eligible', () => {
+  assert.equal(decide().eligible, true);
+});
+
+test('one running current check blocks merge', () => {
+  const result = decide({ checkRuns: [...greenChecks(), check('lint', null, 'in_progress', 3)] });
+  assert.equal(result.reason, 'running_check');
+});
+
+test('one failed current check blocks merge', () => {
+  const result = decide({ checkRuns: [...greenChecks(), check('lint', 'failure', 'completed', 3)] });
+  assert.equal(result.reason, 'failed_check');
+});
+
+test('latest run per check name wins over stale failure', () => {
+  const result = decide({
+    checkRuns: [
+      check('ci', 'failure', 'completed', 1),
+      check('ci', 'success', 'completed', 3),
+      check('check-codex-status', 'success', 'completed', 2),
+    ],
+  });
+  assert.equal(result.eligible, true);
+});
+
+test('cancelled tail is ignored but cannot substitute for a missing gate', () => {
+  assert.equal(decide({
+    checkRuns: [
+      check('ci'),
+      check('check-codex-status', 'success', 'completed', 2),
+      check('check-codex-status', 'cancelled', 'completed', 3),
+    ],
+  }).eligible, true);
+  assert.equal(decide({
+    checkRuns: [
+      check('ci'),
+      check('check-codex-status', 'cancelled', 'completed', 3),
+    ],
+  }).reason, 'missing_or_red_codex_gate');
+});
+
+test('missing authoritative Codex gate blocks merge', () => {
+  const result = decide({ checkRuns: [check('ci')] });
+  assert.equal(result.reason, 'missing_or_red_codex_gate');
+});
+
+test('red Codex gate or active trusted P1/P2 blocks merge', () => {
+  assert.equal(
+    decide({ checkRuns: [check('ci'), check('check-codex-status', 'failure', 'completed', 2)] }).reason,
+    'failed_check',
+  );
+  assert.equal(decide({ activeTrustedFinding: true }).reason, 'active_trusted_finding');
+});
+
+test('administrator Codex override preserves the established escape hatch', () => {
+  const overridden = pr({ labels: [{ name: 'codex-p1-acknowledged' }] });
+  assert.equal(decide({ pr: overridden, activeTrustedFinding: true }).eligible, true);
+});
+
+test('removing an override cannot reuse its green check without current-head review', () => {
+  assert.equal(decide({ currentHeadCodexSignal: false }).reason, 'current_head_review_pending');
+  const overridden = pr({ labels: [{ name: 'codex-p1-acknowledged' }] });
+  assert.equal(decide({ pr: overridden, currentHeadCodexSignal: false }).eligible, true);
+});
+
+test('head SHA movement after validation blocks merge', () => {
+  assert.equal(decide({ currentHead: 'b'.repeat(40) }).reason, 'head_moved');
+});
+
+test('fork PR gets no implicit owner, title, or branch trust', () => {
+  const fork = pr({
+    title: 'chore(automation): sync from automation-core',
+    head: { ref: 'claude/looks-trusted', repo: { full_name: 'attacker/fork' } },
+    user: { login: 'someone' },
+  });
+  assert.equal(isAutoMergeCandidate(fork, REPOSITORY), false);
+});
+
+test('no-automerge is a permanent hard stop', () => {
+  const stopped = pr({ labels: [{ name: 'no-automerge' }] });
+  assert.equal(isAutoMergeCandidate(stopped, REPOSITORY), false);
+});
+
+test('human or unknown needs-owner is a hard stop', () => {
+  const result = decide({ pr: pr({ labels: [{ name: 'needs-owner' }] }) });
+  assert.equal(result.reason, 'manual_needs_owner');
+});
+
+test('automated needs-owner remains while the current head is red', () => {
+  const result = decide({
+    pr: pr({ labels: [{ name: 'needs-owner' }, { name: 'needs-owner-auto' }] }),
+    checkRuns: [check('check-codex-status', 'failure')],
+    companionAutomationProven: true,
+  });
+  assert.equal(result.eligible, false);
+  assert.equal(result.clearTransient, undefined);
+});
+
+test('automated needs-owner clears only when exact current head is fully green', () => {
+  const result = decide({
+    pr: pr({ labels: [{ name: 'needs-owner' }, { name: 'needs-owner-auto' }] }),
+    companionAutomationProven: true,
+  });
+  assert.equal(result.eligible, true);
+  assert.equal(result.clearTransient, true);
+});
+
+test('legacy needs-owner requires proven automation provenance', () => {
+  const legacyPr = pr({ labels: [{ name: 'needs-owner' }] });
+  assert.equal(decide({ pr: legacyPr }).eligible, false);
+  const proven = decide({ pr: legacyPr, legacyAutomationProven: true });
+  assert.equal(proven.eligible, true);
+  assert.equal(proven.clearLegacy, true);
+});
+
+test('legacy github-actions label requires positive circuit-breaker evidence', () => {
+  const event = {
+    id: 1,
+    event: 'labeled',
+    label: { name: 'needs-owner' },
+    actor: { login: 'github-actions[bot]' },
+    created_at: '2026-08-11T20:00:00Z',
+  };
+  assert.equal(legacyAutomationProvenance([event], []), false);
+  const comments = [1, 2, 3].map((attempt) => ({
+    user: { login: 'funzi7' },
+    created_at: `2026-08-11T19:0${attempt}:00Z`,
+    body: `<!-- ai-loop:v1 root_pr=7 head=${HEAD} attempt=${attempt} agent=claude state=requested -->\n[auto-triggered]`,
+  }));
+  assert.equal(legacyAutomationProvenance(
+    [event], comments, { prNumber: 7, commitShas: [HEAD], currentHead: HEAD },
+  ), true);
+});
+
+test('companion provenance rejects an orphan before a later manual hold', () => {
+  const events = [
+    {
+      id: 10, event: 'labeled', label: { name: 'needs-owner-auto' },
+      actor: { login: 'github-actions[bot]' }, created_at: '2026-08-11T20:00:00Z',
+    },
+    {
+      id: 11, event: 'labeled', label: { name: 'needs-owner' },
+      actor: { login: 'funzi7' }, created_at: '2026-08-11T20:10:00Z',
+    },
+  ];
+  assert.equal(companionAutomationProvenance(events), false);
+  events.push({
+    id: 12, event: 'labeled', label: { name: 'needs-owner-auto' },
+    actor: { login: 'github-actions[bot]' }, created_at: '2026-08-11T20:10:01Z',
+  });
+  assert.equal(companionAutomationProvenance(events), false);
+  events.push(
+    {
+      id: 13, event: 'unlabeled', label: { name: 'needs-owner' },
+      actor: { login: 'funzi7' }, created_at: '2026-08-11T20:11:00Z',
+    },
+    {
+      id: 14, event: 'labeled', label: { name: 'needs-owner' },
+      actor: { login: 'github-actions[bot]' }, created_at: '2026-08-11T20:12:00Z',
+    },
+    {
+      id: 15, event: 'labeled', label: { name: 'needs-owner-auto' },
+      actor: { login: 'github-actions[bot]' }, created_at: '2026-08-11T20:12:01Z',
+    },
+  );
+  assert.equal(companionAutomationProvenance(events), true);
+});
+
+test('legacy PAT-owner label needs a nearby watchdog marker', () => {
+  const event = {
+    id: 2,
+    event: 'labeled',
+    label: { name: 'needs-owner' },
+    actor: { login: 'funzi7' },
+    created_at: '2026-08-11T20:00:00Z',
+  };
+  assert.equal(legacyAutomationProvenance([event], []), false);
+  assert.equal(legacyAutomationProvenance([event], [{
+    user: { login: 'funzi7' },
+    created_at: '2026-08-11T20:00:02Z',
+    body: `<!-- ai-loop:v1 root_pr=7 head=${HEAD} agent=watchdog state=escalated -->`,
+  }], { prNumber: 7, commitShas: [HEAD], currentHead: HEAD }), true);
+});
+
+test('watchdog marker must have trusted author and matching PR head', () => {
+  const event = {
+    id: 20, event: 'labeled', label: { name: 'needs-owner' },
+    actor: { login: 'funzi7' }, created_at: '2026-08-11T20:00:00Z',
+  };
+  const marker = (user, root, head) => ({
+    user: { login: user }, created_at: '2026-08-11T20:00:01Z',
+    body: `<!-- ai-loop:v1 root_pr=${root} head=${head} agent=watchdog state=escalated -->`,
+  });
+  assert.equal(legacyAutomationProvenance(
+    [event], [marker('attacker', 7, HEAD)], { prNumber: 7, commitShas: [HEAD], currentHead: HEAD },
+  ), false);
+  assert.equal(legacyAutomationProvenance(
+    [event], [marker('funzi7', 8, HEAD)], { prNumber: 7, commitShas: [HEAD], currentHead: HEAD },
+  ), false);
+  assert.equal(legacyAutomationProvenance(
+    [event], [marker('funzi7', 7, 'b'.repeat(40))], { prNumber: 7, commitShas: [HEAD], currentHead: HEAD },
+  ), false);
+  assert.equal(legacyAutomationProvenance(
+    [event], [marker('funzi7', 7, 'b'.repeat(40))],
+    { prNumber: 7, commitShas: [HEAD, 'b'.repeat(40)], currentHead: HEAD },
+  ), false);
+});
+
+test('protected-path evidence keeps legacy automation label fail-closed', () => {
+  assert.equal(legacyAutomationProvenance([{
+    id: 3,
+    event: 'labeled',
+    label: { name: 'needs-owner' },
+    actor: { login: 'github-actions[bot]' },
+    created_at: '2026-08-11T20:00:00Z',
+  }], [{
+    created_at: '2026-08-11T20:00:01Z',
+    body: 'Auto-merge blocked: this PR touches protected path(s)',
+  }]), false);
+});
+
+test('protected-path trusted owner PR may merge after full review', () => {
+  assert.equal(decide({ protectedPathHit: true }).eligible, true);
+});
+
+test('protected-path fork or untrusted PR remains escalated', () => {
+  const fork = pr({
+    labels: [{ name: 'automerge' }],
+    user: { login: 'someone' },
+    head: { repo: { full_name: 'someone/fork' } },
+  });
+  const result = decide({ pr: fork, protectedPathHit: true });
+  assert.equal(result.reason, 'protected_path_untrusted');
+});
+
+test('trusted same-repo automation-core sync behavior remains eligible', () => {
+  const sync = pr({
+    title: 'chore(automation): sync from automation-core',
+    head: { ref: 'chore/sync-automation-core' },
+  });
+  assert.equal(decide({ pr: sync }).eligible, true);
+});
+
+test('workflow preserves exact-SHA squash merge and same-repo branch deletion', () => {
+  const workflow = fs.readFileSync(
+    path.join(__dirname, '..', 'workflows', 'merge-bot.yml'),
+    'utf8',
+  );
+  assert.match(workflow, /merge_method: 'squash', sha: headSha/);
+  assert.match(workflow, /finalPr\.head\.sha !== headSha/);
+  assert.match(workflow, /pr\.head\.repo\.full_name === `\$\{owner\}\/\$\{repo\}`/);
+  assert.match(workflow, /await github\.rest\.git\.deleteRef/);
+  assert.match(workflow, /unexpected evaluation error; skipping only this PR/);
+  assert.match(workflow, /hasCurrentHeadNonInlineFinding/);
+  assert.match(workflow, /hasActiveTrustedBlocker/);
+  assert.match(workflow, /workflows: \["Codex Gate", "CI", "Automation Core CI"\]/);
+  assert.match(workflow, /const trustedLoopMarker = \(comment\) =>/);
+  assert.match(workflow, /Number\(root\[1\]\) !== prNumber/);
+  assert.match(workflow, /!commitShas\.has\(head\[1\]\)/);
+  assert.match(workflow, /marker\.head === currentHead/);
+  assert.match(workflow, /async function hasCurrentHeadCodexSignal\(prNumber, headSha\)/);
+  assert.match(workflow, /async function observedHeadTransition\(prNumber, headSha\)/);
+  assert.match(workflow, /function signalTargetsHead\(item, headSha, headObservedAt/);
+  assert.doesNotMatch(workflow, /latestCommitDate/);
+  assert.match(workflow, /override absent and current-head Codex signal missing/);
+  assert.match(workflow, /needsEvent\.actor\?\.login === 'github-actions\[bot\]'/);
+  assert.match(workflow, /autoEvent\.actor\?\.login === 'github-actions\[bot\]'/);
+  assert.match(workflow, /GH_LABEL_TOKEN: \$\{\{ github\.token \}\}/);
+  assert.match(workflow, /async function actionLabelRequest\(method, path, body\)/);
+});
+
+test('merge-failure restoration preserves a concurrently added manual stop', () => {
+  const workflow = fs.readFileSync(
+    path.join(__dirname, '..', 'workflows', 'merge-bot.yml'),
+    'utf8',
+  );
+  assert.match(workflow, /async function restoreTransientIfOpen\(prNumber\)/);
+  assert.match(workflow, /const currentLabels = labelNames\(current\)/);
+  assert.match(workflow, /if \(currentLabels\.has\(LABEL_ESCALATE\)\)/);
+  assert.match(workflow, /name: LABEL_ESCALATE_AUTO/);
+  assert.match(workflow, /currentProvenance = await escalationProvenance\(prNumber\)/);
+  assert.match(workflow, /if \(currentProvenance\.companion\)/);
+  assert.match(workflow, /original transient escalation is still intact/);
+  assert.match(workflow, /could not classify live transient pair.*preserving both labels/);
+  assert.match(workflow, /preserving it as a manual\/unknown hard stop/);
+  assert.doesNotMatch(workflow, /restoreTransientEscalation/);
+});
+
+test('only synced automation infrastructure is in the central allow-list', () => {
+  const config = JSON.parse(fs.readFileSync(
+    path.join(__dirname, '..', 'sync-config.json'),
+    'utf8',
+  ));
+  assert.deepEqual(config.synced_workflows, [
+    'codex-auto-fix.yml',
+    'codex-gate.yml',
+    'claude.yml',
+    'ci-doctor.yml',
+    'merge-bot.yml',
+    'claude-fallback-watchdog.yml',
+    'codex-backup-fix.yml',
+  ]);
+  assert.equal(config.synced_workflows.some((name) => /poll|backfill|health/.test(name)), false);
+});
+
+test('only temporary PR automation writers add needs-owner-auto', () => {
+  const read = (name) => fs.readFileSync(
+    path.join(__dirname, '..', 'workflows', name),
+    'utf8',
+  );
+  assert.match(read('codex-auto-fix.yml'), /needs-owner-auto/);
+  assert.match(read('codex-auto-fix.yml'), /pre-existing needs-owner is manual\/unknown/);
+  assert.match(read('codex-auto-fix.yml'), /could not prove needs-owner was absent/);
+  assert.match(read('claude-fallback-watchdog.yml'), /needs-owner-auto/);
+  assert.match(read('claude-fallback-watchdog.yml'), /GH_LABEL_TOKEN: \$\{\{ github\.token \}\}/);
+  assert.match(read('claude-fallback-watchdog.yml'), /async function actionLabelRequest\(method, path, body\)/);
+  assert.doesNotMatch(read('claude.yml'), /needs-owner-auto/);
+  assert.doesNotMatch(read('codex-backup-fix.yml'), /needs-owner-auto/);
+  assert.doesNotMatch(read('ci-doctor.yml'), /needs-owner-auto/);
+});
+
+test('synced review freshness never uses the removed latest-commit-date model', () => {
+  for (const name of [
+    'codex-auto-fix.yml',
+    'codex-gate.yml',
+    'merge-bot.yml',
+    'claude-fallback-watchdog.yml',
+    'codex-backup-fix.yml',
+  ]) {
+    const workflow = fs.readFileSync(
+      path.join(__dirname, '..', 'workflows', name),
+      'utf8',
+    );
+    assert.doesNotMatch(workflow, /latestCommitDate/);
+  }
+});

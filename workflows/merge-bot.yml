@@ -2,9 +2,10 @@ name: Merge Bot
 
 # Generic workflow — synced from automation-core. Closes the self-healing
 # loop: squash-merges PRs that are fully green once codex-gate passes.
-# Woken by: the Codex Gate workflow_run completing successfully (the only
-# signal that the mandatory gate just turned green on a head), a once-daily
-# safety-net cron, or manual dispatch. check_suite is intentionally NOT a
+# Woken by: a successful Codex Gate or repository CI workflow_run, a once-daily
+# safety-net cron, or manual dispatch. The CI wake closes the ordering case
+# where the gate turns green before the final build check. check_suite is
+# intentionally NOT a
 # trigger: it fires on every CI suite (storms ~22x/5min on unrelated runs)
 # yet does NOT fire for the gate's own Actions-created suite — so it added
 # noise without covering the case that matters. A build-gate finishing after
@@ -20,7 +21,7 @@ on:
   # (Codex Gate runs under GITHUB_TOKEN), so this workflow_run is what wakes
   # merge-bot when the gate turns green. Filtered to success in the job if:.
   workflow_run:
-    workflows: ["Codex Gate"]
+    workflows: ["Codex Gate", "CI", "Automation Core CI"]
     types: [completed]
   schedule:
     - cron: '30 7 * * *'   # safety-net once daily (07:30 UTC)
@@ -30,6 +31,7 @@ permissions:
   contents: write
   pull-requests: write
   issues: write
+  actions: read
   checks: read
   statuses: read
 
@@ -42,11 +44,11 @@ jobs:
     runs-on: ubuntu-latest
     # Early-exit: proceed ONLY on a signal that the mandatory gate just turned
     # GREEN — otherwise skip immediately (no scan). Waking conditions:
-    #   (a) Codex Gate workflow_run completed success,
+    #   (a) Codex Gate or repository CI workflow_run completed success,
     #   (b) the daily safety-net cron,
     #   (c) manual dispatch.
-    # workflow_run is filtered to success here so the gate's self-rerun loop
-    # (which fails each iteration) never wakes merge-bot — only its final pass.
+    # workflow_run is filtered to success here. Every wake still revalidates
+    # all latest checks and the authoritative exact-head gate before merging.
     if: |
       (github.event_name == 'workflow_run' &&
         github.event.workflow_run.conclusion == 'success') ||
@@ -78,10 +80,15 @@ jobs:
           # (INCIDENT 2). GITHUB_TOKEN carries this workflow's declared
           # `checks: read` + `statuses: read`, so the reads run on it instead.
           GH_READONLY_TOKEN: ${{ github.token }}
+          # Transient-provenance labels are deliberately assigned as
+          # github-actions[bot], making their event provenance unambiguous.
+          GH_LABEL_TOKEN: ${{ github.token }}
         with:
-          # AUTOMATION_PAT stays the step token: every MUTATION (merge/label/
-          # comment/deleteRef/issue-close) must run on it — pulls.merge must be
-          # PAT-authored so the push to main triggers downstream workflows.
+          # AUTOMATION_PAT stays the step token for merges, comments, branch
+          # deletion, and other mutations that must trigger downstream work.
+          # Only transient-provenance label assignment uses GH_LABEL_TOKEN.
+          # pulls.merge must remain PAT-authored so the push to main triggers
+          # downstream workflows.
           github-token: ${{ secrets.AUTOMATION_PAT }}
           script: |
             const owner = context.repo.owner;
@@ -94,6 +101,25 @@ jobs:
             // two GITHUB_TOKEN reads with the built-in global fetch (raw REST), zero
             // modules.
             const GH_RO = process.env.GH_READONLY_TOKEN;
+            const GH_LABEL_TOKEN = process.env.GH_LABEL_TOKEN;
+            async function actionLabelRequest(method, path, body) {
+              const res = await fetch(`https://api.github.com${path}`, {
+                method,
+                headers: {
+                  Authorization: `Bearer ${GH_LABEL_TOKEN}`,
+                  Accept: 'application/vnd.github+json',
+                  'X-GitHub-Api-Version': '2022-11-28',
+                  'Content-Type': 'application/json',
+                },
+                body: body === undefined ? undefined : JSON.stringify(body),
+              });
+              if (!res.ok) {
+                const error = new Error(`${method} ${path} -> ${res.status}: ${(await res.text()).slice(0, 200)}`);
+                error.status = res.status;
+                throw error;
+              }
+              return res.status === 204 ? null : res.json();
+            }
             // fix #20: follow the Link rel="next" header until absent (50-page
             // safety ceiling) — true pagination, replacing the fixed 10-page valve.
             async function roPage(url) {
@@ -114,12 +140,354 @@ jobs:
             }
             const roCheckRuns = (ref) => roPaged(`/repos/${owner}/${repo}/commits/${encodeURIComponent(ref)}/check-runs?per_page=100`, (d) => d.check_runs || []);
             const roStatuses = (ref) => roPaged(`/repos/${owner}/${repo}/commits/${encodeURIComponent(ref)}/statuses?per_page=100`, (d) => d);
+            const roWorkflowRuns = (ref) => roPaged(`/repos/${owner}/${repo}/actions/runs?head_sha=${encodeURIComponent(ref)}&event=pull_request&per_page=100`, (d) => d.workflow_runs || []);
             const CODEX_CHECK = 'check-codex-status';
             const LABEL_AUTOMERGE = 'automerge';
             const LABEL_ESCALATE = 'needs-owner';
+            const LABEL_ESCALATE_AUTO = 'needs-owner-auto';
+            const LABEL_NO_AUTOMERGE = 'no-automerge';
+            const CODEX_OVERRIDE_LABEL = 'codex-p1-acknowledged';
             const SYNC_TITLE_PREFIX = 'chore(automation): sync from automation-core';
             const SYNC_BRANCH = 'chore/sync-automation-core';   // branch the sync workflow opens
             const OWNER_LOGIN = 'funzi7';
+            const TRUSTED_CODEX_LOGINS = new Set([
+              'chatgpt-codex-connector',
+              'chatgpt-codex-connector[bot]',
+            ]);
+            const P1_PATTERN = /(?:P1-orange|(?:^|\n)[\s>*\-_#`]*(?:\*\*\s*P1\s*\*\*|\[P1\]|P1:))/i;
+            const P2_PATTERN = /(?:P2-yellow|(?:^|\n)[\s>*\-_#`]*(?:\*\*\s*P2\s*\*\*|\[P2\]|P2:))/i;
+
+            const labelNames = (pr) => new Set(
+              (pr.labels || []).map((label) => label.name || label),
+            );
+            const isSameRepo = (pr) => !!(
+              pr.head && pr.head.repo &&
+              pr.head.repo.full_name === `${owner}/${repo}`
+            );
+            const isOwnerSameRepo = (pr) =>
+              isSameRepo(pr) && pr.user && pr.user.login === OWNER_LOGIN;
+
+            function isTrustedSync(pr) {
+              if (!(pr.title || '').startsWith(SYNC_TITLE_PREFIX)) return false;
+              if (!isSameRepo(pr)) return false;
+              return (
+                (pr.user && pr.user.login === OWNER_LOGIN) ||
+                (pr.head && pr.head.ref === SYNC_BRANCH)
+              );
+            }
+
+            function isAutoMergeCandidate(pr) {
+              if (!pr || pr.state !== 'open' || pr.draft) return false;
+              const labels = labelNames(pr);
+              if (labels.has(LABEL_NO_AUTOMERGE)) return false;
+              const sameRepo = isSameRepo(pr);
+              const byClaudeBot = sameRepo && isClaudeBot(pr.user && pr.user.login);
+              const explicitlyLabeled = labels.has(LABEL_AUTOMERGE);
+              const claudeBranch = sameRepo && !!(
+                pr.head && pr.head.ref && pr.head.ref.startsWith('claude/')
+              );
+              return (
+                isOwnerSameRepo(pr) || byClaudeBot || explicitlyLabeled ||
+                isTrustedSync(pr) || claudeBranch
+              );
+            }
+
+            function stripSummarySections(body) {
+              return String(body || '')
+                .replace(/(?:^|\n)#{2,3}\s+Summary[\s\S]*?(?=\n#{2,3}\s|\n---|$)/gi, '')
+                .replace(/(?:^|\n)#{2,3}\s+Testing[\s\S]*?(?=\n#{2,3}\s|\n---|$)/gi, '');
+            }
+
+            function hasSeverity(body) {
+              const semantic = stripSummarySections(body);
+              return P1_PATTERN.test(semantic) || P2_PATTERN.test(semantic);
+            }
+
+            const REVIEWED_COMMIT_PATTERN = /(?:^|\n)\*\*Reviewed commit:\*\*\s*`([a-f0-9]{10,40})`(?:\s|$)/i;
+            function signalTargetsHead(item, headSha, headObservedAt, dateField = 'created_at') {
+              const exactHead = String(headSha || '').toLowerCase();
+              if (!/^[a-f0-9]{40}$/.test(exactHead)) return false;
+              const originalCommit = String(item?.original_commit_id || '').toLowerCase();
+              if (originalCommit) return originalCommit === exactHead;
+              const commit = String(item?.commit_id || '').toLowerCase();
+              if (commit) return commit === exactHead;
+              const marker = String(item?.body || '').match(REVIEWED_COMMIT_PATTERN)?.[1]?.toLowerCase();
+              if (marker) return exactHead.startsWith(marker);
+              const signalAt = new Date(item?.[dateField] || 0).getTime();
+              const observedAt = new Date(headObservedAt || 0).getTime();
+              return Number.isFinite(signalAt) && Number.isFinite(observedAt) &&
+                observedAt > 0 && signalAt > observedAt;
+            }
+
+            async function observedHeadTransition(prNumber, headSha) {
+              const runs = await roWorkflowRuns(headSha);
+              const observed = runs
+                .filter((run) => (
+                  run.head_sha === headSha &&
+                  (run.pull_requests || []).some((candidate) => candidate.number === prNumber)
+                ))
+                .map((run) => new Date(run.created_at || 0).getTime())
+                .filter((value) => Number.isFinite(value) && value > 0);
+              return observed.length ? new Date(Math.min(...observed)) : null;
+            }
+
+            async function hasActiveTrustedFinding(prNumber) {
+              let cursor = null;
+              do {
+                const data = await github.graphql(
+                  `query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+                    repository(owner: $owner, name: $repo) {
+                      pullRequest(number: $number) {
+                        reviewThreads(first: 100, after: $cursor) {
+                          pageInfo { hasNextPage endCursor }
+                          nodes {
+                            isResolved
+                            isOutdated
+                            comments(first: 100) {
+                              nodes { body author { login } }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }`,
+                  { owner, repo, number: prNumber, cursor },
+                );
+                const connection = data.repository.pullRequest.reviewThreads;
+                for (const thread of connection.nodes || []) {
+                  if (thread.isResolved || thread.isOutdated) continue;
+                  if ((thread.comments?.nodes || []).some((comment) =>
+                    TRUSTED_CODEX_LOGINS.has(comment.author?.login || '') &&
+                    hasSeverity(comment.body)
+                  )) return true;
+                }
+                cursor = connection.pageInfo.hasNextPage
+                  ? connection.pageInfo.endCursor
+                  : null;
+              } while (cursor);
+              return false;
+            }
+
+            async function hasCurrentHeadNonInlineFinding(prNumber, headSha) {
+              const [reviews, comments, headObservedAt] = await Promise.all([
+                github.paginate(github.rest.pulls.listReviews, {
+                  owner, repo, pull_number: prNumber, per_page: 100,
+                }),
+                github.paginate(github.rest.issues.listComments, {
+                  owner, repo, issue_number: prNumber, per_page: 100,
+                }),
+                observedHeadTransition(prNumber, headSha),
+              ]);
+              return (
+                reviews.some((review) =>
+                  TRUSTED_CODEX_LOGINS.has(review.user?.login || '') &&
+                  signalTargetsHead(review, headSha, headObservedAt, 'submitted_at') &&
+                  hasSeverity(review.body)
+                ) ||
+                comments.some((comment) =>
+                  TRUSTED_CODEX_LOGINS.has(comment.user?.login || '') &&
+                  signalTargetsHead(comment, headSha, headObservedAt, 'created_at') &&
+                  hasSeverity(comment.body)
+                )
+              );
+            }
+
+            async function hasCurrentHeadCodexSignal(prNumber, headSha) {
+              const [reviews, comments, reviewComments, reactions, headObservedAt] = await Promise.all([
+                github.paginate(github.rest.pulls.listReviews, {
+                  owner, repo, pull_number: prNumber, per_page: 100,
+                }),
+                github.paginate(github.rest.issues.listComments, {
+                  owner, repo, issue_number: prNumber, per_page: 100,
+                }),
+                github.paginate(github.rest.pulls.listReviewComments, {
+                  owner, repo, pull_number: prNumber, per_page: 100,
+                }),
+                github.paginate(github.rest.reactions.listForIssue, {
+                  owner, repo, issue_number: prNumber, per_page: 100,
+                }),
+                observedHeadTransition(prNumber, headSha),
+              ]);
+              const trustedAfterHead = (item, dateField) =>
+                TRUSTED_CODEX_LOGINS.has(item.user?.login || '') &&
+                signalTargetsHead(item, headSha, headObservedAt, dateField);
+              return (
+                reviews.some((item) => trustedAfterHead(item, 'submitted_at')) ||
+                comments.some((item) => trustedAfterHead(item, 'created_at')) ||
+                reviewComments.some((item) => trustedAfterHead(item, 'created_at')) ||
+                reactions.some((item) =>
+                  item.content === '+1' && trustedAfterHead(item, 'created_at')
+                )
+              );
+            }
+
+            async function hasActiveTrustedBlocker(prNumber, headSha) {
+              return (
+                await hasActiveTrustedFinding(prNumber) ||
+                await hasCurrentHeadNonInlineFinding(prNumber, headSha)
+              );
+            }
+
+            async function escalationProvenance(prNumber) {
+              const [events, issueComments, reviewComments, prCommits, currentPrResponse] = await Promise.all([
+                github.paginate(
+                  'GET /repos/{owner}/{repo}/issues/{issue_number}/events',
+                  { owner, repo, issue_number: prNumber, per_page: 100 },
+                ),
+                github.paginate(github.rest.issues.listComments, {
+                  owner, repo, issue_number: prNumber, per_page: 100,
+                }),
+                github.paginate(github.rest.pulls.listReviewComments, {
+                  owner, repo, pull_number: prNumber, per_page: 100,
+                }),
+                github.paginate(github.rest.pulls.listCommits, {
+                  owner, repo, pull_number: prNumber, per_page: 100,
+                }),
+                github.rest.pulls.get({ owner, repo, pull_number: prNumber }),
+              ]);
+              const comments = [...issueComments, ...reviewComments];
+              const commitShas = new Set(prCommits.map((commit) => commit.sha));
+              const currentHead = currentPrResponse.data.head.sha;
+              const trustedLoopMarker = (comment) => {
+                if (![OWNER_LOGIN, 'github-actions[bot]'].includes(comment.user?.login)) return null;
+                const marker = String(comment.body || '').match(/<!-- ai-loop:v1\b([^>]*)-->/i);
+                if (!marker) return null;
+                const root = marker[1].match(/\broot_pr=(\d+)\b/i);
+                const head = marker[1].match(/\bhead=([a-f0-9]{40})\b/i);
+                if (!root || Number(root[1]) !== prNumber || !head || !commitShas.has(head[1])) return null;
+                return { attributes: marker[1], head: head[1] };
+              };
+              const latestLabelEvent = (labelName) => events
+                .filter((event) => (
+                  (event.event === 'labeled' || event.event === 'unlabeled') &&
+                  event.label && event.label.name === labelName
+                ))
+                .sort((a, b) =>
+                  new Date(b.created_at || 0) - new Date(a.created_at || 0) ||
+                  Number(b.id || 0) - Number(a.id || 0)
+                )[0];
+              const needsEvent = latestLabelEvent(LABEL_ESCALATE);
+              const autoEvent = latestLabelEvent(LABEL_ESCALATE_AUTO);
+              const needsAt = new Date(needsEvent?.created_at || 0).getTime();
+              const autoAt = new Date(autoEvent?.created_at || 0).getTime();
+
+              // A companion is valid only when its latest label event follows
+              // the current needs-owner assignment. This rejects an orphaned
+              // needs-owner-auto when a human later re-adds the hard stop.
+              const companionOrdered = autoAt > needsAt || (
+                autoAt === needsAt && Number(autoEvent?.id || 0) >= Number(needsEvent?.id || 0)
+              );
+              const companion = (
+                needsEvent?.event === 'labeled' &&
+                autoEvent?.event === 'labeled' &&
+                needsEvent.actor?.login === 'github-actions[bot]' &&
+                autoEvent.actor?.login === 'github-actions[bot]' &&
+                Number.isFinite(needsAt) && Number.isFinite(autoAt) &&
+                companionOrdered && autoAt - needsAt <= 5 * 60 * 1000
+              );
+
+              // Legacy labels need positive temporary-escalation evidence.
+              // github-actions[bot] attribution alone is insufficient because
+              // permanent fork/protected-path writers used the same actor.
+              const nearbyWatchdogMarker = comments.some((comment) => {
+                const marker = trustedLoopMarker(comment);
+                const commentAt = new Date(comment.created_at || 0).getTime();
+                return (
+                  marker && marker.head === currentHead &&
+                  /\bagent=watchdog\b/i.test(marker.attributes) && /\bstate=escalated\b/i.test(marker.attributes) &&
+                  Number.isFinite(commentAt) && Number.isFinite(needsAt) &&
+                  Math.abs(commentAt - needsAt) <= 5 * 60 * 1000
+                );
+              });
+              const circuitBreakerMarkers = comments.filter((comment) => {
+                const body = String(comment.body || '');
+                const marker = trustedLoopMarker(comment);
+                const commentAt = new Date(comment.created_at || 0).getTime();
+                return (
+                  marker &&
+                  body.includes('[auto-triggered]') &&
+                  /\battempt=\d+\b/i.test(marker.attributes) && /\bagent=claude\b/i.test(marker.attributes) && /\bstate=requested\b/i.test(marker.attributes) &&
+                  Number.isFinite(commentAt) && Number.isFinite(needsAt) &&
+                  commentAt <= needsAt && needsAt - commentAt <= 6 * 60 * 60 * 1000
+                );
+              });
+              const positiveLegacyEvidence = (
+                needsEvent?.event === 'labeled' && (
+                  (needsEvent.actor?.login === 'github-actions[bot]' && circuitBreakerMarkers.length >= 3) ||
+                  (needsEvent.actor?.login === OWNER_LOGIN && nearbyWatchdogMarker)
+                )
+              );
+              const protectedReason = comments.some((comment) => {
+                const body = String(comment.body || '');
+                return (
+                  /Auto-merge blocked: this PR touches protected path/i.test(body) ||
+                  /skipped this fork-headed PR/i.test(body) ||
+                  /fork-headed PR[^\n]*Escalated to needs-owner/is.test(body)
+                );
+              });
+              return {
+                companion,
+                legacy: positiveLegacyEvidence && !protectedReason,
+              };
+            }
+
+            async function restoreTransientIfOpen(prNumber) {
+              // Re-read immediately before restoring. A human may add a new
+              // needs-owner after the bot cleared the old transient labels but
+              // before a failed merge returns. Never attach (or leave) auto
+              // provenance beside that new manual stop.
+              const { data: current } = await github.rest.pulls.get({
+                owner, repo, pull_number: prNumber,
+              });
+              if (current.state !== 'open') return;
+              const currentLabels = labelNames(current);
+              if (currentLabels.has(LABEL_ESCALATE)) {
+                if (currentLabels.has(LABEL_ESCALATE_AUTO)) {
+                  // The first clear request may have failed without changing
+                  // either label. In that case the original automation-owned
+                  // pair is still valid: leave it intact for the next pass.
+                  // If a human removed/re-added needs-owner in the meantime,
+                  // companion provenance is false and only the stale companion
+                  // is removed. A provenance read failure keeps both labels and
+                  // therefore remains fail-closed.
+                  let currentProvenance;
+                  try {
+                    currentProvenance = await escalationProvenance(prNumber);
+                  } catch (e) {
+                    core.warning(`#${prNumber}: could not classify live transient pair during restoration; preserving both labels: ${e.message}`);
+                    return;
+                  }
+                  if (currentProvenance.companion) {
+                    core.warning(`#${prNumber}: original transient escalation is still intact after failed clear/merge; leaving both labels for retry`);
+                    return;
+                  }
+                  await github.rest.issues.removeLabel({
+                    owner, repo, issue_number: prNumber,
+                    name: LABEL_ESCALATE_AUTO,
+                  });
+                }
+                core.warning(`#${prNumber}: live needs-owner appeared before transient restoration; preserving it as a manual/unknown hard stop`);
+                return;
+              }
+
+              const definitions = [
+                { name: LABEL_ESCALATE, color: 'd93f0b', description: 'Escalation — automation stopped, human needed' },
+                { name: LABEL_ESCALATE_AUTO, color: 'fbca04', description: 'Provenance: needs-owner was added by temporary PR automation escalation' },
+              ];
+              for (const label of definitions) {
+                try {
+                  await actionLabelRequest('POST', `/repos/${owner}/${repo}/labels`, label);
+                } catch (e) {
+                  if (e.status !== 422) throw e;
+                }
+              }
+              await actionLabelRequest(
+                'POST',
+                `/repos/${owner}/${repo}/issues/${prNumber}/labels`,
+                { labels: definitions.map((label) => label.name) },
+              );
+              core.info(`#${prNumber}: restored transient escalation after merge did not complete`);
+            }
 
             // minimatch-style glob -> RegExp (supports **, *, ?). Inlined to
             // avoid depending on a package not bundled with github-script.
@@ -169,42 +537,21 @@ jobs:
               owner, repo, state: 'open', per_page: 100,
             });
 
-            const candidates = allOpen.filter((pr) => {
-              // The escalation label (needs-owner) is a HARD STOP — once a human-escalation label is on
-              // a PR, automation must never touch it again (no re-merge attempt,
-              // no repeated guard comment / Telegram). Filter it out before the
-              // PR ever becomes a candidate.
-              if ((pr.labels || []).some((l) => l.name === LABEL_ESCALATE)) return false;
-              const byBot = isClaudeBot(pr.user && pr.user.login);
-              // The `automerge` label is the PRIMARY signal for Claude's fix
-              // PRs: claude.yml passes AUTOMATION_PAT as github_token, so PRs
-              // Claude opens are authored by the OWNER (funzi7), not a bot
-              // login — isClaudeBot misses them. claude.yml labels them
-              // `automerge`, so they still become merge candidates here.
-              const hasAutomerge = (pr.labels || []).some((l) => l.name === LABEL_AUTOMERGE);
-              // A sync PR is trusted ONLY if the title matches AND it is
-              // provably ours — a same-repo branch named like the one the
-              // sync workflow opens, or authored by the owner. The title
-              // alone is forgeable: an outside contributor could open a PR
-              // titled "chore(automation): sync from automation-core" from a
-              // fork and ride straight into auto-merge. The same-repo /
-              // owner check closes that hole (fork PRs carry a head.repo
-              // distinct from base, and can't author as the owner).
-              const titleIsSync = (pr.title || '').startsWith(SYNC_TITLE_PREFIX);
-              const sameRepo = !!(pr.head && pr.head.repo && pr.head.repo.full_name === `${owner}/${repo}`);
-              const isTrustedSync = titleIsSync && (
-                (pr.user && pr.user.login === OWNER_LOGIN) ||
-                ((pr.head && pr.head.ref === SYNC_BRANCH) && sameRepo)
-              );
-              // A PR on a `claude/<...>` branch in THIS repo is Claude Code's
-              // work: claude.yml opens PRs via AUTOMATION_PAT, so they are
-              // authored by the owner (not a bot login) and carry no `automerge`
-              // label — byBot/hasAutomerge both miss them. Every such PR rides a
-              // `claude/` head ref. Requiring the SAME repo (not a fork) makes it
-              // unspoofable from outside: a fork PR carries a different head.repo.
-              const isClaudeBranch = !!(pr.head && pr.head.ref && pr.head.ref.startsWith('claude/')) && sameRepo;
-              return byBot || hasAutomerge || isTrustedSync || isClaudeBranch;
-            });
+            // Ensure the permanent opt-out label is available everywhere the
+            // synced workflow runs. Never remove it automatically.
+            try {
+              await github.rest.issues.createLabel({
+                owner, repo, name: LABEL_NO_AUTOMERGE, color: 'b60205',
+                description: 'Permanent human opt-out: Merge Bot must not merge this PR',
+              });
+            } catch (e) {
+              if (e.status !== 422) core.info(`createLabel ${LABEL_NO_AUTOMERGE} failed (ignored): ${e.message}`);
+            }
+
+            // Normal same-repository owner PRs are first-class candidates,
+            // alongside the established explicit/Claude/sync paths. A fork is
+            // never trusted by its title or branch name.
+            const candidates = allOpen.filter(isAutoMergeCandidate);
 
             if (!candidates.length) {
               core.info('No automerge candidates.');
@@ -215,15 +562,41 @@ jobs:
 
             for (const prLite of candidates) {
               const prNumber = prLite.number;
-              // Re-fetch full PR for mergeable + draft + head sha.
-              const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+              try {
+                // Re-fetch full PR for current labels, mergeability and head SHA.
+                const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
 
-              if (pr.state !== 'open') continue;
-              if (pr.draft) { core.info(`#${prNumber}: draft, skip`); continue; }
-              // mergeable can be null while GitHub computes it — skip this pass.
-              if (pr.mergeable === false) { core.info(`#${prNumber}: not mergeable, skip`); continue; }
+                if (!isAutoMergeCandidate(pr)) {
+                  core.info(`#${prNumber}: no longer an automerge candidate, skip`);
+                  continue;
+                }
+                const initialLabels = labelNames(pr);
+                const hasNeedsOwner = initialLabels.has(LABEL_ESCALATE);
+                const hasAutoProvenance = initialLabels.has(LABEL_ESCALATE_AUTO);
+                let initialProvenance = { companion: false, legacy: false };
+                if (hasNeedsOwner) {
+                  try {
+                    initialProvenance = await escalationProvenance(prNumber);
+                  } catch (e) {
+                    core.warning(`#${prNumber}: needs-owner provenance lookup failed; keeping human stop: ${e.message}`);
+                  }
+                }
+                const transientEscalation = hasNeedsOwner && (
+                  (hasAutoProvenance && initialProvenance.companion) ||
+                  (!hasAutoProvenance && initialProvenance.legacy)
+                );
+                if (hasNeedsOwner && !transientEscalation) {
+                  core.info(`#${prNumber}: manual/unknown needs-owner is a hard stop`);
+                  continue;
+                }
+                // mergeable=null is ambiguous while GitHub computes it. Require
+                // an affirmative true before any transient label can clear.
+                if (pr.mergeable !== true) {
+                  core.info(`#${prNumber}: mergeability is not affirmatively true, skip`);
+                  continue;
+                }
 
-              const headSha = pr.head.sha;
+                const headSha = pr.head.sha;
 
               // All check runs on the head sha (paginate). READ → GITHUB_TOKEN
               // (fix #17 Part C): a fine-grained PAT can't hold Checks perm.
@@ -287,6 +660,29 @@ jobs:
                 continue;
               }
 
+              // Defense in depth: the exact-head gate must be green AND the
+              // current head must have a trusted Codex signal unless this is
+              // the established grace-eligible trusted sync. This prevents a
+              // persisted override-green check from surviving override label
+              // removal before Codex reviews the head.
+              if (
+                !initialLabels.has(CODEX_OVERRIDE_LABEL) &&
+                !isTrustedSync(pr) &&
+                !(await hasCurrentHeadCodexSignal(prNumber, headSha))
+              ) {
+                core.info(`#${prNumber}: no trusted Codex signal on current head, skip`);
+                continue;
+              }
+              // The authoritative current review-thread state must also
+              // contain no unresolved, non-outdated trusted P1/P2 finding.
+              if (
+                !initialLabels.has(CODEX_OVERRIDE_LABEL) &&
+                await hasActiveTrustedBlocker(prNumber, headSha)
+              ) {
+                core.info(`#${prNumber}: active trusted Codex P1/P2 finding, skip`);
+                continue;
+              }
+
               // Protected-path guard: .claude-guard.json on the base branch.
               let guard = null;
               try {
@@ -304,7 +700,7 @@ jobs:
                 const hits = files
                   .map((f) => f.filename)
                   .filter((name) => regexes.some((re) => re.test(name)));
-                if (hits.length) {
+                if (hits.length && !isOwnerSameRepo(pr)) {
                   try {
                     await github.rest.issues.removeLabel({ owner, repo, issue_number: prNumber, name: LABEL_AUTOMERGE });
                   } catch (e) { /* maybe not present */ }
@@ -323,6 +719,86 @@ jobs:
                   core.info(`#${prNumber}: protected path hit, escalated.`);
                   continue;
                 }
+                if (hits.length) {
+                  core.info(`#${prNumber}: protected paths reviewed on trusted same-repo owner PR; exact-head gates remain mandatory`);
+                }
+              }
+
+              // Re-fetch immediately before clearing a transient escalation.
+              // This catches a moved head, new draft/stop label, or changed
+              // mergeability after the initial evaluation. The SHA-pinned merge
+              // below remains the final race guard.
+              const { data: finalPr } = await github.rest.pulls.get({
+                owner, repo, pull_number: prNumber,
+              });
+              const finalLabels = labelNames(finalPr);
+              if (
+                finalPr.state !== 'open' || finalPr.draft ||
+                finalPr.mergeable !== true || finalPr.head.sha !== headSha
+              ) {
+                core.info(`#${prNumber}: PR/head changed after validation, skip`);
+                continue;
+              }
+              if (finalLabels.has(LABEL_NO_AUTOMERGE)) {
+                core.info(`#${prNumber}: no-automerge appeared after validation, hard stop`);
+                continue;
+              }
+              if (
+                !finalLabels.has(CODEX_OVERRIDE_LABEL) &&
+                !isTrustedSync(finalPr) &&
+                !(await hasCurrentHeadCodexSignal(prNumber, headSha))
+              ) {
+                core.info(`#${prNumber}: override absent and current-head Codex signal missing after validation, skip`);
+                continue;
+              }
+              if (
+                !finalLabels.has(CODEX_OVERRIDE_LABEL) &&
+                await hasActiveTrustedBlocker(prNumber, headSha)
+              ) {
+                core.info(`#${prNumber}: trusted P1/P2 appeared after validation, skip`);
+                continue;
+              }
+
+              let clearedTransient = false;
+              const finalHasNeedsOwner = finalLabels.has(LABEL_ESCALATE);
+              const finalHasAutoProvenance = finalLabels.has(LABEL_ESCALATE_AUTO);
+              if (finalHasNeedsOwner) {
+                let finalProvenance = { companion: false, legacy: false };
+                try {
+                  finalProvenance = await escalationProvenance(prNumber);
+                } catch (e) {
+                  core.warning(`#${prNumber}: final needs-owner provenance lookup failed; preserving hard stop: ${e.message}`);
+                }
+                const stillTransient = finalHasAutoProvenance
+                  ? finalProvenance.companion
+                  : finalProvenance.legacy;
+                if (!stillTransient) {
+                  core.info(`#${prNumber}: manual needs-owner appeared after validation, hard stop`);
+                  continue;
+                }
+                try {
+                  // Remove the stop first, then its provenance. If either call
+                  // fails, restore both labels and fail closed for this pass.
+                  await github.rest.issues.removeLabel({
+                    owner, repo, issue_number: prNumber, name: LABEL_ESCALATE,
+                  });
+                  if (finalHasAutoProvenance) {
+                    await github.rest.issues.removeLabel({
+                      owner, repo, issue_number: prNumber,
+                      name: LABEL_ESCALATE_AUTO,
+                    });
+                  }
+                  clearedTransient = true;
+                  core.info(`#${prNumber}: cleared transient needs-owner${finalHasAutoProvenance ? ' + needs-owner-auto' : ' (proven legacy automation event)'} after exact-head fully-green validation; continuing to merge`);
+                } catch (e) {
+                  try {
+                    await restoreTransientIfOpen(prNumber);
+                  } catch (restoreError) {
+                    core.warning(`#${prNumber}: transient-label restore failed: ${restoreError.message}`);
+                  }
+                  core.warning(`#${prNumber}: transient-label clear failed; skip: ${e.message}`);
+                  continue;
+                }
               }
 
               // Squash-merge with the PAT so the push to the base branch
@@ -333,11 +809,23 @@ jobs:
               // may already have merged (405/409) — swallow both and skip this
               // pass (the next event re-evaluates the new head).
               try {
-                await github.rest.pulls.merge({
+                const { data: mergeResult } = await github.rest.pulls.merge({
                   owner, repo, pull_number: prNumber, merge_method: 'squash', sha: headSha,
                 });
+                if (!mergeResult.merged) {
+                  if (clearedTransient) await restoreTransientIfOpen(prNumber);
+                  core.warning(`#${prNumber}: merge API did not merge: ${mergeResult.message || 'unknown reason'}`);
+                  continue;
+                }
                 core.info(`#${prNumber}: merged ✅`);
               } catch (e) {
+                if (clearedTransient) {
+                  try {
+                    await restoreTransientIfOpen(prNumber);
+                  } catch (restoreError) {
+                    core.warning(`#${prNumber}: transient-label restore after merge error failed: ${restoreError.message}`);
+                  }
+                }
                 if (e.status === 405 || e.status === 409) {
                   core.info(`#${prNumber}: head moved / already merged / not mergeable (${e.status}), skip`);
                   continue;
@@ -374,5 +862,11 @@ jobs:
                     await github.rest.issues.update({ owner, repo, issue_number: issNum, state: 'closed' });
                   }
                 } catch (e) { core.info(`issue #${issNum} close skipped: ${e.message}`); }
+              }
+              } catch (e) {
+                // A bad API response or policy-evaluation error on one PR must
+                // never prevent other independently safe candidates from being
+                // evaluated in this run.
+                core.warning(`#${prNumber}: unexpected evaluation error; skipping only this PR: ${e.message}`);
               }
             }

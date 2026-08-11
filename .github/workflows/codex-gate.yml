@@ -1,66 +1,46 @@
 name: Codex Gate
 
-# Blocking status check `check-codex-status`. GREEN requires BOTH:
-#   1. Codex has REVIEWED the current head — a Codex signal (review, comment,
-#      inline note, or 👍 reaction) DATED AFTER the latest commit.
-#   2. No ACTIVE P1 on the head — a P1 marker DATED AFTER the latest commit,
-#      not yet followed by a later Codex fix Summary.
-# ONE consistent freshness rule for both: a signal counts only if its
-# timestamp is after the latest commit's committer date. commit_id is
-# deliberately NEVER used to decide freshness — GitHub re-points a still-
-# applicable inline comment's commit_id to the new head, so commit_id == head
-# does NOT mean Codex reviewed the new commit (it can be an old/stale comment
-# whose line still exists). Using commit_id would (a) make a stale P1 falsely
-# active OR (b) make a stale comment falsely read as a fresh review and flip
-# the gate green before Codex actually re-reviews — the merge-before-review
-# race through a side door. Date-only closes both.
-# It BLOCKS when an active P1 OR an active P2 is unresolved OR Codex hasn't
-# reviewed the head yet (pending). A stale P1/P2 (predating the latest commit) /
-# clean review / 👍 / P3 are all green. `codex-p1-acknowledged` label = manual
-# override.
+# Blocking status check `check-codex-status`.
 #
-# RE-CHECK MODEL (fix #25 — the head-targeted self-rerun POLL was DELETED):
-#   merge-bot reads `check-codex-status` via checks.listForRef(pr.head.sha), so
-#   the verdict must land on the HEAD commit. The gate re-evaluates on Codex
-#   activity (pull_request_review / issue_comment) and on `pull_request`
-#   opened/synchronize — those run against the head, so the check lands there.
-#   The two cases that don't fire a head-run on their own — a late 👍 reaction
-#   (no event) and a silent trusted sync — are covered elsewhere now: the
-#   watchdog SWEEP (fix #18) re-dispatches the gate on the head branch (≤~1h) and
-#   the trusted-sync GRACE-GREEN (fix #21) auto-clears. Manual re-check: Actions →
-#   Codex Gate → Run workflow with the PR number, or add the
-#   `codex-p1-acknowledged` label. The old in-run 90s `sleep` + createWorkflowDispatch
-#   poll — the single biggest per-wave cost (TRF #88: ~10-12 of ~15 runner-min) — is gone.
+# Invariant: an unresolved, non-outdated trusted Codex P1/P2 inline review
+# thread blocks regardless of unrelated later commits or current-head thumbs-up.
+# A finding clears only when its thread is resolved, or GitHub marks it outdated
+# and Codex supplies a current-head signal with no active replacement finding,
+# or the explicit `codex-p1-acknowledged` administrator label is present.
+# Current-head review freshness is bound to the review's exact commit marker or
+# to a signal after an Actions-observed head transition; Git commit timestamps
+# are never used. Thread state comes from GitHub GraphQL.
+# The authoritative decision implementation stays inline in this trusted
+# default-branch workflow. PR-controlled workflow, checkout and require paths
+# are forbidden; review events are rechecked through a default-branch
+# workflow_run relay. A PAT-independent scheduled sweep covers thread-state
+# changes and reaction events that have no supported Actions trigger.
+# Trusted actor allowlisting, Summary/Testing quote stripping, reaction-based
+# clean signals, trusted-sync grace and intentional technical fail-soft remain.
 #
-# Why a re-pointed commit_id can't cause a premature green: "has reviewed" is
-# date-only, so an old inline comment whose commit_id GitHub re-pointed to the
-# new head does NOT count as a review of the new head — the gate stays pending
-# until Codex posts a signal actually dated after the latest commit. (And the
-# active-P1 test is the same date-only basis, so a stale P1 doesn't false-block
-# either.)
-#
-# P1 AND P2 detection is the SAME as the bridge (p1Pattern/p2Pattern via the
-# same badge fragments + stripSummarySections) across the same 3 channels, fully
-# paginated — gate-block severity == bridge-trigger severity, so a P2-no-P1 PR
-# can't merge before its fix lands (the race Codex flagged on #48). fail-soft: a
-# technical error evaluating a PR does NOT block; a detected P1/P2 always blocks
-# (safety wins).
-
 on:
-  pull_request:
-    types: [opened, synchronize, reopened]
-  pull_request_review:
-    types: [submitted, edited, dismissed]
+  # SECURITY: pull_request/review/review_comment workflows execute from the
+  # untrusted PR merge ref. pull_request_target executes this workflow from the
+  # base default branch. No step checks out or executes PR-controlled code.
+  pull_request_target:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  # issue_comment uses the default-branch ref and is safe here; untrusted body
+  # text is never interpolated into executable script.
   issue_comment:
     types: [created, edited, deleted]
-  # fix #25: `pull_request_review_comment` was REMOVED. The verdict is evaluated
-  # against the WHOLE head every run; a Codex review already fires
-  # `pull_request_review`, and each of its N inline notes ADDITIONALLY fired a
-  # gate run that concurrency mostly cancelled after the runner had started — pure
-  # cost. Manual re-check / external-dispatch entry point below: the watchdog
-  # sweep and the silent-sync grace DISPATCH INTO this with a `pr_number` input +
-  # ref = the PR head branch, so the fresh run's head_sha == pr.head.sha and its
-  # check lands on the head where merge-bot looks.
+  # A pull_request_review workflow would execute from the untrusted PR merge
+  # ref. Codex Auto-Fix already receives that event (including clean reviews,
+  # whose job is skipped); its completed run relays here, where GitHub loads
+  # this evaluator from the default branch. This path uses GITHUB_TOKEN only,
+  # so clean reviews are rechecked even when AUTOMATION_PAT is unavailable.
+  workflow_run:
+    workflows: ['Codex Auto-Fix']
+    types: [completed]
+  # GitHub Actions has no pull_request_review_thread trigger. Sweep open PRs
+  # from this trusted default-branch workflow so resolved/reopened thread state
+  # is reflected on the exact head even when AUTOMATION_PAT is unavailable.
+  schedule:
+    - cron: '7,22,37,52 * * * *'
   workflow_dispatch:
     inputs:
       pr_number:
@@ -68,48 +48,36 @@ on:
         required: false
         type: string
 
-# fix #12/#17/#25: collapse the burst of redundant gate runs per PR without ever
-# killing a run mid-verdict. Post-#25 a Codex review fires ONE pull_request_review
-# and a push fires ONE pull_request run — the per-inline-note trigger AND the
-# in-run self-rerun poll are gone, so a wave is far smaller than the old ~4 runs.
-# cancel-in-progress is FALSE (fix #17): an IN-PROGRESS run always runs to
-# completion. Under cancel-in-progress: true a run that had already read Codex's
-# 👍 and CREATED the green codex-gate-verdict tile got cancelled by a newer event
-# BEFORE the job concluded — leaving the authoritative `check-codex-status` job
-# check as `cancelled` on the head, which merge-bot treated as failed and stranded
-# a green PR (INCIDENT 1). Letting runs finish removes that half-run strand.
-# GitHub still collapses the QUEUE per group (at most one pending run; a superseded
-# pending run is dropped before it starts), so event bursts don't storm — they just
-# don't cancel the run already executing. Any `cancelled` check-runs left behind by
-# a superseded QUEUED run are ignored by merge-bot (fix #17 Part B filters them).
-# The `|| github.run_id` fallback guarantees a non-empty group key.
+# Keep one evaluator run alive to completion; event bursts may queue one newer
+# review-thread-aware evaluation, but never cancel a half-published PR-head
+# verdict. Each run creates a fresh completed `check-codex-status` check on the
+# exact PR head; no cross-run check update is attempted.
 concurrency:
-  group: codex-gate-pr-${{ github.event.pull_request.number || github.event.inputs.pr_number || github.event.issue.number || github.run_id }}
+  # The scheduled sweep can cover several PRs in one run, so serialize every
+  # evaluator in the repository. This prevents event-driven and scheduled
+  # snapshots from publishing exact-head verdicts in stale completion order.
+  group: codex-gate-${{ github.repository }}
   cancel-in-progress: false
 
 permissions:
   contents: read
   pull-requests: read
   issues: read
-  # fix #25: `actions:` dropped — the only consumer was the deleted self-rerun
-  # poll (getWorkflowRun/listWorkflowRuns read + createWorkflowDispatch write).
+  # Current-head freshness uses the first pull_request workflow run for the
+  # exact SHA as the server-observed head-transition floor.
+  actions: read
   # fix #11: publish the explicit `check-codex-status` check-run with output text.
   checks: write
 
 jobs:
-  # fix #15: GitHub's 2025-03-31 policy forbids a workflow's GITHUB_TOKEN from
-  # UPDATING the status/conclusion of a check-run created by a DIFFERENT Actions
-  # run ("Check run status and conclusions can only be updated internally by
-  # GitHub Actions"). So find→update publishing jams the gate red on the 2nd run
-  # for a head (🟡 first, then Codex reviews → the update is rejected). The
-  # authoritative `check-codex-status` is therefore the ACTIONS-OWNED job-status
-  # check (this job's `name:`), driven ONLY by the verdict via core.setFailed;
-  # it lands on pr.head.sha (where merge-bot reads it) on every head-run.
-  # The rich 🟢/🔴/🟡 output lives on a SEPARATE, cosmetic, CREATE-ONLY check
-  # `codex-gate-verdict` (publishGateCheck below) — never updated, so the policy
-  # can't jam it, and nothing keys on that name.
+  # pull_request_target and default-branch dispatch runs attach their native job
+  # check to the trusted workflow ref, not necessarily to the PR head. Therefore
+  # the authoritative required check is the create-only `check-codex-status`
+  # check published explicitly against pr.head.sha below. The evaluator job has
+  # a distinct name so branch protection and merge automation cannot confuse it
+  # with the PR-head verdict.
   codex-gate:
-    name: check-codex-status
+    name: codex-gate-evaluator
     runs-on: ubuntu-latest
     steps:
       - name: Resolve PR number(s) to check
@@ -117,12 +85,12 @@ jobs:
         uses: actions/github-script@v8
         with:
           script: |
-            // pull_request → the PR being opened/synced
-            // pull_request_review → context.payload.pull_request
-            // pull_request_review_comment → context.payload.pull_request
+            // pull_request_target → the PR being opened/synced, with this
+            //   workflow loaded from the trusted base/default branch
             // issue_comment → context.payload.issue (PRs are issues for
-            //   the comments API)
-            // workflow_dispatch (self-rerun / manual) → no PR payload at all,
+            //   the comments API; workflow ref is the default branch)
+            // workflow_run → trusted default-branch relay for Codex review
+            //   activity; workflow_dispatch → no PR payload at all,
             //   the PR number comes through as an input; parse it back
             //   into a JS number so downstream filters compare correctly.
             let prNumbers = [];
@@ -131,11 +99,34 @@ jobs:
               prNumbers = [context.payload.pull_request.number];
             } else if (context.payload.issue?.pull_request) {
               prNumbers = [context.payload.issue.number];
-            } else if (
-              context.eventName === 'pull_request_review_comment' &&
-              context.payload.pull_request
-            ) {
-              prNumbers = [context.payload.pull_request.number];
+            } else if (context.eventName === 'workflow_run') {
+              const run = context.payload.workflow_run || {};
+              prNumbers = [...new Set(
+                (run.pull_requests || [])
+                  .map((pull) => Number(pull.number))
+                  .filter(Number.isFinite),
+              )];
+              // GitHub can omit workflow_run.pull_requests for some event
+              // shapes. Resolve against the run SHA without trusting a branch
+              // name supplied by PR code.
+              if (!prNumbers.length && run.head_sha) {
+                const associated = await github.paginate(
+                  github.rest.repos.listPullRequestsAssociatedWithCommit,
+                  { owner: context.repo.owner, repo: context.repo.repo, commit_sha: run.head_sha, per_page: 100 },
+                );
+                prNumbers = [...new Set(
+                  associated
+                    .filter((pull) => pull.state === 'open' && pull.base?.repo?.full_name === `${context.repo.owner}/${context.repo.repo}`)
+                    .map((pull) => Number(pull.number))
+                    .filter(Number.isFinite),
+                  )];
+              }
+            } else if (context.eventName === 'schedule') {
+              const open = await github.paginate(github.rest.pulls.list, {
+                owner: context.repo.owner, repo: context.repo.repo,
+                state: 'open', per_page: 100,
+              });
+              prNumbers = open.map((pull) => pull.number);
             } else if (
               context.eventName === 'workflow_dispatch' &&
               context.payload.inputs?.pr_number
@@ -173,75 +164,198 @@ jobs:
             };
 
             // Strict Codex actor allowlist — must match claude-fallback-watchdog.yml — keep in sync.
-            const TRUSTED_CODEX_LOGINS = new Set(['chatgpt-codex-connector[bot]']);
+            // Exact GitHub App identities: GraphQL reviewThreads omit
+            // the REST-style [bot] suffix.
+            const TRUSTED_CODEX_LOGINS = new Set([
+              'chatgpt-codex-connector',
+              'chatgpt-codex-connector[bot]',
+            ]);
             const isCodex = (user) => !!user?.login && TRUSTED_CODEX_LOGINS.has(user.login);
 
-            // Codex marks P1 findings exactly two ways (SAME detection as
-            // the bridge — do not invent a new pattern):
-            //   - "P1-orange" image-badge URL fragment (appears anywhere
-            //     in the body — the badge can be inline)
-            //   - A line-leading severity label after optional markdown
-            //     line-prefixes (whitespace, blockquote >, list markers,
-            //     _ * ` # ): **P1**, [P1], or P1:
-            // Prose that merely contains the literal token "P1" mid-
-            // sentence MUST NOT match — only a real badge or a real
-            // line-leading severity label.
-            const p1Pattern = /(?:P1-orange|(?:^|\n)[\s>*\-_#`]*(?:\*\*\s*P1\s*\*\*|\[P1\]|P1:))/i;
-            // P2 mirrors p1Pattern EXACTLY (badge fragment `P2-yellow` + a
-            // line-leading **P2** / [P2] / P2:). This is the SAME marker the
-            // bridge keys on for an active P2 — its P2 badge renders as
-            // `![P2 Badge](…/badge/P2-yellow…)`, which contains `P2-yellow` —
-            // so the gate blocks on precisely the P2s the bridge routes to
-            // Claude. Mid-prose "P2" tokens MUST NOT match (same discipline).
-            const p2Pattern = /(?:P2-yellow|(?:^|\n)[\s>*\-_#`]*(?:\*\*\s*P2\s*\*\*|\[P2\]|P2:))/i;
-            const fixSummaryPattern = /###\s+Summary[\s\S]+commit/i;
+            // SECURITY: authoritative policy stays inline in this workflow.
+            // Never checkout/require executable gate code from the PR merge
+            // ref. tools/codex_gate_logic.js mirrors this pure logic for CI.
+            const P1_PATTERN = /(?:P1-orange|(?:^|\n)[\s>*\-_#`]*(?:\*\*\s*P1\s*\*\*|\[P1\]|P1:))/i;
+            const P2_PATTERN = /(?:P2-yellow|(?:^|\n)[\s>*\-_#`]*(?:\*\*\s*P2\s*\*\*|\[P2\]|P2:))/i;
 
-            // Codex's own post-fix Summary blocks frequently quote earlier
-            // P1 markers verbatim. Strip "## Summary" / "## Testing"
-            // sections (## or ###) up to the next same-level heading or a
-            // horizontal rule before running p1Pattern, so a fix Summary
-            // isn't misread as a fresh P1. fixSummaryPattern still uses the
-            // original body — that pattern is looking *for* the Summary.
             function stripSummarySections(body) {
               if (!body) return '';
-              return body
+              return String(body)
                 .replace(/(?:^|\n)#{2,3}\s+Summary[\s\S]*?(?=\n#{2,3}\s|\n---|$)/gi, '')
                 .replace(/(?:^|\n)#{2,3}\s+Testing[\s\S]*?(?=\n#{2,3}\s|\n---|$)/gi, '');
+            }
+
+            function severity(body) {
+              const semantic = stripSummarySections(body);
+              if (P1_PATTERN.test(semantic)) return 'P1';
+              if (P2_PATTERN.test(semantic)) return 'P2';
+              return null;
+            }
+
+            const REVIEWED_COMMIT_PATTERN = /(?:^|\n)\*\*Reviewed commit:\*\*\s*`([a-f0-9]{10,40})`(?:\s|$)/i;
+            function signalTargetsHead(item, headSha, headObservedAt, dateField = 'created_at') {
+              const exactHead = String(headSha || '').toLowerCase();
+              if (!/^[a-f0-9]{40}$/.test(exactHead)) return false;
+              const originalCommit = String(item?.original_commit_id || '').toLowerCase();
+              if (originalCommit) return originalCommit === exactHead;
+              const commit = String(item?.commit_id || '').toLowerCase();
+              if (commit) return commit === exactHead;
+              const marker = String(item?.body || '').match(REVIEWED_COMMIT_PATTERN)?.[1]?.toLowerCase();
+              if (marker) return exactHead.startsWith(marker);
+              const signalAt = new Date(item?.[dateField] || 0).getTime();
+              const observedAt = new Date(headObservedAt || 0).getTime();
+              return Number.isFinite(signalAt) && Number.isFinite(observedAt) &&
+                observedAt > 0 && signalAt > observedAt;
+            }
+
+            async function observedHeadTransition(prNumber, headSha) {
+              const runs = await github.paginate(
+                github.rest.actions.listWorkflowRunsForRepo,
+                { owner, repo, head_sha: headSha, event: 'pull_request', per_page: 100 },
+              );
+              const observed = runs
+                .filter((run) => (
+                  run.head_sha === headSha &&
+                  (run.pull_requests || []).some((candidate) => candidate.number === prNumber)
+                ))
+                .map((run) => new Date(run.created_at || 0).getTime())
+                .filter((value) => Number.isFinite(value) && value > 0);
+              return observed.length ? new Date(Math.min(...observed)) : null;
+            }
+
+            function authorLogin(comment) {
+              return String(
+                comment?.author?.login ||
+                comment?.user?.login ||
+                comment?.authorLogin ||
+                ''
+              );
+            }
+
+            function findingFromThread(thread) {
+              for (const comment of thread?.comments || []) {
+                if (!TRUSTED_CODEX_LOGINS.has(authorLogin(comment))) continue;
+                const level = severity(comment?.body || '');
+                if (!level) continue;
+                return {
+                  severity: level,
+                  path: String(thread?.path || ''),
+                  line: Number.isInteger(thread?.line) ? thread.line : null,
+                  startLine: Number.isInteger(thread?.startLine)
+                    ? thread.startLine
+                    : null,
+                  threadId: String(thread?.id || ''),
+                };
+              }
+              return null;
+            }
+
+            function classifyThreads(threads) {
+              const active = [];
+              const outdated = [];
+              const resolved = [];
+              for (const thread of threads || []) {
+                const finding = findingFromThread(thread);
+                if (!finding) continue;
+                if (thread?.isResolved === true) resolved.push(finding);
+                else if (thread?.isOutdated === true) outdated.push(finding);
+                else active.push(finding);
+              }
+              return { active, outdated, resolved };
+            }
+
+            function decideCodexGate({
+              threads = [],
+              nonInlineFindings = [],
+              currentHeadSignal = false,
+              override = false,
+              technicalError = false,
+            } = {}) {
+              if (override) {
+                return {
+                  status: 'clear',
+                  reason: 'administrator_override',
+                  activeFindings: [],
+                };
+              }
+              if (technicalError) {
+                return {
+                  status: 'clear',
+                  reason: 'technical_fail_soft',
+                  activeFindings: [],
+                };
+              }
+              if (nonInlineFindings.length) {
+                return {
+                  status: 'blocked',
+                  reason: 'active_current_head_non_inline_finding',
+                  activeFindings: nonInlineFindings,
+                };
+              }
+              const classified = classifyThreads(threads);
+              if (classified.active.length) {
+                return {
+                  status: 'blocked',
+                  reason: 'active_unresolved_review_thread',
+                  activeFindings: classified.active,
+                  outdatedFindings: classified.outdated,
+                };
+              }
+              if (classified.outdated.length && !currentHeadSignal) {
+                return {
+                  status: 'pending',
+                  reason: 'outdated_finding_needs_current_head_signal',
+                  activeFindings: [],
+                  outdatedFindings: classified.outdated,
+                };
+              }
+              if (currentHeadSignal) {
+                return {
+                  status: 'clear',
+                  reason: classified.outdated.length
+                    ? 'outdated_findings_and_current_head_signal'
+                    : 'current_head_signal_no_active_findings',
+                  activeFindings: [],
+                  outdatedFindings: classified.outdated,
+                };
+              }
+              // Resolution removes a finding; it is not permanent review
+              // approval for unrelated commits pushed afterward.
+              return {
+                status: 'pending',
+                reason: 'current_head_review_pending',
+                activeFindings: [],
+              };
             }
 
             let anyBlocked = false;
             const results = [];
 
-            // fix #15: publish the rich 🟢/🔴/🟡 output as a COSMETIC, CREATE-ONLY
-            // check named `codex-gate-verdict` (NOT `check-codex-status` — that is
-            // the Actions-owned job-status check now). CREATE-ONLY on purpose: the
-            // 2025-03-31 policy blocks a token from UPDATING another run's check
-            // ("...can only be updated internally by GitHub Actions"), so we never
-            // list/find/update — each run just creates a fresh completed check-run.
-            // Multiple runs accumulate check-runs of this name; the UI and any
-            // latest-per-name reader surface the newest, and merge-bot doesn't key
-            // on this name (it reads `check-codex-status`). Purely informational, so
-            // a create failure (e.g. downgraded checks:write on forked/Dependabot
-            // runs) is logged and NEVER fails the job — the authoritative verdict
-            // is the job-status check driven by core.setFailed.
+            // Publish the authoritative, rich 🟢/🔴/🟡 required check on the
+            // exact PR head. CREATE-ONLY avoids GitHub's cross-run check-update
+            // restriction; each evaluation creates a fresh completed run and
+            // latest-per-name readers consume the newest verdict.
+            let gatePublishFailed = false;
             async function publishGateCheck(headSha, conclusion, title, summary) {
               try {
                 await github.rest.checks.create({
-                  owner, repo, name: 'codex-gate-verdict', head_sha: headSha,
+                  owner, repo, name: 'check-codex-status', head_sha: headSha,
                   status: 'completed', conclusion,
                   output: { title, summary },
                 });
               } catch (e) {
-                core.warning(`codex-gate-verdict publish failed (cosmetic, ignored): ${e.message}`);
+                gatePublishFailed = true;
+                core.error(`check-codex-status publish failed for ${String(headSha).slice(0, 7)}: ${e.message}`);
               }
             }
 
             for (const prNumber of prNumbers) {
+              let headSha = context.payload.pull_request?.head?.sha || null;
               try {
                 const { data: pr } = await github.rest.pulls.get({
                   owner, repo, pull_number: prNumber,
                 });
-                const headSha = pr.head.sha;
+                headSha = pr.head.sha;
                 const head7 = headSha.substring(0, 7);
 
                 // Manual override — admin force-merge.
@@ -272,6 +386,57 @@ jobs:
                 const reactions = await github.paginate(github.rest.reactions.listForIssue, {
                   owner, repo, issue_number: prNumber, per_page: 100,
                 });
+                let headObservedAt = null;
+                try {
+                  headObservedAt = await observedHeadTransition(prNumber, headSha);
+                } catch (e) {
+                  core.warning(`PR #${prNumber}: exact-head transition lookup failed; unmarked review signals and sync grace stay pending: ${e.message}`);
+                }
+
+                // Inline review-thread state is authoritative for P1/P2
+                // liveness. REST comment timestamps cannot tell whether a
+                // finding is resolved or outdated, so fetch the GraphQL
+                // reviewThreads connection (fully paginated).
+                const reviewThreads = [];
+                let threadCursor = null;
+                do {
+                  const threadData = await github.graphql(
+                    `query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+                      repository(owner: $owner, name: $repo) {
+                        pullRequest(number: $number) {
+                          reviewThreads(first: 100, after: $cursor) {
+                            pageInfo { hasNextPage endCursor }
+                            nodes {
+                              id
+                              isResolved
+                              isOutdated
+                              path
+                              line
+                              startLine
+                              comments(first: 100) {
+                                nodes {
+                                  body
+                                  createdAt
+                                  author { login }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }`,
+                    { owner, repo, number: prNumber, cursor: threadCursor },
+                  );
+                  const connection =
+                    threadData.repository.pullRequest.reviewThreads;
+                  reviewThreads.push(...connection.nodes.map(t => ({
+                    ...t,
+                    comments: t.comments.nodes,
+                  })));
+                  threadCursor = connection.pageInfo.hasNextPage
+                    ? connection.pageInfo.endCursor
+                    : null;
+                } while (threadCursor);
 
                 const codexReviews = reviews.filter(r => isCodex(r.user));
                 const codexComments = comments.filter(c => isCodex(c.user));
@@ -284,149 +449,145 @@ jobs:
                   codexReviews.length + codexComments.length +
                   codexReviewComments.length + codexReactions.length;
 
-                const prCommits = await github.paginate(github.rest.pulls.listCommits, {
-                  owner, repo, pull_number: prNumber, per_page: 100,
-                });
-                // latestCommitDate = the MAX committer date across the PR's
-                // commits. Don't assume listCommits returns them sorted — take
-                // the max explicitly so a P1's "after the latest commit?" test
-                // is always against the real newest commit.
-                const latestCommitDate = prCommits.length > 0
-                  ? new Date(Math.max(...prCommits.map(c => new Date(c.commit.committer.date).getTime())))
-                  : new Date(pr.created_at);
-
-                // A Codex signal counts as "on the current head" ONLY if it is
-                // DATED AFTER the latest commit. commit_id is deliberately NOT
-                // used for freshness: GitHub RE-POINTS a still-applicable inline
-                // comment's commit_id to the new head, so commit_id == headSha
-                // does NOT mean Codex reviewed the new commit — it can be an old
-                // (stale) comment whose line still exists. Using the SAME
-                // date-after-latest-commit test for BOTH "has Codex reviewed
-                // this head?" and "is there an active P1?" keeps them consistent
-                // and stops a re-pointed stale comment from either falsely
-                // blocking OR falsely reading as a fresh review (which would
-                // flip the gate green before Codex has re-reviewed the new head
-                // — the merge-before-review race through a side door).
-                const onHead = (date) => !!date && new Date(date) > latestCommitDate;
+                // Exact review.commit_id / Codex's Reviewed commit marker binds
+                // directly to the SHA. Other surfaces (including reactions and
+                // repointed inline comments) count only after GitHub Actions
+                // observed this SHA as this PR's head. Git commit dates are not
+                // push/head-transition timestamps and are never used here.
+                const onHead = (item, dateField) =>
+                  signalTargetsHead(item, headSha, headObservedAt, dateField);
 
                 const allBodies = [
                   ...codexReviews.map(r => ({
                     body: r.body || '',
                     bodyForP1: stripSummarySections(r.body || ''),
                     date: r.submitted_at,
-                    onHead: onHead(r.submitted_at),
+                    onHead: onHead(r, 'submitted_at'),
                   })),
                   ...codexComments.map(c => ({
                     body: c.body || '',
                     bodyForP1: stripSummarySections(c.body || ''),
                     date: c.created_at,
-                    onHead: onHead(c.created_at),
+                    onHead: onHead(c, 'created_at'),
                   })),
                   ...codexReviewComments.map(c => ({
                     body: c.body || '',
                     bodyForP1: stripSummarySections(c.body || ''),
                     date: c.created_at,
-                    onHead: onHead(c.created_at),
+                    onHead: onHead(c, 'created_at'),
                   })),
                 ].sort((a, b) => new Date(a.date) - new Date(b.date));
 
-                // A 👍 reaction counts as "reviewed, no issues" ONLY if it is
-                // dated after the latest commit (Codex must react on the NEW
-                // head). The 👍 fires no event, so the watchdog sweep catches it.
+                // An unmarked 👍 counts only after the server-observed head
+                // transition. The watchdog sweep catches this no-event signal.
                 const codexThumbsUpOnHead = reactions.some(
-                  r => isCodex(r.user) && r.content === '+1' &&
-                       new Date(r.created_at) > latestCommitDate
+                  r => isCodex(r.user) && r.content === '+1' && onHead(r, 'created_at')
                 );
 
                 // Has Codex actually reviewed the CURRENT head? = any Codex
-                // signal (review / comment / inline / 👍) DATED after the latest
-                // commit. Date-only, same basis as activeSevItems below.
+                // signal explicitly bound to the SHA or observed after its
+                // head transition. This does not stale an active review thread.
                 const hasCodexSignalOnHead =
                   allBodies.some(item => item.onHead) || codexThumbsUpOnHead;
 
-                // ACTIVE P1/P2 = a P1 OR P2 marker DATED after the latest
-                // commit. The gate must block on BOTH severities: the bridge
-                // sends a Claude fix on P1 AND P2, so blocking on P1 only let a
-                // P2-no-P1 PR merge BEFORE the fix landed — the merge-before-fix
-                // race Codex flagged on #48. (bodyForP1 is the Summary-stripped
-                // body; stripping is severity-agnostic, so it's reused for P2.)
-                const activeSevItems = allBodies.filter(
-                  item => item.onHead &&
-                    (p1Pattern.test(item.bodyForP1) || p2Pattern.test(item.bodyForP1))
-                );
+                // Review bodies and top-level PR comments can carry trusted
+                // P1/P2 findings without an inline review thread. They remain
+                // active only when explicitly bound to this SHA or posted after
+                // its observed head transition; a later clean signal cannot
+                // erase them. A new head still requires a fresh review.
+                const nonInlineFindings = [
+                  ...codexReviews.map((review) => ({
+                    body: review.body || '',
+                    onHead: onHead(review, 'submitted_at'),
+                    channel: 'review body',
+                  })),
+                  ...codexComments.map((comment) => ({
+                    body: comment.body || '',
+                    onHead: onHead(comment, 'created_at'),
+                    channel: 'PR comment',
+                  })),
+                ].filter((item) => item.onHead && severity(item.body))
+                  .map((item) => ({
+                    severity: severity(item.body),
+                    path: `(${item.channel})`,
+                    line: null,
+                    startLine: null,
+                    threadId: '',
+                  }));
 
-                // 1) Active P1/P2 → block unless a later fix Summary cleared it.
-                if (activeSevItems.length > 0) {
-                  let lastActiveSevDate = null;
-                  let lastFixDate = null;
-                  for (const item of allBodies) {
-                    if (!item.onHead) continue;
-                    if (p1Pattern.test(item.bodyForP1) || p2Pattern.test(item.bodyForP1)) lastActiveSevDate = item.date;
-                    if (fixSummaryPattern.test(item.body)) lastFixDate = item.date;
-                  }
-                  if (lastFixDate && new Date(lastFixDate) > new Date(lastActiveSevDate)) {
-                    results.push(`PR #${prNumber}: ✅ active Codex P1/P2 followed by a fix Summary`);
-                    await publishGateCheck(headSha, 'success', '🟢 Reviewed — clear',
-                      `Codex's P1/P2 on ${head7} was followed by a fix Summary — resolved, no active P1/P2.`);
-                    continue;
-                  }
+                const gateDecision = decideCodexGate({
+                  threads: reviewThreads,
+                  nonInlineFindings,
+                  currentHeadSignal: hasCodexSignalOnHead,
+                });
+
+                // Active thread/non-inline finding state wins over a clean
+                // signal or current-head thumbs-up.
+                if (gateDecision.status === 'blocked') {
+                  const locations = gateDecision.activeFindings
+                    .slice(0, 5)
+                    .map(f => `${f.severity} ${f.path}:${f.line || f.startLine || '?'}`)
+                    .join(', ');
                   results.push(
-                    `PR #${prNumber}: ❌ active Codex P1/P2 unresolved (last active: ${lastActiveSevDate}, last fix: ${lastFixDate || 'none'}, head: ${headSha.substring(0, 7)})`
+                    `PR #${prNumber}: ❌ active trusted Codex P1/P2 finding(s): ${locations}`
                   );
-                  await publishGateCheck(headSha, 'failure', '🔴 Active Codex P1/P2',
-                    `An unresolved Codex P1/P2 on ${head7} is blocking merge. It clears when Codex posts a fix Summary or the head is updated (last active ${lastActiveSevDate}, last fix ${lastFixDate || 'none'}).`);
+                  await publishGateCheck(
+                    headSha,
+                    'failure',
+                    '🔴 Active Codex P1/P2 finding',
+                    `Resolve/update the active trusted finding(s) on ${head7}: ${locations}.`,
+                  );
                   anyBlocked = true;
                   continue;
                 }
 
-                // 2) No active P1, but Codex hasn't reviewed the head yet →
-                // PENDING block. (fix #25: no in-run poll — a late 👍 is caught by
-                // the watchdog sweep, a silent trusted sync by grace-green below.)
-                if (!hasCodexSignalOnHead) {
-                  // fix #21: trusted-sync grace-green. Fires ONLY inside this
-                  // zero-signal 🟡 branch, ONLY for a trusted sync with ZERO Codex
-                  // signals of any kind, ONLY once the head is older than the grace
-                  // window. Any Codex signal (even one) → codexSignalCount > 0 → this
-                  // never fires and the normal rules apply (P1/P2 still blocks, a
-                  // clean review / 👍 still greens, a younger-than-grace silent sync
-                  // stays 🟡).
+                if (gateDecision.status === 'pending') {
+                  // Preserve trusted-sync grace only for total Codex silence.
+                  // A stale/outdated finding is evidence of engagement and
+                  // therefore can never take this bypass.
                   const graceMs = SYNC_GRACE_MINUTES * 60 * 1000;
-                  const headAgeMs = Date.now() - latestCommitDate.getTime();
-                  const silentTrustedSync = isTrustedSync(pr) && codexSignalCount === 0;
+                  const headAgeMs = headObservedAt
+                    ? Date.now() - headObservedAt.getTime()
+                    : 0;
+                  const silentTrustedSync =
+                    isTrustedSync(pr) && codexSignalCount === 0 &&
+                    gateDecision.reason === 'current_head_review_pending';
                   if (silentTrustedSync && headAgeMs > graceMs) {
                     results.push(
                       `PR #${prNumber}: ✅ trusted sync — no Codex signal within ${SYNC_GRACE_MINUTES}m grace on head ${head7}; auto-cleared`
                     );
-                    await publishGateCheck(headSha, 'success', '🟢 Trusted sync — no Codex findings within grace window',
-                      `Byte-copy sync from automation-core (validated upstream). Codex posted no signal within ${SYNC_GRACE_MINUTES} min of head ${head7}, so the gate auto-cleared. Any Codex signal of any kind restores normal rules.`);
+                    await publishGateCheck(
+                      headSha,
+                      'success',
+                      '🟢 Trusted sync — no Codex findings within grace window',
+                      `Validated byte-copy sync; Codex posted no signal within ${SYNC_GRACE_MINUTES} min of ${head7}.`,
+                    );
                     continue;
                   }
-                  // Still-pending. For a silent trusted sync inside the grace window,
-                  // tell the reader exactly when it auto-clears.
-                  const graceLine = silentTrustedSync
-                    ? `\nTrusted sync: auto-clears at ${new Date(latestCommitDate.getTime() + graceMs).toISOString()} if Codex posts nothing.`
-                    : '';
-                  results.push(
-                    `PR #${prNumber}: ⏳ pending — Codex hasn't reviewed head ${headSha.substring(0, 7)} yet; blocking until it does`
+                  const reasonText =
+                    gateDecision.reason === 'outdated_finding_needs_current_head_signal'
+                      ? 'an outdated finding awaits a clean current-head Codex signal'
+                      : `Codex has not reviewed head ${head7}`;
+                  results.push(`PR #${prNumber}: ⏳ pending — ${reasonText}`);
+                  await publishGateCheck(
+                    headSha,
+                    'failure',
+                    '🟡 Waiting for Codex review',
+                    `${reasonText}. Resolved threads clear directly; outdated threads require a current-head clean signal.`,
                   );
-                  await publishGateCheck(headSha, 'failure', '🟡 Waiting for Codex review',
-                    `Codex hasn't reviewed ${head7} yet. The gate re-checks on Codex activity and on the watchdog sweep (≤~1h); manual re-check: Actions → Codex Gate → Run workflow with this PR number, or add the \`codex-p1-acknowledged\` label.${graceLine}`);
                   anyBlocked = true;
                   continue;
                 }
 
-                // 3) Codex reviewed the head and found no active P1 → GREEN.
-                if (codexThumbsUpOnHead && allBodies.every(item => !item.onHead)) {
-                  results.push(`PR #${prNumber}: ✅ Codex reacted 👍 on the head — no issues`);
-                } else if (allBodies.some(item => p1Pattern.test(item.bodyForP1) || p2Pattern.test(item.bodyForP1))) {
-                  results.push(
-                    `PR #${prNumber}: ✅ Codex reviewed head ${headSha.substring(0, 7)} — P1/P2(s) are stale (predate the latest commit)`
-                  );
-                } else {
-                  results.push(`PR #${prNumber}: ✅ Codex reviewed head ${headSha.substring(0, 7)} — no P1/P2`);
-                }
-                await publishGateCheck(headSha, 'success', '🟢 Reviewed — clear',
-                  `Codex reviewed ${head7} with no active P1/P2.`);
+                results.push(
+                  `PR #${prNumber}: ✅ ${gateDecision.reason} on head ${head7}`
+                );
+                await publishGateCheck(
+                  headSha,
+                  'success',
+                  '🟢 Reviewed — clear',
+                  `No unresolved non-outdated trusted Codex P1/P2 thread blocks ${head7} (${gateDecision.reason}).`,
+                );
               } catch (err) {
                 // fail-soft: a TECHNICAL failure (API hiccup, rate limit, etc.)
                 // must NEVER wedge a PR red forever. We did not detect a P1
@@ -437,26 +598,38 @@ jobs:
                   `PR #${prNumber}: ⚠️ gate errored technically — not blocking (fail-soft): ${err.message}`
                 );
                 core.warning(`Codex Gate technical error on PR #${prNumber}: ${err.stack || err.message}`);
+                if (headSha) {
+                  await publishGateCheck(
+                    headSha,
+                    'success',
+                    '🟢 Technical fail-soft',
+                    `The trusted evaluator hit a technical API error for PR #${prNumber}; no active P1/P2 was established.`,
+                  );
+                } else {
+                  gatePublishFailed = true;
+                }
               }
             }
 
             core.summary.addHeading('Codex Gate Results').addList(results).write();
             results.forEach(r => core.info(r));
 
-            // fix #14: fail the `codex-gate` job CLOSED when the verdict blocks
-            // OR the explicit `check-codex-status` publish failed. Succeed only
-            // when the verdict is clear AND the check actually published — so a
-            // downgraded-token run (missing required check) is a VISIBLE red
-            // `codex-gate`, never a green job hiding an unmergeable PR.
-            // fix #15: the job conclusion IS the authoritative `check-codex-status`
-            // (this job's name), so it must equal the VERDICT only — never coupled
-            // to the cosmetic `codex-gate-verdict` publish.
-            if (anyBlocked) {
+            // The evaluator job is diagnostic; the explicit PR-head check is
+            // authoritative. Fail the evaluator when a policy block exists or
+            // the required head check could not be published, so failures remain
+            // visible even though this job itself is attached to the trusted ref.
+            // A scheduled run evaluates every open PR. Keep each explicit
+            // head check red/green independently, but do not fail the aggregate
+            // merely because one unrelated PR is blocked: a successful sweep
+            // must wake Merge Bot for another PR that just cleared. A check
+            // publication failure remains loud, and event-driven single-PR
+            // policy blocks remain failed as before.
+            if ((anyBlocked && context.eventName !== 'schedule') || gatePublishFailed) {
               core.setFailed(
                 'Blocked by Codex Gate: an active P1 or P2 is unresolved, or Codex has not reviewed the current head yet.\n' +
                 'Resolve by one of:\n' +
-                '  1. Wait — Codex reviews automatically on every push; the gate re-checks on Codex activity and on the watchdog sweep (≤~1h), and goes green once Codex posts any signal with no active P1/P2.\n' +
-                '  2. Push a fix commit — P1/P2s raised before it become stale and clear automatically.\n' +
+                '  1. Wait — Codex reviews automatically on every push; the gate re-checks on Codex activity and the trusted scheduled sweep (≤15m), and goes green once Codex posts any signal with no active P1/P2.\n' +
+                '  2. Resolve the review thread, or update its relevant diff and wait for GitHub to mark it outdated plus a clean current-head Codex signal.\n' +
                 '  3. Add label "codex-p1-acknowledged" to override.'
               );
             }

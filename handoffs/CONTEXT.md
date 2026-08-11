@@ -2,7 +2,7 @@
 
 > Canonical, self-contained handoff. Read this first. `LOOP_STATE.md` is the concise per-workflow state reference; `handoffs/loop-build.md` is the dated change log.
 >
-> Privacy rule: this is a public repo. Never write the owner's personal name. Refer to the human as "the owner". The only escalation label is `needs-owner`.
+> Privacy rule: this is a public repo. Never write the owner's personal name. Refer to the human as "the owner". `needs-owner` is the escalation stop; `needs-owner-auto` is provenance only, and `no-automerge` is the permanent opt-out.
 
 ---
 
@@ -13,7 +13,9 @@
 - Codex (`chatgpt-codex-connector[bot]`) reviews PRs and raises P1/P2 findings.
 - Claude fixes when asked by the bridge or CI Doctor.
 - Codex Gate blocks merge until Codex has reviewed the current head and no active P1/P2 remains.
-- Merge Bot merges eligible green PRs when no `needs-owner` hard stop exists.
+- Merge Bot automatically squash-merges an eligible exact-head-green PR. A
+  same-repository owner PR is eligible by default; `no-automerge` is the
+  permanent opt-out, and manual/unknown `needs-owner` remains a hard stop.
 
 The repository preserves a direct-to-main operating convention for automation-core maintenance unless a task explicitly says otherwise. Workflow logic is the source of truth for behavior; this document explains the current architecture and marks superseded incident history.
 
@@ -57,7 +59,10 @@ Per-repo switches are not synced:
 | `CODEX_BACKUP_ENABLED` | disabled | only `true` enables the Codex API backup. Disabled means skipped, not immediate escalation. |
 | `CODEX_CLOUD_ENABLED` | enabled | `false` disables Codex Cloud. |
 
-Trusted Codex identity is exact: `chatgpt-codex-connector[bot]`. Do not add substring, regex, or alias matchers.
+Trusted Codex identity is surface-specific and exact:
+`chatgpt-codex-connector[bot]` on REST comments/reviews and
+`chatgpt-codex-connector` for the same App in GraphQL review threads. Do not
+add substring, regex, or other alias matchers.
 
 ## 3. Verification State
 
@@ -123,11 +128,26 @@ The Codex API backup is dormant by default and requires OpenAI quota plus `CODEX
 
 ### `codex-gate.yml`
 
-The gate blocks until Codex has reviewed the current head and no active P1/P2 remains. It uses date-only freshness against the max commit date and does not trust `commit_id` for freshness. Trusted sync grace-green only applies to zero-signal trusted sync PRs after the grace window.
+The gate blocks until Codex has reviewed the current head and no active P1/P2 remains. Review objects and Codex result comments bind to the exact SHA; unmarked signals must follow an Actions-observed head transition, and Git commit dates are never treated as push times. Repointable inline `commit_id` values alone do not waive review. Trusted sync grace-green only applies to zero-signal trusted sync PRs after the server-observed grace window.
 
 ### `merge-bot.yml`
 
-Merge Bot considers bot-authored PRs, `automerge` PRs, trusted sync PRs, and same-repo `claude/*` PRs. It filters `needs-owner` first, requires latest `check-codex-status` success on the head, respects protected paths, and uses head-SHA-pinned squash merge.
+Merge Bot considers ordinary open non-draft same-repository PRs authored by
+`funzi7`, along with established Claude, explicit `automerge`, and trusted
+sync paths. Fork title/branch naming never creates trust. It requires every
+latest relevant check/status green, an authoritative `check-codex-status`
+success on the exact head, no active trusted P1/P2 thread, affirmative
+mergeability, and a SHA-pinned squash merge. `no-automerge` and manual/unknown
+`needs-owner` are hard stops. Temporary fixer/watchdog escalation writes both
+`needs-owner` and `needs-owner-auto`; only an exact-head fully-green evaluation
+may remove both and continue to merge in the same pass. Protected paths remain
+fail-closed for forks/untrusted/ambiguous PRs but no longer force an additional
+manual merge for a fully reviewed same-repo owner PR.
+
+The 2026-08-11 source reconciliation ported paywall-bot's reviewed Codex Gate
+and watchdog safety fixes upstream before changing merge policy. The stale
+paywall-bot sync PR #89 was closed unmerged and its stale
+`chore/sync-automation-core` branch deleted; it is not a rollout base.
 
 ### Hub-only workflows
 
@@ -209,7 +229,8 @@ E. Longer-term work:
 
 - Keep workflow source copies byte-identical when workflow logic changes.
 - Do not change workflows during documentation-only tasks.
-- Use `needs-owner` as the only escalation label.
+- Use `needs-owner` for the stop, `needs-owner-auto` only as temporary PR
+  automation provenance, and `no-automerge` as the permanent human opt-out.
 - Preserve direct-to-main unless explicitly redirected.
 - Never force-push unless the owner explicitly authorizes that exact operation.
 - Never use browser automation, Playwright, session cookies, UI-click automation, or fake Codex Cloud Update-branch implementations.
