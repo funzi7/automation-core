@@ -186,17 +186,39 @@ jobs:
                   } catch (e) { core.info(`Telegram failed (ignored): ${e.message}`); }
                 }
                 async function escalate(reasonText, tgText) {
-                  const alreadyEscalated =
-                    marked.some((a) => a.agent === 'watchdog' && a.state === 'escalated' && a.head === headSha) ||
-                    (pr.labels || []).some((l) => (l.name || l) === LABEL_ESCALATE);
-                  if (alreadyEscalated) return;
-                  // Watchdog exhaustion is a temporary automation escalation.
-                  // Its companion provenance label lets Merge Bot clear both
-                  // after the exact current head becomes fully green.
+                  if (marked.some((a) => a.agent === 'watchdog' && a.state === 'escalated' && a.head === headSha)) return;
+
+                  // Re-read labels immediately before writing. The open-PR
+                  // snapshot can be stale if a human adds needs-owner while
+                  // this sweep is running; never convert that stop into an
+                  // automation-cleareable escalation. If the lookup fails,
+                  // fail closed by adding needs-owner without provenance.
+                  let addAutoProvenance = false;
+                  try {
+                    const { data: livePr } = await github.rest.pulls.get({
+                      owner, repo, pull_number: prNumber,
+                    });
+                    const liveLabelNames = new Set(
+                      (livePr.labels || []).map((label) => label.name || label),
+                    );
+                    if (liveLabelNames.has(LABEL_ESCALATE)) {
+                      core.warning(`PR #${prNumber}: live needs-owner is manual/unknown; leaving it untouched and not adding needs-owner-auto.`);
+                      return;
+                    }
+                    addAutoProvenance = true;
+                  } catch (e) {
+                    core.warning(`PR #${prNumber}: could not prove needs-owner was absent; adding hard stop without automation provenance: ${e.message}`);
+                  }
+
                   const escalationLabels = [
                     { name: LABEL_ESCALATE, color: 'd93f0b', description: 'Escalation — automation stopped, human needed' },
-                    { name: LABEL_ESCALATE_AUTO, color: 'fbca04', description: 'Provenance: needs-owner was added by temporary PR automation escalation' },
                   ];
+                  if (addAutoProvenance) {
+                    escalationLabels.push({
+                      name: LABEL_ESCALATE_AUTO, color: 'fbca04',
+                      description: 'Provenance: needs-owner was added by temporary PR automation escalation',
+                    });
+                  }
                   for (const label of escalationLabels) {
                     try {
                       await github.rest.issues.createLabel({ owner, repo, ...label });
@@ -683,7 +705,10 @@ jobs:
                       await hasCurrentHeadNonInlineFinding(prNumber, latestCommitDate)
                     );
                   }
-                  const greenHeadNewFinding = verdictGreen && activeFindingNow;
+                  // An explicit administrator acknowledgement intentionally
+                  // keeps the gate green despite the active finding. Do not
+                  // redispatch that acknowledged state every watchdog tick.
+                  const greenHeadNewFinding = !hasOverride && verdictGreen && activeFindingNow;
                   const redThreadStateChanged = activeFindingVerdict && !activeFindingNow;
                   const isCandidate =
                     !newestVerdict || title === PENDING_TITLE ||

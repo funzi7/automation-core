@@ -231,7 +231,10 @@ test('watchdog rechecks changed red thread state from the trusted base ref', () 
   assert.match(watchdog, /const VERDICT_CHECK = 'check-codex-status'/);
   assert.match(watchdog, /async function hasActiveTrustedFinding\(prNumber\)/);
   assert.match(watchdog, /redThreadStateChanged/);
-  assert.match(watchdog, /greenHeadNewFinding/);
+  assert.match(
+    watchdog,
+    /const greenHeadNewFinding = !hasOverride && verdictGreen && activeFindingNow/,
+  );
   assert.match(watchdog, /hasCurrentHeadNonInlineFinding/);
   assert.match(
     watchdog,
@@ -244,4 +247,15 @@ test('watchdog rechecks changed red thread state from the trusted base ref', () 
   assert.doesNotMatch(watchdog, /ref: pr\.head\.ref/);
   assert.match(watchdog, /'chatgpt-codex-connector'/);
   assert.match(watchdog, /'chatgpt-codex-connector\[bot\]'/);
+});
+
+test('watchdog preserves a concurrently added manual needs-owner stop', () => {
+  const watchdog = fs.readFileSync(
+    path.join(__dirname, '..', '.github', 'workflows', 'claude-fallback-watchdog.yml'),
+    'utf8',
+  );
+  assert.match(watchdog, /const \{ data: livePr \} = await github\.rest\.pulls\.get/);
+  assert.match(watchdog, /if \(liveLabelNames\.has\(LABEL_ESCALATE\)\)/);
+  assert.match(watchdog, /live needs-owner is manual\/unknown/);
+  assert.match(watchdog, /could not prove needs-owner was absent/);
 });
