@@ -189,19 +189,25 @@ jobs:
               core.warning(
                 `Circuit breaker: ${autoFixCount} @claude fix rounds on PR #${prNumber} without converging; stopping and escalating to needs-owner.`,
               );
-              // Ensure the escalation label exists, then attach it.
-              // createLabel is best-effort (422 = already exists) so
-              // downstream repos that don't have needs-owner yet still get
-              // it created.
-              try {
-                await github.rest.issues.createLabel({ owner, repo, name: 'needs-owner', color: 'd93f0b', description: 'Escalation — automation stopped, human needed' });
-              } catch (e) { if (e.status !== 422) core.info(`createLabel needs-owner failed (ignored): ${e.message}`); }
+              // This is temporary automation exhaustion, not a human veto.
+              // Add the companion provenance label so Merge Bot may clear both
+              // only after this exact head becomes fully green.
+              const escalationLabels = [
+                { name: 'needs-owner', color: 'd93f0b', description: 'Escalation — automation stopped, human needed' },
+                { name: 'needs-owner-auto', color: 'fbca04', description: 'Provenance: needs-owner was added by temporary PR automation escalation' },
+              ];
+              for (const label of escalationLabels) {
+                try {
+                  await github.rest.issues.createLabel({ owner, repo, ...label });
+                } catch (e) { if (e.status !== 422) core.info(`createLabel ${label.name} failed (ignored): ${e.message}`); }
+              }
               try {
                 await github.rest.issues.addLabels({
-                  owner, repo, issue_number: prNumber, labels: ['needs-owner'],
+                  owner, repo, issue_number: prNumber,
+                  labels: escalationLabels.map((label) => label.name),
                 });
               } catch (e) {
-                core.info(`addLabel needs-owner failed (ignored): ${e.message}`);
+                core.info(`add temporary escalation labels failed (ignored): ${e.message}`);
               }
               // Telegram escalation (HTML; skip silently if unset).
               const tgToken = process.env.TELEGRAM_BOT_TOKEN;
