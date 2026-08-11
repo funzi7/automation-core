@@ -233,9 +233,27 @@ jobs:
                   Number(b.id || 0) - Number(a.id || 0)
                 );
               const latest = labelEvents[0];
-              if (!latest || latest.actor?.login !== 'github-actions[bot]') {
-                return false;
-              }
+              if (!latest) return false;
+              const latestAt = new Date(latest.created_at || 0).getTime();
+              // Legacy circuit-breaker labels written with GITHUB_TOKEN are
+              // attributed to github-actions[bot]. Legacy watchdog writes used
+              // AUTOMATION_PAT and are attributed to the owner, so require the
+              // watchdog's exact temporary-escalation marker within five
+              // minutes of that label event. Owner attribution alone is never
+              // enough because a manual owner label must remain a hard stop.
+              const nearbyWatchdogMarker = comments.some((comment) => {
+                const body = String(comment.body || '');
+                const commentAt = new Date(comment.created_at || 0).getTime();
+                return (
+                  /<!-- ai-loop:v1\b[^>]*\bagent=watchdog\b[^>]*\bstate=escalated\b[^>]*-->/i.test(body) &&
+                  Number.isFinite(commentAt) && Number.isFinite(latestAt) &&
+                  Math.abs(commentAt - latestAt) <= 5 * 60 * 1000
+                );
+              });
+              const automationActor = latest.actor?.login === 'github-actions[bot]' || (
+                latest.actor?.login === OWNER_LOGIN && nearbyWatchdogMarker
+              );
+              if (!automationActor) return false;
               const protectedReason = comments.some((comment) => {
                 const body = String(comment.body || '');
                 return (

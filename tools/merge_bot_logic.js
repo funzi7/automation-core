@@ -74,6 +74,41 @@ function latestChecksByName(checkRuns) {
     });
 }
 
+function legacyAutomationProvenance(events = [], comments = []) {
+  const labelEvents = events
+    .filter((event) =>
+      event?.event === 'labeled' && event?.label?.name === LABEL_ESCALATE
+    )
+    .sort((a, b) =>
+      new Date(b?.created_at || 0) - new Date(a?.created_at || 0) ||
+      Number(b?.id || 0) - Number(a?.id || 0)
+    );
+  const latest = labelEvents[0];
+  if (!latest) return false;
+  const latestAt = new Date(latest.created_at || 0).getTime();
+  const nearbyWatchdogMarker = comments.some((comment) => {
+    const body = String(comment?.body || '');
+    const commentAt = new Date(comment?.created_at || 0).getTime();
+    return (
+      /<!-- ai-loop:v1\b[^>]*\bagent=watchdog\b[^>]*\bstate=escalated\b[^>]*-->/i.test(body) &&
+      Number.isFinite(commentAt) && Number.isFinite(latestAt) &&
+      Math.abs(commentAt - latestAt) <= 5 * 60 * 1000
+    );
+  });
+  const automationActor = latest?.actor?.login === 'github-actions[bot]' || (
+    latest?.actor?.login === OWNER_LOGIN && nearbyWatchdogMarker
+  );
+  if (!automationActor) return false;
+  return !comments.some((comment) => {
+    const body = String(comment?.body || '');
+    return (
+      /Auto-merge blocked: this PR touches protected path/i.test(body) ||
+      /skipped this fork-headed PR/i.test(body) ||
+      /fork-headed PR[^\n]*Escalated to needs-owner/is.test(body)
+    );
+  });
+}
+
 function evaluateHeadChecks(checkRuns, statuses) {
   const latestChecks = latestChecksByName(checkRuns);
   let running = false;
@@ -169,6 +204,7 @@ module.exports = {
   isTrustedSync,
   isAutoMergeCandidate,
   latestChecksByName,
+  legacyAutomationProvenance,
   evaluateHeadChecks,
   evaluateMergePolicy,
 };

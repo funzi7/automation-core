@@ -7,6 +7,7 @@ const path = require('node:path');
 const {
   isAutoMergeCandidate,
   evaluateMergePolicy,
+  legacyAutomationProvenance,
 } = require('../tools/merge_bot_logic');
 
 const REPOSITORY = 'funzi7/example';
@@ -172,6 +173,44 @@ test('legacy needs-owner requires proven automation provenance', () => {
   const proven = decide({ pr: legacyPr, legacyAutomationProven: true });
   assert.equal(proven.eligible, true);
   assert.equal(proven.clearLegacy, true);
+});
+
+test('legacy github-actions label event proves temporary automation provenance', () => {
+  assert.equal(legacyAutomationProvenance([{
+    id: 1,
+    event: 'labeled',
+    label: { name: 'needs-owner' },
+    actor: { login: 'github-actions[bot]' },
+    created_at: '2026-08-11T20:00:00Z',
+  }], []), true);
+});
+
+test('legacy PAT-owner label needs a nearby watchdog marker', () => {
+  const event = {
+    id: 2,
+    event: 'labeled',
+    label: { name: 'needs-owner' },
+    actor: { login: 'funzi7' },
+    created_at: '2026-08-11T20:00:00Z',
+  };
+  assert.equal(legacyAutomationProvenance([event], []), false);
+  assert.equal(legacyAutomationProvenance([event], [{
+    created_at: '2026-08-11T20:00:02Z',
+    body: '<!-- ai-loop:v1 root_pr=7 head=abc agent=watchdog state=escalated -->',
+  }]), true);
+});
+
+test('protected-path evidence keeps legacy automation label fail-closed', () => {
+  assert.equal(legacyAutomationProvenance([{
+    id: 3,
+    event: 'labeled',
+    label: { name: 'needs-owner' },
+    actor: { login: 'github-actions[bot]' },
+    created_at: '2026-08-11T20:00:00Z',
+  }], [{
+    created_at: '2026-08-11T20:00:01Z',
+    body: 'Auto-merge blocked: this PR touches protected path(s)',
+  }]), false);
 });
 
 test('protected-path trusted owner PR may merge after full review', () => {
