@@ -2,9 +2,10 @@ name: Merge Bot
 
 # Generic workflow — synced from automation-core. Closes the self-healing
 # loop: squash-merges PRs that are fully green once codex-gate passes.
-# Woken by: the Codex Gate workflow_run completing successfully (the only
-# signal that the mandatory gate just turned green on a head), a once-daily
-# safety-net cron, or manual dispatch. check_suite is intentionally NOT a
+# Woken by: a successful Codex Gate or repository CI workflow_run, a once-daily
+# safety-net cron, or manual dispatch. The CI wake closes the ordering case
+# where the gate turns green before the final build check. check_suite is
+# intentionally NOT a
 # trigger: it fires on every CI suite (storms ~22x/5min on unrelated runs)
 # yet does NOT fire for the gate's own Actions-created suite — so it added
 # noise without covering the case that matters. A build-gate finishing after
@@ -20,7 +21,7 @@ on:
   # (Codex Gate runs under GITHUB_TOKEN), so this workflow_run is what wakes
   # merge-bot when the gate turns green. Filtered to success in the job if:.
   workflow_run:
-    workflows: ["Codex Gate"]
+    workflows: ["Codex Gate", "CI", "Automation Core CI"]
     types: [completed]
   schedule:
     - cron: '30 7 * * *'   # safety-net once daily (07:30 UTC)
@@ -42,11 +43,11 @@ jobs:
     runs-on: ubuntu-latest
     # Early-exit: proceed ONLY on a signal that the mandatory gate just turned
     # GREEN — otherwise skip immediately (no scan). Waking conditions:
-    #   (a) Codex Gate workflow_run completed success,
+    #   (a) Codex Gate or repository CI workflow_run completed success,
     #   (b) the daily safety-net cron,
     #   (c) manual dispatch.
-    # workflow_run is filtered to success here so the gate's self-rerun loop
-    # (which fails each iteration) never wakes merge-bot — only its final pass.
+    # workflow_run is filtered to success here. Every wake still revalidates
+    # all latest checks and the authoritative exact-head gate before merging.
     if: |
       (github.event_name == 'workflow_run' &&
         github.event.workflow_run.conclusion == 'success') ||
@@ -254,7 +255,7 @@ jobs:
             }
 
             async function escalationProvenance(prNumber) {
-              const [events, issueComments, reviewComments] = await Promise.all([
+              const [events, issueComments, reviewComments, prCommits] = await Promise.all([
                 github.paginate(
                   'GET /repos/{owner}/{repo}/issues/{issue_number}/events',
                   { owner, repo, issue_number: prNumber, per_page: 100 },
@@ -265,8 +266,21 @@ jobs:
                 github.paginate(github.rest.pulls.listReviewComments, {
                   owner, repo, pull_number: prNumber, per_page: 100,
                 }),
+                github.paginate(github.rest.pulls.listCommits, {
+                  owner, repo, pull_number: prNumber, per_page: 100,
+                }),
               ]);
               const comments = [...issueComments, ...reviewComments];
+              const commitShas = new Set(prCommits.map((commit) => commit.sha));
+              const trustedLoopMarker = (comment) => {
+                if (![OWNER_LOGIN, 'github-actions[bot]'].includes(comment.user?.login)) return null;
+                const marker = String(comment.body || '').match(/<!-- ai-loop:v1\b([^>]*)-->/i);
+                if (!marker) return null;
+                const root = marker[1].match(/\broot_pr=(\d+)\b/i);
+                const head = marker[1].match(/\bhead=([a-f0-9]{40})\b/i);
+                if (!root || Number(root[1]) !== prNumber || !head || !commitShas.has(head[1])) return null;
+                return marker[1];
+              };
               const latestLabelEvent = (labelName) => events
                 .filter((event) => (
                   (event.event === 'labeled' || event.event === 'unlabeled') &&
@@ -299,21 +313,22 @@ jobs:
               // github-actions[bot] attribution alone is insufficient because
               // permanent fork/protected-path writers used the same actor.
               const nearbyWatchdogMarker = comments.some((comment) => {
-                const body = String(comment.body || '');
+                const marker = trustedLoopMarker(comment);
                 const commentAt = new Date(comment.created_at || 0).getTime();
                 return (
-                  /<!-- ai-loop:v1\b[^>]*\bagent=watchdog\b[^>]*\bstate=escalated\b[^>]*-->/i.test(body) &&
+                  marker && /\bagent=watchdog\b/i.test(marker) && /\bstate=escalated\b/i.test(marker) &&
                   Number.isFinite(commentAt) && Number.isFinite(needsAt) &&
                   Math.abs(commentAt - needsAt) <= 5 * 60 * 1000
                 );
               });
               const circuitBreakerMarkers = comments.filter((comment) => {
                 const body = String(comment.body || '');
+                const marker = trustedLoopMarker(comment);
                 const commentAt = new Date(comment.created_at || 0).getTime();
                 return (
-                  [OWNER_LOGIN, 'github-actions[bot]'].includes(comment.user?.login) &&
+                  marker &&
                   body.includes('[auto-triggered]') &&
-                  /<!-- ai-loop:v1\b[^>]*\battempt=\d+\b[^>]*\bagent=claude\b[^>]*\bstate=requested\b[^>]*-->/i.test(body) &&
+                  /\battempt=\d+\b/i.test(marker) && /\bagent=claude\b/i.test(marker) && /\bstate=requested\b/i.test(marker) &&
                   Number.isFinite(commentAt) && Number.isFinite(needsAt) &&
                   commentAt <= needsAt && needsAt - commentAt <= 6 * 60 * 60 * 1000
                 );

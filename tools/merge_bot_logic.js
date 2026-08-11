@@ -100,27 +100,42 @@ function companionAutomationProvenance(events = []) {
   return ordered && autoAt - needsAt <= 5 * 60 * 1000;
 }
 
-function legacyAutomationProvenance(events = [], comments = []) {
+function legacyAutomationProvenance(
+  events = [],
+  comments = [],
+  { prNumber, commitShas = [] } = {},
+) {
   const latest = latestLabelEvent(events, LABEL_ESCALATE);
   if (latest?.event !== 'labeled') return false;
   if (!latest) return false;
   const latestAt = new Date(latest.created_at || 0).getTime();
+  const knownHeads = new Set(commitShas);
+  const trustedLoopMarker = (comment) => {
+    if (!['github-actions[bot]', OWNER_LOGIN].includes(comment?.user?.login || comment?.author?.login)) return null;
+    const marker = String(comment?.body || '').match(/<!-- ai-loop:v1\b([^>]*)-->/i);
+    if (!marker) return null;
+    const root = marker[1].match(/\broot_pr=(\d+)\b/i);
+    const head = marker[1].match(/\bhead=([a-f0-9]{40})\b/i);
+    if (!root || Number(root[1]) !== Number(prNumber) || !head || !knownHeads.has(head[1])) return null;
+    return marker[1];
+  };
   const nearbyWatchdogMarker = comments.some((comment) => {
-    const body = String(comment?.body || '');
+    const marker = trustedLoopMarker(comment);
     const commentAt = new Date(comment?.created_at || 0).getTime();
     return (
-      /<!-- ai-loop:v1\b[^>]*\bagent=watchdog\b[^>]*\bstate=escalated\b[^>]*-->/i.test(body) &&
+      marker && /\bagent=watchdog\b/i.test(marker) && /\bstate=escalated\b/i.test(marker) &&
       Number.isFinite(commentAt) && Number.isFinite(latestAt) &&
       Math.abs(commentAt - latestAt) <= 5 * 60 * 1000
     );
   });
   const circuitBreakerMarkers = comments.filter((comment) => {
     const body = String(comment?.body || '');
+    const marker = trustedLoopMarker(comment);
     const commentAt = new Date(comment?.created_at || 0).getTime();
     return (
-      ['github-actions[bot]', OWNER_LOGIN].includes(comment?.user?.login || comment?.author?.login) &&
+      marker &&
       body.includes('[auto-triggered]') &&
-      /<!-- ai-loop:v1\b[^>]*\battempt=\d+\b[^>]*\bagent=claude\b[^>]*\bstate=requested\b[^>]*-->/i.test(body) &&
+      /\battempt=\d+\b/i.test(marker) && /\bagent=claude\b/i.test(marker) && /\bstate=requested\b/i.test(marker) &&
       Number.isFinite(commentAt) && Number.isFinite(latestAt) &&
       commentAt <= latestAt && latestAt - commentAt <= 6 * 60 * 60 * 1000
     );

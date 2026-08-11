@@ -190,9 +190,11 @@ test('legacy github-actions label requires positive circuit-breaker evidence', (
   const comments = [1, 2, 3].map((attempt) => ({
     user: { login: 'funzi7' },
     created_at: `2026-08-11T19:0${attempt}:00Z`,
-    body: `<!-- ai-loop:v1 root_pr=7 head=abc attempt=${attempt} agent=claude state=requested -->\n[auto-triggered]`,
+    body: `<!-- ai-loop:v1 root_pr=7 head=${HEAD} attempt=${attempt} agent=claude state=requested -->\n[auto-triggered]`,
   }));
-  assert.equal(legacyAutomationProvenance([event], comments), true);
+  assert.equal(legacyAutomationProvenance(
+    [event], comments, { prNumber: 7, commitShas: [HEAD] },
+  ), true);
 });
 
 test('companion provenance rejects an orphan before a later manual hold', () => {
@@ -224,9 +226,30 @@ test('legacy PAT-owner label needs a nearby watchdog marker', () => {
   };
   assert.equal(legacyAutomationProvenance([event], []), false);
   assert.equal(legacyAutomationProvenance([event], [{
+    user: { login: 'funzi7' },
     created_at: '2026-08-11T20:00:02Z',
-    body: '<!-- ai-loop:v1 root_pr=7 head=abc agent=watchdog state=escalated -->',
-  }]), true);
+    body: `<!-- ai-loop:v1 root_pr=7 head=${HEAD} agent=watchdog state=escalated -->`,
+  }], { prNumber: 7, commitShas: [HEAD] }), true);
+});
+
+test('watchdog marker must have trusted author and matching PR head', () => {
+  const event = {
+    id: 20, event: 'labeled', label: { name: 'needs-owner' },
+    actor: { login: 'funzi7' }, created_at: '2026-08-11T20:00:00Z',
+  };
+  const marker = (user, root, head) => ({
+    user: { login: user }, created_at: '2026-08-11T20:00:01Z',
+    body: `<!-- ai-loop:v1 root_pr=${root} head=${head} agent=watchdog state=escalated -->`,
+  });
+  assert.equal(legacyAutomationProvenance(
+    [event], [marker('attacker', 7, HEAD)], { prNumber: 7, commitShas: [HEAD] },
+  ), false);
+  assert.equal(legacyAutomationProvenance(
+    [event], [marker('funzi7', 8, HEAD)], { prNumber: 7, commitShas: [HEAD] },
+  ), false);
+  assert.equal(legacyAutomationProvenance(
+    [event], [marker('funzi7', 7, 'b'.repeat(40))], { prNumber: 7, commitShas: [HEAD] },
+  ), false);
 });
 
 test('protected-path evidence keeps legacy automation label fail-closed', () => {
@@ -276,6 +299,10 @@ test('workflow preserves exact-SHA squash merge and same-repo branch deletion', 
   assert.match(workflow, /unexpected evaluation error; skipping only this PR/);
   assert.match(workflow, /hasCurrentHeadNonInlineFinding/);
   assert.match(workflow, /hasActiveTrustedBlocker/);
+  assert.match(workflow, /workflows: \["Codex Gate", "CI", "Automation Core CI"\]/);
+  assert.match(workflow, /const trustedLoopMarker = \(comment\) =>/);
+  assert.match(workflow, /Number\(root\[1\]\) !== prNumber/);
+  assert.match(workflow, /!commitShas\.has\(head\[1\]\)/);
 });
 
 test('merge-failure restoration preserves a concurrently added manual stop', () => {
