@@ -74,16 +74,35 @@ function latestChecksByName(checkRuns) {
     });
 }
 
-function legacyAutomationProvenance(events = [], comments = []) {
-  const labelEvents = events
+function latestLabelEvent(events = [], labelName) {
+  return events
     .filter((event) =>
-      event?.event === 'labeled' && event?.label?.name === LABEL_ESCALATE
+      (event?.event === 'labeled' || event?.event === 'unlabeled') &&
+      event?.label?.name === labelName
     )
     .sort((a, b) =>
       new Date(b?.created_at || 0) - new Date(a?.created_at || 0) ||
       Number(b?.id || 0) - Number(a?.id || 0)
-    );
-  const latest = labelEvents[0];
+    )[0];
+}
+
+function companionAutomationProvenance(events = []) {
+  const needs = latestLabelEvent(events, LABEL_ESCALATE);
+  const auto = latestLabelEvent(events, LABEL_ESCALATE_AUTO);
+  if (needs?.event !== 'labeled' || auto?.event !== 'labeled') return false;
+  if (!['github-actions[bot]', OWNER_LOGIN].includes(auto?.actor?.login)) return false;
+  const needsAt = new Date(needs.created_at || 0).getTime();
+  const autoAt = new Date(auto.created_at || 0).getTime();
+  if (!Number.isFinite(needsAt) || !Number.isFinite(autoAt)) return false;
+  const ordered = autoAt > needsAt || (
+    autoAt === needsAt && Number(auto.id || 0) >= Number(needs.id || 0)
+  );
+  return ordered && autoAt - needsAt <= 5 * 60 * 1000;
+}
+
+function legacyAutomationProvenance(events = [], comments = []) {
+  const latest = latestLabelEvent(events, LABEL_ESCALATE);
+  if (latest?.event !== 'labeled') return false;
   if (!latest) return false;
   const latestAt = new Date(latest.created_at || 0).getTime();
   const nearbyWatchdogMarker = comments.some((comment) => {
@@ -95,10 +114,22 @@ function legacyAutomationProvenance(events = [], comments = []) {
       Math.abs(commentAt - latestAt) <= 5 * 60 * 1000
     );
   });
-  const automationActor = latest?.actor?.login === 'github-actions[bot]' || (
-    latest?.actor?.login === OWNER_LOGIN && nearbyWatchdogMarker
+  const circuitBreakerMarkers = comments.filter((comment) => {
+    const body = String(comment?.body || '');
+    const commentAt = new Date(comment?.created_at || 0).getTime();
+    return (
+      ['github-actions[bot]', OWNER_LOGIN].includes(comment?.user?.login || comment?.author?.login) &&
+      body.includes('[auto-triggered]') &&
+      /<!-- ai-loop:v1\b[^>]*\battempt=\d+\b[^>]*\bagent=claude\b[^>]*\bstate=requested\b[^>]*-->/i.test(body) &&
+      Number.isFinite(commentAt) && Number.isFinite(latestAt) &&
+      commentAt <= latestAt && latestAt - commentAt <= 6 * 60 * 60 * 1000
+    );
+  });
+  const positiveTemporaryEvidence = (
+    (latest?.actor?.login === 'github-actions[bot]' && circuitBreakerMarkers.length >= 3) ||
+    (latest?.actor?.login === OWNER_LOGIN && nearbyWatchdogMarker)
   );
-  if (!automationActor) return false;
+  if (!positiveTemporaryEvidence) return false;
   return !comments.some((comment) => {
     const body = String(comment?.body || '');
     return (
@@ -146,6 +177,7 @@ function evaluateMergePolicy({
   activeTrustedFinding = false,
   protectedPathHit = false,
   legacyAutomationProven = false,
+  companionAutomationProven = false,
   evaluatedHead = pr?.head?.sha,
   currentHead = pr?.head?.sha,
 } = {}) {
@@ -160,7 +192,7 @@ function evaluateMergePolicy({
   const hasNeedsOwner = labels.has(LABEL_ESCALATE);
   const hasAutoProvenance = labels.has(LABEL_ESCALATE_AUTO);
   const transientEscalation = hasNeedsOwner && (
-    hasAutoProvenance || legacyAutomationProven
+    (hasAutoProvenance && companionAutomationProven) || legacyAutomationProven
   );
   if (hasNeedsOwner && !transientEscalation) {
     return { eligible: false, reason: 'manual_needs_owner' };
@@ -204,6 +236,7 @@ module.exports = {
   isTrustedSync,
   isAutoMergeCandidate,
   latestChecksByName,
+  companionAutomationProvenance,
   legacyAutomationProvenance,
   evaluateHeadChecks,
   evaluateMergePolicy,

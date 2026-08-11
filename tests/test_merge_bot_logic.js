@@ -7,6 +7,7 @@ const path = require('node:path');
 const {
   isAutoMergeCandidate,
   evaluateMergePolicy,
+  companionAutomationProvenance,
   legacyAutomationProvenance,
 } = require('../tools/merge_bot_logic');
 
@@ -154,6 +155,7 @@ test('automated needs-owner remains while the current head is red', () => {
   const result = decide({
     pr: pr({ labels: [{ name: 'needs-owner' }, { name: 'needs-owner-auto' }] }),
     checkRuns: [check('check-codex-status', 'failure')],
+    companionAutomationProven: true,
   });
   assert.equal(result.eligible, false);
   assert.equal(result.clearTransient, undefined);
@@ -162,6 +164,7 @@ test('automated needs-owner remains while the current head is red', () => {
 test('automated needs-owner clears only when exact current head is fully green', () => {
   const result = decide({
     pr: pr({ labels: [{ name: 'needs-owner' }, { name: 'needs-owner-auto' }] }),
+    companionAutomationProven: true,
   });
   assert.equal(result.eligible, true);
   assert.equal(result.clearTransient, true);
@@ -175,14 +178,40 @@ test('legacy needs-owner requires proven automation provenance', () => {
   assert.equal(proven.clearLegacy, true);
 });
 
-test('legacy github-actions label event proves temporary automation provenance', () => {
-  assert.equal(legacyAutomationProvenance([{
+test('legacy github-actions label requires positive circuit-breaker evidence', () => {
+  const event = {
     id: 1,
     event: 'labeled',
     label: { name: 'needs-owner' },
     actor: { login: 'github-actions[bot]' },
     created_at: '2026-08-11T20:00:00Z',
-  }], []), true);
+  };
+  assert.equal(legacyAutomationProvenance([event], []), false);
+  const comments = [1, 2, 3].map((attempt) => ({
+    user: { login: 'funzi7' },
+    created_at: `2026-08-11T19:0${attempt}:00Z`,
+    body: `<!-- ai-loop:v1 root_pr=7 head=abc attempt=${attempt} agent=claude state=requested -->\n[auto-triggered]`,
+  }));
+  assert.equal(legacyAutomationProvenance([event], comments), true);
+});
+
+test('companion provenance rejects an orphan before a later manual hold', () => {
+  const events = [
+    {
+      id: 10, event: 'labeled', label: { name: 'needs-owner-auto' },
+      actor: { login: 'github-actions[bot]' }, created_at: '2026-08-11T20:00:00Z',
+    },
+    {
+      id: 11, event: 'labeled', label: { name: 'needs-owner' },
+      actor: { login: 'funzi7' }, created_at: '2026-08-11T20:10:00Z',
+    },
+  ];
+  assert.equal(companionAutomationProvenance(events), false);
+  events.push({
+    id: 12, event: 'labeled', label: { name: 'needs-owner-auto' },
+    actor: { login: 'github-actions[bot]' }, created_at: '2026-08-11T20:10:01Z',
+  });
+  assert.equal(companionAutomationProvenance(events), true);
 });
 
 test('legacy PAT-owner label needs a nearby watchdog marker', () => {

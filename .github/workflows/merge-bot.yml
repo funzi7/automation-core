@@ -253,8 +253,8 @@ jobs:
               );
             }
 
-            async function isLegacyAutomationEscalation(prNumber) {
-              const [events, comments] = await Promise.all([
+            async function escalationProvenance(prNumber) {
+              const [events, issueComments, reviewComments] = await Promise.all([
                 github.paginate(
                   'GET /repos/{owner}/{repo}/issues/{issue_number}/events',
                   { owner, repo, issue_number: prNumber, per_page: 100 },
@@ -262,38 +262,68 @@ jobs:
                 github.paginate(github.rest.issues.listComments, {
                   owner, repo, issue_number: prNumber, per_page: 100,
                 }),
+                github.paginate(github.rest.pulls.listReviewComments, {
+                  owner, repo, pull_number: prNumber, per_page: 100,
+                }),
               ]);
-              const labelEvents = events
-                .filter((event) =>
-                  event.event === 'labeled' &&
-                  event.label && event.label.name === LABEL_ESCALATE
-                )
+              const comments = [...issueComments, ...reviewComments];
+              const latestLabelEvent = (labelName) => events
+                .filter((event) => (
+                  (event.event === 'labeled' || event.event === 'unlabeled') &&
+                  event.label && event.label.name === labelName
+                ))
                 .sort((a, b) =>
                   new Date(b.created_at || 0) - new Date(a.created_at || 0) ||
                   Number(b.id || 0) - Number(a.id || 0)
-                );
-              const latest = labelEvents[0];
-              if (!latest) return false;
-              const latestAt = new Date(latest.created_at || 0).getTime();
-              // Legacy circuit-breaker labels written with GITHUB_TOKEN are
-              // attributed to github-actions[bot]. Legacy watchdog writes used
-              // AUTOMATION_PAT and are attributed to the owner, so require the
-              // watchdog's exact temporary-escalation marker within five
-              // minutes of that label event. Owner attribution alone is never
-              // enough because a manual owner label must remain a hard stop.
+                )[0];
+              const needsEvent = latestLabelEvent(LABEL_ESCALATE);
+              const autoEvent = latestLabelEvent(LABEL_ESCALATE_AUTO);
+              const needsAt = new Date(needsEvent?.created_at || 0).getTime();
+              const autoAt = new Date(autoEvent?.created_at || 0).getTime();
+
+              // A companion is valid only when its latest label event follows
+              // the current needs-owner assignment. This rejects an orphaned
+              // needs-owner-auto when a human later re-adds the hard stop.
+              const companionOrdered = autoAt > needsAt || (
+                autoAt === needsAt && Number(autoEvent?.id || 0) >= Number(needsEvent?.id || 0)
+              );
+              const companion = (
+                needsEvent?.event === 'labeled' &&
+                autoEvent?.event === 'labeled' &&
+                [OWNER_LOGIN, 'github-actions[bot]'].includes(autoEvent.actor?.login) &&
+                Number.isFinite(needsAt) && Number.isFinite(autoAt) &&
+                companionOrdered && autoAt - needsAt <= 5 * 60 * 1000
+              );
+
+              // Legacy labels need positive temporary-escalation evidence.
+              // github-actions[bot] attribution alone is insufficient because
+              // permanent fork/protected-path writers used the same actor.
               const nearbyWatchdogMarker = comments.some((comment) => {
                 const body = String(comment.body || '');
                 const commentAt = new Date(comment.created_at || 0).getTime();
                 return (
                   /<!-- ai-loop:v1\b[^>]*\bagent=watchdog\b[^>]*\bstate=escalated\b[^>]*-->/i.test(body) &&
-                  Number.isFinite(commentAt) && Number.isFinite(latestAt) &&
-                  Math.abs(commentAt - latestAt) <= 5 * 60 * 1000
+                  Number.isFinite(commentAt) && Number.isFinite(needsAt) &&
+                  Math.abs(commentAt - needsAt) <= 5 * 60 * 1000
                 );
               });
-              const automationActor = latest.actor?.login === 'github-actions[bot]' || (
-                latest.actor?.login === OWNER_LOGIN && nearbyWatchdogMarker
+              const circuitBreakerMarkers = comments.filter((comment) => {
+                const body = String(comment.body || '');
+                const commentAt = new Date(comment.created_at || 0).getTime();
+                return (
+                  [OWNER_LOGIN, 'github-actions[bot]'].includes(comment.user?.login) &&
+                  body.includes('[auto-triggered]') &&
+                  /<!-- ai-loop:v1\b[^>]*\battempt=\d+\b[^>]*\bagent=claude\b[^>]*\bstate=requested\b[^>]*-->/i.test(body) &&
+                  Number.isFinite(commentAt) && Number.isFinite(needsAt) &&
+                  commentAt <= needsAt && needsAt - commentAt <= 6 * 60 * 60 * 1000
+                );
+              });
+              const positiveLegacyEvidence = (
+                needsEvent?.event === 'labeled' && (
+                  (needsEvent.actor?.login === 'github-actions[bot]' && circuitBreakerMarkers.length >= 3) ||
+                  (needsEvent.actor?.login === OWNER_LOGIN && nearbyWatchdogMarker)
+                )
               );
-              if (!automationActor) return false;
               const protectedReason = comments.some((comment) => {
                 const body = String(comment.body || '');
                 return (
@@ -302,7 +332,10 @@ jobs:
                   /fork-headed PR[^\n]*Escalated to needs-owner/is.test(body)
                 );
               });
-              return !protectedReason;
+              return {
+                companion,
+                legacy: positiveLegacyEvidence && !protectedReason,
+              };
             }
 
             async function restoreTransientIfOpen(prNumber) {
@@ -428,16 +461,17 @@ jobs:
                 const initialLabels = labelNames(pr);
                 const hasNeedsOwner = initialLabels.has(LABEL_ESCALATE);
                 const hasAutoProvenance = initialLabels.has(LABEL_ESCALATE_AUTO);
-                let legacyAutoClearable = false;
-                if (hasNeedsOwner && !hasAutoProvenance) {
+                let initialProvenance = { companion: false, legacy: false };
+                if (hasNeedsOwner) {
                   try {
-                    legacyAutoClearable = await isLegacyAutomationEscalation(prNumber);
+                    initialProvenance = await escalationProvenance(prNumber);
                   } catch (e) {
-                    core.warning(`#${prNumber}: legacy needs-owner provenance lookup failed; keeping human stop: ${e.message}`);
+                    core.warning(`#${prNumber}: needs-owner provenance lookup failed; keeping human stop: ${e.message}`);
                   }
                 }
                 const transientEscalation = hasNeedsOwner && (
-                  hasAutoProvenance || legacyAutoClearable
+                  (hasAutoProvenance && initialProvenance.companion) ||
+                  (!hasAutoProvenance && initialProvenance.legacy)
                 );
                 if (hasNeedsOwner && !transientEscalation) {
                   core.info(`#${prNumber}: manual/unknown needs-owner is a hard stop`);
@@ -597,9 +631,15 @@ jobs:
               const finalHasNeedsOwner = finalLabels.has(LABEL_ESCALATE);
               const finalHasAutoProvenance = finalLabels.has(LABEL_ESCALATE_AUTO);
               if (finalHasNeedsOwner) {
-                const stillTransient = finalHasAutoProvenance || (
-                  transientEscalation && !hasAutoProvenance
-                );
+                let finalProvenance = { companion: false, legacy: false };
+                try {
+                  finalProvenance = await escalationProvenance(prNumber);
+                } catch (e) {
+                  core.warning(`#${prNumber}: final needs-owner provenance lookup failed; preserving hard stop: ${e.message}`);
+                }
+                const stillTransient = finalHasAutoProvenance
+                  ? finalProvenance.companion
+                  : finalProvenance.legacy;
                 if (!stillTransient) {
                   core.info(`#${prNumber}: manual needs-owner appeared after validation, hard stop`);
                   continue;
