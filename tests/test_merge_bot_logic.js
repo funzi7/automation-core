@@ -270,6 +270,8 @@ test('only temporary PR automation writers add needs-owner-auto', () => {
     'utf8',
   );
   assert.match(read('codex-auto-fix.yml'), /needs-owner-auto/);
+  assert.match(read('codex-auto-fix.yml'), /pre-existing needs-owner is manual\/unknown/);
+  assert.match(read('codex-auto-fix.yml'), /could not prove needs-owner was absent/);
   assert.match(read('claude-fallback-watchdog.yml'), /needs-owner-auto/);
   assert.doesNotMatch(read('claude.yml'), /needs-owner-auto/);
   assert.doesNotMatch(read('codex-backup-fix.yml'), /needs-owner-auto/);

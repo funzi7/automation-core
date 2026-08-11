@@ -189,13 +189,37 @@ jobs:
               core.warning(
                 `Circuit breaker: ${autoFixCount} @claude fix rounds on PR #${prNumber} without converging; stopping and escalating to needs-owner.`,
               );
-              // This is temporary automation exhaustion, not a human veto.
-              // Add the companion provenance label so Merge Bot may clear both
-              // only after this exact head becomes fully green.
+              // Never convert a pre-existing human/unknown stop into a
+              // transient automation escalation. If the live-label lookup
+              // fails, fail closed by adding needs-owner alone; provenance is
+              // attached only when we proved the stop was absent first.
+              let addAutoProvenance = false;
+              try {
+                const { data: currentPr } = await github.rest.pulls.get({
+                  owner, repo, pull_number: prNumber,
+                });
+                const currentLabels = new Set(
+                  (currentPr.labels || []).map((label) => label.name || label),
+                );
+                if (currentLabels.has('needs-owner')) {
+                  core.warning(`PR #${prNumber}: pre-existing needs-owner is manual/unknown; leaving it untouched and not adding needs-owner-auto.`);
+                  core.setOutput("should_trigger", "false");
+                  return;
+                }
+                addAutoProvenance = true;
+              } catch (e) {
+                core.warning(`PR #${prNumber}: could not prove needs-owner was absent; adding hard stop without automation provenance: ${e.message}`);
+              }
+
               const escalationLabels = [
                 { name: 'needs-owner', color: 'd93f0b', description: 'Escalation — automation stopped, human needed' },
-                { name: 'needs-owner-auto', color: 'fbca04', description: 'Provenance: needs-owner was added by temporary PR automation escalation' },
               ];
+              if (addAutoProvenance) {
+                escalationLabels.push({
+                  name: 'needs-owner-auto', color: 'fbca04',
+                  description: 'Provenance: needs-owner was added by temporary PR automation escalation',
+                });
+              }
               for (const label of escalationLabels) {
                 try {
                   await github.rest.issues.createLabel({ owner, repo, ...label });
