@@ -315,6 +315,7 @@ jobs:
               const runId = Number(context.runId);
               const attempt = Number(process.env.GITHUB_RUN_ATTEMPT || 1);
               const alreadyRecorded = (comments || []).some((comment) => {
+                if ((comment.user?.login || '') !== 'github-actions[bot]') return false;
                 const match = String(comment.body || '').match(HEAD_EPOCH_MARKER_PATTERN);
                 return match && Number(match[1]) === runId && Number(match[2]) === attempt;
               });
@@ -334,9 +335,8 @@ jobs:
               ]);
               const markerEpoch = currentHeadEpochFromTimeline(markers, headSha);
               const runEpoch = currentHeadEpochFromRuns(runs, prNumber, headSha);
-              if (markerEpoch && runEpoch) {
-                return new Date(Math.max(markerEpoch.getTime(), runEpoch.getTime()));
-              }
+              // Authenticated markers retain the complete contiguous epoch. The
+              // repository run list is bounded and is only a legacy fallback.
               return markerEpoch || runEpoch;
             }
 

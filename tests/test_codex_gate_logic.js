@@ -10,6 +10,7 @@ const {
   signalTargetsHead,
   currentHeadEpochStart,
   currentHeadEpochFromVerifiedRuns,
+  selectHeadEpoch,
 } = require('../tools/codex_gate_logic');
 
 const CODEX = 'chatgpt-codex-connector';
@@ -147,6 +148,13 @@ test('verified gate runs preserve the current contiguous epoch beyond run-search
     '2026-08-11T13:00:00.000Z',
   );
   assert.equal(currentHeadEpochFromVerifiedRuns(markers, headB), null);
+});
+
+test('authenticated marker epoch wins when bounded run history starts later', () => {
+  const markerEpoch = new Date('2026-08-11T13:00:00Z');
+  const truncatedRunEpoch = new Date('2026-08-11T14:00:00Z');
+  assert.equal(selectHeadEpoch(markerEpoch, truncatedRunEpoch), markerEpoch);
+  assert.equal(selectHeadEpoch(null, truncatedRunEpoch), truncatedRunEpoch);
 });
 
 test('resolved thread clears with a current-head signal', () => {
@@ -298,6 +306,7 @@ test('authoritative workflow keeps gate policy inline', () => {
   assert.match(workflow, /async function observedHeadTransition\(prNumber, headSha, comments = \[\]\)/);
   assert.match(workflow, /codex-head-epoch:v2/);
   assert.match(workflow, /async function ensureHeadEpochMarker\(prNumber, comments\)/);
+  assert.match(workflow, /if \(\(comment\.user\?\.login \|\| ''\) !== 'github-actions\[bot\]'\) return false/);
   assert.match(workflow, /actions\/runs\/\{run_id\}\/attempts\/\{attempt_number\}/);
   assert.match(workflow, /run\.path !== '\.github\/workflows\/codex-gate\.yml'/);
   assert.match(workflow, /run\.event !== 'pull_request_target'/);
@@ -315,6 +324,8 @@ test('authoritative workflow keeps gate policy inline', () => {
   );
   assert.match(workflow, /let prWorkflowRunsPromise = null/);
   assert.match(workflow, /const \[markers, runs\] = await Promise\.all/);
+  assert.match(workflow, /return markerEpoch \|\| runEpoch/);
+  assert.doesNotMatch(workflow, /Math\.max\(markerEpoch/);
   assert.match(workflow, /function signalTargetsHead\(item, headSha, headObservedAt/);
   assert.match(workflow, /actions: read/);
   assert.doesNotMatch(workflow, /latestCommitDate/);
@@ -358,6 +369,8 @@ test('watchdog rechecks changed red thread state from the trusted base ref', () 
   assert.match(watchdog, /hasCurrentHeadNonInlineFinding/);
   assert.match(watchdog, /let prWorkflowRunsPromise = null/);
   assert.match(watchdog, /const \[markers, runs\] = await Promise\.all/);
+  assert.match(watchdog, /return markerEpoch \|\| runEpoch/);
+  assert.doesNotMatch(watchdog, /Math\.max\(markerEpoch/);
   assert.match(watchdog, /if \(accepted\.has\(key\)\) continue/);
   assert.doesNotMatch(watchdog, /refs\.set\(/);
   assert.match(watchdog, /roPage\(`https:\/\/api\.github\.com\/repos\/\$\{owner\}\/\$\{repo\}\/actions\/runs\/\$\{runId\}\/attempts\/\$\{attempt\}`\)/);

@@ -354,6 +354,8 @@ test('workflow preserves exact-SHA squash merge and same-repo branch deletion', 
   assert.match(workflow, /\.filter\(\(c\) => !NON_BLOCKING_DIAGNOSTIC_CHECKS\.has\(c\.name\)\)/);
   assert.match(workflow, /let prWorkflowRunsPromise = null/);
   assert.match(workflow, /const \[markers, runs\] = await Promise\.all/);
+  assert.match(workflow, /return markerEpoch \|\| runEpoch/);
+  assert.doesNotMatch(workflow, /Math\.max\(markerEpoch/);
   assert.match(workflow, /function signalTargetsHead\(item, headSha, headObservedAt/);
   assert.doesNotMatch(workflow, /latestCommitDate/);
   assert.match(workflow, /override absent and current-head Codex signal missing/);

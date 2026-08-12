@@ -76,6 +76,12 @@ function currentHeadEpochFromVerifiedRuns(markers = [], headSha) {
   return epoch.length ? new Date(Math.min(...epoch)) : null;
 }
 
+function selectHeadEpoch(markerEpoch, runEpoch) {
+  // Verified markers are the unbounded source. A repository run page can be
+  // truncated inside an unchanged-head epoch, so it is only a fallback.
+  return markerEpoch || runEpoch || null;
+}
+
 function stripSummarySections(body) {
   if (!body) return '';
   return String(body)
@@ -199,6 +205,7 @@ module.exports = {
   signalTargetsHead,
   currentHeadEpochStart,
   currentHeadEpochFromVerifiedRuns,
+  selectHeadEpoch,
   stripSummarySections,
   severity,
   findingFromThread,

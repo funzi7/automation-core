@@ -678,9 +678,8 @@ jobs:
                 .sort((a, b) =>
                   b.observedAt - a.observedAt);
               const runEpoch = currentHeadEpochFromTimeline(timeline, headSha);
-              if (markerEpoch && runEpoch) {
-                return new Date(Math.max(markerEpoch.getTime(), runEpoch.getTime()));
-              }
+              // Authenticated markers retain the complete contiguous epoch. The
+              // repository run list is bounded and is only a legacy fallback.
               return markerEpoch || runEpoch;
             }
 
