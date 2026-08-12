@@ -55,11 +55,9 @@ function isClaudeAutomationPr(pr, repositoryFullName) {
 }
 
 function mayAutoMergeProtectedPaths(pr, repositoryFullName, claudeAutomationProven = false) {
-  return isTrustedSync(pr, repositoryFullName) || (
-    isOwnerSameRepo(pr, repositoryFullName) &&
-    !isClaudeAutomationPr(pr, repositoryFullName) &&
-    !claudeAutomationProven
-  );
+  if (isClaudeAutomationPr(pr, repositoryFullName) || claudeAutomationProven) return false;
+  return isTrustedSync(pr, repositoryFullName) ||
+    isOwnerSameRepo(pr, repositoryFullName);
 }
 
 function isAutoMergeCandidate(pr, repositoryFullName) {

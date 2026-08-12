@@ -355,6 +355,14 @@ test('trusted same-repo automation-core sync behavior remains eligible', () => {
   });
   assert.equal(decide({ pr: sync }).eligible, true);
   assert.equal(decide({ pr: sync, protectedPathHit: true }).eligible, true);
+  assert.equal(
+    decide({
+      pr: sync,
+      protectedPathHit: true,
+      claudeAutomationProven: true,
+    }).reason,
+    'protected_path_untrusted',
+  );
 });
 
 test('sync title alone cannot grant trusted protected-path provenance', () => {

@@ -207,8 +207,8 @@ jobs:
             }
 
             async function mayAutoMergeProtectedPaths(pr) {
-              if (isTrustedSync(pr)) return true;
-              return isOwnerSameRepo(pr) && !(await hasClaudeAutomationProvenance(pr));
+              if (await hasClaudeAutomationProvenance(pr)) return false;
+              return isTrustedSync(pr) || isOwnerSameRepo(pr);
             }
 
             function isAutoMergeCandidate(pr) {
