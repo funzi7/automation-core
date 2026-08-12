@@ -195,7 +195,7 @@ jobs:
             }
 
             const REVIEWED_COMMIT_PATTERN = /(?:^|\n)\*\*Reviewed commit:\*\*\s*`([a-f0-9]{10,40})`(?:\s|$)/i;
-            const HEAD_EPOCH_MARKER_PATTERN = /<!--\s*codex-head-epoch:v1\s+head=([a-f0-9]{40})(?:\s+observed=([0-9TZ:.-]+))?\s*-->/i;
+            const HEAD_EPOCH_MARKER_PATTERN = /<!--\s*codex-head-epoch:v2\s+run=(\d+)\s+attempt=(\d+)\s*-->/i;
             function signalTargetsHead(item, headSha, headObservedAt, dateField = 'created_at') {
               const exactHead = String(headSha || '').toLowerCase();
               if (!/^[a-f0-9]{40}$/.test(exactHead)) return false;
@@ -222,32 +222,49 @@ jobs:
               return prWorkflowRunsPromise;
             }
 
-            function trustedHeadMarkers(comments) {
-              return (comments || [])
-                .filter((comment) => (comment.user?.login || '') === 'github-actions[bot]')
-                .map((comment) => {
-                  const match = String(comment.body || '').match(HEAD_EPOCH_MARKER_PATTERN);
-                  return {
-                    head: match?.[1]?.toLowerCase(),
-                    observedAt: new Date(match?.[2] || comment.created_at || 0).getTime(),
-                    recordedAt: new Date(comment.created_at || 0).getTime(),
-                    id: Number(comment.id || 0),
-                  };
-                })
-                .filter((marker) =>
-                  marker.head && Number.isFinite(marker.observedAt) && marker.observedAt > 0 &&
-                  Number.isFinite(marker.recordedAt) && marker.recordedAt > 0)
-                .sort((a, b) => b.recordedAt - a.recordedAt || b.id - a.id);
+            const epochRunCache = new Map();
+            async function trustedHeadMarkers(comments, prNumber) {
+              const refs = new Map();
+              for (const comment of comments || []) {
+                if ((comment.user?.login || '') !== 'github-actions[bot]') continue;
+                const match = String(comment.body || '').match(HEAD_EPOCH_MARKER_PATTERN);
+                if (match) refs.set(Number(match[1]), Number(match[2]));
+              }
+              const markers = [];
+              for (const [runId, attempt] of refs) {
+                if (!epochRunCache.has(runId)) {
+                  epochRunCache.set(runId, github.rest.actions.getWorkflowRun({
+                    owner, repo, run_id: runId,
+                  }).then(({ data }) => data));
+                }
+                try {
+                  const run = await epochRunCache.get(runId);
+                  const belongsToPr = (run.pull_requests || [])
+                    .some((pull) => Number(pull.number) === Number(prNumber));
+                  if (
+                    run.path !== '.github/workflows/codex-gate.yml' ||
+                    run.event !== 'pull_request_target' ||
+                    Number(run.run_attempt) !== attempt || !belongsToPr
+                  ) continue;
+                  const observedAt = new Date(run.created_at || 0).getTime();
+                  const head = String(run.head_sha || '').toLowerCase();
+                  if (/^[a-f0-9]{40}$/.test(head) && Number.isFinite(observedAt) && observedAt > 0) {
+                    markers.push({ head, observedAt, id: Number(run.id || runId) });
+                  }
+                } catch (e) {
+                  core.warning(`PR #${prNumber}: epoch run ${runId} verification failed: ${e.message}`);
+                }
+              }
+              return markers.sort((a, b) => b.observedAt - a.observedAt || b.id - a.id);
             }
 
-            function currentHeadEpochFromComments(comments, headSha) {
+            function currentHeadEpochFromTimeline(timeline, headSha) {
               const exactHead = String(headSha || '').toLowerCase();
-              const markers = trustedHeadMarkers(comments);
-              if (!markers.length || markers[0].head !== exactHead) return null;
+              if (!timeline.length || timeline[0].head !== exactHead) return null;
               const epoch = [];
-              for (const marker of markers) {
-                if (marker.head !== exactHead) break;
-                epoch.push(marker.observedAt);
+              for (const item of timeline) {
+                if (item.head !== exactHead) break;
+                epoch.push(item.observedAt);
               }
               return epoch.length ? new Date(Math.min(...epoch)) : null;
             }
@@ -265,88 +282,42 @@ jobs:
             }
 
             function currentHeadEpochFromRuns(runs, prNumber, headSha) {
-              const exactHead = String(headSha || '').toLowerCase();
               const timeline = prRunTimeline(runs, prNumber).reverse();
-              if (!timeline.length || timeline[0].head !== exactHead) return null;
-              const epoch = [];
-              for (const run of timeline) {
-                if (run.head !== exactHead) break;
-                epoch.push(run.observedAt);
-              }
-              return epoch.length ? new Date(Math.min(...epoch)) : null;
+              return currentHeadEpochFromTimeline(timeline, headSha);
             }
 
-            async function recordHeadEpochMarker(prNumber, headSha, observedAt, comments) {
-              const observed = new Date(observedAt);
-              if (!/^[a-f0-9]{40}$/.test(headSha) || !Number.isFinite(observed.getTime())) return comments;
+            async function ensureHeadEpochMarker(prNumber, comments) {
+              if (
+                context.eventName !== 'pull_request_target' ||
+                Number(context.payload.pull_request?.number) !== Number(prNumber) ||
+                !new Set(['opened', 'synchronize', 'reopened']).has(context.payload.action)
+              ) return comments;
+              const runId = Number(context.runId);
+              const attempt = Number(process.env.GITHUB_RUN_ATTEMPT || 1);
+              const alreadyRecorded = (comments || []).some((comment) => {
+                const match = String(comment.body || '').match(HEAD_EPOCH_MARKER_PATTERN);
+                return match && Number(match[1]) === runId && Number(match[2]) === attempt;
+              });
+              if (alreadyRecorded) return comments;
               const { data: marker } = await github.rest.issues.createComment({
                 owner, repo, issue_number: prNumber,
-                body: `<!-- codex-head-epoch:v1 head=${headSha} observed=${observed.toISOString()} -->`,
+                body: `<!-- codex-head-epoch:v2 run=${runId} attempt=${attempt} -->`,
               });
-              core.info(`PR #${prNumber}: recorded trusted head epoch ${headSha.slice(0, 7)}`);
+              core.info(`PR #${prNumber}: indexed trusted head epoch run ${runId}/${attempt}`);
               return [...comments, marker];
             }
 
-            async function reconcileHeadEpochMarkers(prNumber, headSha, eventHeadSha, eventObservedAt, comments) {
-              const exactHead = String(headSha || '').toLowerCase();
-              const eventHead = String(eventHeadSha || '').toLowerCase();
-              const eventAt = new Date(eventObservedAt || 0).getTime();
-              const runs = await allPrWorkflowRuns();
-              const timeline = prRunTimeline(runs, prNumber);
-              let updated = comments;
-              let latest = trustedHeadMarkers(updated)[0] || null;
-
-              const record = async (head, observedAt) => {
-                if (!/^[a-f0-9]{40}$/.test(head) || latest?.head === head) return;
-                updated = await recordHeadEpochMarker(prNumber, head, observedAt, updated);
-                latest = trustedHeadMarkers(updated)[0] || latest;
-              };
-
-              if (!latest) {
-                const bootstrap = currentHeadEpochFromRuns(runs, prNumber, exactHead);
-                if (
-                  /^[a-f0-9]{40}$/.test(eventHead) && eventHead !== exactHead &&
-                  Number.isFinite(eventAt) && eventAt > (bootstrap?.getTime() || 0)
-                ) {
-                  await record(eventHead, eventAt);
-                  await record(exactHead, Date.now());
-                  return updated;
-                }
-                await record(exactHead, bootstrap || new Date());
-                return updated;
-              }
-
-              // Reconcile recent server-observed transitions before reusing a
-              // matching marker. This records fast A->B->A sequences even when
-              // the evaluator itself reads only the final live A.
-              for (const run of timeline.filter((item) => item.observedAt >= latest.recordedAt)) {
-                await record(run.head, run.observedAt);
-              }
-              // The immutable pull_request_target event payload preserves an
-              // intermediate head even if its queued evaluator later reads a
-              // newer live head.
-              if (Number.isFinite(eventAt) && eventAt > (latest?.recordedAt || 0)) {
-                await record(eventHead, eventAt);
-              }
-              if (latest?.head !== exactHead) {
-                const bootstrap = currentHeadEpochFromRuns(runs, prNumber, exactHead);
-                const bootstrapAt = bootstrap?.getTime() || 0;
-                const floor = bootstrapAt > (latest?.observedAt || 0)
-                  ? bootstrapAt
-                  : Date.now();
-                await record(exactHead, floor);
-              }
-              return updated;
-            }
-
             async function observedHeadTransition(prNumber, headSha, comments = []) {
-              const markerEpoch = currentHeadEpochFromComments(comments, headSha);
-              if (markerEpoch) return markerEpoch;
-              // Bootstrap fallback for PRs opened before trusted head markers
-              // existed. The marker path above is not subject to GitHub's
-              // repository-wide workflow-run search cap.
-              const runs = await allPrWorkflowRuns();
-              return currentHeadEpochFromRuns(runs, prNumber, headSha);
+              const [markers, runs] = await Promise.all([
+                trustedHeadMarkers(comments, prNumber),
+                allPrWorkflowRuns(),
+              ]);
+              const markerEpoch = currentHeadEpochFromTimeline(markers, headSha);
+              const runEpoch = currentHeadEpochFromRuns(runs, prNumber, headSha);
+              if (markerEpoch && runEpoch) {
+                return new Date(Math.max(markerEpoch.getTime(), runEpoch.getTime()));
+              }
+              return markerEpoch || runEpoch;
             }
 
             function authorLogin(comment) {
@@ -494,19 +465,7 @@ jobs:
                   owner, repo, issue_number: prNumber, per_page: 100,
                 });
                 try {
-                  const eventHeadSha = context.payload.pull_request?.number === prNumber
-                    ? context.payload.pull_request.head?.sha
-                    : null;
-                  let eventObservedAt = null;
-                  if (eventHeadSha) {
-                    const { data: eventRun } = await github.rest.actions.getWorkflowRun({
-                      owner, repo, run_id: context.runId,
-                    });
-                    eventObservedAt = eventRun.created_at;
-                  }
-                  comments = await reconcileHeadEpochMarkers(
-                    prNumber, headSha, eventHeadSha, eventObservedAt, comments,
-                  );
+                  comments = await ensureHeadEpochMarker(prNumber, comments);
                 } catch (e) {
                   core.warning(`PR #${prNumber}: trusted head marker publish failed; markerless signals stay fail-closed: ${e.message}`);
                 }

@@ -9,7 +9,7 @@ const {
   severity,
   signalTargetsHead,
   currentHeadEpochStart,
-  currentHeadEpochFromComments,
+  currentHeadEpochFromVerifiedRuns,
 } = require('../tools/codex_gate_logic');
 
 const CODEX = 'chatgpt-codex-connector';
@@ -132,36 +132,21 @@ test('A to B to A force-push starts a new current-head epoch', () => {
   assert.equal(currentHeadEpochStart(runs, 9, headB), null);
 });
 
-test('trusted head markers preserve the current contiguous epoch beyond run-search caps', () => {
+test('verified gate runs preserve the current contiguous epoch beyond run-search caps', () => {
   const headA = 'a'.repeat(40);
   const headB = 'b'.repeat(40);
-  const marker = (head, createdAt, observedAt, id, login = 'github-actions[bot]') => ({
-    id,
-    user: { login },
-    body: `<!-- codex-head-epoch:v1 head=${head} observed=${observedAt} -->`,
-    created_at: createdAt,
-  });
-  const comments = [
-    marker(headA, '2026-08-11T10:05:00Z', '2026-08-11T10:00:00Z', 1),
-    marker(headA, '2026-08-11T11:05:00Z', '2026-08-11T11:00:00Z', 2),
-    marker(headB, '2026-08-11T12:05:00Z', '2026-08-11T12:00:00Z', 3),
-    marker(headA, '2026-08-11T14:05:00Z', '2026-08-11T13:00:00Z', 4),
-    marker(headA, '2026-08-11T14:05:00Z', '2026-08-11T14:00:00Z', 5),
+  const markers = [
+    { head: headA, observedAt: '2026-08-11T10:00:00Z', id: 1 },
+    { head: headA, observedAt: '2026-08-11T11:00:00Z', id: 2 },
+    { head: headB, observedAt: '2026-08-11T12:00:00Z', id: 3 },
+    { head: headA, observedAt: '2026-08-11T13:00:00Z', id: 4 },
+    { head: headA, observedAt: '2026-08-11T14:00:00Z', id: 5 },
   ];
   assert.equal(
-    currentHeadEpochFromComments(comments, headA).toISOString(),
+    currentHeadEpochFromVerifiedRuns(markers, headA).toISOString(),
     '2026-08-11T13:00:00.000Z',
   );
-  assert.equal(currentHeadEpochFromComments(comments, headB), null);
-});
-
-test('head epoch markers fail closed for untrusted authors', () => {
-  const head = 'a'.repeat(40);
-  assert.equal(currentHeadEpochFromComments([{
-    user: { login: 'funzi7' },
-    body: `<!-- codex-head-epoch:v1 head=${head} observed=2026-08-11T13:00:00Z -->`,
-    created_at: '2026-08-11T13:00:00Z',
-  }], head), null);
+  assert.equal(currentHeadEpochFromVerifiedRuns(markers, headB), null);
 });
 
 test('resolved thread clears with a current-head signal', () => {
@@ -311,22 +296,20 @@ test('authoritative workflow keeps gate policy inline', () => {
   assert.match(workflow, /cron: '7,22,37,52 \* \* \* \*'/);
   assert.match(workflow, /context\.eventName === 'schedule'/);
   assert.match(workflow, /async function observedHeadTransition\(prNumber, headSha, comments = \[\]\)/);
-  assert.match(workflow, /codex-head-epoch:v1/);
-  assert.match(workflow, /observed=\$\{observed\.toISOString\(\)\}/);
-  assert.match(workflow, /async function reconcileHeadEpochMarkers\(prNumber, headSha, eventHeadSha, eventObservedAt, comments\)/);
-  assert.match(workflow, /for \(const run of timeline\.filter\(\(item\) => item\.observedAt >= latest\.recordedAt\)\)/);
-  assert.match(workflow, /context\.payload\.pull_request\.head\?\.sha/);
+  assert.match(workflow, /codex-head-epoch:v2/);
+  assert.match(workflow, /async function ensureHeadEpochMarker\(prNumber, comments\)/);
   assert.match(workflow, /github\.rest\.actions\.getWorkflowRun/);
-  assert.match(workflow, /eventAt > \(latest\?\.recordedAt \|\| 0\)/);
-  assert.match(workflow, /await record\(exactHead, bootstrap \|\| new Date\(\)\)/);
+  assert.match(workflow, /run\.path !== '\.github\/workflows\/codex-gate\.yml'/);
+  assert.match(workflow, /run\.event !== 'pull_request_target'/);
+  assert.match(workflow, /Number\(run\.run_attempt\) !== attempt \|\| !belongsToPr/);
   assert.match(workflow, /issues: write/);
   assert.ok(
-    workflow.indexOf('comments = await reconcileHeadEpochMarkers') <
+    workflow.indexOf('comments = await ensureHeadEpochMarker') <
       workflow.indexOf('// Manual override — admin force-merge.'),
     'head epoch reconciliation must precede the administrator override return',
   );
   assert.match(workflow, /let prWorkflowRunsPromise = null/);
-  assert.match(workflow, /const runs = await allPrWorkflowRuns\(\)/);
+  assert.match(workflow, /const \[markers, runs\] = await Promise\.all/);
   assert.match(workflow, /function signalTargetsHead\(item, headSha, headObservedAt/);
   assert.match(workflow, /actions: read/);
   assert.doesNotMatch(workflow, /latestCommitDate/);
@@ -369,7 +352,7 @@ test('watchdog rechecks changed red thread state from the trusted base ref', () 
   );
   assert.match(watchdog, /hasCurrentHeadNonInlineFinding/);
   assert.match(watchdog, /let prWorkflowRunsPromise = null/);
-  assert.match(watchdog, /const runs = await allPrWorkflowRuns\(\)/);
+  assert.match(watchdog, /const \[markers, runs\] = await Promise\.all/);
   assert.match(
     watchdog,
     /!overrideCandidate && !redThreadStateChanged/,

@@ -586,7 +586,7 @@ jobs:
               return P1_PATTERN.test(semantic) || P2_PATTERN.test(semantic);
             };
             const REVIEWED_COMMIT_PATTERN = /(?:^|\n)\*\*Reviewed commit:\*\*\s*`([a-f0-9]{10,40})`(?:\s|$)/i;
-            const HEAD_EPOCH_MARKER_PATTERN = /<!--\s*codex-head-epoch:v1\s+head=([a-f0-9]{40})(?:\s+observed=([0-9TZ:.-]+))?\s*-->/i;
+            const HEAD_EPOCH_MARKER_PATTERN = /<!--\s*codex-head-epoch:v2\s+run=(\d+)\s+attempt=(\d+)\s*-->/i;
             const signalTargetsHead = (item, headSha, headObservedAt, dateField = 'created_at') => {
               const exactHead = String(headSha || '').toLowerCase();
               const originalCommit = String(item?.original_commit_id || '').toLowerCase();
@@ -600,49 +600,73 @@ jobs:
               return Number.isFinite(signalAt) && Number.isFinite(observedAt) &&
                 observedAt > 0 && signalAt > observedAt;
             };
-            function currentHeadEpochFromComments(comments, headSha) {
+            const epochRunCache = new Map();
+            async function trustedHeadMarkers(comments, prNumber) {
+              const refs = new Map();
+              for (const comment of comments || []) {
+                if ((comment.user?.login || '') !== 'github-actions[bot]') continue;
+                const match = String(comment.body || '').match(HEAD_EPOCH_MARKER_PATTERN);
+                if (match) refs.set(Number(match[1]), Number(match[2]));
+              }
+              const markers = [];
+              for (const [runId, attempt] of refs) {
+                if (!epochRunCache.has(runId)) {
+                  epochRunCache.set(runId,
+                    roPage(`/repos/${owner}/${repo}/actions/runs/${runId}`).then(({ data }) => data));
+                }
+                try {
+                  const run = await epochRunCache.get(runId);
+                  const belongsToPr = (run.pull_requests || [])
+                    .some((pull) => Number(pull.number) === Number(prNumber));
+                  if (
+                    run.path !== '.github/workflows/codex-gate.yml' ||
+                    run.event !== 'pull_request_target' ||
+                    Number(run.run_attempt) !== attempt || !belongsToPr
+                  ) continue;
+                  const observedAt = new Date(run.created_at || 0).getTime();
+                  const head = String(run.head_sha || '').toLowerCase();
+                  if (/^[a-f0-9]{40}$/.test(head) && Number.isFinite(observedAt) && observedAt > 0) {
+                    markers.push({ head, observedAt, id: Number(run.id || runId) });
+                  }
+                } catch (e) {
+                  core.info(`PR #${prNumber}: epoch run ${runId} verification failed: ${e.message}`);
+                }
+              }
+              return markers.sort((a, b) => b.observedAt - a.observedAt || b.id - a.id);
+            }
+
+            function currentHeadEpochFromTimeline(timeline, headSha) {
               const exactHead = String(headSha || '').toLowerCase();
-              const markers = (comments || [])
-                .filter((comment) => (comment.user?.login || '') === 'github-actions[bot]')
-                .map((comment) => {
-                  const match = String(comment.body || '').match(HEAD_EPOCH_MARKER_PATTERN);
-                  return {
-                    head: match?.[1]?.toLowerCase(),
-                    observedAt: new Date(match?.[2] || comment.created_at || 0).getTime(),
-                    recordedAt: new Date(comment.created_at || 0).getTime(),
-                    id: Number(comment.id || 0),
-                  };
-                })
-                .filter((marker) =>
-                  marker.head && Number.isFinite(marker.observedAt) && marker.observedAt > 0 &&
-                  Number.isFinite(marker.recordedAt) && marker.recordedAt > 0)
-                .sort((a, b) => b.recordedAt - a.recordedAt || b.id - a.id);
-              if (!markers.length || markers[0].head !== exactHead) return null;
+              if (!timeline.length || timeline[0].head !== exactHead) return null;
               const epoch = [];
-              for (const marker of markers) {
-                if (marker.head !== exactHead) break;
-                epoch.push(marker.observedAt);
+              for (const item of timeline) {
+                if (item.head !== exactHead) break;
+                epoch.push(item.observedAt);
               }
               return epoch.length ? new Date(Math.min(...epoch)) : null;
             }
 
             async function observedHeadTransition(prNumber, headSha, comments = []) {
-              const markerEpoch = currentHeadEpochFromComments(comments, headSha);
-              if (markerEpoch) return markerEpoch;
-              const runs = await allPrWorkflowRuns();
+              const [markers, runs] = await Promise.all([
+                trustedHeadMarkers(comments, prNumber),
+                allPrWorkflowRuns(),
+              ]);
+              const markerEpoch = currentHeadEpochFromTimeline(markers, headSha);
               const timeline = runs
                 .filter((run) =>
                   (run.pull_requests || []).some((candidate) => candidate.number === prNumber))
+                .map((run) => ({
+                  head: String(run.head_sha || '').toLowerCase(),
+                  observedAt: new Date(run.created_at || 0).getTime(),
+                }))
+                .filter((run) => /^[a-f0-9]{40}$/.test(run.head) && Number.isFinite(run.observedAt) && run.observedAt > 0)
                 .sort((a, b) =>
-                  new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime());
-              if (!timeline.length || timeline[0].head_sha !== headSha) return null;
-              const currentEpoch = [];
-              for (const run of timeline) {
-                if (run.head_sha !== headSha) break;
-                const observedAt = new Date(run.created_at || 0).getTime();
-                if (Number.isFinite(observedAt) && observedAt > 0) currentEpoch.push(observedAt);
+                  b.observedAt - a.observedAt);
+              const runEpoch = currentHeadEpochFromTimeline(timeline, headSha);
+              if (markerEpoch && runEpoch) {
+                return new Date(Math.max(markerEpoch.getTime(), runEpoch.getTime()));
               }
-              return currentEpoch.length ? new Date(Math.min(...currentEpoch)) : null;
+              return markerEpoch || runEpoch;
             }
 
             async function hasActiveTrustedFinding(prNumber) {
