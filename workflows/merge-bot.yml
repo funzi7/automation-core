@@ -249,7 +249,7 @@ jobs:
                 if (accepted.has(key)) continue;
                 if (!epochRunCache.has(key)) {
                   epochRunCache.set(key,
-                    roPage(`/repos/${owner}/${repo}/actions/runs/${runId}/attempts/${attempt}`).then(({ data }) => data));
+                    roPage(`https://api.github.com/repos/${owner}/${repo}/actions/runs/${runId}/attempts/${attempt}`).then(({ data }) => data));
                 }
                 try {
                   const run = await epochRunCache.get(key);

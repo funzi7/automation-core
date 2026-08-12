@@ -360,7 +360,7 @@ test('watchdog rechecks changed red thread state from the trusted base ref', () 
   assert.match(watchdog, /const \[markers, runs\] = await Promise\.all/);
   assert.match(watchdog, /if \(accepted\.has\(key\)\) continue/);
   assert.doesNotMatch(watchdog, /refs\.set\(/);
-  assert.match(watchdog, /actions\/runs\/\$\{runId\}\/attempts\/\$\{attempt\}/);
+  assert.match(watchdog, /roPage\(`https:\/\/api\.github\.com\/repos\/\$\{owner\}\/\$\{repo\}\/actions\/runs\/\$\{runId\}\/attempts\/\$\{attempt\}`\)/);
   assert.match(watchdog, /if \(head !== exactHead\) break/);
   assert.match(
     watchdog,
