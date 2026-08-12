@@ -301,7 +301,8 @@ test('authoritative workflow keeps gate policy inline', () => {
   assert.match(workflow, /github\.rest\.actions\.getWorkflowRun/);
   assert.match(workflow, /run\.path !== '\.github\/workflows\/codex-gate\.yml'/);
   assert.match(workflow, /run\.event !== 'pull_request_target'/);
-  assert.match(workflow, /Number\(run\.run_attempt\) !== attempt \|\| !belongsToPr/);
+  assert.match(workflow, /Number\(run\.run_attempt\) !== attempt \|\| !associatedPr/);
+  assert.match(workflow, /const head = String\(associatedPr\.head\?\.sha \|\| ''\)/);
   assert.match(workflow, /issues: write/);
   assert.ok(
     workflow.indexOf('comments = await ensureHeadEpochMarker') <

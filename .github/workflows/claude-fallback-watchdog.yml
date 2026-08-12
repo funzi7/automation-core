@@ -616,15 +616,15 @@ jobs:
                 }
                 try {
                   const run = await epochRunCache.get(runId);
-                  const belongsToPr = (run.pull_requests || [])
-                    .some((pull) => Number(pull.number) === Number(prNumber));
+                  const associatedPr = (run.pull_requests || [])
+                    .find((pull) => Number(pull.number) === Number(prNumber));
                   if (
                     run.path !== '.github/workflows/codex-gate.yml' ||
                     run.event !== 'pull_request_target' ||
-                    Number(run.run_attempt) !== attempt || !belongsToPr
+                    Number(run.run_attempt) !== attempt || !associatedPr
                   ) continue;
                   const observedAt = new Date(run.created_at || 0).getTime();
-                  const head = String(run.head_sha || '').toLowerCase();
+                  const head = String(associatedPr.head?.sha || '').toLowerCase();
                   if (/^[a-f0-9]{40}$/.test(head) && Number.isFinite(observedAt) && observedAt > 0) {
                     markers.push({ head, observedAt, id: Number(run.id || runId) });
                   }
