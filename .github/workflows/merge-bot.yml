@@ -147,6 +147,9 @@ jobs:
               return prWorkflowRunsPromise;
             };
             const CODEX_CHECK = 'check-codex-status';
+            // The evaluator job is intentionally diagnostic and commonly fails
+            // before review. Its explicit exact-head check below is authoritative.
+            const NON_BLOCKING_DIAGNOSTIC_CHECKS = new Set(['codex-gate-evaluator']);
             const LABEL_AUTOMERGE = 'automerge';
             const LABEL_ESCALATE = 'needs-owner';
             const LABEL_ESCALATE_AUTO = 'needs-owner-auto';
@@ -706,6 +709,7 @@ jobs:
               const recency = (c) => new Date(c.completed_at || c.started_at || 0).getTime();
               const seenNames = new Set();
               const latestCheckRuns = [...checkRuns]
+                .filter((c) => !NON_BLOCKING_DIAGNOSTIC_CHECKS.has(c.name))
                 .sort((a, b) => recency(b) - recency(a))
                 .filter((c) => (seenNames.has(c.name) ? false : (seenNames.add(c.name), true)));
 

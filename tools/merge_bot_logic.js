@@ -10,6 +10,7 @@
 
 const OWNER_LOGIN = 'funzi7';
 const CODEX_CHECK = 'check-codex-status';
+const NON_BLOCKING_DIAGNOSTIC_CHECKS = new Set(['codex-gate-evaluator']);
 const LABEL_AUTOMERGE = 'automerge';
 const LABEL_ESCALATE = 'needs-owner';
 const LABEL_ESCALATE_AUTO = 'needs-owner-auto';
@@ -66,6 +67,7 @@ function latestChecksByName(checkRuns) {
   const seen = new Set();
   return [...(checkRuns || [])]
     .filter((check) => check?.conclusion !== 'cancelled')
+    .filter((check) => !NON_BLOCKING_DIAGNOSTIC_CHECKS.has(check?.name))
     .sort((a, b) => recency(b) - recency(a))
     .filter((check) => {
       if (seen.has(check.name)) return false;
@@ -249,6 +251,7 @@ function evaluateMergePolicy({
 module.exports = {
   OWNER_LOGIN,
   CODEX_CHECK,
+  NON_BLOCKING_DIAGNOSTIC_CHECKS,
   LABEL_AUTOMERGE,
   LABEL_ESCALATE,
   LABEL_ESCALATE_AUTO,

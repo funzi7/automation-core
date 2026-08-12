@@ -132,6 +132,10 @@ Synced workflows listed in `sync-config.json`: `codex-auto-fix.yml`, `codex-gate
 - Requires latest `check-codex-status` on the exact head to be success and
   independently checks for active trusted P1/P2 review threads.
 - Uses latest check run per name and ignores cancelled tails from superseded queued runs.
+- Ignores only the intentionally diagnostic `codex-gate-evaluator` job, whose
+  expected pre-review failure can remain attached to the PR head. The explicit
+  exact-head `check-codex-status` is authoritative; every other latest failed
+  or running check/status still blocks.
 - Protected paths still escalate untrusted/fork/ambiguous PRs. A fully reviewed
   same-repo owner PR may merge without a second manual merge step.
 - Squash merge is head-SHA-pinned.

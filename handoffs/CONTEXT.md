@@ -144,6 +144,11 @@ may remove both and continue to merge in the same pass. Protected paths remain
 fail-closed for forks/untrusted/ambiguous PRs but no longer force an additional
 manual merge for a fully reviewed same-repo owner PR.
 
+The native `codex-gate-evaluator` job is diagnostic and can retain its expected
+pre-review failure on the PR head. Merge Bot ignores only that diagnostic
+check name; the explicit exact-head `check-codex-status` must exist and
+succeed, and every other latest failed/running check or status still blocks.
+
 The 2026-08-11 source reconciliation ported paywall-bot's reviewed Codex Gate
 and watchdog safety fixes upstream before changing merge policy. The stale
 paywall-bot sync PR #89 was closed unmerged and its stale

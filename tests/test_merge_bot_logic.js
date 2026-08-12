@@ -83,6 +83,15 @@ test('one failed current check blocks merge', () => {
   assert.equal(result.reason, 'failed_check');
 });
 
+test('diagnostic evaluator failure is ignored but authoritative gate remains mandatory', () => {
+  assert.equal(decide({
+    checkRuns: [...greenChecks(), check('codex-gate-evaluator', 'failure', 'completed', 3)],
+  }).eligible, true);
+  assert.equal(decide({
+    checkRuns: [check('ci'), check('codex-gate-evaluator', 'success', 'completed', 3)],
+  }).reason, 'missing_or_red_codex_gate');
+});
+
 test('latest run per check name wins over stale failure', () => {
   const result = decide({
     checkRuns: [
@@ -341,6 +350,8 @@ test('workflow preserves exact-SHA squash merge and same-repo branch deletion', 
   assert.doesNotMatch(workflow, /refs\.set\(/);
   assert.match(workflow, /actions\/runs\/\$\{runId\}\/attempts\/\$\{attempt\}/);
   assert.match(workflow, /if \(head !== exactHead\) break/);
+  assert.match(workflow, /NON_BLOCKING_DIAGNOSTIC_CHECKS = new Set\(\['codex-gate-evaluator'\]\)/);
+  assert.match(workflow, /\.filter\(\(c\) => !NON_BLOCKING_DIAGNOSTIC_CHECKS\.has\(c\.name\)\)/);
   assert.match(workflow, /let prWorkflowRunsPromise = null/);
   assert.match(workflow, /const \[markers, runs\] = await Promise\.all/);
   assert.match(workflow, /function signalTargetsHead\(item, headSha, headObservedAt/);
