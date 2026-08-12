@@ -192,6 +192,26 @@ jobs:
             });
             core.setOutput('numbers', JSON.stringify(open.map((pr) => pr.number)));
 
+      - name: Mark Claude PR creation pending
+        if: steps.keycheck.outputs.has_key == 'true' && steps.pr_context.outputs.is_pr_comment != 'true'
+        uses: actions/github-script@v8
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const issueNum = context.payload.issue?.number;
+            if (!issueNum) throw new Error('Issue number missing for Claude PR provenance');
+            try {
+              await github.rest.issues.createLabel({
+                ...context.repo, name: 'claude-pr-pending', color: 'd4c5f9',
+                description: 'Transient provenance: Claude may be creating a PR for this Issue',
+              });
+            } catch (e) {
+              if (e.status !== 422) throw e;
+            }
+            await github.rest.issues.addLabels({
+              ...context.repo, issue_number: issueNum, labels: ['claude-pr-pending'],
+            });
+
       - name: Run Claude Code (Issue/new-PR path)
         id: claude_issue
         if: steps.keycheck.outputs.has_key == 'true' && steps.pr_context.outputs.is_pr_comment != 'true'
@@ -517,3 +537,7 @@ jobs:
             );
             if (!matches.length) { core.info(`No newly created Claude PR found that closes #${issueNum}.`); return; }
             for (const pr of matches) await label(pr.number);
+            await github.rest.issues.removeLabel({
+              owner, repo, issue_number: issueNum, name: 'claude-pr-pending',
+            });
+            core.info(`Cleared claude-pr-pending on Issue #${issueNum} after durable PR provenance was recorded.`);

@@ -402,6 +402,8 @@ test('workflow preserves exact-SHA squash merge and same-repo branch deletion', 
   assert.match(workflow, /hasClaudeAutomationProvenance/);
   assert.match(workflow, /!\(await mayAutoMergeProtectedPaths\(pr\)\)/);
   assert.match(workflow, /event\.actor\?\.login === 'github-actions\[bot\]'/);
+  assert.match(workflow, /CLAUDE_PENDING_LABEL = 'claude-pr-pending'/);
+  assert.match(workflow, /const linkedIssues = \[\.\.\.String\(pr\.body \|\| ''\)\.matchAll/);
   assert.match(workflow, /workflows: \["Codex Gate", "CI", "Automation Core CI"\]/);
   assert.match(workflow, /const trustedLoopMarker = \(comment\) =>/);
   assert.match(workflow, /Number\(root\[1\]\) !== prNumber/);
@@ -499,6 +501,16 @@ test('Claude PR provenance records on failure while automerge remains success-on
   assert.match(workflow, /CLAUDE_BRANCH_NAME: \$\{\{ steps\.claude_issue\.outputs\.branch_name \}\}/);
   assert.match(workflow, /!preexisting\.has\(pr\.number\)/);
   assert.match(workflow, /!claudeBranch \|\| pr\.head\?\.ref === claudeBranch/);
+  assert.match(workflow, /name: Mark Claude PR creation pending/);
+  assert.ok(
+    workflow.indexOf('Mark Claude PR creation pending') <
+      workflow.indexOf('Run Claude Code (Issue/new-PR path)'),
+    'pending provenance must be visible before Claude can expose a PR',
+  );
+  const durableAt = workflow.indexOf('for (const pr of matches) await label(pr.number)');
+  const clearAt = workflow.indexOf("name: 'claude-pr-pending'", durableAt);
+  assert.ok(durableAt >= 0 && clearAt > durableAt,
+    'pending provenance may clear only after durable PR labels are attached');
 });
 
 test('synced review freshness never uses the removed latest-commit-date model', () => {

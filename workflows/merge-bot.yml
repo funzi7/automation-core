@@ -155,6 +155,7 @@ jobs:
             const LABEL_ESCALATE_AUTO = 'needs-owner-auto';
             const LABEL_NO_AUTOMERGE = 'no-automerge';
             const CLAUDE_GENERATED_LABEL = 'claude-generated';
+            const CLAUDE_PENDING_LABEL = 'claude-pr-pending';
             const CODEX_OVERRIDE_LABEL = 'codex-p1-acknowledged';
             const SYNC_TITLE_PREFIX = 'chore(automation): sync from automation-core';
             const SYNC_BRANCH = 'chore/sync-automation-core';   // branch the sync workflow opens
@@ -195,11 +196,23 @@ jobs:
                   'GET /repos/{owner}/{repo}/issues/{issue_number}/events',
                   { owner, repo, issue_number: pr.number, per_page: 100 },
                 );
-                return events.some((event) =>
+                if (events.some((event) =>
                   event.event === 'labeled' &&
                   event.label?.name === CLAUDE_GENERATED_LABEL &&
                   event.actor?.login === 'github-actions[bot]'
-                );
+                )) return true;
+                const linkedIssues = [...String(pr.body || '').matchAll(
+                  /(?:close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)\s+#(\d+)/gi,
+                )].map((match) => Number(match[1]));
+                for (const issueNum of new Set(linkedIssues)) {
+                  const { data: issue } = await github.rest.issues.get({
+                    owner, repo, issue_number: issueNum,
+                  });
+                  if ((issue.labels || []).some((label) =>
+                    (label.name || label) === CLAUDE_PENDING_LABEL
+                  )) return true;
+                }
+                return false;
               } catch (e) {
                 core.warning(`#${pr.number}: Claude provenance lookup failed; protected path stays fail-closed: ${e.message}`);
                 return true;
