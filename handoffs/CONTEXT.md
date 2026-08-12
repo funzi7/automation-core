@@ -144,13 +144,12 @@ may remove both and continue to merge in the same pass. Protected paths remain
 fail-closed for forks/untrusted/ambiguous PRs but no longer force an additional
 manual merge for a fully reviewed ordinary same-repo owner PR. The trusted
 Claude workflow writes durable `claude-generated` provenance as
-`github-actions[bot]`; Merge Bot also keeps `claude/*` as a conservative
-fallback and checks historical label events. Before Claude can expose an Issue
-fix PR, the workflow adds `claude-pr-pending` to the triggering Issue; linked
-protected PRs fail closed during that window, and the marker clears only after
-durable PR provenance lands. PAT-owner Claude PRs therefore remain protected-path
-fail-closed regardless of branch naming or timing. Exact trusted automation-core
-sync PRs retain their rollout only when no Claude provenance exists.
+`github-actions[bot]`; Merge Bot also checks historical label events. For Issue
+runs, the action controls the `claude/*` branch, Claude lacks broad branch and
+PR-creation commands, and a trusted post-step creates the PR from the action's
+exact branch output. Provenance is therefore present at creation, before CI or
+Gate can wake. PAT-owner Claude PRs remain protected-path fail-closed; exact
+trusted automation-core sync PRs retain rollout only without Claude provenance.
 
 The native `codex-gate-evaluator` job is diagnostic and can retain its expected
 pre-review failure on the PR head. Merge Bot ignores only that diagnostic

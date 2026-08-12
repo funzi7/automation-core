@@ -180,38 +180,6 @@ jobs:
           fi
           echo "Checked out original PR head branch ${HEAD_REF} at ${HEAD_SHA}."
 
-      - name: Snapshot PRs before Claude issue run
-        id: pre_issue_prs
-        if: steps.keycheck.outputs.has_key == 'true' && steps.pr_context.outputs.is_pr_comment != 'true'
-        uses: actions/github-script@v8
-        with:
-          github-token: ${{ github.token }}
-          script: |
-            const open = await github.paginate(github.rest.pulls.list, {
-              ...context.repo, state: 'open', per_page: 100,
-            });
-            core.setOutput('numbers', JSON.stringify(open.map((pr) => pr.number)));
-
-      - name: Mark Claude PR creation pending
-        if: steps.keycheck.outputs.has_key == 'true' && steps.pr_context.outputs.is_pr_comment != 'true'
-        uses: actions/github-script@v8
-        with:
-          github-token: ${{ github.token }}
-          script: |
-            const issueNum = context.payload.issue?.number;
-            if (!issueNum) throw new Error('Issue number missing for Claude PR provenance');
-            try {
-              await github.rest.issues.createLabel({
-                ...context.repo, name: 'claude-pr-pending', color: 'd4c5f9',
-                description: 'Transient provenance: Claude may be creating a PR for this Issue',
-              });
-            } catch (e) {
-              if (e.status !== 422) throw e;
-            }
-            await github.rest.issues.addLabels({
-              ...context.repo, issue_number: issueNum, labels: ['claude-pr-pending'],
-            });
-
       - name: Run Claude Code (Issue/new-PR path)
         id: claude_issue
         if: steps.keycheck.outputs.has_key == 'true' && steps.pr_context.outputs.is_pr_comment != 'true'
@@ -222,6 +190,7 @@ jobs:
           github_token: ${{ secrets.AUTOMATION_PAT || github.token }}
           trigger_phrase: "@claude"
           label_trigger: "claude-fix"
+          branch_prefix: "claude/"
           # fix #16: expose the SDK transcript ONLY when the repo opts in via the
           # Actions variable CLAUDE_SHOW_FULL_OUTPUT == 'true'. Default (var unset
           # or any other value) keeps today's hidden output ("full output hidden
@@ -232,20 +201,18 @@ jobs:
           # reports permission_denials_count but hides WHICH tools were denied, so
           # the count alone can't tune --allowedTools), then flip it back.
           show_full_output: ${{ vars.CLAUDE_SHOW_FULL_OUTPUT == 'true' }}
-          # --max-turns 50 + a BROAD allowlist (fix #7). The previous
+          # --max-turns 50 + the common inspector/test allowlist (fix #7). The previous
           # --max-turns 20 + narrow per-subcommand list caused error_max_turns
           # on paywall-bot #49: the fixer kept trying tools OUTSIDE the allowlist
           # (11 permission_denials), burning all 20 turns on denial churn without
-          # opening a fix PR. Now: 50 turns; broad `Bash(git:*)`; the common
-          # interpreters/inspectors a fix needs (python/python3/pytest/pip/node/
-          # npm + ls/cat/find/head/tail/sed/mkdir/cp/mv); plus MultiEdit. gh
-          # stays limited to pr/issue. SECURITY: the fixer can already commit +
-          # push code via Edit + git, so a broader COMMAND allowlist adds little
-          # marginal risk; tighten if desired. The PR's CI (codex-gate) remains
-          # the real validation gate.
+          # delivering a fix. Now: 50 turns; common interpreters/inspectors
+          # (python/python3/pytest/pip/node/npm + ls/cat/find/head/tail/sed/
+          # mkdir/cp/mv); plus MultiEdit. The action supplies its own constrained
+          # commit/push tools. Claude cannot create/switch branches or open PRs.
+          # The PR's CI (codex-gate) remains the real validation gate.
           claude_args: |
             --max-turns 50
-            --allowedTools "Read,Glob,Grep,Edit,Write,MultiEdit,Bash(git:*),Bash(python:*),Bash(python3:*),Bash(pytest:*),Bash(pip:*),Bash(node:*),Bash(npm:*),Bash(ls:*),Bash(cat:*),Bash(find:*),Bash(head:*),Bash(tail:*),Bash(sed:*),Bash(mkdir:*),Bash(cp:*),Bash(mv:*),Bash(gh pr:*),Bash(gh issue:*),Bash(actionlint)"
+            --allowedTools "Read,Glob,Grep,Edit,Write,MultiEdit,Bash(python:*),Bash(python3:*),Bash(pytest:*),Bash(pip:*),Bash(node:*),Bash(npm:*),Bash(ls:*),Bash(cat:*),Bash(find:*),Bash(head:*),Bash(tail:*),Bash(sed:*),Bash(mkdir:*),Bash(cp:*),Bash(mv:*),Bash(gh issue:*),Bash(actionlint)"
           additional_permissions: |
             actions: read
           prompt: |
@@ -257,22 +224,21 @@ jobs:
                  failed job names, a link to the failing run, and a tail of the
                  failing job logs. Diagnose the ROOT CAUSE from those logs — do
                  not guess.
-              2. Create a NEW branch (e.g. `claude/fix-<short-desc>`). NEVER
-                 commit or push directly to `main`.
+              2. The action has already checked out its controlled `claude/*`
+                 branch. Work only on that branch; do not create or switch branches.
               3. Apply the minimal fix. If the repo has a CLAUDE.md with a
                  build/test/gate command, OBEY it and run that gate locally;
-                 it must be green before you open the PR.
-              4. Open a PR from your branch that links the Issue with
-                 `Fixes #<N>` (the Issue number you were invoked on) and briefly
-                 explains the root cause and the fix.
-              5. Do NOT merge the PR yourself — codex-gate reviews it and
+                 it must be green before you finish.
+              4. Commit and push the current branch. Do not open a PR yourself;
+                 the trusted post-step creates it from the action's exact branch.
+              5. Do NOT merge anything — codex-gate reviews the resulting PR and
                  merge-bot merges once everything is green.
 
             Prefer the allowed tools and do NOT attempt tools outside the allowlist (denied calls waste your turn budget); the PR's CI (codex-gate) is the final validation, so do not block on running the full suite locally if the sandbox can't.
 
             If triggered by an @claude mention on an Issue, follow the request
-            in the comment, working on a new branch and opening a PR the same
-            way. Use `Fixes #<N>` for the Issue number. Do not merge it yourself.
+            in the comment on the action-controlled branch. Commit and push; the
+            trusted post-step opens the PR. Do not merge it yourself.
 
       - name: Run Claude Code (existing PR head path)
         id: claude_pr
@@ -481,6 +447,47 @@ jobs:
               core.info(`no-delivery handling failed (ignored): ${e.message}`);
             }
 
+      - name: Create Claude PR from trusted branch
+        if: ${{ always() && steps.claude_issue.outcome != 'skipped' && steps.claude_issue.outputs.branch_name != '' }}
+        uses: actions/github-script@v8
+        env:
+          CLAUDE_BRANCH_NAME: ${{ steps.claude_issue.outputs.branch_name }}
+        with:
+          # PAT-authored creation wakes CI/Codex Gate. The exact branch is an
+          # action output and must retain the action-controlled prefix.
+          github-token: ${{ secrets.AUTOMATION_PAT || github.token }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const branch = String(process.env.CLAUDE_BRANCH_NAME || '');
+            if (!branch.startsWith('claude/')) throw new Error(`Refusing untrusted Claude branch: ${branch}`);
+            const issueNum = context.payload.issue?.number;
+            if (!issueNum) throw new Error('Issue number missing for Claude PR creation');
+            const existing = await github.paginate(github.rest.pulls.list, {
+              owner, repo, state: 'open', head: `${owner}:${branch}`, per_page: 100,
+            });
+            if (existing.length) {
+              core.info(`Claude PR #${existing[0].number} already exists for ${branch}.`);
+              return;
+            }
+            try {
+              await github.rest.git.getRef({ owner, repo, ref: `heads/${branch}` });
+            } catch (e) {
+              if (e.status === 404) { core.info(`Claude branch ${branch} was not pushed; no PR to create.`); return; }
+              throw e;
+            }
+            const base = context.payload.repository.default_branch;
+            const { data: comparison } = await github.rest.repos.compareCommitsWithBasehead({
+              owner, repo, basehead: `${base}...${branch}`,
+            });
+            if (comparison.ahead_by < 1) { core.info(`Claude branch ${branch} has no delivered commit.`); return; }
+            const title = `fix: ${String(context.payload.issue.title || `Issue #${issueNum}`).slice(0, 240)}`;
+            const { data: created } = await github.rest.pulls.create({
+              owner, repo, head: branch, base, title,
+              body: `Fixes #${issueNum}\n\nCreated from the trusted Claude workflow branch for this Issue.`,
+            });
+            core.info(`Created Claude PR #${created.number} from trusted branch ${branch}.`);
+
       - name: Record Claude PR provenance and conditionally auto-merge
         # Provenance must survive a run that creates a PR and then fails or is
         # cancelled. `automerge` remains success-only; a failed delivery gets
@@ -488,7 +495,6 @@ jobs:
         if: ${{ always() && steps.claude_issue.outcome != 'skipped' }}
         uses: actions/github-script@v8
         env:
-          PREEXISTING_PR_NUMBERS: ${{ steps.pre_issue_prs.outputs.numbers }}
           CLAUDE_BRANCH_NAME: ${{ steps.claude_issue.outputs.branch_name }}
         with:
           # Use the default token so the durable claude-generated label event is
@@ -499,8 +505,9 @@ jobs:
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const delivered = '${{ steps.claude_issue.outcome }}' === 'success';
-            const preexisting = new Set(JSON.parse(process.env.PREEXISTING_PR_NUMBERS || '[]'));
             const claudeBranch = String(process.env.CLAUDE_BRANCH_NAME || '');
+            if (!claudeBranch) { core.info('Claude action reported no branch; no PR provenance to record.'); return; }
+            if (!claudeBranch.startsWith('claude/')) throw new Error(`Refusing untrusted Claude branch: ${claudeBranch}`);
             const labels = [
               { name: 'claude-generated', color: '5319e7', description: 'Provenance: PR was created by the Claude automation workflow' },
               ...(delivered ? [
@@ -523,21 +530,8 @@ jobs:
               core.info(`Labeled PR #${prNumber} claude-generated${delivered ? ' + automerge' : ' (delivery not successful)'}.`);
             }
 
-            // Only label PRs that appeared during this run, close the triggering
-            // Issue, and (when the action reports it) use Claude's exact branch.
-            const issueNum = context.payload.issue && context.payload.issue.number;
-            if (!issueNum) { core.info('No issue/PR context to label.'); return; }
-            const open = await github.paginate(github.rest.pulls.list, { owner, repo, state: 'open', per_page: 100 });
-            const re = new RegExp(`(?:close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)\\s+#${issueNum}\\b`, 'i');
-            const matches = open.filter((pr) =>
-              !preexisting.has(pr.number) &&
-              pr.head?.repo?.full_name === `${owner}/${repo}` &&
-              re.test(pr.body || '') &&
-              (!claudeBranch || pr.head?.ref === claudeBranch)
-            );
-            if (!matches.length) { core.info(`No newly created Claude PR found that closes #${issueNum}.`); return; }
-            for (const pr of matches) await label(pr.number);
-            await github.rest.issues.removeLabel({
-              owner, repo, issue_number: issueNum, name: 'claude-pr-pending',
+            const matches = await github.paginate(github.rest.pulls.list, {
+              owner, repo, state: 'open', head: `${owner}:${claudeBranch}`, per_page: 100,
             });
-            core.info(`Cleared claude-pr-pending on Issue #${issueNum} after durable PR provenance was recorded.`);
+            if (!matches.length) { core.info(`No PR exists for trusted Claude branch ${claudeBranch}.`); return; }
+            for (const pr of matches) await label(pr.number);

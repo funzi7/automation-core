@@ -16,7 +16,6 @@ const LABEL_ESCALATE = 'needs-owner';
 const LABEL_ESCALATE_AUTO = 'needs-owner-auto';
 const LABEL_NO_AUTOMERGE = 'no-automerge';
 const CLAUDE_GENERATED_LABEL = 'claude-generated';
-const CLAUDE_PENDING_LABEL = 'claude-pr-pending';
 const CODEX_OVERRIDE_LABEL = 'codex-p1-acknowledged';
 const SYNC_TITLE_PREFIX = 'chore(automation): sync from automation-core';
 const SYNC_BRANCH = 'chore/sync-automation-core';
@@ -276,7 +275,6 @@ module.exports = {
   LABEL_ESCALATE_AUTO,
   LABEL_NO_AUTOMERGE,
   CLAUDE_GENERATED_LABEL,
-  CLAUDE_PENDING_LABEL,
   CODEX_OVERRIDE_LABEL,
   SYNC_TITLE_PREFIX,
   SYNC_BRANCH,
