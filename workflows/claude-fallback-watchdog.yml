@@ -601,42 +601,53 @@ jobs:
                 observedAt > 0 && signalAt > observedAt;
             };
             const epochRunCache = new Map();
-            async function trustedHeadMarkers(comments, prNumber) {
+            async function trustedHeadMarkers(comments, prNumber, headSha) {
+              const exactHead = String(headSha || '').toLowerCase();
               const refs = [];
               for (const comment of comments || []) {
                 if ((comment.user?.login || '') !== 'github-actions[bot]') continue;
                 const match = String(comment.body || '').match(HEAD_EPOCH_MARKER_PATTERN);
-                if (match) refs.push([Number(match[1]), Number(match[2])]);
+                if (match) refs.push({
+                  runId: Number(match[1]), attempt: Number(match[2]),
+                  commentAt: new Date(comment.created_at || 0).getTime(),
+                  commentId: Number(comment.id || 0),
+                });
               }
+              refs.sort((a, b) => b.commentAt - a.commentAt || b.commentId - a.commentId);
               const markers = [];
               const accepted = new Set();
-              for (const [runId, attempt] of refs) {
-                if (!epochRunCache.has(runId)) {
-                  epochRunCache.set(runId,
-                    roPage(`/repos/${owner}/${repo}/actions/runs/${runId}`).then(({ data }) => data));
+              for (const { runId, attempt, commentAt } of refs) {
+                const key = `${runId}/${attempt}`;
+                if (accepted.has(key)) continue;
+                if (!epochRunCache.has(key)) {
+                  epochRunCache.set(key,
+                    roPage(`/repos/${owner}/${repo}/actions/runs/${runId}/attempts/${attempt}`).then(({ data }) => data));
                 }
                 try {
-                  const run = await epochRunCache.get(runId);
-                  const associatedPr = (run.pull_requests || [])
-                    .find((pull) => Number(pull.number) === Number(prNumber));
+                  const run = await epochRunCache.get(key);
+                  const belongsToPr = (run.pull_requests || [])
+                    .some((pull) => Number(pull.number) === Number(prNumber));
+                  const startedAt = new Date(run.run_started_at || run.created_at || 0).getTime();
+                  const finishedAt = new Date(run.updated_at || 0).getTime();
+                  const commentInsideRun = Number.isFinite(commentAt) &&
+                    commentAt >= startedAt - 5000 && commentAt <= finishedAt + 5000;
                   if (
                     run.path !== '.github/workflows/codex-gate.yml' ||
                     run.event !== 'pull_request_target' ||
-                    Number(run.run_attempt) !== attempt || !associatedPr
+                    Number(run.run_attempt) !== attempt || !belongsToPr || !commentInsideRun
                   ) continue;
-                  const key = `${runId}/${attempt}`;
-                  if (accepted.has(key)) continue;
                   accepted.add(key);
                   const observedAt = new Date(run.created_at || 0).getTime();
-                  const head = String(associatedPr.head?.sha || '').toLowerCase();
+                  const head = String(run.head_sha || '').toLowerCase();
                   if (/^[a-f0-9]{40}$/.test(head) && Number.isFinite(observedAt) && observedAt > 0) {
                     markers.push({ head, observedAt, id: Number(run.id || runId) });
+                    if (head !== exactHead) break;
                   }
                 } catch (e) {
                   core.info(`PR #${prNumber}: epoch run ${runId} verification failed: ${e.message}`);
                 }
               }
-              return markers.sort((a, b) => b.observedAt - a.observedAt || b.id - a.id);
+              return markers;
             }
 
             function currentHeadEpochFromTimeline(timeline, headSha) {
@@ -652,7 +663,7 @@ jobs:
 
             async function observedHeadTransition(prNumber, headSha, comments = []) {
               const [markers, runs] = await Promise.all([
-                trustedHeadMarkers(comments, prNumber),
+                trustedHeadMarkers(comments, prNumber, headSha),
                 allPrWorkflowRuns(),
               ]);
               const markerEpoch = currentHeadEpochFromTimeline(markers, headSha);

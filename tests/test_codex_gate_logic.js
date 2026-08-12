@@ -298,14 +298,15 @@ test('authoritative workflow keeps gate policy inline', () => {
   assert.match(workflow, /async function observedHeadTransition\(prNumber, headSha, comments = \[\]\)/);
   assert.match(workflow, /codex-head-epoch:v2/);
   assert.match(workflow, /async function ensureHeadEpochMarker\(prNumber, comments\)/);
-  assert.match(workflow, /github\.rest\.actions\.getWorkflowRun/);
+  assert.match(workflow, /actions\/runs\/\{run_id\}\/attempts\/\{attempt_number\}/);
   assert.match(workflow, /run\.path !== '\.github\/workflows\/codex-gate\.yml'/);
   assert.match(workflow, /run\.event !== 'pull_request_target'/);
-  assert.match(workflow, /Number\(run\.run_attempt\) !== attempt \|\| !associatedPr/);
-  assert.match(workflow, /const head = String\(associatedPr\.head\?\.sha \|\| ''\)/);
+  assert.match(workflow, /Number\(run\.run_attempt\) !== attempt \|\| !belongsToPr \|\| !commentInsideRun/);
+  assert.match(workflow, /const head = String\(run\.head_sha \|\| ''\)/);
   assert.match(workflow, /const refs = \[\]/);
   assert.match(workflow, /if \(accepted\.has\(key\)\) continue/);
   assert.doesNotMatch(workflow, /refs\.set\(/);
+  assert.match(workflow, /if \(head !== exactHead\) break/);
   assert.match(workflow, /issues: write/);
   assert.ok(
     workflow.indexOf('comments = await ensureHeadEpochMarker') <
@@ -359,6 +360,8 @@ test('watchdog rechecks changed red thread state from the trusted base ref', () 
   assert.match(watchdog, /const \[markers, runs\] = await Promise\.all/);
   assert.match(watchdog, /if \(accepted\.has\(key\)\) continue/);
   assert.doesNotMatch(watchdog, /refs\.set\(/);
+  assert.match(watchdog, /actions\/runs\/\$\{runId\}\/attempts\/\$\{attempt\}/);
+  assert.match(watchdog, /if \(head !== exactHead\) break/);
   assert.match(
     watchdog,
     /!overrideCandidate && !redThreadStateChanged/,
