@@ -586,7 +586,7 @@ jobs:
               return P1_PATTERN.test(semantic) || P2_PATTERN.test(semantic);
             };
             const REVIEWED_COMMIT_PATTERN = /(?:^|\n)\*\*Reviewed commit:\*\*\s*`([a-f0-9]{10,40})`(?:\s|$)/i;
-            const HEAD_EPOCH_MARKER_PATTERN = /<!--\s*codex-head-epoch:v1\s+head=([a-f0-9]{40})\s*-->/i;
+            const HEAD_EPOCH_MARKER_PATTERN = /<!--\s*codex-head-epoch:v1\s+head=([a-f0-9]{40})(?:\s+observed=([0-9TZ:.-]+))?\s*-->/i;
             const signalTargetsHead = (item, headSha, headObservedAt, dateField = 'created_at') => {
               const exactHead = String(headSha || '').toLowerCase();
               const originalCommit = String(item?.original_commit_id || '').toLowerCase();
@@ -604,12 +604,19 @@ jobs:
               const exactHead = String(headSha || '').toLowerCase();
               const markers = (comments || [])
                 .filter((comment) => (comment.user?.login || '') === 'github-actions[bot]')
-                .map((comment) => ({
-                  head: String(comment.body || '').match(HEAD_EPOCH_MARKER_PATTERN)?.[1]?.toLowerCase(),
-                  observedAt: new Date(comment.created_at || 0).getTime(),
-                }))
-                .filter((marker) => marker.head && Number.isFinite(marker.observedAt) && marker.observedAt > 0)
-                .sort((a, b) => b.observedAt - a.observedAt);
+                .map((comment) => {
+                  const match = String(comment.body || '').match(HEAD_EPOCH_MARKER_PATTERN);
+                  return {
+                    head: match?.[1]?.toLowerCase(),
+                    observedAt: new Date(match?.[2] || comment.created_at || 0).getTime(),
+                    recordedAt: new Date(comment.created_at || 0).getTime(),
+                    id: Number(comment.id || 0),
+                  };
+                })
+                .filter((marker) =>
+                  marker.head && Number.isFinite(marker.observedAt) && marker.observedAt > 0 &&
+                  Number.isFinite(marker.recordedAt) && marker.recordedAt > 0)
+                .sort((a, b) => b.recordedAt - a.recordedAt || b.id - a.id);
               if (!markers.length || markers[0].head !== exactHead) return null;
               const epoch = [];
               for (const marker of markers) {

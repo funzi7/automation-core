@@ -19,7 +19,7 @@ const TRUSTED_CODEX_LOGINS = new Set([
 const P1_PATTERN = /(?:P1-orange|(?:^|\n)[\s>*\-_#`]*(?:\*\*\s*P1\s*\*\*|\[P1\]|P1:))/i;
 const P2_PATTERN = /(?:P2-yellow|(?:^|\n)[\s>*\-_#`]*(?:\*\*\s*P2\s*\*\*|\[P2\]|P2:))/i;
 const REVIEWED_COMMIT_PATTERN = /(?:^|\n)\*\*Reviewed commit:\*\*\s*`([a-f0-9]{10,40})`(?:\s|$)/i;
-const HEAD_EPOCH_MARKER_PATTERN = /<!--\s*codex-head-epoch:v1\s+head=([a-f0-9]{40})\s*-->/i;
+const HEAD_EPOCH_MARKER_PATTERN = /<!--\s*codex-head-epoch:v1\s+head=([a-f0-9]{40})(?:\s+observed=([0-9TZ:.-]+))?\s*-->/i;
 
 function signalTargetsHead(item, headSha, headObservedAt = null, dateField = 'created_at') {
   const exactHead = String(headSha || '').toLowerCase();
@@ -60,12 +60,19 @@ function currentHeadEpochFromComments(comments = [], headSha) {
   const markers = comments
     .filter((comment) =>
       String(comment?.user?.login || comment?.author?.login || '') === 'github-actions[bot]')
-    .map((comment) => ({
-      head: String(comment?.body || '').match(HEAD_EPOCH_MARKER_PATTERN)?.[1]?.toLowerCase(),
-      observedAt: new Date(comment?.created_at || comment?.createdAt || 0).getTime(),
-    }))
-    .filter((marker) => marker.head && Number.isFinite(marker.observedAt) && marker.observedAt > 0)
-    .sort((a, b) => b.observedAt - a.observedAt);
+    .map((comment) => {
+      const match = String(comment?.body || '').match(HEAD_EPOCH_MARKER_PATTERN);
+      return {
+        head: match?.[1]?.toLowerCase(),
+        observedAt: new Date(match?.[2] || comment?.created_at || comment?.createdAt || 0).getTime(),
+        recordedAt: new Date(comment?.created_at || comment?.createdAt || 0).getTime(),
+        id: Number(comment?.id || 0),
+      };
+    })
+    .filter((marker) =>
+      marker.head && Number.isFinite(marker.observedAt) && marker.observedAt > 0 &&
+      Number.isFinite(marker.recordedAt) && marker.recordedAt > 0)
+    .sort((a, b) => b.recordedAt - a.recordedAt || b.id - a.id);
   if (!markers.length || markers[0].head !== exactHead) return null;
   const epoch = [];
   for (const marker of markers) {

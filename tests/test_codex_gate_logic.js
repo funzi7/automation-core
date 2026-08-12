@@ -135,17 +135,18 @@ test('A to B to A force-push starts a new current-head epoch', () => {
 test('trusted head markers preserve the current contiguous epoch beyond run-search caps', () => {
   const headA = 'a'.repeat(40);
   const headB = 'b'.repeat(40);
-  const marker = (head, createdAt, login = 'github-actions[bot]') => ({
+  const marker = (head, createdAt, observedAt, id, login = 'github-actions[bot]') => ({
+    id,
     user: { login },
-    body: `<!-- codex-head-epoch:v1 head=${head} -->`,
+    body: `<!-- codex-head-epoch:v1 head=${head} observed=${observedAt} -->`,
     created_at: createdAt,
   });
   const comments = [
-    marker(headA, '2026-08-11T10:00:00Z'),
-    marker(headA, '2026-08-11T11:00:00Z'),
-    marker(headB, '2026-08-11T12:00:00Z'),
-    marker(headA, '2026-08-11T13:00:00Z'),
-    marker(headA, '2026-08-11T14:00:00Z'),
+    marker(headA, '2026-08-11T10:05:00Z', '2026-08-11T10:00:00Z', 1),
+    marker(headA, '2026-08-11T11:05:00Z', '2026-08-11T11:00:00Z', 2),
+    marker(headB, '2026-08-11T12:05:00Z', '2026-08-11T12:00:00Z', 3),
+    marker(headA, '2026-08-11T14:05:00Z', '2026-08-11T13:00:00Z', 4),
+    marker(headA, '2026-08-11T14:05:00Z', '2026-08-11T14:00:00Z', 5),
   ];
   assert.equal(
     currentHeadEpochFromComments(comments, headA).toISOString(),
@@ -158,7 +159,7 @@ test('head epoch markers fail closed for untrusted authors', () => {
   const head = 'a'.repeat(40);
   assert.equal(currentHeadEpochFromComments([{
     user: { login: 'funzi7' },
-    body: `<!-- codex-head-epoch:v1 head=${head} -->`,
+    body: `<!-- codex-head-epoch:v1 head=${head} observed=2026-08-11T13:00:00Z -->`,
     created_at: '2026-08-11T13:00:00Z',
   }], head), null);
 });
@@ -311,6 +312,11 @@ test('authoritative workflow keeps gate policy inline', () => {
   assert.match(workflow, /context\.eventName === 'schedule'/);
   assert.match(workflow, /async function observedHeadTransition\(prNumber, headSha, comments = \[\]\)/);
   assert.match(workflow, /codex-head-epoch:v1/);
+  assert.match(workflow, /observed=\$\{observed\.toISOString\(\)\}/);
+  assert.match(workflow, /async function reconcileHeadEpochMarkers\(prNumber, headSha, eventHeadSha, comments\)/);
+  assert.match(workflow, /for \(const run of timeline\.filter\(\(item\) => item\.observedAt >= latest\.recordedAt\)\)/);
+  assert.match(workflow, /context\.payload\.pull_request\.head\?\.sha/);
+  assert.match(workflow, /await record\(exactHead, bootstrap \|\| new Date\(\)\)/);
   assert.match(workflow, /issues: write/);
   assert.match(workflow, /let prWorkflowRunsPromise = null/);
   assert.match(workflow, /const runs = await allPrWorkflowRuns\(\)/);

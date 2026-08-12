@@ -195,7 +195,7 @@ jobs:
             }
 
             const REVIEWED_COMMIT_PATTERN = /(?:^|\n)\*\*Reviewed commit:\*\*\s*`([a-f0-9]{10,40})`(?:\s|$)/i;
-            const HEAD_EPOCH_MARKER_PATTERN = /<!--\s*codex-head-epoch:v1\s+head=([a-f0-9]{40})\s*-->/i;
+            const HEAD_EPOCH_MARKER_PATTERN = /<!--\s*codex-head-epoch:v1\s+head=([a-f0-9]{40})(?:\s+observed=([0-9TZ:.-]+))?\s*-->/i;
             function signalTargetsHead(item, headSha, headObservedAt, dateField = 'created_at') {
               const exactHead = String(headSha || '').toLowerCase();
               if (!/^[a-f0-9]{40}$/.test(exactHead)) return false;
@@ -225,12 +225,19 @@ jobs:
             function trustedHeadMarkers(comments) {
               return (comments || [])
                 .filter((comment) => (comment.user?.login || '') === 'github-actions[bot]')
-                .map((comment) => ({
-                  head: String(comment.body || '').match(HEAD_EPOCH_MARKER_PATTERN)?.[1]?.toLowerCase(),
-                  observedAt: new Date(comment.created_at || 0).getTime(),
-                }))
-                .filter((marker) => marker.head && Number.isFinite(marker.observedAt) && marker.observedAt > 0)
-                .sort((a, b) => b.observedAt - a.observedAt);
+                .map((comment) => {
+                  const match = String(comment.body || '').match(HEAD_EPOCH_MARKER_PATTERN);
+                  return {
+                    head: match?.[1]?.toLowerCase(),
+                    observedAt: new Date(match?.[2] || comment.created_at || 0).getTime(),
+                    recordedAt: new Date(comment.created_at || 0).getTime(),
+                    id: Number(comment.id || 0),
+                  };
+                })
+                .filter((marker) =>
+                  marker.head && Number.isFinite(marker.observedAt) && marker.observedAt > 0 &&
+                  Number.isFinite(marker.recordedAt) && marker.recordedAt > 0)
+                .sort((a, b) => b.recordedAt - a.recordedAt || b.id - a.id);
             }
 
             function currentHeadEpochFromComments(comments, headSha) {
@@ -245,15 +252,85 @@ jobs:
               return epoch.length ? new Date(Math.min(...epoch)) : null;
             }
 
-            async function ensureHeadEpochMarker(prNumber, headSha, comments) {
-              const latest = trustedHeadMarkers(comments)[0];
-              if (latest?.head === String(headSha || '').toLowerCase()) return comments;
+            function prRunTimeline(runs, prNumber) {
+              return (runs || [])
+                .filter((run) =>
+                  (run.pull_requests || []).some((candidate) => candidate.number === prNumber))
+                .map((run) => ({
+                  head: String(run.head_sha || '').toLowerCase(),
+                  observedAt: new Date(run.created_at || 0).getTime(),
+                }))
+                .filter((run) => /^[a-f0-9]{40}$/.test(run.head) && Number.isFinite(run.observedAt) && run.observedAt > 0)
+                .sort((a, b) => a.observedAt - b.observedAt);
+            }
+
+            function currentHeadEpochFromRuns(runs, prNumber, headSha) {
+              const exactHead = String(headSha || '').toLowerCase();
+              const timeline = prRunTimeline(runs, prNumber).reverse();
+              if (!timeline.length || timeline[0].head !== exactHead) return null;
+              const epoch = [];
+              for (const run of timeline) {
+                if (run.head !== exactHead) break;
+                epoch.push(run.observedAt);
+              }
+              return epoch.length ? new Date(Math.min(...epoch)) : null;
+            }
+
+            async function recordHeadEpochMarker(prNumber, headSha, observedAt, comments) {
+              const observed = new Date(observedAt);
+              if (!/^[a-f0-9]{40}$/.test(headSha) || !Number.isFinite(observed.getTime())) return comments;
               const { data: marker } = await github.rest.issues.createComment({
                 owner, repo, issue_number: prNumber,
-                body: `<!-- codex-head-epoch:v1 head=${headSha} -->`,
+                body: `<!-- codex-head-epoch:v1 head=${headSha} observed=${observed.toISOString()} -->`,
               });
               core.info(`PR #${prNumber}: recorded trusted head epoch ${headSha.slice(0, 7)}`);
               return [...comments, marker];
+            }
+
+            async function reconcileHeadEpochMarkers(prNumber, headSha, eventHeadSha, comments) {
+              const exactHead = String(headSha || '').toLowerCase();
+              const eventHead = String(eventHeadSha || '').toLowerCase();
+              const runs = await allPrWorkflowRuns();
+              const timeline = prRunTimeline(runs, prNumber);
+              let updated = comments;
+              let latest = trustedHeadMarkers(updated)[0] || null;
+
+              const record = async (head, observedAt) => {
+                if (!/^[a-f0-9]{40}$/.test(head) || latest?.head === head) return;
+                updated = await recordHeadEpochMarker(prNumber, head, observedAt, updated);
+                latest = trustedHeadMarkers(updated)[0] || latest;
+              };
+
+              if (!latest) {
+                if (/^[a-f0-9]{40}$/.test(eventHead) && eventHead !== exactHead) {
+                  await record(eventHead, Date.now());
+                  await record(exactHead, Date.now());
+                  return updated;
+                }
+                const bootstrap = currentHeadEpochFromRuns(runs, prNumber, exactHead);
+                await record(exactHead, bootstrap || new Date());
+                return updated;
+              }
+
+              // Reconcile recent server-observed transitions before reusing a
+              // matching marker. This records fast A->B->A sequences even when
+              // the evaluator itself reads only the final live A.
+              for (const run of timeline.filter((item) => item.observedAt >= latest.recordedAt)) {
+                await record(run.head, run.observedAt);
+              }
+              // The immutable pull_request_target event payload preserves an
+              // intermediate head even if its queued evaluator later reads a
+              // newer live head.
+              await record(eventHead, Date.now());
+              if (latest?.head !== exactHead) {
+                const bootstrap = currentHeadEpochFromRuns(runs, prNumber, exactHead);
+                const bootstrapAt = bootstrap?.getTime() || 0;
+                const floor = bootstrapAt > (latest?.observedAt || 0)
+                  ? bootstrapAt
+                  : Date.now();
+                await record(exactHead, floor);
+              }
+              return updated;
             }
 
             async function observedHeadTransition(prNumber, headSha, comments = []) {
@@ -263,19 +340,7 @@ jobs:
               // existed. The marker path above is not subject to GitHub's
               // repository-wide workflow-run search cap.
               const runs = await allPrWorkflowRuns();
-              const timeline = runs
-                .filter((run) =>
-                  (run.pull_requests || []).some((candidate) => candidate.number === prNumber))
-                .sort((a, b) =>
-                  new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime());
-              if (!timeline.length || timeline[0].head_sha !== headSha) return null;
-              const currentEpoch = [];
-              for (const run of timeline) {
-                if (run.head_sha !== headSha) break;
-                const observedAt = new Date(run.created_at || 0).getTime();
-                if (Number.isFinite(observedAt) && observedAt > 0) currentEpoch.push(observedAt);
-              }
-              return currentEpoch.length ? new Date(Math.min(...currentEpoch)) : null;
+              return currentHeadEpochFromRuns(runs, prNumber, headSha);
             }
 
             function authorLogin(comment) {
@@ -431,7 +496,10 @@ jobs:
                   owner, repo, issue_number: prNumber, per_page: 100,
                 });
                 try {
-                  comments = await ensureHeadEpochMarker(prNumber, headSha, comments);
+                  const eventHeadSha = context.payload.pull_request?.number === prNumber
+                    ? context.payload.pull_request.head?.sha
+                    : null;
+                  comments = await reconcileHeadEpochMarkers(prNumber, headSha, eventHeadSha, comments);
                 } catch (e) {
                   core.warning(`PR #${prNumber}: trusted head marker publish failed; markerless signals stay fail-closed: ${e.message}`);
                 }
