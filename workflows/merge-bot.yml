@@ -209,6 +209,7 @@ jobs:
             }
 
             const REVIEWED_COMMIT_PATTERN = /(?:^|\n)\*\*Reviewed commit:\*\*\s*`([a-f0-9]{10,40})`(?:\s|$)/i;
+            const HEAD_EPOCH_MARKER_PATTERN = /<!--\s*codex-head-epoch:v1\s+head=([a-f0-9]{40})\s*-->/i;
             function signalTargetsHead(item, headSha, headObservedAt, dateField = 'created_at') {
               const exactHead = String(headSha || '').toLowerCase();
               if (!/^[a-f0-9]{40}$/.test(exactHead)) return false;
@@ -224,7 +225,28 @@ jobs:
                 observedAt > 0 && signalAt > observedAt;
             }
 
-            async function observedHeadTransition(prNumber, headSha) {
+            function currentHeadEpochFromComments(comments, headSha) {
+              const exactHead = String(headSha || '').toLowerCase();
+              const markers = (comments || [])
+                .filter((comment) => (comment.user?.login || '') === 'github-actions[bot]')
+                .map((comment) => ({
+                  head: String(comment.body || '').match(HEAD_EPOCH_MARKER_PATTERN)?.[1]?.toLowerCase(),
+                  observedAt: new Date(comment.created_at || 0).getTime(),
+                }))
+                .filter((marker) => marker.head && Number.isFinite(marker.observedAt) && marker.observedAt > 0)
+                .sort((a, b) => b.observedAt - a.observedAt);
+              if (!markers.length || markers[0].head !== exactHead) return null;
+              const epoch = [];
+              for (const marker of markers) {
+                if (marker.head !== exactHead) break;
+                epoch.push(marker.observedAt);
+              }
+              return epoch.length ? new Date(Math.min(...epoch)) : null;
+            }
+
+            async function observedHeadTransition(prNumber, headSha, comments = []) {
+              const markerEpoch = currentHeadEpochFromComments(comments, headSha);
+              if (markerEpoch) return markerEpoch;
               const runs = await allPrWorkflowRuns();
               const timeline = runs
                 .filter((run) =>
@@ -279,15 +301,15 @@ jobs:
             }
 
             async function hasCurrentHeadNonInlineFinding(prNumber, headSha) {
-              const [reviews, comments, headObservedAt] = await Promise.all([
+              const [reviews, comments] = await Promise.all([
                 github.paginate(github.rest.pulls.listReviews, {
                   owner, repo, pull_number: prNumber, per_page: 100,
                 }),
                 github.paginate(github.rest.issues.listComments, {
                   owner, repo, issue_number: prNumber, per_page: 100,
                 }),
-                observedHeadTransition(prNumber, headSha),
               ]);
+              const headObservedAt = await observedHeadTransition(prNumber, headSha, comments);
               return (
                 reviews.some((review) =>
                   TRUSTED_CODEX_LOGINS.has(review.user?.login || '') &&
@@ -303,7 +325,7 @@ jobs:
             }
 
             async function hasCurrentHeadCodexSignal(prNumber, headSha) {
-              const [reviews, comments, reviewComments, reactions, headObservedAt] = await Promise.all([
+              const [reviews, comments, reviewComments, reactions] = await Promise.all([
                 github.paginate(github.rest.pulls.listReviews, {
                   owner, repo, pull_number: prNumber, per_page: 100,
                 }),
@@ -316,8 +338,8 @@ jobs:
                 github.paginate(github.rest.reactions.listForIssue, {
                   owner, repo, issue_number: prNumber, per_page: 100,
                 }),
-                observedHeadTransition(prNumber, headSha),
               ]);
+              const headObservedAt = await observedHeadTransition(prNumber, headSha, comments);
               const trustedAfterHead = (item, dateField) =>
                 TRUSTED_CODEX_LOGINS.has(item.user?.login || '') &&
                 signalTargetsHead(item, headSha, headObservedAt, dateField);

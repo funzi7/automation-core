@@ -128,7 +128,7 @@ The Codex API backup is dormant by default and requires OpenAI quota plus `CODEX
 
 ### `codex-gate.yml`
 
-The gate blocks until Codex has reviewed the current head and no active P1/P2 remains. Review objects and Codex result comments bind to the exact SHA; unmarked signals must follow the start of the current contiguous Actions-observed head-SHA epoch, and Git commit dates are never treated as push times. Repointable inline `commit_id` values alone do not waive review. Trusted sync grace-green only applies to zero-signal trusted sync PRs after the server-observed grace window.
+The gate blocks until Codex has reviewed the current head and no active P1/P2 remains. Review objects and Codex result comments bind to the exact SHA; unmarked signals must follow the current contiguous head-SHA epoch recorded by an authenticated `github-actions[bot]` marker, and Git commit dates are never treated as push times. Markerless legacy PRs retain a fail-closed Actions-history bootstrap, but normal operation no longer depends on GitHub's capped repository-wide run search. Repointable inline `commit_id` values alone do not waive review. Trusted sync grace-green only applies to zero-signal trusted sync PRs after the server-observed grace window.
 
 ### `merge-bot.yml`
 

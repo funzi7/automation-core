@@ -19,6 +19,7 @@ const TRUSTED_CODEX_LOGINS = new Set([
 const P1_PATTERN = /(?:P1-orange|(?:^|\n)[\s>*\-_#`]*(?:\*\*\s*P1\s*\*\*|\[P1\]|P1:))/i;
 const P2_PATTERN = /(?:P2-yellow|(?:^|\n)[\s>*\-_#`]*(?:\*\*\s*P2\s*\*\*|\[P2\]|P2:))/i;
 const REVIEWED_COMMIT_PATTERN = /(?:^|\n)\*\*Reviewed commit:\*\*\s*`([a-f0-9]{10,40})`(?:\s|$)/i;
+const HEAD_EPOCH_MARKER_PATTERN = /<!--\s*codex-head-epoch:v1\s+head=([a-f0-9]{40})\s*-->/i;
 
 function signalTargetsHead(item, headSha, headObservedAt = null, dateField = 'created_at') {
   const exactHead = String(headSha || '').toLowerCase();
@@ -51,6 +52,27 @@ function currentHeadEpochStart(runs = [], prNumber, headSha) {
     if (Number.isFinite(observedAt) && observedAt > 0) currentEpoch.push(observedAt);
   }
   return currentEpoch.length ? new Date(Math.min(...currentEpoch)) : null;
+}
+
+function currentHeadEpochFromComments(comments = [], headSha) {
+  const exactHead = String(headSha || '').toLowerCase();
+  if (!/^[a-f0-9]{40}$/.test(exactHead)) return null;
+  const markers = comments
+    .filter((comment) =>
+      String(comment?.user?.login || comment?.author?.login || '') === 'github-actions[bot]')
+    .map((comment) => ({
+      head: String(comment?.body || '').match(HEAD_EPOCH_MARKER_PATTERN)?.[1]?.toLowerCase(),
+      observedAt: new Date(comment?.created_at || comment?.createdAt || 0).getTime(),
+    }))
+    .filter((marker) => marker.head && Number.isFinite(marker.observedAt) && marker.observedAt > 0)
+    .sort((a, b) => b.observedAt - a.observedAt);
+  if (!markers.length || markers[0].head !== exactHead) return null;
+  const epoch = [];
+  for (const marker of markers) {
+    if (marker.head !== exactHead) break;
+    epoch.push(marker.observedAt);
+  }
+  return epoch.length ? new Date(Math.min(...epoch)) : null;
 }
 
 function stripSummarySections(body) {
@@ -172,8 +194,10 @@ module.exports = {
   P1_PATTERN,
   P2_PATTERN,
   REVIEWED_COMMIT_PATTERN,
+  HEAD_EPOCH_MARKER_PATTERN,
   signalTargetsHead,
   currentHeadEpochStart,
+  currentHeadEpochFromComments,
   stripSummarySections,
   severity,
   findingFromThread,

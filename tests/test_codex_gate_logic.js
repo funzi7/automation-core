@@ -9,6 +9,7 @@ const {
   severity,
   signalTargetsHead,
   currentHeadEpochStart,
+  currentHeadEpochFromComments,
 } = require('../tools/codex_gate_logic');
 
 const CODEX = 'chatgpt-codex-connector';
@@ -129,6 +130,37 @@ test('A to B to A force-push starts a new current-head epoch', () => {
   ];
   assert.equal(currentHeadEpochStart(runs, 9, headA).toISOString(), '2026-08-11T20:00:00.000Z');
   assert.equal(currentHeadEpochStart(runs, 9, headB), null);
+});
+
+test('trusted head markers preserve the current contiguous epoch beyond run-search caps', () => {
+  const headA = 'a'.repeat(40);
+  const headB = 'b'.repeat(40);
+  const marker = (head, createdAt, login = 'github-actions[bot]') => ({
+    user: { login },
+    body: `<!-- codex-head-epoch:v1 head=${head} -->`,
+    created_at: createdAt,
+  });
+  const comments = [
+    marker(headA, '2026-08-11T10:00:00Z'),
+    marker(headA, '2026-08-11T11:00:00Z'),
+    marker(headB, '2026-08-11T12:00:00Z'),
+    marker(headA, '2026-08-11T13:00:00Z'),
+    marker(headA, '2026-08-11T14:00:00Z'),
+  ];
+  assert.equal(
+    currentHeadEpochFromComments(comments, headA).toISOString(),
+    '2026-08-11T13:00:00.000Z',
+  );
+  assert.equal(currentHeadEpochFromComments(comments, headB), null);
+});
+
+test('head epoch markers fail closed for untrusted authors', () => {
+  const head = 'a'.repeat(40);
+  assert.equal(currentHeadEpochFromComments([{
+    user: { login: 'funzi7' },
+    body: `<!-- codex-head-epoch:v1 head=${head} -->`,
+    created_at: '2026-08-11T13:00:00Z',
+  }], head), null);
 });
 
 test('resolved thread clears with a current-head signal', () => {
@@ -277,7 +309,9 @@ test('authoritative workflow keeps gate policy inline', () => {
   assert.match(workflow, /group: codex-gate-\$\{\{ github\.repository \}\}/);
   assert.match(workflow, /cron: '7,22,37,52 \* \* \* \*'/);
   assert.match(workflow, /context\.eventName === 'schedule'/);
-  assert.match(workflow, /async function observedHeadTransition\(prNumber, headSha\)/);
+  assert.match(workflow, /async function observedHeadTransition\(prNumber, headSha, comments = \[\]\)/);
+  assert.match(workflow, /codex-head-epoch:v1/);
+  assert.match(workflow, /issues: write/);
   assert.match(workflow, /let prWorkflowRunsPromise = null/);
   assert.match(workflow, /const runs = await allPrWorkflowRuns\(\)/);
   assert.match(workflow, /function signalTargetsHead\(item, headSha, headObservedAt/);

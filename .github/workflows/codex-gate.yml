@@ -8,7 +8,7 @@ name: Codex Gate
 # and Codex supplies a current-head signal with no active replacement finding,
 # or the explicit `codex-p1-acknowledged` administrator label is present.
 # Current-head review freshness is bound to the review's exact commit marker or
-# to a signal after an Actions-observed head transition; Git commit timestamps
+# to a signal after a trusted bot-recorded head transition; Git commit timestamps
 # are never used. Thread state comes from GitHub GraphQL.
 # The authoritative decision implementation stays inline in this trusted
 # default-branch workflow. PR-controlled workflow, checkout and require paths
@@ -62,9 +62,11 @@ concurrency:
 permissions:
   contents: read
   pull-requests: read
-  issues: read
-  # Current-head freshness uses the start of the current contiguous
-  # pull_request-run SHA epoch as the server-observed transition floor.
+  # The trusted default-branch evaluator records each new PR-head epoch in an
+  # authenticated github-actions[bot] marker comment.
+  issues: write
+  # Markerless legacy PRs bootstrap from the current contiguous pull_request-run
+  # SHA epoch as a server-observed transition floor.
   actions: read
   # fix #11: publish the explicit `check-codex-status` check-run with output text.
   checks: write
@@ -193,6 +195,7 @@ jobs:
             }
 
             const REVIEWED_COMMIT_PATTERN = /(?:^|\n)\*\*Reviewed commit:\*\*\s*`([a-f0-9]{10,40})`(?:\s|$)/i;
+            const HEAD_EPOCH_MARKER_PATTERN = /<!--\s*codex-head-epoch:v1\s+head=([a-f0-9]{40})\s*-->/i;
             function signalTargetsHead(item, headSha, headObservedAt, dateField = 'created_at') {
               const exactHead = String(headSha || '').toLowerCase();
               if (!/^[a-f0-9]{40}$/.test(exactHead)) return false;
@@ -219,7 +222,46 @@ jobs:
               return prWorkflowRunsPromise;
             }
 
-            async function observedHeadTransition(prNumber, headSha) {
+            function trustedHeadMarkers(comments) {
+              return (comments || [])
+                .filter((comment) => (comment.user?.login || '') === 'github-actions[bot]')
+                .map((comment) => ({
+                  head: String(comment.body || '').match(HEAD_EPOCH_MARKER_PATTERN)?.[1]?.toLowerCase(),
+                  observedAt: new Date(comment.created_at || 0).getTime(),
+                }))
+                .filter((marker) => marker.head && Number.isFinite(marker.observedAt) && marker.observedAt > 0)
+                .sort((a, b) => b.observedAt - a.observedAt);
+            }
+
+            function currentHeadEpochFromComments(comments, headSha) {
+              const exactHead = String(headSha || '').toLowerCase();
+              const markers = trustedHeadMarkers(comments);
+              if (!markers.length || markers[0].head !== exactHead) return null;
+              const epoch = [];
+              for (const marker of markers) {
+                if (marker.head !== exactHead) break;
+                epoch.push(marker.observedAt);
+              }
+              return epoch.length ? new Date(Math.min(...epoch)) : null;
+            }
+
+            async function ensureHeadEpochMarker(prNumber, headSha, comments) {
+              const latest = trustedHeadMarkers(comments)[0];
+              if (latest?.head === String(headSha || '').toLowerCase()) return comments;
+              const { data: marker } = await github.rest.issues.createComment({
+                owner, repo, issue_number: prNumber,
+                body: `<!-- codex-head-epoch:v1 head=${headSha} -->`,
+              });
+              core.info(`PR #${prNumber}: recorded trusted head epoch ${headSha.slice(0, 7)}`);
+              return [...comments, marker];
+            }
+
+            async function observedHeadTransition(prNumber, headSha, comments = []) {
+              const markerEpoch = currentHeadEpochFromComments(comments, headSha);
+              if (markerEpoch) return markerEpoch;
+              // Bootstrap fallback for PRs opened before trusted head markers
+              // existed. The marker path above is not subject to GitHub's
+              // repository-wide workflow-run search cap.
               const runs = await allPrWorkflowRuns();
               const timeline = runs
                 .filter((run) =>
@@ -385,9 +427,14 @@ jobs:
                 const reviews = await github.paginate(github.rest.pulls.listReviews, {
                   owner, repo, pull_number: prNumber, per_page: 100,
                 });
-                const comments = await github.paginate(github.rest.issues.listComments, {
+                let comments = await github.paginate(github.rest.issues.listComments, {
                   owner, repo, issue_number: prNumber, per_page: 100,
                 });
+                try {
+                  comments = await ensureHeadEpochMarker(prNumber, headSha, comments);
+                } catch (e) {
+                  core.warning(`PR #${prNumber}: trusted head marker publish failed; markerless signals stay fail-closed: ${e.message}`);
+                }
                 const reviewComments = await github.paginate(github.rest.pulls.listReviewComments, {
                   owner, repo, pull_number: prNumber, per_page: 100,
                 });
@@ -401,7 +448,7 @@ jobs:
                 });
                 let headObservedAt = null;
                 try {
-                  headObservedAt = await observedHeadTransition(prNumber, headSha);
+                  headObservedAt = await observedHeadTransition(prNumber, headSha, comments);
                 } catch (e) {
                   core.warning(`PR #${prNumber}: exact-head transition lookup failed; unmarked review signals and sync grace stay pending: ${e.message}`);
                 }
