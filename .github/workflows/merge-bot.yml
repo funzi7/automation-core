@@ -140,8 +140,16 @@ jobs:
             }
             const roCheckRuns = (ref) => roPaged(`/repos/${owner}/${repo}/commits/${encodeURIComponent(ref)}/check-runs?per_page=100`, (d) => d.check_runs || []);
             const roStatuses = (ref) => roPaged(`/repos/${owner}/${repo}/commits/${encodeURIComponent(ref)}/statuses?per_page=100`, (d) => d);
-            const roWorkflowRuns = (ref) => roPaged(`/repos/${owner}/${repo}/actions/runs?head_sha=${encodeURIComponent(ref)}&event=pull_request&per_page=100`, (d) => d.workflow_runs || []);
+            const roWorkflowRuns = () => roPaged(`/repos/${owner}/${repo}/actions/runs?event=pull_request&per_page=100`, (d) => d.workflow_runs || []);
+            let prWorkflowRunsPromise = null;
+            const allPrWorkflowRuns = () => {
+              if (!prWorkflowRunsPromise) prWorkflowRunsPromise = roWorkflowRuns();
+              return prWorkflowRunsPromise;
+            };
             const CODEX_CHECK = 'check-codex-status';
+            // The evaluator job is intentionally diagnostic and commonly fails
+            // before review. Its explicit exact-head check below is authoritative.
+            const NON_BLOCKING_DIAGNOSTIC_CHECKS = new Set(['codex-gate-evaluator']);
             const LABEL_AUTOMERGE = 'automerge';
             const LABEL_ESCALATE = 'needs-owner';
             const LABEL_ESCALATE_AUTO = 'needs-owner-auto';
@@ -204,6 +212,7 @@ jobs:
             }
 
             const REVIEWED_COMMIT_PATTERN = /(?:^|\n)\*\*Reviewed commit:\*\*\s*`([a-f0-9]{10,40})`(?:\s|$)/i;
+            const HEAD_EPOCH_MARKER_PATTERN = /<!--\s*codex-head-epoch:v2\s+run=(\d+)\s+attempt=(\d+)\s*-->/i;
             function signalTargetsHead(item, headSha, headObservedAt, dateField = 'created_at') {
               const exactHead = String(headSha || '').toLowerCase();
               if (!/^[a-f0-9]{40}$/.test(exactHead)) return false;
@@ -219,16 +228,106 @@ jobs:
                 observedAt > 0 && signalAt > observedAt;
             }
 
-            async function observedHeadTransition(prNumber, headSha) {
-              const runs = await roWorkflowRuns(headSha);
-              const observed = runs
-                .filter((run) => (
-                  run.head_sha === headSha &&
-                  (run.pull_requests || []).some((candidate) => candidate.number === prNumber)
-                ))
-                .map((run) => new Date(run.created_at || 0).getTime())
-                .filter((value) => Number.isFinite(value) && value > 0);
-              return observed.length ? new Date(Math.min(...observed)) : null;
+            const epochRunCache = new Map();
+            async function trustedHeadMarkers(comments, prNumber, headSha) {
+              const exactHead = String(headSha || '').toLowerCase();
+              const refs = [];
+              for (const comment of comments || []) {
+                if ((comment.user?.login || '') !== 'github-actions[bot]') continue;
+                const match = String(comment.body || '').match(HEAD_EPOCH_MARKER_PATTERN);
+                if (match) refs.push({
+                  runId: Number(match[1]), attempt: Number(match[2]),
+                  commentAt: new Date(comment.created_at || 0).getTime(),
+                  commentId: Number(comment.id || 0),
+                });
+              }
+              refs.sort((a, b) => b.commentAt - a.commentAt || b.commentId - a.commentId);
+              const markers = [];
+              const accepted = new Set();
+              for (const { runId, attempt, commentAt } of refs) {
+                const key = `${runId}/${attempt}`;
+                if (accepted.has(key)) continue;
+                if (!epochRunCache.has(key)) {
+                  epochRunCache.set(key,
+                    roPage(`https://api.github.com/repos/${owner}/${repo}/actions/runs/${runId}/attempts/${attempt}`).then(({ data }) => data));
+                }
+                try {
+                  const run = await epochRunCache.get(key);
+                  const belongsToPr = (run.pull_requests || [])
+                    .some((pull) => Number(pull.number) === Number(prNumber));
+                  const startedAt = new Date(run.run_started_at || run.created_at || 0).getTime();
+                  const finishedAt = new Date(run.updated_at || 0).getTime();
+                  const commentInsideRun = Number.isFinite(commentAt) &&
+                    commentAt >= startedAt - 5000 && commentAt <= finishedAt + 5000;
+                  if (
+                    run.path !== '.github/workflows/codex-gate.yml' ||
+                    run.event !== 'pull_request_target' ||
+                    Number(run.run_attempt) !== attempt || !belongsToPr || !commentInsideRun
+                  ) continue;
+                  accepted.add(key);
+                  const observedAt = new Date(run.created_at || 0).getTime();
+                  const head = String(run.head_sha || '').toLowerCase();
+                  if (/^[a-f0-9]{40}$/.test(head) && Number.isFinite(observedAt) && observedAt > 0) {
+                    markers.push({ head, observedAt, id: Number(run.id || runId) });
+                    if (head !== exactHead) break;
+                  }
+                } catch (e) {
+                  core.warning(`#${prNumber}: epoch run ${runId} verification failed: ${e.message}`);
+                }
+              }
+              return markers;
+            }
+
+            function currentHeadEpochFromTimeline(timeline, headSha) {
+              return currentHeadEpochEvidenceFromTimeline(timeline, headSha).epoch;
+            }
+
+            function currentHeadEpochEvidenceFromTimeline(timeline, headSha) {
+              const exactHead = String(headSha || '').toLowerCase();
+              if (!timeline.length || timeline[0].head !== exactHead) {
+                return { epoch: null, hasBoundary: false };
+              }
+              const epoch = [];
+              for (const item of timeline) {
+                if (item.head !== exactHead) {
+                  return {
+                    epoch: epoch.length ? new Date(Math.min(...epoch)) : null,
+                    hasBoundary: true,
+                  };
+                }
+                epoch.push(item.observedAt);
+              }
+              return {
+                epoch: epoch.length ? new Date(Math.min(...epoch)) : null,
+                hasBoundary: false,
+              };
+            }
+
+            async function observedHeadTransition(prNumber, headSha, comments = []) {
+              const [markers, runs] = await Promise.all([
+                trustedHeadMarkers(comments, prNumber, headSha),
+                allPrWorkflowRuns(),
+              ]);
+              const markerEpoch = currentHeadEpochFromTimeline(markers, headSha);
+              const timeline = runs
+                .filter((run) =>
+                  (run.pull_requests || []).some((candidate) => candidate.number === prNumber))
+                .map((run) => ({
+                  head: String(run.head_sha || '').toLowerCase(),
+                  observedAt: new Date(run.created_at || 0).getTime(),
+                }))
+                .filter((run) => /^[a-f0-9]{40}$/.test(run.head) && Number.isFinite(run.observedAt) && run.observedAt > 0)
+                .sort((a, b) =>
+                  b.observedAt - a.observedAt);
+              const runEvidence = currentHeadEpochEvidenceFromTimeline(timeline, headSha);
+              const runEpoch = runEvidence.epoch;
+              // Authenticated markers retain the complete contiguous epoch. The
+              // bounded run list may advance it only when it proves an
+              // intervening different head that a failed marker write missed.
+              if (markerEpoch && runEpoch && runEvidence.hasBoundary) {
+                return new Date(Math.max(markerEpoch.getTime(), runEpoch.getTime()));
+              }
+              return markerEpoch || runEpoch;
             }
 
             async function hasActiveTrustedFinding(prNumber) {
@@ -269,15 +368,15 @@ jobs:
             }
 
             async function hasCurrentHeadNonInlineFinding(prNumber, headSha) {
-              const [reviews, comments, headObservedAt] = await Promise.all([
+              const [reviews, comments] = await Promise.all([
                 github.paginate(github.rest.pulls.listReviews, {
                   owner, repo, pull_number: prNumber, per_page: 100,
                 }),
                 github.paginate(github.rest.issues.listComments, {
                   owner, repo, issue_number: prNumber, per_page: 100,
                 }),
-                observedHeadTransition(prNumber, headSha),
               ]);
+              const headObservedAt = await observedHeadTransition(prNumber, headSha, comments);
               return (
                 reviews.some((review) =>
                   TRUSTED_CODEX_LOGINS.has(review.user?.login || '') &&
@@ -293,7 +392,7 @@ jobs:
             }
 
             async function hasCurrentHeadCodexSignal(prNumber, headSha) {
-              const [reviews, comments, reviewComments, reactions, headObservedAt] = await Promise.all([
+              const [reviews, comments, reviewComments, reactions] = await Promise.all([
                 github.paginate(github.rest.pulls.listReviews, {
                   owner, repo, pull_number: prNumber, per_page: 100,
                 }),
@@ -306,8 +405,8 @@ jobs:
                 github.paginate(github.rest.reactions.listForIssue, {
                   owner, repo, issue_number: prNumber, per_page: 100,
                 }),
-                observedHeadTransition(prNumber, headSha),
               ]);
+              const headObservedAt = await observedHeadTransition(prNumber, headSha, comments);
               const trustedAfterHead = (item, dateField) =>
                 TRUSTED_CODEX_LOGINS.has(item.user?.login || '') &&
                 signalTargetsHead(item, headSha, headObservedAt, dateField);
@@ -628,6 +727,7 @@ jobs:
               const recency = (c) => new Date(c.completed_at || c.started_at || 0).getTime();
               const seenNames = new Set();
               const latestCheckRuns = [...checkRuns]
+                .filter((c) => !NON_BLOCKING_DIAGNOSTIC_CHECKS.has(c.name))
                 .sort((a, b) => recency(b) - recency(a))
                 .filter((c) => (seenNames.has(c.name) ? false : (seenNames.add(c.name), true)));
 

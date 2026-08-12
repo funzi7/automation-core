@@ -83,6 +83,15 @@ test('one failed current check blocks merge', () => {
   assert.equal(result.reason, 'failed_check');
 });
 
+test('diagnostic evaluator failure is ignored but authoritative gate remains mandatory', () => {
+  assert.equal(decide({
+    checkRuns: [...greenChecks(), check('codex-gate-evaluator', 'failure', 'completed', 3)],
+  }).eligible, true);
+  assert.equal(decide({
+    checkRuns: [check('ci'), check('codex-gate-evaluator', 'success', 'completed', 3)],
+  }).reason, 'missing_or_red_codex_gate');
+});
+
 test('latest run per check name wins over stale failure', () => {
   const result = decide({
     checkRuns: [
@@ -330,7 +339,23 @@ test('workflow preserves exact-SHA squash merge and same-repo branch deletion', 
   assert.match(workflow, /!commitShas\.has\(head\[1\]\)/);
   assert.match(workflow, /marker\.head === currentHead/);
   assert.match(workflow, /async function hasCurrentHeadCodexSignal\(prNumber, headSha\)/);
-  assert.match(workflow, /async function observedHeadTransition\(prNumber, headSha\)/);
+  assert.match(workflow, /async function observedHeadTransition\(prNumber, headSha, comments = \[\]\)/);
+  assert.match(workflow, /codex-head-epoch:v2/);
+  assert.match(workflow, /run\.path !== '\.github\/workflows\/codex-gate\.yml'/);
+  assert.match(workflow, /run\.event !== 'pull_request_target'/);
+  assert.match(workflow, /Number\(run\.run_attempt\) !== attempt \|\| !belongsToPr \|\| !commentInsideRun/);
+  assert.match(workflow, /const head = String\(run\.head_sha \|\| ''\)/);
+  assert.match(workflow, /const refs = \[\]/);
+  assert.match(workflow, /if \(accepted\.has\(key\)\) continue/);
+  assert.doesNotMatch(workflow, /refs\.set\(/);
+  assert.match(workflow, /roPage\(`https:\/\/api\.github\.com\/repos\/\$\{owner\}\/\$\{repo\}\/actions\/runs\/\$\{runId\}\/attempts\/\$\{attempt\}`\)/);
+  assert.match(workflow, /if \(head !== exactHead\) break/);
+  assert.match(workflow, /NON_BLOCKING_DIAGNOSTIC_CHECKS = new Set\(\['codex-gate-evaluator'\]\)/);
+  assert.match(workflow, /\.filter\(\(c\) => !NON_BLOCKING_DIAGNOSTIC_CHECKS\.has\(c\.name\)\)/);
+  assert.match(workflow, /let prWorkflowRunsPromise = null/);
+  assert.match(workflow, /const \[markers, runs\] = await Promise\.all/);
+  assert.match(workflow, /return markerEpoch \|\| runEpoch/);
+  assert.match(workflow, /runEvidence\.hasBoundary/);
   assert.match(workflow, /function signalTargetsHead\(item, headSha, headObservedAt/);
   assert.doesNotMatch(workflow, /latestCommitDate/);
   assert.match(workflow, /override absent and current-head Codex signal missing/);

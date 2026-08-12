@@ -128,7 +128,7 @@ The Codex API backup is dormant by default and requires OpenAI quota plus `CODEX
 
 ### `codex-gate.yml`
 
-The gate blocks until Codex has reviewed the current head and no active P1/P2 remains. Review objects and Codex result comments bind to the exact SHA; unmarked signals must follow an Actions-observed head transition, and Git commit dates are never treated as push times. Repointable inline `commit_id` values alone do not waive review. Trusted sync grace-green only applies to zero-signal trusted sync PRs after the server-observed grace window.
+The gate blocks until Codex has reviewed the current head and no active P1/P2 remains. Review objects and Codex result comments bind directly to the exact SHA; unmarked signals must follow the server-observed current contiguous head-SHA epoch, and Git commit dates are never treated as push times. Epoch comments contain only a run ID/attempt index. Gate, watchdog, and merge bot fetch that exact attempt, require the repository's `pull_request_target` Codex Gate path plus same-PR association, require the comment timestamp to fall inside the attempt, and derive SHA/time from the immutable attempt fields rather than comment text or the mutable live PR association. Valid markers are scanned newest-first only to the first different-head boundary, then conservatively combined with recent PR-run history. This prevents shared-actor forgery and duplicate poisoning, preserves A→B→A, survives the repository-wide search cap, and keeps recheck cost bounded. Repointable inline `commit_id` values alone do not waive review. Trusted sync grace-green only applies to zero-signal trusted sync PRs after the server-observed grace window.
 
 ### `merge-bot.yml`
 
@@ -143,6 +143,11 @@ mergeability, and a SHA-pinned squash merge. `no-automerge` and manual/unknown
 may remove both and continue to merge in the same pass. Protected paths remain
 fail-closed for forks/untrusted/ambiguous PRs but no longer force an additional
 manual merge for a fully reviewed same-repo owner PR.
+
+The native `codex-gate-evaluator` job is diagnostic and can retain its expected
+pre-review failure on the PR head. Merge Bot ignores only that diagnostic
+check name; the explicit exact-head `check-codex-status` must exist and
+succeed, and every other latest failed/running check or status still blocks.
 
 The 2026-08-11 source reconciliation ported paywall-bot's reviewed Codex Gate
 and watchdog safety fixes upstream before changing merge policy. The stale

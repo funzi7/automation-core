@@ -19,6 +19,7 @@ const TRUSTED_CODEX_LOGINS = new Set([
 const P1_PATTERN = /(?:P1-orange|(?:^|\n)[\s>*\-_#`]*(?:\*\*\s*P1\s*\*\*|\[P1\]|P1:))/i;
 const P2_PATTERN = /(?:P2-yellow|(?:^|\n)[\s>*\-_#`]*(?:\*\*\s*P2\s*\*\*|\[P2\]|P2:))/i;
 const REVIEWED_COMMIT_PATTERN = /(?:^|\n)\*\*Reviewed commit:\*\*\s*`([a-f0-9]{10,40})`(?:\s|$)/i;
+const HEAD_EPOCH_MARKER_PATTERN = /<!--\s*codex-head-epoch:v2\s+run=(\d+)\s+attempt=(\d+)\s*-->/i;
 
 function signalTargetsHead(item, headSha, headObservedAt = null, dateField = 'created_at') {
   const exactHead = String(headSha || '').toLowerCase();
@@ -35,13 +36,54 @@ function signalTargetsHead(item, headSha, headObservedAt = null, dateField = 'cr
     observedAt > 0 && signalAt > observedAt;
 }
 
-function firstHeadObservation(runs = [], prNumber, headSha) {
-  const observed = runs
-    .filter((run) => String(run?.head_sha || '') === headSha &&
+function currentHeadEpochStart(runs = [], prNumber, headSha) {
+  const timeline = runs
+    .filter((run) =>
       (run?.pull_requests || []).some((candidate) => candidate.number === prNumber))
-    .map((run) => new Date(run?.created_at || 0).getTime())
-    .filter((value) => Number.isFinite(value) && value > 0);
-  return observed.length ? new Date(Math.min(...observed)) : null;
+    .sort((a, b) =>
+      new Date(b?.created_at || 0).getTime() - new Date(a?.created_at || 0).getTime());
+  // If Actions has not observed the live head yet, do not reuse an older
+  // historical epoch for the same SHA.
+  if (!timeline.length || String(timeline[0]?.head_sha || '') !== headSha) return null;
+  const currentEpoch = [];
+  for (const run of timeline) {
+    if (String(run?.head_sha || '') !== headSha) break;
+    const observedAt = new Date(run?.created_at || 0).getTime();
+    if (Number.isFinite(observedAt) && observedAt > 0) currentEpoch.push(observedAt);
+  }
+  return currentEpoch.length ? new Date(Math.min(...currentEpoch)) : null;
+}
+
+function currentHeadEpochFromVerifiedRuns(markers = [], headSha) {
+  const exactHead = String(headSha || '').toLowerCase();
+  if (!/^[a-f0-9]{40}$/.test(exactHead)) return null;
+  const timeline = markers
+    .map((marker) => ({
+      head: String(marker?.head || '').toLowerCase(),
+      observedAt: new Date(marker?.observedAt || 0).getTime(),
+      id: Number(marker?.id || 0),
+    }))
+    .filter((marker) =>
+      /^[a-f0-9]{40}$/.test(marker.head) &&
+      Number.isFinite(marker.observedAt) && marker.observedAt > 0)
+    .sort((a, b) => b.observedAt - a.observedAt || b.id - a.id);
+  if (!timeline.length || timeline[0].head !== exactHead) return null;
+  const epoch = [];
+  for (const marker of timeline) {
+    if (marker.head !== exactHead) break;
+    epoch.push(marker.observedAt);
+  }
+  return epoch.length ? new Date(Math.min(...epoch)) : null;
+}
+
+function selectHeadEpoch(markerEpoch, runEpoch, runHasBoundary = false) {
+  // Verified markers are the unbounded source. A repository run page can be
+  // truncated inside an unchanged-head epoch. It may advance the marker epoch
+  // only when it proves an intervening different head.
+  if (markerEpoch && runEpoch && runHasBoundary) {
+    return new Date(Math.max(markerEpoch.getTime(), runEpoch.getTime()));
+  }
+  return markerEpoch || runEpoch || null;
 }
 
 function stripSummarySections(body) {
@@ -163,8 +205,11 @@ module.exports = {
   P1_PATTERN,
   P2_PATTERN,
   REVIEWED_COMMIT_PATTERN,
+  HEAD_EPOCH_MARKER_PATTERN,
   signalTargetsHead,
-  firstHeadObservation,
+  currentHeadEpochStart,
+  currentHeadEpochFromVerifiedRuns,
+  selectHeadEpoch,
   stripSummarySections,
   severity,
   findingFromThread,
