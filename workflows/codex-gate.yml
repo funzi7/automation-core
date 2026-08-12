@@ -287,9 +287,10 @@ jobs:
               return [...comments, marker];
             }
 
-            async function reconcileHeadEpochMarkers(prNumber, headSha, eventHeadSha, comments) {
+            async function reconcileHeadEpochMarkers(prNumber, headSha, eventHeadSha, eventObservedAt, comments) {
               const exactHead = String(headSha || '').toLowerCase();
               const eventHead = String(eventHeadSha || '').toLowerCase();
+              const eventAt = new Date(eventObservedAt || 0).getTime();
               const runs = await allPrWorkflowRuns();
               const timeline = prRunTimeline(runs, prNumber);
               let updated = comments;
@@ -302,12 +303,15 @@ jobs:
               };
 
               if (!latest) {
-                if (/^[a-f0-9]{40}$/.test(eventHead) && eventHead !== exactHead) {
-                  await record(eventHead, Date.now());
+                const bootstrap = currentHeadEpochFromRuns(runs, prNumber, exactHead);
+                if (
+                  /^[a-f0-9]{40}$/.test(eventHead) && eventHead !== exactHead &&
+                  Number.isFinite(eventAt) && eventAt > (bootstrap?.getTime() || 0)
+                ) {
+                  await record(eventHead, eventAt);
                   await record(exactHead, Date.now());
                   return updated;
                 }
-                const bootstrap = currentHeadEpochFromRuns(runs, prNumber, exactHead);
                 await record(exactHead, bootstrap || new Date());
                 return updated;
               }
@@ -321,7 +325,9 @@ jobs:
               // The immutable pull_request_target event payload preserves an
               // intermediate head even if its queued evaluator later reads a
               // newer live head.
-              await record(eventHead, Date.now());
+              if (Number.isFinite(eventAt) && eventAt > (latest?.recordedAt || 0)) {
+                await record(eventHead, eventAt);
+              }
               if (latest?.head !== exactHead) {
                 const bootstrap = currentHeadEpochFromRuns(runs, prNumber, exactHead);
                 const bootstrapAt = bootstrap?.getTime() || 0;
@@ -491,7 +497,16 @@ jobs:
                   const eventHeadSha = context.payload.pull_request?.number === prNumber
                     ? context.payload.pull_request.head?.sha
                     : null;
-                  comments = await reconcileHeadEpochMarkers(prNumber, headSha, eventHeadSha, comments);
+                  let eventObservedAt = null;
+                  if (eventHeadSha) {
+                    const { data: eventRun } = await github.rest.actions.getWorkflowRun({
+                      owner, repo, run_id: context.runId,
+                    });
+                    eventObservedAt = eventRun.created_at;
+                  }
+                  comments = await reconcileHeadEpochMarkers(
+                    prNumber, headSha, eventHeadSha, eventObservedAt, comments,
+                  );
                 } catch (e) {
                   core.warning(`PR #${prNumber}: trusted head marker publish failed; markerless signals stay fail-closed: ${e.message}`);
                 }

@@ -313,9 +313,11 @@ test('authoritative workflow keeps gate policy inline', () => {
   assert.match(workflow, /async function observedHeadTransition\(prNumber, headSha, comments = \[\]\)/);
   assert.match(workflow, /codex-head-epoch:v1/);
   assert.match(workflow, /observed=\$\{observed\.toISOString\(\)\}/);
-  assert.match(workflow, /async function reconcileHeadEpochMarkers\(prNumber, headSha, eventHeadSha, comments\)/);
+  assert.match(workflow, /async function reconcileHeadEpochMarkers\(prNumber, headSha, eventHeadSha, eventObservedAt, comments\)/);
   assert.match(workflow, /for \(const run of timeline\.filter\(\(item\) => item\.observedAt >= latest\.recordedAt\)\)/);
   assert.match(workflow, /context\.payload\.pull_request\.head\?\.sha/);
+  assert.match(workflow, /github\.rest\.actions\.getWorkflowRun/);
+  assert.match(workflow, /eventAt > \(latest\?\.recordedAt \|\| 0\)/);
   assert.match(workflow, /await record\(exactHead, bootstrap \|\| new Date\(\)\)/);
   assert.match(workflow, /issues: write/);
   assert.ok(
