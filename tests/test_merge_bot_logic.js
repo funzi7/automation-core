@@ -350,7 +350,6 @@ test('protected-path fork or untrusted PR remains escalated', () => {
 test('trusted same-repo automation-core sync behavior remains eligible', () => {
   const sync = pr({
     title: 'chore(automation): sync from automation-core',
-    user: { login: 'github-actions[bot]' },
     head: { ref: 'chore/sync-automation-core' },
   });
   assert.equal(decide({ pr: sync }).eligible, true);
@@ -503,6 +502,8 @@ test('Claude PR provenance records on failure while automerge remains success-on
     workflow.indexOf('Run Claude Code (Issue/new-PR path)'),
     workflow.indexOf('Run Claude Code (existing PR head path)'),
   );
+  assert.match(issuePath, /github_token: \$\{\{ github\.token \}\}/);
+  assert.doesNotMatch(issuePath, /secrets\.AUTOMATION_PAT/);
   assert.doesNotMatch(issuePath, /Bash\(git:\*\)/);
   assert.doesNotMatch(issuePath, /Bash\(gh pr:\*\)/);
 });

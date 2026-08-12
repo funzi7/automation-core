@@ -186,8 +186,9 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          # PAT so Claude's PR triggers codex-gate; default token fallback.
-          github_token: ${{ secrets.AUTOMATION_PAT || github.token }}
+          # Issue-mode Claude never receives AUTOMATION_PAT. The trusted
+          # post-step alone uses it to create the exact action-controlled PR.
+          github_token: ${{ github.token }}
           trigger_phrase: "@claude"
           label_trigger: "claude-fix"
           branch_prefix: "claude/"

@@ -185,7 +185,8 @@ jobs:
             function isTrustedSync(pr) {
               if ((pr.title || '') !== SYNC_TITLE_PREFIX) return false;
               if (!isSameRepo(pr)) return false;
-              return pr.head && pr.head.ref === SYNC_BRANCH;
+              return pr.user?.login === OWNER_LOGIN &&
+                pr.head && pr.head.ref === SYNC_BRANCH;
             }
 
             async function hasClaudeAutomationProvenance(pr) {
