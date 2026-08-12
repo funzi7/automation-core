@@ -175,6 +175,11 @@ jobs:
             const isOwnerSameRepo = (pr) =>
               isSameRepo(pr) && pr.user && pr.user.login === OWNER_LOGIN;
 
+            const isClaudeAutomationPr = (pr) => isSameRepo(pr) && !!(
+              isClaudeBot(pr.user && pr.user.login) ||
+              (pr.head && pr.head.ref && pr.head.ref.startsWith('claude/'))
+            );
+
             function isTrustedSync(pr) {
               if (!(pr.title || '').startsWith(SYNC_TITLE_PREFIX)) return false;
               if (!isSameRepo(pr)) return false;
@@ -183,6 +188,9 @@ jobs:
                 (pr.head && pr.head.ref === SYNC_BRANCH)
               );
             }
+
+            const mayAutoMergeProtectedPaths = (pr) =>
+              isTrustedSync(pr) || (isOwnerSameRepo(pr) && !isClaudeAutomationPr(pr));
 
             function isAutoMergeCandidate(pr) {
               if (!pr || pr.state !== 'open' || pr.draft) return false;
@@ -800,7 +808,7 @@ jobs:
                 const hits = files
                   .map((f) => f.filename)
                   .filter((name) => regexes.some((re) => re.test(name)));
-                if (hits.length && !isOwnerSameRepo(pr)) {
+                if (hits.length && !mayAutoMergeProtectedPaths(pr)) {
                   try {
                     await github.rest.issues.removeLabel({ owner, repo, issue_number: prNumber, name: LABEL_AUTOMERGE });
                   } catch (e) { /* maybe not present */ }
@@ -820,7 +828,7 @@ jobs:
                   continue;
                 }
                 if (hits.length) {
-                  core.info(`#${prNumber}: protected paths reviewed on trusted same-repo owner PR; exact-head gates remain mandatory`);
+                  core.info(`#${prNumber}: protected paths reviewed on trusted owner/sync PR; exact-head gates remain mandatory`);
                 }
               }
 

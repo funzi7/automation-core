@@ -142,7 +142,10 @@ mergeability, and a SHA-pinned squash merge. `no-automerge` and manual/unknown
 `needs-owner` and `needs-owner-auto`; only an exact-head fully-green evaluation
 may remove both and continue to merge in the same pass. Protected paths remain
 fail-closed for forks/untrusted/ambiguous PRs but no longer force an additional
-manual merge for a fully reviewed same-repo owner PR.
+manual merge for a fully reviewed ordinary same-repo owner PR. Claude-created
+`claude/*` PRs remain protected-path fail-closed even when `AUTOMATION_PAT`
+records the owner as author; exact trusted automation-core sync PRs retain their
+established protected-path rollout behavior.
 
 The native `codex-gate-evaluator` job is diagnostic and can retain its expected
 pre-review failure on the PR head. Merge Bot ignores only that diagnostic

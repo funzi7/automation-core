@@ -45,6 +45,19 @@ function isTrustedSync(pr, repositoryFullName) {
   return pr?.user?.login === OWNER_LOGIN || pr?.head?.ref === SYNC_BRANCH;
 }
 
+function isClaudeAutomationPr(pr, repositoryFullName) {
+  return isSameRepo(pr, repositoryFullName) && (
+    isClaudeBot(pr?.user?.login) || String(pr?.head?.ref || '').startsWith('claude/')
+  );
+}
+
+function mayAutoMergeProtectedPaths(pr, repositoryFullName) {
+  return isTrustedSync(pr, repositoryFullName) || (
+    isOwnerSameRepo(pr, repositoryFullName) &&
+    !isClaudeAutomationPr(pr, repositoryFullName)
+  );
+}
+
 function isAutoMergeCandidate(pr, repositoryFullName) {
   if (!pr || pr.state !== 'open' || pr.draft) return false;
   const labels = labelNames(pr);
@@ -234,7 +247,7 @@ function evaluateMergePolicy({
   if (activeTrustedFinding && !labels.has(CODEX_OVERRIDE_LABEL)) {
     return { eligible: false, reason: 'active_trusted_finding' };
   }
-  if (protectedPathHit && !isOwnerSameRepo(pr, repositoryFullName)) {
+  if (protectedPathHit && !mayAutoMergeProtectedPaths(pr, repositoryFullName)) {
     return { eligible: false, reason: 'protected_path_untrusted' };
   }
   if (!evaluatedHead || currentHead !== evaluatedHead || pr?.head?.sha !== evaluatedHead) {
@@ -263,6 +276,8 @@ module.exports = {
   isSameRepo,
   isOwnerSameRepo,
   isTrustedSync,
+  isClaudeAutomationPr,
+  mayAutoMergeProtectedPaths,
   isAutoMergeCandidate,
   latestChecksByName,
   companionAutomationProvenance,

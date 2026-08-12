@@ -303,6 +303,18 @@ test('protected-path trusted owner PR may merge after full review', () => {
   assert.equal(decide({ protectedPathHit: true }).eligible, true);
 });
 
+test('protected-path PAT-owner Claude PR remains escalated', () => {
+  const claude = pr({
+    head: { ref: 'claude/fix-sensitive-workflow' },
+    labels: [{ name: 'automerge' }],
+  });
+  assert.equal(isAutoMergeCandidate(claude, REPOSITORY), true);
+  assert.equal(
+    decide({ pr: claude, protectedPathHit: true }).reason,
+    'protected_path_untrusted',
+  );
+});
+
 test('protected-path fork or untrusted PR remains escalated', () => {
   const fork = pr({
     labels: [{ name: 'automerge' }],
@@ -319,6 +331,7 @@ test('trusted same-repo automation-core sync behavior remains eligible', () => {
     head: { ref: 'chore/sync-automation-core' },
   });
   assert.equal(decide({ pr: sync }).eligible, true);
+  assert.equal(decide({ pr: sync, protectedPathHit: true }).eligible, true);
 });
 
 test('workflow preserves exact-SHA squash merge and same-repo branch deletion', () => {
@@ -333,6 +346,8 @@ test('workflow preserves exact-SHA squash merge and same-repo branch deletion', 
   assert.match(workflow, /unexpected evaluation error; skipping only this PR/);
   assert.match(workflow, /hasCurrentHeadNonInlineFinding/);
   assert.match(workflow, /hasActiveTrustedBlocker/);
+  assert.match(workflow, /isClaudeAutomationPr/);
+  assert.match(workflow, /!mayAutoMergeProtectedPaths\(pr\)/);
   assert.match(workflow, /workflows: \["Codex Gate", "CI", "Automation Core CI"\]/);
   assert.match(workflow, /const trustedLoopMarker = \(comment\) =>/);
   assert.match(workflow, /Number\(root\[1\]\) !== prNumber/);

@@ -137,7 +137,9 @@ Synced workflows listed in `sync-config.json`: `codex-auto-fix.yml`, `codex-gate
   exact-head `check-codex-status` is authoritative; every other latest failed
   or running check/status still blocks.
 - Protected paths still escalate untrusted/fork/ambiguous PRs. A fully reviewed
-  same-repo owner PR may merge without a second manual merge step.
+  ordinary same-repo owner PR may merge without a second manual merge step;
+  PAT-owner `claude/*` PRs remain escalated, while exact trusted sync PRs retain
+  their existing path.
 - Squash merge is head-SHA-pinned.
 
 ### Hub-only workflows

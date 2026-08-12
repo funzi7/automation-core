@@ -88,7 +88,9 @@ escalated to manual `needs-owner`. A same-repository PR authored by `funzi7`
 may still auto-merge protected workflow changes, but only after the unchanged
 full exact-head CI, trusted Codex review/gate, active-thread, mergeability, and
 SHA-pinned merge requirements pass. Add `no-automerge` for an explicit human
-hold.
+hold. Because `AUTOMATION_PAT` can make a Claude-created PR appear owner-authored,
+same-repository `claude/*` PRs remain fail-closed for protected paths. The exact
+same-repository automation-core sync signature remains trusted.
 
 ### Default merge policy
 
