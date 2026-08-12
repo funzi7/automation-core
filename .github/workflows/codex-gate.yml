@@ -279,14 +279,28 @@ jobs:
             }
 
             function currentHeadEpochFromTimeline(timeline, headSha) {
+              return currentHeadEpochEvidenceFromTimeline(timeline, headSha).epoch;
+            }
+
+            function currentHeadEpochEvidenceFromTimeline(timeline, headSha) {
               const exactHead = String(headSha || '').toLowerCase();
-              if (!timeline.length || timeline[0].head !== exactHead) return null;
+              if (!timeline.length || timeline[0].head !== exactHead) {
+                return { epoch: null, hasBoundary: false };
+              }
               const epoch = [];
               for (const item of timeline) {
-                if (item.head !== exactHead) break;
+                if (item.head !== exactHead) {
+                  return {
+                    epoch: epoch.length ? new Date(Math.min(...epoch)) : null,
+                    hasBoundary: true,
+                  };
+                }
                 epoch.push(item.observedAt);
               }
-              return epoch.length ? new Date(Math.min(...epoch)) : null;
+              return {
+                epoch: epoch.length ? new Date(Math.min(...epoch)) : null,
+                hasBoundary: false,
+              };
             }
 
             function prRunTimeline(runs, prNumber) {
@@ -301,9 +315,9 @@ jobs:
                 .sort((a, b) => a.observedAt - b.observedAt);
             }
 
-            function currentHeadEpochFromRuns(runs, prNumber, headSha) {
+            function currentHeadEpochEvidenceFromRuns(runs, prNumber, headSha) {
               const timeline = prRunTimeline(runs, prNumber).reverse();
-              return currentHeadEpochFromTimeline(timeline, headSha);
+              return currentHeadEpochEvidenceFromTimeline(timeline, headSha);
             }
 
             async function ensureHeadEpochMarker(prNumber, comments) {
@@ -334,9 +348,14 @@ jobs:
                 allPrWorkflowRuns(),
               ]);
               const markerEpoch = currentHeadEpochFromTimeline(markers, headSha);
-              const runEpoch = currentHeadEpochFromRuns(runs, prNumber, headSha);
+              const runEvidence = currentHeadEpochEvidenceFromRuns(runs, prNumber, headSha);
+              const runEpoch = runEvidence.epoch;
               // Authenticated markers retain the complete contiguous epoch. The
-              // repository run list is bounded and is only a legacy fallback.
+              // bounded run list may advance it only when it proves an
+              // intervening different head that a failed marker write missed.
+              if (markerEpoch && runEpoch && runEvidence.hasBoundary) {
+                return new Date(Math.max(markerEpoch.getTime(), runEpoch.getTime()));
+              }
               return markerEpoch || runEpoch;
             }
 

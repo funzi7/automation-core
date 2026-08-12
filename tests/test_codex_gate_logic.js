@@ -153,8 +153,17 @@ test('verified gate runs preserve the current contiguous epoch beyond run-search
 test('authenticated marker epoch wins when bounded run history starts later', () => {
   const markerEpoch = new Date('2026-08-11T13:00:00Z');
   const truncatedRunEpoch = new Date('2026-08-11T14:00:00Z');
-  assert.equal(selectHeadEpoch(markerEpoch, truncatedRunEpoch), markerEpoch);
+  assert.equal(selectHeadEpoch(markerEpoch, truncatedRunEpoch, false), markerEpoch);
   assert.equal(selectHeadEpoch(null, truncatedRunEpoch), truncatedRunEpoch);
+});
+
+test('proven intervening run head advances an incomplete marker epoch', () => {
+  const incompleteMarkerEpoch = new Date('2026-08-11T13:00:00Z');
+  const provenReturnToHead = new Date('2026-08-11T15:00:00Z');
+  assert.equal(
+    selectHeadEpoch(incompleteMarkerEpoch, provenReturnToHead, true).toISOString(),
+    '2026-08-11T15:00:00.000Z',
+  );
 });
 
 test('resolved thread clears with a current-head signal', () => {
@@ -325,7 +334,7 @@ test('authoritative workflow keeps gate policy inline', () => {
   assert.match(workflow, /let prWorkflowRunsPromise = null/);
   assert.match(workflow, /const \[markers, runs\] = await Promise\.all/);
   assert.match(workflow, /return markerEpoch \|\| runEpoch/);
-  assert.doesNotMatch(workflow, /Math\.max\(markerEpoch/);
+  assert.match(workflow, /runEvidence\.hasBoundary/);
   assert.match(workflow, /function signalTargetsHead\(item, headSha, headObservedAt/);
   assert.match(workflow, /actions: read/);
   assert.doesNotMatch(workflow, /latestCommitDate/);
@@ -370,7 +379,7 @@ test('watchdog rechecks changed red thread state from the trusted base ref', () 
   assert.match(watchdog, /let prWorkflowRunsPromise = null/);
   assert.match(watchdog, /const \[markers, runs\] = await Promise\.all/);
   assert.match(watchdog, /return markerEpoch \|\| runEpoch/);
-  assert.doesNotMatch(watchdog, /Math\.max\(markerEpoch/);
+  assert.match(watchdog, /runEvidence\.hasBoundary/);
   assert.match(watchdog, /if \(accepted\.has\(key\)\) continue/);
   assert.doesNotMatch(watchdog, /refs\.set\(/);
   assert.match(watchdog, /roPage\(`https:\/\/api\.github\.com\/repos\/\$\{owner\}\/\$\{repo\}\/actions\/runs\/\$\{runId\}\/attempts\/\$\{attempt\}`\)/);

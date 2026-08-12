@@ -651,14 +651,28 @@ jobs:
             }
 
             function currentHeadEpochFromTimeline(timeline, headSha) {
+              return currentHeadEpochEvidenceFromTimeline(timeline, headSha).epoch;
+            }
+
+            function currentHeadEpochEvidenceFromTimeline(timeline, headSha) {
               const exactHead = String(headSha || '').toLowerCase();
-              if (!timeline.length || timeline[0].head !== exactHead) return null;
+              if (!timeline.length || timeline[0].head !== exactHead) {
+                return { epoch: null, hasBoundary: false };
+              }
               const epoch = [];
               for (const item of timeline) {
-                if (item.head !== exactHead) break;
+                if (item.head !== exactHead) {
+                  return {
+                    epoch: epoch.length ? new Date(Math.min(...epoch)) : null,
+                    hasBoundary: true,
+                  };
+                }
                 epoch.push(item.observedAt);
               }
-              return epoch.length ? new Date(Math.min(...epoch)) : null;
+              return {
+                epoch: epoch.length ? new Date(Math.min(...epoch)) : null,
+                hasBoundary: false,
+              };
             }
 
             async function observedHeadTransition(prNumber, headSha, comments = []) {
@@ -677,9 +691,14 @@ jobs:
                 .filter((run) => /^[a-f0-9]{40}$/.test(run.head) && Number.isFinite(run.observedAt) && run.observedAt > 0)
                 .sort((a, b) =>
                   b.observedAt - a.observedAt);
-              const runEpoch = currentHeadEpochFromTimeline(timeline, headSha);
+              const runEvidence = currentHeadEpochEvidenceFromTimeline(timeline, headSha);
+              const runEpoch = runEvidence.epoch;
               // Authenticated markers retain the complete contiguous epoch. The
-              // repository run list is bounded and is only a legacy fallback.
+              // bounded run list may advance it only when it proves an
+              // intervening different head that a failed marker write missed.
+              if (markerEpoch && runEpoch && runEvidence.hasBoundary) {
+                return new Date(Math.max(markerEpoch.getTime(), runEpoch.getTime()));
+              }
               return markerEpoch || runEpoch;
             }
 

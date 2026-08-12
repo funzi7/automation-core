@@ -76,9 +76,13 @@ function currentHeadEpochFromVerifiedRuns(markers = [], headSha) {
   return epoch.length ? new Date(Math.min(...epoch)) : null;
 }
 
-function selectHeadEpoch(markerEpoch, runEpoch) {
+function selectHeadEpoch(markerEpoch, runEpoch, runHasBoundary = false) {
   // Verified markers are the unbounded source. A repository run page can be
-  // truncated inside an unchanged-head epoch, so it is only a fallback.
+  // truncated inside an unchanged-head epoch. It may advance the marker epoch
+  // only when it proves an intervening different head.
+  if (markerEpoch && runEpoch && runHasBoundary) {
+    return new Date(Math.max(markerEpoch.getTime(), runEpoch.getTime()));
+  }
   return markerEpoch || runEpoch || null;
 }
 
