@@ -316,6 +316,27 @@ test('protected-path PAT-owner Claude PR remains escalated', () => {
   );
 });
 
+test('durable Claude provenance blocks protected arbitrary owner branch', () => {
+  const arbitrary = pr({ head: { ref: 'fix/claude-chose-this-name' } });
+  assert.equal(decide({ pr: arbitrary, protectedPathHit: true }).eligible, true);
+  assert.equal(
+    decide({
+      pr: arbitrary,
+      protectedPathHit: true,
+      claudeAutomationProven: true,
+    }).reason,
+    'protected_path_untrusted',
+  );
+  const labeled = pr({
+    head: { ref: 'fix/another-name' },
+    labels: [{ name: 'claude-generated' }],
+  });
+  assert.equal(
+    decide({ pr: labeled, protectedPathHit: true }).reason,
+    'protected_path_untrusted',
+  );
+});
+
 test('protected-path fork or untrusted PR remains escalated', () => {
   const fork = pr({
     labels: [{ name: 'automerge' }],
@@ -370,7 +391,9 @@ test('workflow preserves exact-SHA squash merge and same-repo branch deletion', 
   assert.match(workflow, /hasCurrentHeadNonInlineFinding/);
   assert.match(workflow, /hasActiveTrustedBlocker/);
   assert.match(workflow, /isClaudeAutomationPr/);
-  assert.match(workflow, /!mayAutoMergeProtectedPaths\(pr\)/);
+  assert.match(workflow, /hasClaudeAutomationProvenance/);
+  assert.match(workflow, /!\(await mayAutoMergeProtectedPaths\(pr\)\)/);
+  assert.match(workflow, /event\.actor\?\.login === 'github-actions\[bot\]'/);
   assert.match(workflow, /workflows: \["Codex Gate", "CI", "Automation Core CI"\]/);
   assert.match(workflow, /const trustedLoopMarker = \(comment\) =>/);
   assert.match(workflow, /Number\(root\[1\]\) !== prNumber/);

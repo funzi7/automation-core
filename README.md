@@ -57,6 +57,7 @@ still happen within minutes — the crons are just the backstop.
 |-------|---------|
 | `claude-fix` | "Claude, fix this." Set by ci-doctor; triggers Claude Fixer. |
 | `automerge` | This PR may be auto-merged by Merge Bot once green. |
+| `claude-generated` | Durable provenance that the trusted Claude workflow created the PR; protected paths remain fail-closed even if PAT authorship looks human. |
 | `no-automerge` | Permanent human opt-out. Merge Bot never removes it and never merges while it is present. |
 | `needs-owner` | Human/manual escalation stop. Without proven automation provenance it remains a hard stop. |
 | `needs-owner-auto` | Companion provenance for a temporary PR fixer/watchdog exhaustion. Merge Bot clears it together with `needs-owner` only after the current head is mergeable, fully green, exact-head gated, and free of active trusted P1/P2 findings. |
@@ -89,8 +90,10 @@ may still auto-merge protected workflow changes, but only after the unchanged
 full exact-head CI, trusted Codex review/gate, active-thread, mergeability, and
 SHA-pinned merge requirements pass. Add `no-automerge` for an explicit human
 hold. Because `AUTOMATION_PAT` can make a Claude-created PR appear owner-authored,
-same-repository `claude/*` PRs remain fail-closed for protected paths. The exact
-same-repository automation-core sync signature remains trusted.
+the trusted Claude workflow records durable `claude-generated` provenance using
+the Actions identity; that provenance (and `claude/*` as a conservative fallback)
+keeps protected paths fail-closed. The exact same-repository automation-core sync
+signature remains trusted.
 
 ### Default merge policy
 

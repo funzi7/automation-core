@@ -154,6 +154,7 @@ jobs:
             const LABEL_ESCALATE = 'needs-owner';
             const LABEL_ESCALATE_AUTO = 'needs-owner-auto';
             const LABEL_NO_AUTOMERGE = 'no-automerge';
+            const CLAUDE_GENERATED_LABEL = 'claude-generated';
             const CODEX_OVERRIDE_LABEL = 'codex-p1-acknowledged';
             const SYNC_TITLE_PREFIX = 'chore(automation): sync from automation-core';
             const SYNC_BRANCH = 'chore/sync-automation-core';   // branch the sync workflow opens
@@ -177,7 +178,8 @@ jobs:
 
             const isClaudeAutomationPr = (pr) => isSameRepo(pr) && !!(
               isClaudeBot(pr.user && pr.user.login) ||
-              (pr.head && pr.head.ref && pr.head.ref.startsWith('claude/'))
+              (pr.head && pr.head.ref && pr.head.ref.startsWith('claude/')) ||
+              labelNames(pr).has(CLAUDE_GENERATED_LABEL)
             );
 
             function isTrustedSync(pr) {
@@ -186,8 +188,28 @@ jobs:
               return pr.head && pr.head.ref === SYNC_BRANCH;
             }
 
-            const mayAutoMergeProtectedPaths = (pr) =>
-              isTrustedSync(pr) || (isOwnerSameRepo(pr) && !isClaudeAutomationPr(pr));
+            async function hasClaudeAutomationProvenance(pr) {
+              if (isClaudeAutomationPr(pr)) return true;
+              try {
+                const events = await github.paginate(
+                  'GET /repos/{owner}/{repo}/issues/{issue_number}/events',
+                  { owner, repo, issue_number: pr.number, per_page: 100 },
+                );
+                return events.some((event) =>
+                  event.event === 'labeled' &&
+                  event.label?.name === CLAUDE_GENERATED_LABEL &&
+                  event.actor?.login === 'github-actions[bot]'
+                );
+              } catch (e) {
+                core.warning(`#${pr.number}: Claude provenance lookup failed; protected path stays fail-closed: ${e.message}`);
+                return true;
+              }
+            }
+
+            async function mayAutoMergeProtectedPaths(pr) {
+              if (isTrustedSync(pr)) return true;
+              return isOwnerSameRepo(pr) && !(await hasClaudeAutomationProvenance(pr));
+            }
 
             function isAutoMergeCandidate(pr) {
               if (!pr || pr.state !== 'open' || pr.draft) return false;
@@ -805,7 +827,7 @@ jobs:
                 const hits = files
                   .map((f) => f.filename)
                   .filter((name) => regexes.some((re) => re.test(name)));
-                if (hits.length && !mayAutoMergeProtectedPaths(pr)) {
+                if (hits.length && !(await mayAutoMergeProtectedPaths(pr))) {
                   try {
                     await github.rest.issues.removeLabel({ owner, repo, issue_number: prNumber, name: LABEL_AUTOMERGE });
                   } catch (e) { /* maybe not present */ }
