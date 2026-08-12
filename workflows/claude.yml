@@ -180,6 +180,18 @@ jobs:
           fi
           echo "Checked out original PR head branch ${HEAD_REF} at ${HEAD_SHA}."
 
+      - name: Snapshot PRs before Claude issue run
+        id: pre_issue_prs
+        if: steps.keycheck.outputs.has_key == 'true' && steps.pr_context.outputs.is_pr_comment != 'true'
+        uses: actions/github-script@v8
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const open = await github.paginate(github.rest.pulls.list, {
+              ...context.repo, state: 'open', per_page: 100,
+            });
+            core.setOutput('numbers', JSON.stringify(open.map((pr) => pr.number)));
+
       - name: Run Claude Code (Issue/new-PR path)
         id: claude_issue
         if: steps.keycheck.outputs.has_key == 'true' && steps.pr_context.outputs.is_pr_comment != 'true'
@@ -455,6 +467,9 @@ jobs:
         # only the durable claude-generated marker.
         if: ${{ always() && steps.claude_issue.outcome != 'skipped' }}
         uses: actions/github-script@v8
+        env:
+          PREEXISTING_PR_NUMBERS: ${{ steps.pre_issue_prs.outputs.numbers }}
+          CLAUDE_BRANCH_NAME: ${{ steps.claude_issue.outputs.branch_name }}
         with:
           # Use the default token so the durable claude-generated label event is
           # attributable to github-actions[bot], independently of PAT-authored
@@ -464,6 +479,8 @@ jobs:
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const delivered = '${{ steps.claude_issue.outcome }}' === 'success';
+            const preexisting = new Set(JSON.parse(process.env.PREEXISTING_PR_NUMBERS || '[]'));
+            const claudeBranch = String(process.env.CLAUDE_BRANCH_NAME || '');
             const labels = [
               { name: 'claude-generated', color: '5319e7', description: 'Provenance: PR was created by the Claude automation workflow' },
               ...(delivered ? [
@@ -486,15 +503,17 @@ jobs:
               core.info(`Labeled PR #${prNumber} claude-generated${delivered ? ' + automerge' : ' (delivery not successful)'}.`);
             }
 
-            // ONLY label a PR that Claude CREATED to resolve a claude-fix Issue:
-            // Claude opened a NEW PR closing the triggering Issue (Fixes #N); find
-            // the open PR(s) linking this issue and label those. We deliberately do
-            // NOT label an arbitrary PR reached via an @claude mention — that would
-            // auto-merge any PR that merely mentions Claude (Codex P1).
+            // Only label PRs that appeared during this run, close the triggering
+            // Issue, and (when the action reports it) use Claude's exact branch.
             const issueNum = context.payload.issue && context.payload.issue.number;
             if (!issueNum) { core.info('No issue/PR context to label.'); return; }
             const open = await github.paginate(github.rest.pulls.list, { owner, repo, state: 'open', per_page: 100 });
             const re = new RegExp(`(?:close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)\\s+#${issueNum}\\b`, 'i');
-            const matches = open.filter((pr) => re.test(pr.body || ''));
-            if (!matches.length) { core.info(`No open PR found that closes #${issueNum}.`); return; }
+            const matches = open.filter((pr) =>
+              !preexisting.has(pr.number) &&
+              pr.head?.repo?.full_name === `${owner}/${repo}` &&
+              re.test(pr.body || '') &&
+              (!claudeBranch || pr.head?.ref === claudeBranch)
+            );
+            if (!matches.length) { core.info(`No newly created Claude PR found that closes #${issueNum}.`); return; }
             for (const pr of matches) await label(pr.number);

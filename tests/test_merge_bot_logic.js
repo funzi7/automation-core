@@ -493,6 +493,12 @@ test('Claude PR provenance records on failure while automerge remains success-on
   assert.match(workflow, /const delivered = '\$\{\{ steps\.claude_issue\.outcome \}\}' === 'success'/);
   assert.match(workflow, /labels: delivered \? \['claude-generated', 'automerge'\] : \['claude-generated'\]/);
   assert.match(workflow, /github-token: \$\{\{ github\.token \}\}/);
+  assert.match(workflow, /id: pre_issue_prs/);
+  assert.match(workflow, /core\.setOutput\('numbers', JSON\.stringify\(open\.map\(\(pr\) => pr\.number\)\)\)/);
+  assert.match(workflow, /PREEXISTING_PR_NUMBERS: \$\{\{ steps\.pre_issue_prs\.outputs\.numbers \}\}/);
+  assert.match(workflow, /CLAUDE_BRANCH_NAME: \$\{\{ steps\.claude_issue\.outputs\.branch_name \}\}/);
+  assert.match(workflow, /!preexisting\.has\(pr\.number\)/);
+  assert.match(workflow, /!claudeBranch \|\| pr\.head\?\.ref === claudeBranch/);
 });
 
 test('synced review freshness never uses the removed latest-commit-date model', () => {
