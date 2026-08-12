@@ -449,14 +449,11 @@ jobs:
               core.info(`no-delivery handling failed (ignored): ${e.message}`);
             }
 
-      - name: Label Claude's PR for auto-merge and provenance
-        # P1 fix: only label when Claude Code actually RAN AND SUCCEEDED. With
-        # always() this labeled PRs even on a failed/cancelled run, so a PR
-        # Claude did NOT fix could pick up `automerge` and auto-merge.
-        # steps.claude_issue.outcome is 'success' only on a real success; it is
-        # 'failure'/'cancelled' on a bad run and 'skipped' in the
-        # fail-soft (no ANTHROPIC_API_KEY) path — none of which should label.
-        if: steps.claude_issue.outcome == 'success'
+      - name: Record Claude PR provenance and conditionally auto-merge
+        # Provenance must survive a run that creates a PR and then fails or is
+        # cancelled. `automerge` remains success-only; a failed delivery gets
+        # only the durable claude-generated marker.
+        if: ${{ always() && steps.claude_issue.outcome != 'skipped' }}
         uses: actions/github-script@v8
         with:
           # Use the default token so the durable claude-generated label event is
@@ -466,9 +463,12 @@ jobs:
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
+            const delivered = '${{ steps.claude_issue.outcome }}' === 'success';
             const labels = [
-              { name: 'automerge', color: '0e8a16', description: 'Auto-merge by Merge Bot once green' },
               { name: 'claude-generated', color: '5319e7', description: 'Provenance: PR was created by the Claude automation workflow' },
+              ...(delivered ? [
+                { name: 'automerge', color: '0e8a16', description: 'Auto-merge by Merge Bot once green' },
+              ] : []),
             ];
             for (const label of labels) {
               try {
@@ -481,9 +481,9 @@ jobs:
             async function label(prNumber) {
               await github.rest.issues.addLabels({
                 owner, repo, issue_number: prNumber,
-                labels: ['automerge', 'claude-generated'],
+                labels: delivered ? ['claude-generated', 'automerge'] : ['claude-generated'],
               });
-              core.info(`Labeled PR #${prNumber} automerge + claude-generated.`);
+              core.info(`Labeled PR #${prNumber} claude-generated${delivered ? ' + automerge' : ' (delivery not successful)'}.`);
             }
 
             // ONLY label a PR that Claude CREATED to resolve a claude-fix Issue:

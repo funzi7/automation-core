@@ -484,6 +484,17 @@ test('only temporary PR automation writers add needs-owner-auto', () => {
   assert.doesNotMatch(read('ci-doctor.yml'), /needs-owner-auto/);
 });
 
+test('Claude PR provenance records on failure while automerge remains success-only', () => {
+  const workflow = fs.readFileSync(
+    path.join(__dirname, '..', 'workflows', 'claude.yml'),
+    'utf8',
+  );
+  assert.match(workflow, /always\(\) && steps\.claude_issue\.outcome != 'skipped'/);
+  assert.match(workflow, /const delivered = '\$\{\{ steps\.claude_issue\.outcome \}\}' === 'success'/);
+  assert.match(workflow, /labels: delivered \? \['claude-generated', 'automerge'\] : \['claude-generated'\]/);
+  assert.match(workflow, /github-token: \$\{\{ github\.token \}\}/);
+});
+
 test('synced review freshness never uses the removed latest-commit-date model', () => {
   for (const name of [
     'codex-auto-fix.yml',
