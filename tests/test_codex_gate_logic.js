@@ -318,6 +318,11 @@ test('authoritative workflow keeps gate policy inline', () => {
   assert.match(workflow, /context\.payload\.pull_request\.head\?\.sha/);
   assert.match(workflow, /await record\(exactHead, bootstrap \|\| new Date\(\)\)/);
   assert.match(workflow, /issues: write/);
+  assert.ok(
+    workflow.indexOf('comments = await reconcileHeadEpochMarkers') <
+      workflow.indexOf('// Manual override — admin force-merge.'),
+    'head epoch reconciliation must precede the administrator override return',
+  );
   assert.match(workflow, /let prWorkflowRunsPromise = null/);
   assert.match(workflow, /const runs = await allPrWorkflowRuns\(\)/);
   assert.match(workflow, /function signalTargetsHead\(item, headSha, headObservedAt/);

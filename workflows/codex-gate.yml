@@ -478,14 +478,6 @@ jobs:
                 headSha = pr.head.sha;
                 const head7 = headSha.substring(0, 7);
 
-                // Manual override — admin force-merge.
-                if (pr.labels.some(l => l.name === 'codex-p1-acknowledged')) {
-                  results.push(`PR #${prNumber}: ✅ override label present`);
-                  await publishGateCheck(headSha, 'success', '🟢 Reviewed — clear',
-                    `Override label \`codex-p1-acknowledged\` is set on ${head7} — gate forced green.`);
-                  continue;
-                }
-
                 // Codex feedback across all three channels, fully paginated
                 // (the default 30/page silently drops the first Codex review
                 // on chatty PRs — the very place a P1 lives).
@@ -502,6 +494,15 @@ jobs:
                   comments = await reconcileHeadEpochMarkers(prNumber, headSha, eventHeadSha, comments);
                 } catch (e) {
                   core.warning(`PR #${prNumber}: trusted head marker publish failed; markerless signals stay fail-closed: ${e.message}`);
+                }
+                // Manual override — admin force-merge. Epoch reconciliation
+                // deliberately happens first so A->B->A cannot reuse a signal
+                // from the earlier A after the override is removed.
+                if (pr.labels.some(l => l.name === 'codex-p1-acknowledged')) {
+                  results.push(`PR #${prNumber}: ✅ override label present`);
+                  await publishGateCheck(headSha, 'success', '🟢 Reviewed — clear',
+                    `Override label \`codex-p1-acknowledged\` is set on ${head7} — gate forced green.`);
+                  continue;
                 }
                 const reviewComments = await github.paginate(github.rest.pulls.listReviewComments, {
                   owner, repo, pull_number: prNumber, per_page: 100,
