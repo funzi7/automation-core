@@ -40,9 +40,9 @@ function isClaudeBot(login) {
 }
 
 function isTrustedSync(pr, repositoryFullName) {
-  if (!String(pr?.title || '').startsWith(SYNC_TITLE_PREFIX)) return false;
+  if (String(pr?.title || '') !== SYNC_TITLE_PREFIX) return false;
   if (!isSameRepo(pr, repositoryFullName)) return false;
-  return pr?.user?.login === OWNER_LOGIN || pr?.head?.ref === SYNC_BRANCH;
+  return pr?.head?.ref === SYNC_BRANCH;
 }
 
 function isClaudeAutomationPr(pr, repositoryFullName) {

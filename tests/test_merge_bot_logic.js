@@ -305,6 +305,7 @@ test('protected-path trusted owner PR may merge after full review', () => {
 
 test('protected-path PAT-owner Claude PR remains escalated', () => {
   const claude = pr({
+    title: 'chore(automation): sync from automation-core',
     head: { ref: 'claude/fix-sensitive-workflow' },
     labels: [{ name: 'automerge' }],
   });
@@ -328,10 +329,32 @@ test('protected-path fork or untrusted PR remains escalated', () => {
 test('trusted same-repo automation-core sync behavior remains eligible', () => {
   const sync = pr({
     title: 'chore(automation): sync from automation-core',
+    user: { login: 'github-actions[bot]' },
     head: { ref: 'chore/sync-automation-core' },
   });
   assert.equal(decide({ pr: sync }).eligible, true);
   assert.equal(decide({ pr: sync, protectedPathHit: true }).eligible, true);
+});
+
+test('sync title alone cannot grant trusted protected-path provenance', () => {
+  const spoof = pr({
+    title: 'chore(automation): sync from automation-core',
+    user: { login: 'github-actions[bot]' },
+    labels: [{ name: 'automerge' }],
+    head: { ref: 'fix/not-the-sync-branch' },
+  });
+  assert.equal(
+    decide({ pr: spoof, protectedPathHit: true }).reason,
+    'protected_path_untrusted',
+  );
+  const claudeSpoof = pr({
+    title: 'chore(automation): sync from automation-core',
+    head: { ref: 'claude/not-the-sync-branch' },
+  });
+  assert.equal(
+    decide({ pr: claudeSpoof, protectedPathHit: true }).reason,
+    'protected_path_untrusted',
+  );
 });
 
 test('workflow preserves exact-SHA squash merge and same-repo branch deletion', () => {

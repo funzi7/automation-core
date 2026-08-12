@@ -181,12 +181,9 @@ jobs:
             );
 
             function isTrustedSync(pr) {
-              if (!(pr.title || '').startsWith(SYNC_TITLE_PREFIX)) return false;
+              if ((pr.title || '') !== SYNC_TITLE_PREFIX) return false;
               if (!isSameRepo(pr)) return false;
-              return (
-                (pr.user && pr.user.login === OWNER_LOGIN) ||
-                (pr.head && pr.head.ref === SYNC_BRANCH)
-              );
+              return pr.head && pr.head.ref === SYNC_BRANCH;
             }
 
             const mayAutoMergeProtectedPaths = (pr) =>
