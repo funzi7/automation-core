@@ -303,6 +303,9 @@ test('authoritative workflow keeps gate policy inline', () => {
   assert.match(workflow, /run\.event !== 'pull_request_target'/);
   assert.match(workflow, /Number\(run\.run_attempt\) !== attempt \|\| !associatedPr/);
   assert.match(workflow, /const head = String\(associatedPr\.head\?\.sha \|\| ''\)/);
+  assert.match(workflow, /const refs = \[\]/);
+  assert.match(workflow, /if \(accepted\.has\(key\)\) continue/);
+  assert.doesNotMatch(workflow, /refs\.set\(/);
   assert.match(workflow, /issues: write/);
   assert.ok(
     workflow.indexOf('comments = await ensureHeadEpochMarker') <
@@ -354,6 +357,8 @@ test('watchdog rechecks changed red thread state from the trusted base ref', () 
   assert.match(watchdog, /hasCurrentHeadNonInlineFinding/);
   assert.match(watchdog, /let prWorkflowRunsPromise = null/);
   assert.match(watchdog, /const \[markers, runs\] = await Promise\.all/);
+  assert.match(watchdog, /if \(accepted\.has\(key\)\) continue/);
+  assert.doesNotMatch(watchdog, /refs\.set\(/);
   assert.match(
     watchdog,
     /!overrideCandidate && !redThreadStateChanged/,

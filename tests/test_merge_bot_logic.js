@@ -336,6 +336,9 @@ test('workflow preserves exact-SHA squash merge and same-repo branch deletion', 
   assert.match(workflow, /run\.event !== 'pull_request_target'/);
   assert.match(workflow, /Number\(run\.run_attempt\) !== attempt \|\| !associatedPr/);
   assert.match(workflow, /const head = String\(associatedPr\.head\?\.sha \|\| ''\)/);
+  assert.match(workflow, /const refs = \[\]/);
+  assert.match(workflow, /if \(accepted\.has\(key\)\) continue/);
+  assert.doesNotMatch(workflow, /refs\.set\(/);
   assert.match(workflow, /let prWorkflowRunsPromise = null/);
   assert.match(workflow, /const \[markers, runs\] = await Promise\.all/);
   assert.match(workflow, /function signalTargetsHead\(item, headSha, headObservedAt/);
