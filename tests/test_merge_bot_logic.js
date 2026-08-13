@@ -527,7 +527,46 @@ test('Claude PR provenance records on failure while automerge remains success-on
     'utf8',
   );
   assert.match(workflow, /always\(\) && steps\.claude_issue\.outcome != 'skipped'/);
-  assert.match(workflow, /const delivered = '\$\{\{ steps\.claude_issue\.outcome \}\}' === 'success'/);
+  assert.match(workflow, /name: Capture Issue-mode branch baselines/);
+  assert.match(workflow, /github\.rest\.git\.listMatchingRefs/);
+  assert.match(workflow, /core\.setOutput\('branch_heads_json', JSON\.stringify\(baselines\)\)/);
+  assert.match(workflow, /name: Revoke stale Issue-mode automerge before retry/);
+  assert.match(workflow, /const provenancePattern = \/<!--\\s\*claude-pr-provenance:v1/);
+  assert.match(workflow, /comment\.user\?\.login \|\| ''\) !== 'github-actions\[bot\]'/);
+  assert.match(workflow, /linkedPrNumbers\.add\(Number\(marker\[2\]\)\)/);
+  assert.match(workflow, /pr\.head\?\.repo\?\.full_name === `\$\{owner\}\/\$\{repo\}`/);
+  assert.match(workflow, /entry\.name === 'claude-generated'/);
+  const preModelRevocation = workflow.slice(
+    workflow.indexOf('Revoke stale Issue-mode automerge before retry'),
+    workflow.indexOf('Run Claude Code (Issue/new-PR path)'),
+  );
+  assert.doesNotMatch(preModelRevocation, /Fixes #/);
+  assert.match(workflow, /stale automerge remained before Claude retry/);
+  assert.ok(
+    workflow.indexOf('Revoke stale Issue-mode automerge before retry') <
+      workflow.indexOf('Run Claude Code (Issue/new-PR path)'),
+    'stale automerge must be revoked before model execution',
+  );
+  assert.match(workflow, /ISSUE_BRANCH_BASELINES_JSON: \$\{\{ steps\.issue_branch_baseline\.outputs\.branch_heads_json \}\}/);
+  assert.match(workflow, /IS_PR_COMMENT: \$\{\{ steps\.pr_context\.outputs\.is_pr_comment \}\}/);
+  assert.match(workflow, /if \(process\.env\.IS_PR_COMMENT !== 'true'\)/);
+  assert.match(workflow, /const before = String\(baselines\[branch\] \|\| process\.env\.ISSUE_BASE_SHA \|\| ''\)\.toLowerCase\(\)/);
+  assert.match(workflow, /after !== before/);
+  assert.match(workflow, /CLAUDE_DELIVERED: \$\{\{ steps\.delivery\.outputs\.delivered \}\}/);
+  assert.match(workflow, /const delivered = process\.env\.CLAUDE_ACTION_OUTCOME === 'success' &&\s*process\.env\.CLAUDE_DELIVERED === 'true'/);
+  const provenanceStep = workflow.slice(
+    workflow.indexOf('Record Claude PR provenance and conditionally auto-merge'),
+  );
+  assert.match(provenanceStep, /CLAUDE_ACTION_OUTCOME: \$\{\{ steps\.claude_issue\.outcome \}\}/);
+  assert.match(provenanceStep, /CLAUDE_DELIVERED: \$\{\{ steps\.delivery\.outputs\.delivered \}\}/);
+  assert.match(provenanceStep, /if \(!delivered\) \{/);
+  assert.match(provenanceStep, /await github\.rest\.issues\.removeLabel\(\{/);
+  assert.match(provenanceStep, /name: 'automerge'/);
+  assert.match(provenanceStep, /stale automerge remained after undelivered retry/);
+  assert.match(provenanceStep, /const marker = `<!-- claude-pr-provenance:v1 issue=\$\{issueNum\} pr=\$\{prNumber\} -->`/);
+  assert.match(provenanceStep, /\(comment\.user\?\.login \|\| ''\) === 'github-actions\[bot\]'/);
+  assert.match(provenanceStep, /Trusted Claude workflow linkage to PR #\$\{prNumber\}/);
+  assert.doesNotMatch(workflow, /No trigger comment .* treat as delivered/);
   assert.match(workflow, /labels: delivered \? \['claude-generated', 'automerge'\] : \['claude-generated'\]/);
   assert.match(workflow, /github-token: \$\{\{ github\.token \}\}/);
   assert.match(workflow, /CLAUDE_BRANCH_NAME: \$\{\{ steps\.claude_issue\.outputs\.branch_name \}\}/);
