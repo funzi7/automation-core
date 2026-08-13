@@ -12,6 +12,7 @@ const {
   currentHeadEpochFromVerifiedRuns,
   selectHeadEpoch,
   isCodexCapacityNotice,
+  isCodexTaskResult,
 } = require('../tools/codex_gate_logic');
 
 const CODEX = 'chatgpt-codex-connector';
@@ -95,11 +96,38 @@ test('review freshness is bound to the actual head, not a backdated commit', () 
   );
 });
 
-test('unmarked current-head signal must follow the observed head transition', () => {
+test('unmarked signal cannot inherit a newer head from timing alone', () => {
   const signal = { created_at: '2026-08-11T15:00:00Z', body: 'clean' };
-  assert.equal(signalTargetsHead(signal, 'c'.repeat(40), '2026-08-11T14:00:00Z'), true);
+  assert.equal(signalTargetsHead(signal, 'c'.repeat(40), '2026-08-11T14:00:00Z'), false);
   assert.equal(signalTargetsHead(signal, 'c'.repeat(40), '2026-08-11T16:00:00Z'), false);
   assert.equal(signalTargetsHead(signal, 'c'.repeat(40), null), false);
+});
+
+test('delayed Codex task result cannot satisfy a newer exact head', () => {
+  const task = {
+    created_at: '2026-08-13T13:40:08Z',
+    body: [
+      '### Summary',
+      '* Updated the earlier head.',
+      '**Reviewed commit:** `bbbbbbbbbb`',
+      '[View task →](https://chatgpt.com/s/example)',
+    ].join('\n'),
+  };
+  assert.equal(isCodexTaskResult(task.body), true);
+  assert.equal(
+    signalTargetsHead(task, 'b'.repeat(40), '2026-08-13T13:39:24Z'),
+    false,
+  );
+});
+
+test('explicit reviewed-commit result binds only to its exact head', () => {
+  const result = {
+    created_at: '2026-08-13T13:40:08Z',
+    body: 'Codex Review: clean\n\n**Reviewed commit:** `cccccccccc`',
+  };
+  assert.equal(isCodexTaskResult(result.body), false);
+  assert.equal(signalTargetsHead(result, 'c'.repeat(40)), true);
+  assert.equal(signalTargetsHead(result, 'd'.repeat(40)), false);
 });
 
 test('an explicit mismatched commit never falls back to a later timestamp', () => {
@@ -499,7 +527,7 @@ test('review-thread changes have a supported PAT-independent gate sweep', () => 
   assert.match(gate, /anyBlocked && context\.eventName !== 'schedule'/);
 });
 
-test('bridge preserves unmarked current-head top-level findings via verified gate epoch', () => {
+test('bridge requires explicit head binding for top-level findings', () => {
   const bridge = fs.readFileSync(
     path.join(__dirname, '..', 'workflows', 'codex-auto-fix.yml'),
     'utf8',
@@ -527,7 +555,9 @@ test('bridge preserves unmarked current-head top-level findings via verified gat
   assert.match(bridge, /event: 'pull_request', per_page: 100/);
   assert.match(bridge, /markerEvidence\.epoch \|\| runEvidence\.epoch/);
   assert.match(bridge, /headObservedAt = await observedHeadTransition\(issueComments\)/);
-  assert.match(bridge, /signalAt > observedAt/);
+  assert.match(bridge, /if \(isCodexTaskResult\(item\?\.body\)\) return false/);
+  assert.match(bridge, /const loopHead = markerHead\(item\?\.body\)/);
+  assert.doesNotMatch(bridge, /signalAt > observedAt/);
   assert.doesNotMatch(bridge, /prData\?\.updated_at/);
   assert.doesNotMatch(bridge, /commit dates.*transition timestamp/i);
   const digest = bridge.slice(
@@ -556,7 +586,8 @@ test('backup fixer includes trusted current-head top-level findings', () => {
   assert.match(backup, /run\.event !== 'pull_request_target'/);
   assert.match(backup, /github\.rest\.actions\.listWorkflowRunsForRepo/);
   assert.match(backup, /headObservedAt = await observedHeadTransition\(ic\)/);
-  assert.match(backup, /signalAt > observedAt/);
+  assert.match(backup, /if \(isCodexTaskResult\(item\?\.body\)\) return false/);
+  assert.doesNotMatch(backup, /signalAt > observedAt/);
   assert.match(backup, /\.\.\.ic\.filter\(\(c\) => isCodex\(c\) && targetsHead\(c\)/);
   assert.match(backup, /isCapacityNotice\(c\.body\)/);
   assert.match(backup, /PR_NUMBER: \$\{\{ inputs\.pr_number \}\}/);

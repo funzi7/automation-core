@@ -7,16 +7,17 @@ name: Codex Gate
 # A finding clears only when its thread is resolved, or GitHub marks it outdated
 # and Codex supplies a current-head signal with no active replacement finding,
 # or the explicit `codex-p1-acknowledged` administrator label is present.
-# Current-head review freshness is bound to the review's exact commit marker or
-# to a signal after a trusted bot-recorded head transition; Git commit timestamps
-# are never used. Thread state comes from GitHub GraphQL.
+# Current-head review freshness is bound to exact `commit_id`,
+# `original_commit_id`, or `Reviewed commit` evidence. Task summaries,
+# reactions, and timestamp-only signals never count. Thread state comes from
+# GitHub GraphQL.
 # The authoritative decision implementation stays inline in this trusted
 # default-branch workflow. PR-controlled workflow, checkout and require paths
 # are forbidden; review events are rechecked through a default-branch
 # workflow_run relay. A PAT-independent scheduled sweep covers thread-state
-# changes and reaction events that have no supported Actions trigger.
-# Trusted actor allowlisting, Summary/Testing quote stripping, reaction-based
-# clean signals, trusted-sync grace and intentional technical fail-soft remain.
+# changes that have no supported Actions trigger. Trusted actor allowlisting,
+# Summary/Testing quote stripping, trusted-sync grace and intentional technical
+# fail-soft remain.
 #
 on:
   # SECURITY: pull_request/review/review_comment workflows execute from the
@@ -203,20 +204,25 @@ jobs:
               return /^You have reached your Codex usage limits for code reviews\./i.test(text) ||
                 /^Codex (?:is|was) (?:currently )?(?:at capacity|unable to (?:complete|perform) (?:this )?code review)/i.test(text);
             }
+            function isCodexTaskResult(body) {
+              const text = String(body || '');
+              return /(?:^|\n)#{2,3}\s+Summary(?:\s|$)/i.test(text) &&
+                /\[View task(?:\s*(?:→|->))?\s*\]\(/i.test(text);
+            }
             const HEAD_EPOCH_MARKER_PATTERN = /<!--\s*codex-head-epoch:v3\s+run=(\d+)\s+attempt=(\d+)\s+pr=(\d+)\s+head=([a-f0-9]{40})\s*-->/i;
             function signalTargetsHead(item, headSha, headObservedAt, dateField = 'created_at') {
               const exactHead = String(headSha || '').toLowerCase();
               if (!/^[a-f0-9]{40}$/.test(exactHead)) return false;
+              if (isCodexTaskResult(item?.body)) return false;
               const originalCommit = String(item?.original_commit_id || '').toLowerCase();
               if (originalCommit) return originalCommit === exactHead;
               const commit = String(item?.commit_id || '').toLowerCase();
               if (commit) return commit === exactHead;
               const marker = String(item?.body || '').match(REVIEWED_COMMIT_PATTERN)?.[1]?.toLowerCase();
               if (marker) return exactHead.startsWith(marker);
-              const signalAt = new Date(item?.[dateField] || 0).getTime();
-              const observedAt = new Date(headObservedAt || 0).getTime();
-              return Number.isFinite(signalAt) && Number.isFinite(observedAt) &&
-                observedAt > 0 && signalAt > observedAt;
+              // A delayed old-head task may finish after a new push. Timing
+              // alone is never an exact-head review binding.
+              return false;
             }
 
             let prWorkflowRunsPromise = null;
@@ -603,14 +609,6 @@ jobs:
                 const reviewComments = await github.paginate(github.rest.pulls.listReviewComments, {
                   owner, repo, pull_number: prNumber, per_page: 100,
                 });
-                // PR-level reactions — Codex leaves a 👍 here when it has no
-                // issues, sometimes WITHOUT any review body. That 👍 is a valid
-                // "reviewed, nothing to fix" signal, so it counts. The 👍 fires
-                // no event, so the watchdog sweep (fix #18) is what re-dispatches
-                // the gate to catch it on the head (fix #25 removed the in-run poll).
-                const reactions = await github.paginate(github.rest.reactions.listForIssue, {
-                  owner, repo, issue_number: prNumber, per_page: 100,
-                });
                 let headObservedAt = null;
                 try {
                   headObservedAt = await observedHeadTransition(prNumber, headSha, comments);
@@ -666,24 +664,21 @@ jobs:
                 // A trusted-actor quota/capacity notice proves no review
                 // occurred. It must never become an affirmative head signal.
                 const codexReviews = reviews.filter(r =>
-                  isCodex(r.user) && !isCodexCapacityNotice(r.body));
+                  isCodex(r.user) && !isCodexCapacityNotice(r.body) && !isCodexTaskResult(r.body));
                 const codexComments = comments.filter(c =>
-                  isCodex(c.user) && !isCodexCapacityNotice(c.body));
+                  isCodex(c.user) && !isCodexCapacityNotice(c.body) && !isCodexTaskResult(c.body));
                 const codexReviewComments = reviewComments.filter(c =>
-                  isCodex(c.user) && !isCodexCapacityNotice(c.body));
-                // fix #21: total Codex signals of ANY kind (any date) — reviews,
-                // review comments, issue comments, and issue-level reactions. Zero
-                // means Codex never engaged at all (the trusted-sync grace precondition).
-                const codexReactions = reactions.filter(r => isCodex(r.user));
+                  isCodex(c.user) && !isCodexCapacityNotice(c.body) && !isCodexTaskResult(c.body));
+                // Total exact-bindable Codex signals of any date. Zero means
+                // no review result engaged (the trusted-sync grace precondition).
                 const codexSignalCount =
                   codexReviews.length + codexComments.length +
-                  codexReviewComments.length + codexReactions.length;
+                  codexReviewComments.length;
 
-                // Exact review.commit_id / Codex's Reviewed commit marker binds
-                // directly to the SHA. Other surfaces (including reactions and
-                // repointed inline comments) count only after GitHub Actions
-                // observed this SHA as this PR's head. Git commit dates are not
-                // push/head-transition timestamps and are never used here.
+                // Exact review.commit_id / original_commit_id / Codex's Reviewed
+                // commit marker binds directly to the SHA. Unmarked comments,
+                // reactions, and task summaries are never affirmative because
+                // asynchronous old-head work can finish after a new push.
                 const onHead = (item, dateField) =>
                   signalTargetsHead(item, headSha, headObservedAt, dateField);
 
@@ -708,17 +703,11 @@ jobs:
                   })),
                 ].sort((a, b) => new Date(a.date) - new Date(b.date));
 
-                // An unmarked 👍 counts only after the server-observed head
-                // transition. The watchdog sweep catches this no-event signal.
-                const codexThumbsUpOnHead = reactions.some(
-                  r => isCodex(r.user) && r.content === '+1' && onHead(r, 'created_at')
-                );
-
                 // Has Codex actually reviewed the CURRENT head? = any Codex
-                // signal explicitly bound to the SHA or observed after its
-                // head transition. This does not stale an active review thread.
+                // review result explicitly bound to the SHA. This does not
+                // stale an active review thread.
                 const hasCodexSignalOnHead =
-                  allBodies.some(item => item.onHead) || codexThumbsUpOnHead;
+                  allBodies.some(item => item.onHead);
 
                 // Review bodies and top-level PR comments can carry trusted
                 // P1/P2 findings without an inline review thread. They remain

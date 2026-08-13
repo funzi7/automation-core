@@ -6,7 +6,7 @@ Central source of truth for CI/CD automation across all of @funzi7's repositorie
 
 `workflows/` — generic GitHub Actions workflows synced to every participating repo:
 - `codex-auto-fix.yml` — triggers Codex to fix flagged P1/P2 reviews automatically
-- `codex-gate.yml` — blocks PR merge until a valid current-head Codex review signal exists and no P1/P2 remains; quota/capacity notices never count
+- `codex-gate.yml` — blocks PR merge until a Codex review/result explicitly binds to the current head and no P1/P2 remains; capacity notices, task summaries, reactions, and timing-only signals never count
 - `claude.yml` — **Claude Fixer**: Claude Code fixes a `claude-fix` Issue (or an `@claude` mention) on a branch and opens a PR
 - `ci-doctor.yml` — **CI Doctor**: detects failed runs on the default branch and opens `claude-fix` Issues
 - `merge-bot.yml` — **Merge Bot**: squash-merges fully-green PRs once codex-gate passes
@@ -51,6 +51,12 @@ dispatch/update/backup failures alert once per repository/PR/exact-head/
 operation/normalized-error marker; identical retries keep logging without
 repeating Telegram. CI Doctor also ignores internal automation by workflow
 path, including parse-failed runs whose display name degrades to the YAML path.
+
+Exact-head review binding is fail-closed against asynchronous races. A review
+must carry GitHub's `commit_id`/`original_commit_id` or Codex's explicit
+`Reviewed commit` marker. An old-head task summary that arrives after a new push
+cannot turn the new head green merely because its timestamp is later; neither
+can an unbound reaction.
 
 **Scheduling (kept light to restrain Actions-minute cost):** CI Doctor runs on
 a cron **twice a day** (06:00 & 18:00 UTC) to sweep the default branch for

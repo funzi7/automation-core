@@ -27,19 +27,25 @@ function isCodexCapacityNotice(body) {
     /^Codex (?:is|was) (?:currently )?(?:at capacity|unable to (?:complete|perform) (?:this )?code review)/i.test(text);
 }
 
+function isCodexTaskResult(body) {
+  const text = String(body || '');
+  return /(?:^|\n)#{2,3}\s+Summary(?:\s|$)/i.test(text) &&
+    /\[View task(?:\s*(?:→|->))?\s*\]\(/i.test(text);
+}
+
 function signalTargetsHead(item, headSha, headObservedAt = null, dateField = 'created_at') {
   const exactHead = String(headSha || '').toLowerCase();
   if (!/^[a-f0-9]{40}$/.test(exactHead)) return false;
+  if (isCodexTaskResult(item?.body)) return false;
   const originalCommit = String(item?.original_commit_id || '').toLowerCase();
   if (originalCommit) return originalCommit === exactHead;
   const commit = String(item?.commit_id || '').toLowerCase();
   if (commit) return commit === exactHead;
   const marker = String(item?.body || '').match(REVIEWED_COMMIT_PATTERN)?.[1]?.toLowerCase();
   if (marker) return exactHead.startsWith(marker);
-  const signalAt = new Date(item?.[dateField] || 0).getTime();
-  const observedAt = new Date(headObservedAt || 0).getTime();
-  return Number.isFinite(signalAt) && Number.isFinite(observedAt) &&
-    observedAt > 0 && signalAt > observedAt;
+  // Timing alone cannot bind an asynchronous result to a head: an old-head
+  // task can finish after a new push. Affirmative signals must name a commit.
+  return false;
 }
 
 function currentHeadEpochStart(runs = [], prNumber, headSha) {
@@ -213,6 +219,7 @@ module.exports = {
   REVIEWED_COMMIT_PATTERN,
   HEAD_EPOCH_MARKER_PATTERN,
   isCodexCapacityNotice,
+  isCodexTaskResult,
   signalTargetsHead,
   currentHeadEpochStart,
   currentHeadEpochFromVerifiedRuns,
