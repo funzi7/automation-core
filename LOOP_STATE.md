@@ -205,9 +205,17 @@ Synced workflows listed in `sync-config.json`: `codex-auto-fix.yml`, `codex-gate
 - HISTORICAL: older onboarding notes for OPT/TRF described PRs before merge. Current verified facts: OPT #12 merged; TRF #80 merged.
 - HISTORICAL: prior escalation-label migration notes exist in older commits. Current docs and workflows use only `needs-owner`; do not reintroduce any prior name.
 
-## Validation Notes For This Normalization
+## Validation Notes For This Recovery Record And Hardening
 
-- Workflow logic was not changed.
-- `workflows/` and `.github/workflows/` were intentionally not changed.
-- No downstream repo was changed.
+- The recovery documentation was reconciled with production evidence.
+- Workflow data transport was hardened without changing gate or fixer semantics:
+  direct GitHub expressions in every `actions/github-script` body were moved to
+  step/job `env`, including `bootstrap.yml` and the source/mirror copies of
+  `claude.yml`, `codex-auto-fix.yml`, and `codex-backup-fix.yml`.
+- The validator now examines every tracked YAML workflow, rejects any direct
+  expression in a `github-script` body, and syntax-checks all extracted scripts.
+- The source/mirror workflow pairs remain byte-identical. Paywall-bot received
+  the seven-workflow version from PR #94; the three newly hardened synced pairs
+  require one final normal downstream sync after this change merges.
+- No application repository logic was changed.
 - No force push, browser automation, Playwright, session-cookie automation, UI automation, or fake Codex Cloud Update-branch implementation was used.

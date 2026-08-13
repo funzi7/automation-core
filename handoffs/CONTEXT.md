@@ -45,7 +45,11 @@ Code architecture base: fix #27 implementation commit `93f6acb9d2e0396afad3e1085
 
 Previous documentation reconciliation: `ff57a73220faa5dbb563edc7b035fc6cc653c509`.
 
-This final normalization is documentation-only. It does not change workflow logic.
+This recovery pass also hardens workflow expression transport and its validator.
+It moves values out of every `actions/github-script` body and into step/job
+`env` in `bootstrap.yml` plus the source/mirror copies of `claude.yml`,
+`codex-auto-fix.yml`, and `codex-backup-fix.yml`. The gate/fixer semantics are
+unchanged, and the source/mirror pairs remain byte-identical.
 
 Current fixer ladder:
 
@@ -234,17 +238,23 @@ These are preserved as incident records. They are not current operating instruct
 - HISTORICAL: Cloud View task / Created commit summaries once looked actionable enough to wait on. Current rule: they are non-delivery unless a real PR-head commit lands.
 - HISTORICAL: prior onboarding notes described OPT #12 and TRF #80 before merge. Current verified facts: both are merged.
 - HISTORICAL: old escalation-label migration notes exist in git history. Current rule: only `needs-owner` is valid; do not reintroduce any prior name.
-- HISTORICAL: manually applied YAML/script edits once broke workflow parsing. Current rule: validate YAML/actionlint/script syntax before workflow changes. This task did not change workflows.
+- HISTORICAL: manually applied YAML/script edits once broke workflow parsing. Current rule: validate YAML/actionlint/script syntax before workflow changes. This pass changed expression transport in four workflow definitions and validated every tracked workflow/script body.
 
 ## 7. Current Open TODO
 
-A. Documentation/state work completed in this pass:
+A. Recovery documentation and expression-safety work completed in this pass:
 
 - stale current-tense claims normalized;
 - Claude PR-head delivery and Claude proxy described as implemented but runtime-unverified;
 - disabled Codex API backup behavior corrected to skipped, not immediate escalation;
 - OPT #12 and TRF #80 recorded as merged;
-- no workflow logic changed.
+- GitHub expression values were moved from inline `github-script` bodies to
+  step/job `env` without changing gate or fixer semantics;
+- validation now scans every tracked YAML workflow, rejects any direct
+  expression in a `github-script` body, and syntax-checks every extracted body;
+- the changed source/mirror workflow pairs are byte-identical; after this pass
+  merges, paywall-bot needs one final normal sync for the three changed synced
+  pairs.
 
 B. Claude-budget-blocked runtime verification:
 
