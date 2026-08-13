@@ -501,8 +501,15 @@ test('transient clear revalidates the exact label assignments before merge', () 
   assert.match(workflow, /if \(!clearStillOwned\) \{/);
   assert.match(workflow, /await restoreRaceHardStopIfOpen\(prNumber\)/);
   assert.match(workflow, /labels: \[LABEL_ESCALATE\]/);
-  assert.match(workflow, /state=clear_race/);
-  assert.match(workflow, /marker && \/\\bstate=clear_race/);
+  assert.match(workflow, /state=clear_race label_event=\$\{restoredProvenance\.needsEventId\}/);
+  assert.match(workflow, /racedLabelEvent = marker\?\.attributes/);
+  assert.match(workflow, /Number\(racedLabelEvent\) === Number\(needsEvent\?\.id \|\| 0\)/);
+  assert.match(workflow, /restoredProvenance = await escalationProvenance\(prNumber\)/);
+  const raceRestore = workflow.slice(
+    workflow.indexOf('async function restoreRaceHardStopIfOpen'),
+    workflow.indexOf('async function persistPermanentStop'),
+  );
+  assert.doesNotMatch(raceRestore, /current\.state !== 'open'/);
   assert.match(workflow, /marker persistence fails, attach the permanent policy stop/);
   assert.match(workflow, /labels: \[LABEL_NO_AUTOMERGE\]/);
   assert.match(workflow, /async function persistPermanentStop\(prNumber, reason\)/);

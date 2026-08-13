@@ -579,8 +579,11 @@ jobs:
               const protectedReason = comments.some((comment) => {
                 const body = String(comment.body || '');
                 const marker = trustedLoopMarker(comment);
+                const racedLabelEvent = marker?.attributes
+                  .match(/\blabel_event=(\d+)\b/i)?.[1];
                 return (
-                  (marker && /\bstate=clear_race\b/i.test(marker.attributes)) ||
+                  (marker && /\bstate=clear_race\b/i.test(marker.attributes) &&
+                    Number(racedLabelEvent) === Number(needsEvent?.id || 0)) ||
                   /Auto-merge blocked: this PR touches protected path/i.test(body) ||
                   /skipped this fork-headed PR/i.test(body) ||
                   /fork-headed PR[^\n]*Escalated to needs-owner/is.test(body)
@@ -642,7 +645,6 @@ jobs:
               const { data: current } = await github.rest.pulls.get({
                 owner, repo, pull_number: prNumber,
               });
-              if (current.state !== 'open') return;
               const currentLabels = labelNames(current);
               if (currentLabels.has(LABEL_ESCALATE_AUTO)) {
                 await github.rest.issues.removeLabel({
@@ -667,9 +669,13 @@ jobs:
               // nearby watchdog-owned legacy escalation on a later pass. If
               // marker persistence fails, attach the permanent policy stop.
               try {
+                const restoredProvenance = await escalationProvenance(prNumber);
+                if (!restoredProvenance.needsEventId) {
+                  throw new Error('restored needs-owner label event is unavailable');
+                }
                 await github.rest.issues.createComment({
                   owner, repo, issue_number: prNumber,
-                  body: `<!-- ai-loop:v1 root_pr=${prNumber} head=${current.head.sha} agent=merge-bot state=clear_race -->\nMerge Bot detected a concurrent needs-owner transition while clearing an automated escalation. The restored needs-owner is a permanent manual/unknown hard stop.`,
+                  body: `<!-- ai-loop:v1 root_pr=${prNumber} head=${current.head.sha} agent=merge-bot state=clear_race label_event=${restoredProvenance.needsEventId} -->\nMerge Bot detected a concurrent needs-owner transition while clearing an automated escalation. The restored needs-owner is a permanent manual/unknown hard stop.`,
                 });
               } catch (e) {
                 await persistPermanentStop(prNumber, 'clear-race marker persistence failed');
