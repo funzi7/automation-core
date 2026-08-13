@@ -326,14 +326,19 @@ test('authoritative workflow keeps gate policy inline', () => {
   assert.match(workflow, /cron: '7,22,37,52 \* \* \* \*'/);
   assert.match(workflow, /context\.eventName === 'schedule'/);
   assert.match(workflow, /async function observedHeadTransition\(prNumber, headSha, comments = \[\]\)/);
-  assert.match(workflow, /codex-head-epoch:v2/);
+  assert.match(workflow, /codex-head-epoch:v3/);
+  assert.match(workflow, /pr=\$\{prNumber\} head=\$\{markerHead\}/);
+  assert.match(workflow, /const head = markerHead/);
+  assert.doesNotMatch(workflow, /const head = String\(run\.head_sha \|\| ''\)\.toLowerCase\(\)/);
   assert.match(workflow, /async function ensureHeadEpochMarker\(prNumber, comments\)/);
+  assert.match(workflow, /context\.payload\.pull_request\?\.head\?\.sha/);
+  assert.match(workflow, /String\(match\[4\]\)\.toLowerCase\(\) === markerHead/);
   assert.match(workflow, /if \(\(comment\.user\?\.login \|\| ''\) !== 'github-actions\[bot\]'\) return false/);
   assert.match(workflow, /actions\/runs\/\{run_id\}\/attempts\/\{attempt_number\}/);
   assert.match(workflow, /run\.path !== '\.github\/workflows\/codex-gate\.yml'/);
   assert.match(workflow, /run\.event !== 'pull_request_target'/);
   assert.match(workflow, /Number\(run\.run_attempt\) !== attempt \|\| !belongsToPr \|\| !commentInsideRun/);
-  assert.match(workflow, /const head = String\(run\.head_sha \|\| ''\)/);
+  assert.match(workflow, /const head = markerHead/);
   assert.match(workflow, /const refs = \[\]/);
   assert.match(workflow, /if \(accepted\.has\(key\)\) continue/);
   assert.doesNotMatch(workflow, /refs\.set\(/);
@@ -455,6 +460,9 @@ test('bridge preserves unmarked current-head top-level findings via verified gat
     'utf8',
   );
   assert.match(bridge, /const HEAD_EPOCH_MARKER_PATTERN =/);
+  assert.match(bridge, /markerPr: Number\(match\[3\]\)/);
+  assert.match(bridge, /markerHead: match\[4\]\.toLowerCase\(\)/);
+  assert.match(bridge, /const runHead = ref\.markerHead/);
   assert.match(bridge, /permissions:[\s\S]*actions: read/);
   assert.match(bridge, /async function observedHeadTransition\(comments\)/);
   assert.match(bridge, /comment\.user\?\.login \|\| ''\) !== 'github-actions\[bot\]'/);

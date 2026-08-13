@@ -422,11 +422,12 @@ test('workflow preserves exact-SHA squash merge and same-repo branch deletion', 
   assert.match(workflow, /marker\.head === currentHead/);
   assert.match(workflow, /async function hasCurrentHeadCodexSignal\(prNumber, headSha\)/);
   assert.match(workflow, /async function observedHeadTransition\(prNumber, headSha, comments = \[\]\)/);
-  assert.match(workflow, /codex-head-epoch:v2/);
+  assert.match(workflow, /codex-head-epoch:v3/);
+  assert.match(workflow, /const head = markerHead/);
   assert.match(workflow, /run\.path !== '\.github\/workflows\/codex-gate\.yml'/);
   assert.match(workflow, /run\.event !== 'pull_request_target'/);
   assert.match(workflow, /Number\(run\.run_attempt\) !== attempt \|\| !belongsToPr \|\| !commentInsideRun/);
-  assert.match(workflow, /const head = String\(run\.head_sha \|\| ''\)/);
+  assert.match(workflow, /const head = markerHead/);
   assert.match(workflow, /const refs = \[\]/);
   assert.match(workflow, /if \(accepted\.has\(key\)\) continue/);
   assert.doesNotMatch(workflow, /refs\.set\(/);

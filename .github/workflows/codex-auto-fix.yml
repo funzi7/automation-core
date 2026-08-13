@@ -157,7 +157,7 @@ jobs:
               return;
             }
             const REVIEWED_COMMIT_PATTERN = /(?:^|\n)\*\*Reviewed commit:\*\*\s*`([a-f0-9]{10,40})`(?:\s|$)/i;
-            const HEAD_EPOCH_MARKER_PATTERN = /<!--\s*codex-head-epoch:v2\s+run=(\d+)\s+attempt=(\d+)\s*-->/i;
+            const HEAD_EPOCH_MARKER_PATTERN = /<!--\s*codex-head-epoch:v3\s+run=(\d+)\s+attempt=(\d+)\s+pr=(\d+)\s+head=([a-f0-9]{40})\s*-->/i;
             const markerHead = (body) => String(body || '').match(/<!--\s*ai-loop:v1\b[^>]*\bhead=([a-f0-9]{40})\b[^>]*-->/i)?.[1];
             let headObservedAt = null;
             const signalTargetsHead = (item, dateField = 'created_at') => {
@@ -187,6 +187,8 @@ jobs:
                 return [{
                   runId: Number(match[1]),
                   attempt: Number(match[2]),
+                  markerPr: Number(match[3]),
+                  markerHead: match[4].toLowerCase(),
                   commentAt: new Date(comment.created_at || 0).getTime(),
                   commentId: Number(comment.id || 0),
                 }];
@@ -194,6 +196,7 @@ jobs:
               const verifiedRuns = [];
               const verifiedKeys = new Set();
               for (const ref of refs) {
+                if (ref.markerPr !== Number(prNumber)) continue;
                 const key = `${ref.runId}/${ref.attempt}`;
                 if (verifiedKeys.has(key)) continue;
                 let run;
@@ -222,7 +225,9 @@ jobs:
                 ) continue;
                 verifiedKeys.add(key);
                 const observedAt = new Date(run.created_at || 0).getTime();
-                const runHead = String(run.head_sha || '').toLowerCase();
+                // pull_request_target run.head_sha is the base SHA. Trust
+                // the payload head stored inside the verified Gate attempt.
+                const runHead = ref.markerHead;
                 if (!/^[a-f0-9]{40}$/.test(runHead) || !Number.isFinite(observedAt) || observedAt <= 0) continue;
                 verifiedRuns.push({
                   head: runHead,
