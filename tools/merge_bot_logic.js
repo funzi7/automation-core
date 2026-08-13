@@ -15,6 +15,7 @@ const LABEL_AUTOMERGE = 'automerge';
 const LABEL_ESCALATE = 'needs-owner';
 const LABEL_ESCALATE_AUTO = 'needs-owner-auto';
 const LABEL_NO_AUTOMERGE = 'no-automerge';
+const CLAUDE_GENERATED_LABEL = 'claude-generated';
 const CODEX_OVERRIDE_LABEL = 'codex-p1-acknowledged';
 const SYNC_TITLE_PREFIX = 'chore(automation): sync from automation-core';
 const SYNC_BRANCH = 'chore/sync-automation-core';
@@ -40,9 +41,23 @@ function isClaudeBot(login) {
 }
 
 function isTrustedSync(pr, repositoryFullName) {
-  if (!String(pr?.title || '').startsWith(SYNC_TITLE_PREFIX)) return false;
+  if (String(pr?.title || '') !== SYNC_TITLE_PREFIX) return false;
   if (!isSameRepo(pr, repositoryFullName)) return false;
-  return pr?.user?.login === OWNER_LOGIN || pr?.head?.ref === SYNC_BRANCH;
+  return pr?.user?.login === OWNER_LOGIN && pr?.head?.ref === SYNC_BRANCH;
+}
+
+function isClaudeAutomationPr(pr, repositoryFullName) {
+  return isSameRepo(pr, repositoryFullName) && (
+    isClaudeBot(pr?.user?.login) ||
+    String(pr?.head?.ref || '').startsWith('claude/') ||
+    labelNames(pr).has(CLAUDE_GENERATED_LABEL)
+  );
+}
+
+function mayAutoMergeProtectedPaths(pr, repositoryFullName, claudeAutomationProven = false) {
+  if (isClaudeAutomationPr(pr, repositoryFullName) || claudeAutomationProven) return false;
+  return isTrustedSync(pr, repositoryFullName) ||
+    isOwnerSameRepo(pr, repositoryFullName);
 }
 
 function isAutoMergeCandidate(pr, repositoryFullName) {
@@ -199,6 +214,7 @@ function evaluateMergePolicy({
   legacyAutomationProven = false,
   companionAutomationProven = false,
   currentHeadCodexSignal = true,
+  claudeAutomationProven = false,
   evaluatedHead = pr?.head?.sha,
   currentHead = pr?.head?.sha,
 } = {}) {
@@ -234,7 +250,9 @@ function evaluateMergePolicy({
   if (activeTrustedFinding && !labels.has(CODEX_OVERRIDE_LABEL)) {
     return { eligible: false, reason: 'active_trusted_finding' };
   }
-  if (protectedPathHit && !isOwnerSameRepo(pr, repositoryFullName)) {
+  if (protectedPathHit && !mayAutoMergeProtectedPaths(
+    pr, repositoryFullName, claudeAutomationProven,
+  )) {
     return { eligible: false, reason: 'protected_path_untrusted' };
   }
   if (!evaluatedHead || currentHead !== evaluatedHead || pr?.head?.sha !== evaluatedHead) {
@@ -256,6 +274,7 @@ module.exports = {
   LABEL_ESCALATE,
   LABEL_ESCALATE_AUTO,
   LABEL_NO_AUTOMERGE,
+  CLAUDE_GENERATED_LABEL,
   CODEX_OVERRIDE_LABEL,
   SYNC_TITLE_PREFIX,
   SYNC_BRANCH,
@@ -263,6 +282,8 @@ module.exports = {
   isSameRepo,
   isOwnerSameRepo,
   isTrustedSync,
+  isClaudeAutomationPr,
+  mayAutoMergeProtectedPaths,
   isAutoMergeCandidate,
   latestChecksByName,
   companionAutomationProvenance,

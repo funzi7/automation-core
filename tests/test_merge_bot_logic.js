@@ -303,6 +303,40 @@ test('protected-path trusted owner PR may merge after full review', () => {
   assert.equal(decide({ protectedPathHit: true }).eligible, true);
 });
 
+test('protected-path PAT-owner Claude PR remains escalated', () => {
+  const claude = pr({
+    title: 'chore(automation): sync from automation-core',
+    head: { ref: 'claude/fix-sensitive-workflow' },
+    labels: [{ name: 'automerge' }],
+  });
+  assert.equal(isAutoMergeCandidate(claude, REPOSITORY), true);
+  assert.equal(
+    decide({ pr: claude, protectedPathHit: true }).reason,
+    'protected_path_untrusted',
+  );
+});
+
+test('durable Claude provenance blocks protected arbitrary owner branch', () => {
+  const arbitrary = pr({ head: { ref: 'fix/claude-chose-this-name' } });
+  assert.equal(decide({ pr: arbitrary, protectedPathHit: true }).eligible, true);
+  assert.equal(
+    decide({
+      pr: arbitrary,
+      protectedPathHit: true,
+      claudeAutomationProven: true,
+    }).reason,
+    'protected_path_untrusted',
+  );
+  const labeled = pr({
+    head: { ref: 'fix/another-name' },
+    labels: [{ name: 'claude-generated' }],
+  });
+  assert.equal(
+    decide({ pr: labeled, protectedPathHit: true }).reason,
+    'protected_path_untrusted',
+  );
+});
+
 test('protected-path fork or untrusted PR remains escalated', () => {
   const fork = pr({
     labels: [{ name: 'automerge' }],
@@ -319,6 +353,36 @@ test('trusted same-repo automation-core sync behavior remains eligible', () => {
     head: { ref: 'chore/sync-automation-core' },
   });
   assert.equal(decide({ pr: sync }).eligible, true);
+  assert.equal(decide({ pr: sync, protectedPathHit: true }).eligible, true);
+  assert.equal(
+    decide({
+      pr: sync,
+      protectedPathHit: true,
+      claudeAutomationProven: true,
+    }).reason,
+    'protected_path_untrusted',
+  );
+});
+
+test('sync title alone cannot grant trusted protected-path provenance', () => {
+  const spoof = pr({
+    title: 'chore(automation): sync from automation-core',
+    user: { login: 'github-actions[bot]' },
+    labels: [{ name: 'automerge' }],
+    head: { ref: 'fix/not-the-sync-branch' },
+  });
+  assert.equal(
+    decide({ pr: spoof, protectedPathHit: true }).reason,
+    'protected_path_untrusted',
+  );
+  const claudeSpoof = pr({
+    title: 'chore(automation): sync from automation-core',
+    head: { ref: 'claude/not-the-sync-branch' },
+  });
+  assert.equal(
+    decide({ pr: claudeSpoof, protectedPathHit: true }).reason,
+    'protected_path_untrusted',
+  );
 });
 
 test('workflow preserves exact-SHA squash merge and same-repo branch deletion', () => {
@@ -333,6 +397,10 @@ test('workflow preserves exact-SHA squash merge and same-repo branch deletion', 
   assert.match(workflow, /unexpected evaluation error; skipping only this PR/);
   assert.match(workflow, /hasCurrentHeadNonInlineFinding/);
   assert.match(workflow, /hasActiveTrustedBlocker/);
+  assert.match(workflow, /isClaudeAutomationPr/);
+  assert.match(workflow, /hasClaudeAutomationProvenance/);
+  assert.match(workflow, /!\(await mayAutoMergeProtectedPaths\(pr\)\)/);
+  assert.match(workflow, /event\.actor\?\.login === 'github-actions\[bot\]'/);
   assert.match(workflow, /workflows: \["Codex Gate", "CI", "Automation Core CI"\]/);
   assert.match(workflow, /const trustedLoopMarker = \(comment\) =>/);
   assert.match(workflow, /Number\(root\[1\]\) !== prNumber/);
@@ -413,6 +481,31 @@ test('only temporary PR automation writers add needs-owner-auto', () => {
   assert.doesNotMatch(read('claude.yml'), /needs-owner-auto/);
   assert.doesNotMatch(read('codex-backup-fix.yml'), /needs-owner-auto/);
   assert.doesNotMatch(read('ci-doctor.yml'), /needs-owner-auto/);
+});
+
+test('Claude PR provenance records on failure while automerge remains success-only', () => {
+  const workflow = fs.readFileSync(
+    path.join(__dirname, '..', 'workflows', 'claude.yml'),
+    'utf8',
+  );
+  assert.match(workflow, /always\(\) && steps\.claude_issue\.outcome != 'skipped'/);
+  assert.match(workflow, /const delivered = '\$\{\{ steps\.claude_issue\.outcome \}\}' === 'success'/);
+  assert.match(workflow, /labels: delivered \? \['claude-generated', 'automerge'\] : \['claude-generated'\]/);
+  assert.match(workflow, /github-token: \$\{\{ github\.token \}\}/);
+  assert.match(workflow, /CLAUDE_BRANCH_NAME: \$\{\{ steps\.claude_issue\.outputs\.branch_name \}\}/);
+  assert.match(workflow, /name: Create Claude PR from trusted branch/);
+  assert.match(workflow, /branch_prefix: "claude\/"/);
+  assert.match(workflow, /if \(!branch\.startsWith\('claude\/'\)\) throw new Error/);
+  assert.match(workflow, /await github\.rest\.pulls\.create/);
+  assert.match(workflow, /head: `\$\{owner\}:\$\{claudeBranch\}`/);
+  const issuePath = workflow.slice(
+    workflow.indexOf('Run Claude Code (Issue/new-PR path)'),
+    workflow.indexOf('Run Claude Code (existing PR head path)'),
+  );
+  assert.match(issuePath, /github_token: \$\{\{ github\.token \}\}/);
+  assert.doesNotMatch(issuePath, /secrets\.AUTOMATION_PAT/);
+  assert.doesNotMatch(issuePath, /Bash\(git:\*\)/);
+  assert.doesNotMatch(issuePath, /Bash\(gh pr:\*\)/);
 });
 
 test('synced review freshness never uses the removed latest-commit-date model', () => {

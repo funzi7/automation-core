@@ -186,10 +186,12 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          # PAT so Claude's PR triggers codex-gate; default token fallback.
-          github_token: ${{ secrets.AUTOMATION_PAT || github.token }}
+          # Issue-mode Claude never receives AUTOMATION_PAT. The trusted
+          # post-step alone uses it to create the exact action-controlled PR.
+          github_token: ${{ github.token }}
           trigger_phrase: "@claude"
           label_trigger: "claude-fix"
+          branch_prefix: "claude/"
           # fix #16: expose the SDK transcript ONLY when the repo opts in via the
           # Actions variable CLAUDE_SHOW_FULL_OUTPUT == 'true'. Default (var unset
           # or any other value) keeps today's hidden output ("full output hidden
@@ -200,20 +202,18 @@ jobs:
           # reports permission_denials_count but hides WHICH tools were denied, so
           # the count alone can't tune --allowedTools), then flip it back.
           show_full_output: ${{ vars.CLAUDE_SHOW_FULL_OUTPUT == 'true' }}
-          # --max-turns 50 + a BROAD allowlist (fix #7). The previous
+          # --max-turns 50 + the common inspector/test allowlist (fix #7). The previous
           # --max-turns 20 + narrow per-subcommand list caused error_max_turns
           # on paywall-bot #49: the fixer kept trying tools OUTSIDE the allowlist
           # (11 permission_denials), burning all 20 turns on denial churn without
-          # opening a fix PR. Now: 50 turns; broad `Bash(git:*)`; the common
-          # interpreters/inspectors a fix needs (python/python3/pytest/pip/node/
-          # npm + ls/cat/find/head/tail/sed/mkdir/cp/mv); plus MultiEdit. gh
-          # stays limited to pr/issue. SECURITY: the fixer can already commit +
-          # push code via Edit + git, so a broader COMMAND allowlist adds little
-          # marginal risk; tighten if desired. The PR's CI (codex-gate) remains
-          # the real validation gate.
+          # delivering a fix. Now: 50 turns; common interpreters/inspectors
+          # (python/python3/pytest/pip/node/npm + ls/cat/find/head/tail/sed/
+          # mkdir/cp/mv); plus MultiEdit. The action supplies its own constrained
+          # commit/push tools. Claude cannot create/switch branches or open PRs.
+          # The PR's CI (codex-gate) remains the real validation gate.
           claude_args: |
             --max-turns 50
-            --allowedTools "Read,Glob,Grep,Edit,Write,MultiEdit,Bash(git:*),Bash(python:*),Bash(python3:*),Bash(pytest:*),Bash(pip:*),Bash(node:*),Bash(npm:*),Bash(ls:*),Bash(cat:*),Bash(find:*),Bash(head:*),Bash(tail:*),Bash(sed:*),Bash(mkdir:*),Bash(cp:*),Bash(mv:*),Bash(gh pr:*),Bash(gh issue:*),Bash(actionlint)"
+            --allowedTools "Read,Glob,Grep,Edit,Write,MultiEdit,Bash(python:*),Bash(python3:*),Bash(pytest:*),Bash(pip:*),Bash(node:*),Bash(npm:*),Bash(ls:*),Bash(cat:*),Bash(find:*),Bash(head:*),Bash(tail:*),Bash(sed:*),Bash(mkdir:*),Bash(cp:*),Bash(mv:*),Bash(gh issue:*),Bash(actionlint)"
           additional_permissions: |
             actions: read
           prompt: |
@@ -225,22 +225,21 @@ jobs:
                  failed job names, a link to the failing run, and a tail of the
                  failing job logs. Diagnose the ROOT CAUSE from those logs — do
                  not guess.
-              2. Create a NEW branch (e.g. `claude/fix-<short-desc>`). NEVER
-                 commit or push directly to `main`.
+              2. The action has already checked out its controlled `claude/*`
+                 branch. Work only on that branch; do not create or switch branches.
               3. Apply the minimal fix. If the repo has a CLAUDE.md with a
                  build/test/gate command, OBEY it and run that gate locally;
-                 it must be green before you open the PR.
-              4. Open a PR from your branch that links the Issue with
-                 `Fixes #<N>` (the Issue number you were invoked on) and briefly
-                 explains the root cause and the fix.
-              5. Do NOT merge the PR yourself — codex-gate reviews it and
+                 it must be green before you finish.
+              4. Commit and push the current branch. Do not open a PR yourself;
+                 the trusted post-step creates it from the action's exact branch.
+              5. Do NOT merge anything — codex-gate reviews the resulting PR and
                  merge-bot merges once everything is green.
 
             Prefer the allowed tools and do NOT attempt tools outside the allowlist (denied calls waste your turn budget); the PR's CI (codex-gate) is the final validation, so do not block on running the full suite locally if the sandbox can't.
 
             If triggered by an @claude mention on an Issue, follow the request
-            in the comment, working on a new branch and opening a PR the same
-            way. Use `Fixes #<N>` for the Issue number. Do not merge it yourself.
+            in the comment on the action-controlled branch. Commit and push; the
+            trusted post-step opens the PR. Do not merge it yourself.
 
       - name: Run Claude Code (existing PR head path)
         id: claude_pr
@@ -449,44 +448,91 @@ jobs:
               core.info(`no-delivery handling failed (ignored): ${e.message}`);
             }
 
-      - name: Label Claude's PR for auto-merge
-        # P1 fix: only label when Claude Code actually RAN AND SUCCEEDED. With
-        # always() this labeled PRs even on a failed/cancelled run, so a PR
-        # Claude did NOT fix could pick up `automerge` and auto-merge.
-        # steps.claude_issue.outcome is 'success' only on a real success; it is
-        # 'failure'/'cancelled' on a bad run and 'skipped' in the
-        # fail-soft (no ANTHROPIC_API_KEY) path — none of which should label.
-        if: steps.claude_issue.outcome == 'success'
+      - name: Create Claude PR from trusted branch
+        if: ${{ always() && steps.claude_issue.outcome != 'skipped' && steps.claude_issue.outputs.branch_name != '' }}
         uses: actions/github-script@v8
+        env:
+          CLAUDE_BRANCH_NAME: ${{ steps.claude_issue.outputs.branch_name }}
         with:
-          # AUTOMATION_PAT (default-token fallback) so merge-bot can pick up the
-          # PR. Claude's PRs are authored by the owner (PAT-authed), not a bot,
-          # so without the `automerge` label merge-bot can't identify them.
+          # PAT-authored creation wakes CI/Codex Gate. The exact branch is an
+          # action output and must retain the action-controlled prefix.
           github-token: ${{ secrets.AUTOMATION_PAT || github.token }}
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
-            // Upsert the label (addLabels only attaches existing labels).
+            const branch = String(process.env.CLAUDE_BRANCH_NAME || '');
+            if (!branch.startsWith('claude/')) throw new Error(`Refusing untrusted Claude branch: ${branch}`);
+            const issueNum = context.payload.issue?.number;
+            if (!issueNum) throw new Error('Issue number missing for Claude PR creation');
+            const existing = await github.paginate(github.rest.pulls.list, {
+              owner, repo, state: 'open', head: `${owner}:${branch}`, per_page: 100,
+            });
+            if (existing.length) {
+              core.info(`Claude PR #${existing[0].number} already exists for ${branch}.`);
+              return;
+            }
             try {
-              await github.rest.issues.createLabel({ owner, repo, name: 'automerge', color: '0e8a16', description: 'Auto-merge by Merge Bot once green' });
-            } catch (e) { if (e.status !== 422) core.info(`createLabel automerge failed (ignored): ${e.message}`); }
+              await github.rest.git.getRef({ owner, repo, ref: `heads/${branch}` });
+            } catch (e) {
+              if (e.status === 404) { core.info(`Claude branch ${branch} was not pushed; no PR to create.`); return; }
+              throw e;
+            }
+            const base = context.payload.repository.default_branch;
+            const { data: comparison } = await github.rest.repos.compareCommitsWithBasehead({
+              owner, repo, basehead: `${base}...${branch}`,
+            });
+            if (comparison.ahead_by < 1) { core.info(`Claude branch ${branch} has no delivered commit.`); return; }
+            const title = `fix: ${String(context.payload.issue.title || `Issue #${issueNum}`).slice(0, 240)}`;
+            const { data: created } = await github.rest.pulls.create({
+              owner, repo, head: branch, base, title,
+              body: `Fixes #${issueNum}\n\nCreated from the trusted Claude workflow branch for this Issue.`,
+            });
+            core.info(`Created Claude PR #${created.number} from trusted branch ${branch}.`);
 
-            async function label(prNumber) {
+      - name: Record Claude PR provenance and conditionally auto-merge
+        # Provenance must survive a run that creates a PR and then fails or is
+        # cancelled. `automerge` remains success-only; a failed delivery gets
+        # only the durable claude-generated marker.
+        if: ${{ always() && steps.claude_issue.outcome != 'skipped' }}
+        uses: actions/github-script@v8
+        env:
+          CLAUDE_BRANCH_NAME: ${{ steps.claude_issue.outputs.branch_name }}
+        with:
+          # Use the default token so the durable claude-generated label event is
+          # attributable to github-actions[bot], independently of PAT-authored
+          # PR ownership or Claude's chosen branch name.
+          github-token: ${{ github.token }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const delivered = '${{ steps.claude_issue.outcome }}' === 'success';
+            const claudeBranch = String(process.env.CLAUDE_BRANCH_NAME || '');
+            if (!claudeBranch) { core.info('Claude action reported no branch; no PR provenance to record.'); return; }
+            if (!claudeBranch.startsWith('claude/')) throw new Error(`Refusing untrusted Claude branch: ${claudeBranch}`);
+            const labels = [
+              { name: 'claude-generated', color: '5319e7', description: 'Provenance: PR was created by the Claude automation workflow' },
+              ...(delivered ? [
+                { name: 'automerge', color: '0e8a16', description: 'Auto-merge by Merge Bot once green' },
+              ] : []),
+            ];
+            for (const label of labels) {
               try {
-                await github.rest.issues.addLabels({ owner, repo, issue_number: prNumber, labels: ['automerge'] });
-                core.info(`Labeled PR #${prNumber} automerge.`);
-              } catch (e) { core.info(`addLabel automerge on #${prNumber} failed (ignored): ${e.message}`); }
+                await github.rest.issues.createLabel({ owner, repo, ...label });
+              } catch (e) {
+                if (e.status !== 422) throw e;
+              }
             }
 
-            // ONLY label a PR that Claude CREATED to resolve a claude-fix Issue:
-            // Claude opened a NEW PR closing the triggering Issue (Fixes #N); find
-            // the open PR(s) linking this issue and label those. We deliberately do
-            // NOT label an arbitrary PR reached via an @claude mention — that would
-            // auto-merge any PR that merely mentions Claude (Codex P1).
-            const issueNum = context.payload.issue && context.payload.issue.number;
-            if (!issueNum) { core.info('No issue/PR context to label.'); return; }
-            const open = await github.paginate(github.rest.pulls.list, { owner, repo, state: 'open', per_page: 100 });
-            const re = new RegExp(`(?:close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)\\s+#${issueNum}\\b`, 'i');
-            const matches = open.filter((pr) => re.test(pr.body || ''));
-            if (!matches.length) { core.info(`No open PR found that closes #${issueNum}.`); return; }
+            async function label(prNumber) {
+              await github.rest.issues.addLabels({
+                owner, repo, issue_number: prNumber,
+                labels: delivered ? ['claude-generated', 'automerge'] : ['claude-generated'],
+              });
+              core.info(`Labeled PR #${prNumber} claude-generated${delivered ? ' + automerge' : ' (delivery not successful)'}.`);
+            }
+
+            const matches = await github.paginate(github.rest.pulls.list, {
+              owner, repo, state: 'open', head: `${owner}:${claudeBranch}`, per_page: 100,
+            });
+            if (!matches.length) { core.info(`No PR exists for trusted Claude branch ${claudeBranch}.`); return; }
             for (const pr of matches) await label(pr.number);

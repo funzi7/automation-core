@@ -142,7 +142,14 @@ mergeability, and a SHA-pinned squash merge. `no-automerge` and manual/unknown
 `needs-owner` and `needs-owner-auto`; only an exact-head fully-green evaluation
 may remove both and continue to merge in the same pass. Protected paths remain
 fail-closed for forks/untrusted/ambiguous PRs but no longer force an additional
-manual merge for a fully reviewed same-repo owner PR.
+manual merge for a fully reviewed ordinary same-repo owner PR. The trusted
+Claude workflow writes durable `claude-generated` provenance as
+`github-actions[bot]`; Merge Bot also checks historical label events. For Issue
+runs, the action controls the `claude/*` branch, Claude lacks broad branch and
+PR-creation commands, and a trusted post-step creates the PR from the action's
+exact branch output. Provenance is therefore present at creation, before CI or
+Gate can wake. PAT-owner Claude PRs remain protected-path fail-closed; exact
+trusted automation-core sync PRs retain rollout only without Claude provenance.
 
 The native `codex-gate-evaluator` job is diagnostic and can retain its expected
 pre-review failure on the PR head. Merge Bot ignores only that diagnostic
