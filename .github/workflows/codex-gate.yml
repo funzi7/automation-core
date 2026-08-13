@@ -141,11 +141,13 @@ jobs:
       - name: Evaluate Codex P1 status for each PR
         if: steps.prs.outputs.numbers != '[]'
         uses: actions/github-script@v8
+        env:
+          PR_NUMBERS_JSON: ${{ steps.prs.outputs.numbers }}
         with:
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
-            const prNumbers = JSON.parse('${{ steps.prs.outputs.numbers }}');
+            const prNumbers = JSON.parse(process.env.PR_NUMBERS_JSON || '[]');
 
             // fix #21: trusted-sync grace-green. A sync PR is a byte-copy of an
             // upstream automation-core main that already passed our full validation;
