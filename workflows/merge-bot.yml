@@ -578,7 +578,12 @@ jobs:
               );
               const protectedReason = comments.some((comment) => {
                 const body = String(comment.body || '');
+                const marker = trustedLoopMarker(comment);
+                const racedLabelEvent = marker?.attributes
+                  .match(/\blabel_event=(\d+)\b/i)?.[1];
                 return (
+                  (marker && /\bstate=clear_race\b/i.test(marker.attributes) &&
+                    Number(racedLabelEvent) === Number(needsEvent?.id || 0)) ||
                   /Auto-merge blocked: this PR touches protected path/i.test(body) ||
                   /skipped this fork-headed PR/i.test(body) ||
                   /fork-headed PR[^\n]*Escalated to needs-owner/is.test(body)
@@ -587,7 +592,112 @@ jobs:
               return {
                 companion,
                 legacy: positiveLegacyEvidence && !protectedReason,
+                needsEventId: Number(needsEvent?.id || 0),
+                autoEventId: Number(autoEvent?.id || 0),
               };
+            }
+
+            async function transientClearKeptValidatedOwnership(
+              prNumber, expectedNeedsEventId, expectedAutoEventId, hadAutoProvenance,
+            ) {
+              // Label deletion has no conditional API. Prove after the requests
+              // that each deleted assignment was still the exact event validated
+              // above. Any intervening human remove/re-add changes adjacency and
+              // must abort the merge even when the label is absent again.
+              // Serialize these reads so the event timeline is the final
+              // ownership snapshot. A parallel, earlier timeline could miss an
+              // add/remove transition visible only after the label snapshot.
+              const currentResponse = await github.rest.pulls.get({
+                owner, repo, pull_number: prNumber,
+              });
+              const currentLabels = labelNames(currentResponse.data);
+              if (currentLabels.has(LABEL_NO_AUTOMERGE) ||
+                  currentLabels.has(LABEL_ESCALATE) ||
+                  currentLabels.has(LABEL_ESCALATE_AUTO)) return false;
+              const events = await github.paginate(
+                'GET /repos/{owner}/{repo}/issues/{issue_number}/events',
+                { owner, repo, issue_number: prNumber, per_page: 100 },
+              );
+              const latestNoAutomergeEvent = events
+                .filter((event) => (
+                  (event.event === 'labeled' || event.event === 'unlabeled') &&
+                  event.label?.name === LABEL_NO_AUTOMERGE
+                ))
+                .sort((a, b) =>
+                  new Date(b.created_at || 0) - new Date(a.created_at || 0) ||
+                  Number(b.id || 0) - Number(a.id || 0))[0];
+              if (latestNoAutomergeEvent?.event === 'labeled') return false;
+
+              const transitionIsDirectClear = (labelName, expectedEventId) => {
+                const timeline = events
+                  .filter((event) => (
+                    (event.event === 'labeled' || event.event === 'unlabeled') &&
+                    event.label?.name === labelName
+                  ))
+                  .sort((a, b) =>
+                    new Date(b.created_at || 0) - new Date(a.created_at || 0) ||
+                    Number(b.id || 0) - Number(a.id || 0));
+                return timeline[0]?.event === 'unlabeled' &&
+                  Number(timeline[1]?.id || 0) === Number(expectedEventId) &&
+                  timeline[1]?.event === 'labeled';
+              };
+
+              return transitionIsDirectClear(LABEL_ESCALATE, expectedNeedsEventId) &&
+                (!hadAutoProvenance ||
+                  transitionIsDirectClear(LABEL_ESCALATE_AUTO, expectedAutoEventId));
+            }
+
+            async function restoreRaceHardStopIfOpen(prNumber) {
+              // A mismatched label timeline means the cleared assignment is no
+              // longer proven automation-owned. Restore only needs-owner, never
+              // its transient companion, so later passes keep it fail-closed.
+              const { data: current } = await github.rest.pulls.get({
+                owner, repo, pull_number: prNumber,
+              });
+              const currentLabels = labelNames(current);
+              if (currentLabels.has(LABEL_ESCALATE_AUTO)) {
+                await github.rest.issues.removeLabel({
+                  owner, repo, issue_number: prNumber,
+                  name: LABEL_ESCALATE_AUTO,
+                });
+              }
+              if (!currentLabels.has(LABEL_ESCALATE)) {
+                try {
+                  await github.rest.issues.addLabels({
+                    owner, repo, issue_number: prNumber,
+                    labels: [LABEL_ESCALATE],
+                  });
+                } catch (e) {
+                  // If the ordinary hard stop cannot be restored, fall back to
+                  // the policy's permanent stop before surfacing the error.
+                  await persistPermanentStop(prNumber, 'needs-owner restore failed');
+                  throw e;
+                }
+              }
+              // Persist why this restored stop must never be treated as a
+              // nearby watchdog-owned legacy escalation on a later pass. If
+              // marker persistence fails, attach the permanent policy stop.
+              try {
+                const restoredProvenance = await escalationProvenance(prNumber);
+                if (!restoredProvenance.needsEventId) {
+                  throw new Error('restored needs-owner label event is unavailable');
+                }
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: prNumber,
+                  body: `<!-- ai-loop:v1 root_pr=${prNumber} head=${current.head.sha} agent=merge-bot state=clear_race label_event=${restoredProvenance.needsEventId} -->\nMerge Bot detected a concurrent needs-owner transition while clearing an automated escalation. The restored needs-owner is a permanent manual/unknown hard stop.`,
+                });
+              } catch (e) {
+                await persistPermanentStop(prNumber, 'clear-race marker persistence failed');
+                throw e;
+              }
+            }
+
+            async function persistPermanentStop(prNumber, reason) {
+              await github.rest.issues.addLabels({
+                owner, repo, issue_number: prNumber,
+                labels: [LABEL_NO_AUTOMERGE],
+              });
+              core.warning(`#${prNumber}: persisted no-automerge because ${reason}`);
             }
 
             async function restoreTransientIfOpen(prNumber) {
@@ -985,6 +1095,24 @@ jobs:
                       name: LABEL_ESCALATE_AUTO,
                     });
                   }
+                  const clearStillOwned = await transientClearKeptValidatedOwnership(
+                    prNumber,
+                    finalProvenance.needsEventId,
+                    finalProvenance.autoEventId,
+                    finalHasAutoProvenance,
+                  );
+                  if (!clearStillOwned) {
+                    try {
+                      await restoreRaceHardStopIfOpen(prNumber);
+                    } catch (restoreError) {
+                      core.warning(`#${prNumber}: raced hard-stop restore failed: ${restoreError.message}`);
+                      // Do not suppress restoration failure until a durable
+                      // permanent stop exists for all later merge-bot runs.
+                      await persistPermanentStop(prNumber, 'raced hard-stop restoration failed');
+                    }
+                    core.warning(`#${prNumber}: needs-owner ownership changed during clear; restored a fail-closed hard stop and skipped merge`);
+                    continue;
+                  }
                   clearedTransient = true;
                   core.info(`#${prNumber}: cleared transient needs-owner${finalHasAutoProvenance ? ' + needs-owner-auto' : ' (proven legacy automation event)'} after exact-head fully-green validation; continuing to merge`);
                 } catch (e) {
@@ -992,6 +1120,7 @@ jobs:
                     await restoreTransientIfOpen(prNumber);
                   } catch (restoreError) {
                     core.warning(`#${prNumber}: transient-label restore failed: ${restoreError.message}`);
+                    await persistPermanentStop(prNumber, 'transient-label restoration failed');
                   }
                   core.warning(`#${prNumber}: transient-label clear failed; skip: ${e.message}`);
                   continue;
