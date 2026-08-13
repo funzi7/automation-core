@@ -48,6 +48,14 @@ function signalTargetsHead(item, headSha, headObservedAt = null, dateField = 'cr
   return false;
 }
 
+function reactionTargetsOnlyObservedHead(reaction, headObservedAt, onlyObservedHead) {
+  if (!onlyObservedHead || reaction?.content !== '+1') return false;
+  const reactionAt = new Date(reaction?.created_at || 0).getTime();
+  const observedAt = new Date(headObservedAt || 0).getTime();
+  return Number.isFinite(reactionAt) && Number.isFinite(observedAt) &&
+    observedAt > 0 && reactionAt > observedAt;
+}
+
 function currentHeadEpochStart(runs = [], prNumber, headSha) {
   const timeline = runs
     .filter((run) =>
@@ -221,6 +229,7 @@ module.exports = {
   isCodexCapacityNotice,
   isCodexTaskResult,
   signalTargetsHead,
+  reactionTargetsOnlyObservedHead,
   currentHeadEpochStart,
   currentHeadEpochFromVerifiedRuns,
   selectHeadEpoch,

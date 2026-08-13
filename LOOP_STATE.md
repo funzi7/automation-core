@@ -46,8 +46,10 @@ auto-merged as `cb5cc5d87f335963e1f80db54de11fe706e3f6de`. Paywall documentation
 then exposed another exact-head race: a Codex task summary started on the old
 head arrived after a new push and the Gate accepted its later timestamp as a
 review of the new head, merging PR #97 before that head's review completed.
-The current correction rejects task summaries/reactions/timing-only signals;
-only commit-bearing review/result surfaces can satisfy exact-head freshness.
+The current correction rejects task summaries and timing-only signals. A clean
+reaction is accepted only when authenticated Gate markers prove the PR has had
+one observed head; after any transition, commit-bearing review/result evidence
+is mandatory.
 
 Code architecture base: fix #27 plus the Codex backup hardening and the
 2026-08-11 reconciliation of paywall-bot's reviewed Codex Gate/watchdog fixes
@@ -138,7 +140,7 @@ Synced workflows listed in `sync-config.json`: `codex-auto-fix.yml`, `codex-gate
 - Green requires Codex has reviewed the current head and no active P1/P2 remains.
 - Usage-limit and capacity notices from the trusted Codex actor are explicitly non-review signals.
 - P1 and P2 both block; this must match bridge-trigger severity. Historical P1-only behavior is SUPERSEDED.
-- Freshness is never inferred from Git author/committer dates or from a signal timestamp after the observed head transition. Review objects and inline comments bind through immutable `commit_id`/`original_commit_id`; Codex result comments must name the exact `Reviewed commit`. Task summaries, unbound reactions, and other unmarked surfaces are not affirmative review signals because old-head asynchronous work can finish after a new push. Authenticated head-epoch evidence remains authoritative for trusted-sync grace and A→B→A boundaries, not for upgrading an unmarked result into a review.
+- Freshness is never inferred from Git author/committer dates or from a signal timestamp after the observed head transition. Review objects and inline comments bind through immutable `commit_id`/`original_commit_id`; Codex result comments must name the exact `Reviewed commit`. Task summaries and other unmarked result surfaces are not affirmative because old-head asynchronous work can finish after a new push. Reaction-only clean is the narrow exception: it counts only when authenticated Gate marker history proves the PR has never had another observed head. After any head transition, immutable commit-bearing evidence is mandatory.
 - Trusted-sync grace-green is limited to zero-Codex-signal sync PRs older than `SYNC_GRACE_MINUTES`.
 - The old in-run self-rerun poll is gone; the watchdog sweep handles late Codex signals and override-label dispatches.
 

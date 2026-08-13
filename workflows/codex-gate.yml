@@ -8,9 +8,9 @@ name: Codex Gate
 # and Codex supplies a current-head signal with no active replacement finding,
 # or the explicit `codex-p1-acknowledged` administrator label is present.
 # Current-head review freshness is bound to exact `commit_id`,
-# `original_commit_id`, or `Reviewed commit` evidence. Task summaries,
-# reactions, and timestamp-only signals never count. Thread state comes from
-# GitHub GraphQL.
+# `original_commit_id`, or `Reviewed commit` evidence. Task summaries and
+# timestamp-only results never count. Reaction-only clean is limited to an
+# authenticated PR with one observed head. Thread state comes from GraphQL.
 # The authoritative decision implementation stays inline in this trusted
 # default-branch workflow. PR-controlled workflow, checkout and require paths
 # are forbidden; review events are rechecked through a default-branch
@@ -307,6 +307,31 @@ jobs:
               // is authenticated, using the immutable run creation time.
               return markers.sort((a, b) =>
                 b.observedAt - a.observedAt || b.id - a.id);
+            }
+
+            async function onlyObservedHead(prNumber, headSha, comments) {
+              const exactHead = String(headSha || '').toLowerCase();
+              const rawHeads = (comments || [])
+                .filter((comment) => (comment.user?.login || '') === 'github-actions[bot]')
+                .map((comment) => String(comment.body || '').match(HEAD_EPOCH_MARKER_PATTERN))
+                .filter((match) => match && Number(match[3]) === Number(prNumber))
+                .map((match) => String(match[4]).toLowerCase());
+              if (!rawHeads.length || rawHeads.some((head) => head !== exactHead)) return false;
+              const runs = await allPrWorkflowRuns();
+              if ((runs || []).some((run) =>
+                (run.pull_requests || []).some((pull) => Number(pull.number) === Number(prNumber)) &&
+                String(run.head_sha || '').toLowerCase() !== exactHead
+              )) return false;
+              const verified = await trustedHeadMarkers(comments, prNumber);
+              return verified.some((marker) => marker.head === exactHead);
+            }
+
+            function reactionTargetsOnlyObservedHead(reaction, headObservedAt, isOnlyHead) {
+              if (!isOnlyHead || reaction?.content !== '+1') return false;
+              const reactionAt = new Date(reaction?.created_at || 0).getTime();
+              const observedAt = new Date(headObservedAt || 0).getTime();
+              return Number.isFinite(reactionAt) && Number.isFinite(observedAt) &&
+                observedAt > 0 && reactionAt > observedAt;
             }
 
             function currentHeadEpochFromTimeline(timeline, headSha) {
@@ -609,6 +634,9 @@ jobs:
                 const reviewComments = await github.paginate(github.rest.pulls.listReviewComments, {
                   owner, repo, pull_number: prNumber, per_page: 100,
                 });
+                const reactions = await github.paginate(github.rest.reactions.listForIssue, {
+                  owner, repo, issue_number: prNumber, per_page: 100,
+                });
                 let headObservedAt = null;
                 try {
                   headObservedAt = await observedHeadTransition(prNumber, headSha, comments);
@@ -669,11 +697,12 @@ jobs:
                   isCodex(c.user) && !isCodexCapacityNotice(c.body) && !isCodexTaskResult(c.body));
                 const codexReviewComments = reviewComments.filter(c =>
                   isCodex(c.user) && !isCodexCapacityNotice(c.body) && !isCodexTaskResult(c.body));
+                const codexReactions = reactions.filter(r => isCodex(r.user));
                 // Total exact-bindable Codex signals of any date. Zero means
                 // no review result engaged (the trusted-sync grace precondition).
                 const codexSignalCount =
                   codexReviews.length + codexComments.length +
-                  codexReviewComments.length;
+                  codexReviewComments.length + codexReactions.length;
 
                 // Exact review.commit_id / original_commit_id / Codex's Reviewed
                 // commit marker binds directly to the SHA. Unmarked comments,
@@ -703,11 +732,22 @@ jobs:
                   })),
                 ].sort((a, b) => new Date(a.date) - new Date(b.date));
 
+                const reactionOnlyHead = await onlyObservedHead(
+                  prNumber, headSha, comments,
+                );
+                const codexReactionOnHead = codexReactions.some((reaction) =>
+                  reactionTargetsOnlyObservedHead(
+                    reaction, headObservedAt, reactionOnlyHead,
+                  )
+                );
+
                 // Has Codex actually reviewed the CURRENT head? = any Codex
-                // review result explicitly bound to the SHA. This does not
-                // stale an active review thread.
+                // review result explicitly bound to the SHA. A reaction-only
+                // clean result is allowed only when authenticated marker
+                // history proves this PR has never had another observed head.
+                // This does not stale an active review thread.
                 const hasCodexSignalOnHead =
-                  allBodies.some(item => item.onHead);
+                  allBodies.some(item => item.onHead) || codexReactionOnHead;
 
                 // Review bodies and top-level PR comments can carry trusted
                 // P1/P2 findings without an inline review thread. They remain
