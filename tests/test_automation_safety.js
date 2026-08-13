@@ -8,7 +8,7 @@ const path = require('node:path');
 const {
   LARGE_SCRIPT_EXPRESSION_THRESHOLD,
   largeGithubScriptHasDirectExpression,
-  githubScriptHasUnquotedExpression,
+  githubScriptHasDirectExpression,
   failureFingerprint,
   failureAlertMarker,
   hasFailureAlertMarker,
@@ -62,13 +62,11 @@ test('large github-script expressions are rejected while env transport is safe',
   assert.equal(largeGithubScriptHasDirectExpression("const value = '${{ github.sha }}';"), false);
 });
 
-test('unquoted or template github-script expressions fail typed syntax safety', () => {
-  assert.equal(githubScriptHasUnquotedExpression('const sha = ${{ github.sha }};'), true);
-  assert.equal(githubScriptHasUnquotedExpression('const enabled = ${{ inputs.enabled }};'), true);
-  assert.equal(githubScriptHasUnquotedExpression('const sha = `${{ github.sha }}`;'), true);
-  assert.equal(githubScriptHasUnquotedExpression("const sha = '${{ github.sha }}';"), false);
-  assert.equal(githubScriptHasUnquotedExpression('// ${{ github.sha }}\nconst sha = process.env.SHA;'), false);
-  assert.equal(githubScriptHasUnquotedExpression('const sha = process.env.SHA;'), false);
+test('all direct github-script expressions fail closed regardless of quoting', () => {
+  assert.equal(githubScriptHasDirectExpression('const sha = ${{ github.sha }};'), true);
+  assert.equal(githubScriptHasDirectExpression("const sha = '${{ github.sha }}';"), true);
+  assert.equal(githubScriptHasDirectExpression('const sha = `${{ github.sha }}`;'), true);
+  assert.equal(githubScriptHasDirectExpression('const sha = process.env.SHA;'), false);
 });
 
 function trackedYamlFiles() {
@@ -91,7 +89,7 @@ test('all tracked workflow github-script bodies pass expression-size safety', ()
       checkedBlocks += 1;
       if (Buffer.byteLength(body, 'utf8') >= LARGE_SCRIPT_EXPRESSION_THRESHOLD) largeBlocks += 1;
       assert.equal(largeGithubScriptHasDirectExpression(body), false, workflowPath);
-      assert.equal(githubScriptHasUnquotedExpression(body), false, workflowPath);
+      assert.equal(githubScriptHasDirectExpression(body), false, workflowPath);
     }
   }
   assert.ok(checkedBlocks >= 1, 'regression must inspect tracked github-script bodies');

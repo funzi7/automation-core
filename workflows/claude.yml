@@ -119,14 +119,18 @@ jobs:
       - name: Skip fork-headed PR safely
         if: steps.keycheck.outputs.has_key == 'true' && steps.pr_context.outputs.is_pr_comment == 'true' && steps.pr_context.outputs.same_repo_pr != 'true'
         uses: actions/github-script@v8
+        env:
+          PR_NUMBER: ${{ steps.pr_context.outputs.pr_number }}
+          HEAD_SHA: ${{ steps.pr_context.outputs.head_sha }}
+          HEAD_REPO: ${{ steps.pr_context.outputs.head_repo }}
         with:
           github-token: ${{ github.token }}
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
-            const prNumber = parseInt('${{ steps.pr_context.outputs.pr_number }}', 10);
-            const headSha = '${{ steps.pr_context.outputs.head_sha }}';
-            const headRepo = '${{ steps.pr_context.outputs.head_repo }}';
+            const prNumber = parseInt(process.env.PR_NUMBER || '', 10);
+            const headSha = process.env.HEAD_SHA || '';
+            const headRepo = process.env.HEAD_REPO || '';
             const comment = context.payload.comment;
             const attemptMatch = String(comment?.body || '').match(/ai-loop:v1[^>]*\battempt=(\d+)/);
             const attemptAttr = attemptMatch ? ` attempt=${parseInt(attemptMatch[1], 10)}` : '';
