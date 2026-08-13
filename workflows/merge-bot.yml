@@ -253,20 +253,23 @@ jobs:
               return /^You have reached your Codex usage limits for code reviews\./i.test(text) ||
                 /^Codex (?:is|was) (?:currently )?(?:at capacity|unable to (?:complete|perform) (?:this )?code review)/i.test(text);
             }
+            function isCodexTaskResult(body) {
+              const text = String(body || '');
+              return /(?:^|\n)#{2,3}\s+Summary(?:\s|$)/i.test(text) &&
+                /\[View task(?:\s*(?:→|->))?\s*\]\(/i.test(text);
+            }
             const HEAD_EPOCH_MARKER_PATTERN = /<!--\s*codex-head-epoch:v3\s+run=(\d+)\s+attempt=(\d+)\s+pr=(\d+)\s+head=([a-f0-9]{40})\s*-->/i;
             function signalTargetsHead(item, headSha, headObservedAt, dateField = 'created_at') {
               const exactHead = String(headSha || '').toLowerCase();
               if (!/^[a-f0-9]{40}$/.test(exactHead)) return false;
+              if (isCodexTaskResult(item?.body)) return false;
               const originalCommit = String(item?.original_commit_id || '').toLowerCase();
               if (originalCommit) return originalCommit === exactHead;
               const commit = String(item?.commit_id || '').toLowerCase();
               if (commit) return commit === exactHead;
               const marker = String(item?.body || '').match(REVIEWED_COMMIT_PATTERN)?.[1]?.toLowerCase();
               if (marker) return exactHead.startsWith(marker);
-              const signalAt = new Date(item?.[dateField] || 0).getTime();
-              const observedAt = new Date(headObservedAt || 0).getTime();
-              return Number.isFinite(signalAt) && Number.isFinite(observedAt) &&
-                observedAt > 0 && signalAt > observedAt;
+              return false;
             }
 
             const epochRunCache = new Map();
@@ -451,7 +454,7 @@ jobs:
             }
 
             async function hasCurrentHeadCodexSignal(prNumber, headSha) {
-              const [reviews, comments, reviewComments, reactions] = await Promise.all([
+              const [reviews, comments, reviewComments] = await Promise.all([
                 github.paginate(github.rest.pulls.listReviews, {
                   owner, repo, pull_number: prNumber, per_page: 100,
                 }),
@@ -460,9 +463,6 @@ jobs:
                 }),
                 github.paginate(github.rest.pulls.listReviewComments, {
                   owner, repo, pull_number: prNumber, per_page: 100,
-                }),
-                github.paginate(github.rest.reactions.listForIssue, {
-                  owner, repo, issue_number: prNumber, per_page: 100,
                 }),
               ]);
               const headObservedAt = await observedHeadTransition(prNumber, headSha, comments);
@@ -473,10 +473,7 @@ jobs:
               return (
                 reviews.some((item) => trustedAfterHead(item, 'submitted_at')) ||
                 comments.some((item) => trustedAfterHead(item, 'created_at')) ||
-                reviewComments.some((item) => trustedAfterHead(item, 'created_at')) ||
-                reactions.some((item) =>
-                  item.content === '+1' && trustedAfterHead(item, 'created_at')
-                )
+                reviewComments.some((item) => trustedAfterHead(item, 'created_at'))
               );
             }
 

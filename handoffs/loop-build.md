@@ -4,6 +4,11 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
 
 ---
 
+## [2026-08-13 UTC] Reject delayed old-head task results
+- Production trigger: paywall-bot PR #97 head `29b7c16d29749ba35b371a6a17068b4ee6746e0c` was pushed at 13:39 UTC. A Codex task summary initiated on the prior head arrived at 13:40 and the timestamp fallback treated it as current-head review, allowing merge `0c4ae03fdbc7c7bf79b41c4fb31dd19db0c10e10` before the actual current-head Codex review at 13:41.
+- Correction: Gate, Merge Bot, Watchdog, bridge, and backup fixer accept only immutable `commit_id`/`original_commit_id`, explicit `Reviewed commit`, or trusted `ai-loop` head markers where applicable. Task summaries, unbound reactions, and timing-only surfaces cannot satisfy or supply current-head review evidence.
+- Containment: automation-core Merge Bot was disabled while the forward fix was prepared. Re-enable it only after this PR is exact-head CI/review/Gate green so it can perform the normal SHA-pinned merge; then complete the downstream sync.
+
 ## [2026-08-13 UTC] Emergency Gate repair, provenance hardening, and paywall rollout
 - Emergency bootstrap: PR #40, merge `fd16f6ad875726386f4f7c029993639cafebaa01`.
 - Root cause: direct `${{ ... }}` interpolation inside a roughly 25 KB `actions/github-script` scalar exceeded GitHub's 21,000-character expression ceiling after template expansion. Inputs now travel through `env`; final review expanded deterministic validation to all tracked workflow YAML and rejects every direct expression inside `github-script` bodies, including quoted/type-injectable forms.

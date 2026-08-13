@@ -112,6 +112,11 @@ jobs:
             const CODEX = 'chatgpt-codex-connector[bot]';
             const targetHead = String(process.env.TARGET_HEAD || '').toLowerCase();
             const REVIEWED_COMMIT_PATTERN = /(?:^|\n)\*\*Reviewed commit:\*\*\s*`([a-f0-9]{10,40})`(?:\s|$)/i;
+            const isCodexTaskResult = (body) => {
+              const text = String(body || '');
+              return /(?:^|\n)#{2,3}\s+Summary(?:\s|$)/i.test(text) &&
+                /\[View task(?:\s*(?:→|->))?\s*\]\(/i.test(text);
+            };
             const HEAD_EPOCH_MARKER_PATTERN = /<!--\s*codex-head-epoch:v3\s+run=(\d+)\s+attempt=(\d+)\s+pr=(\d+)\s+head=([a-f0-9]{40})\s*-->/i;
             const MAX_EPOCH_MARKER_CANDIDATES = 16;
             let headObservedAt = null;
@@ -230,19 +235,17 @@ jobs:
             // Mirror the gate's exact-head model. Review objects bind by exact
             // commit_id; inline comments bind by original_commit_id so GitHub's
             // repointing of still-applicable comments cannot revive an old finding.
-            // Top-level comments bind only after the authenticated current-head
-            // epoch established by Gate/run evidence.
+            // Top-level comments must carry an explicit reviewed-commit marker;
+            // asynchronous task timing cannot bind them to a head.
             const targetsHead = (item, dateField = 'created_at') => {
+              if (isCodexTaskResult(item?.body)) return false;
               const originalCommit = String(item?.original_commit_id || '').toLowerCase();
               if (originalCommit) return originalCommit === targetHead;
               const commit = String(item?.commit_id || '').toLowerCase();
               if (commit) return commit === targetHead;
               const marker = String(item?.body || '').match(REVIEWED_COMMIT_PATTERN)?.[1]?.toLowerCase();
               if (marker) return targetHead.startsWith(marker);
-              const signalAt = new Date(item?.[dateField] || 0).getTime();
-              const observedAt = new Date(headObservedAt || 0).getTime();
-              return Number.isFinite(signalAt) && Number.isFinite(observedAt) &&
-                observedAt > 0 && signalAt > observedAt;
+              return false;
             };
             const isCodex = (c) => (c.user && c.user.login) === CODEX;
             const hasSev = (b) => b.includes("P1") || b.includes("P2");

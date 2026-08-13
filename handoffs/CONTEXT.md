@@ -41,6 +41,16 @@ old parse/dispatch/Telegram failure; CI Doctor did not recreate closed Issue
 review and Gate, then Merge Bot auto-merged it as
 `2575f0f2b16c12ebb9b9173e8c9a8248ab529ebe`.
 
+Expression-safety PR #52 normally auto-merged as
+`961b51d9ff23edd215ff026d8dc0845f9a8124a9`, then paywall-bot sync PR #96
+normally auto-merged as `cb5cc5d87f335963e1f80db54de11fe706e3f6de`.
+Documentation PR #97 exposed a separate delayed-result race: a Codex task
+summary initiated on the old head arrived after a new push, and timestamp-only
+binding let it green the new head before that head's review completed. The
+current repair admits only review/result surfaces explicitly bound by
+`commit_id`, `original_commit_id`, or `Reviewed commit`; task summaries,
+unbound reactions, and timing-only signals are non-review evidence.
+
 Code architecture base: fix #27 implementation commit `93f6acb9d2e0396afad3e10854503024843c32de`.
 
 Previous documentation reconciliation: `ff57a73220faa5dbb563edc7b035fc6cc653c509`.
@@ -162,7 +172,7 @@ The Codex API backup is dormant by default and requires OpenAI quota plus `CODEX
 
 ### `codex-gate.yml`
 
-The gate blocks until Codex has reviewed the current head and no active P1/P2 remains. Trusted Codex usage-limit/capacity notices are explicitly excluded from review signals. Review objects and Codex result comments bind directly to the exact SHA; unmarked signals must follow the server-observed current contiguous head-SHA epoch, and Git commit dates are never treated as push times. Epoch comments contain only a run ID/attempt index. Gate, watchdog, and merge bot fetch that exact attempt, require the repository's `pull_request_target` Codex Gate path plus same-PR association, require the comment timestamp to fall inside the attempt, and derive SHA/time from the immutable attempt fields rather than comment text or the mutable live PR association. Valid markers are scanned newest-first only to the first different-head boundary, then conservatively combined with recent PR-run history. This prevents shared-actor forgery and duplicate poisoning, preserves A→B→A, survives the repository-wide search cap, and keeps recheck cost bounded. Repointable inline `commit_id` values alone do not waive review. Trusted sync grace-green only applies to zero-signal trusted sync PRs after the server-observed grace window.
+The gate blocks until Codex has reviewed the current head and no active P1/P2 remains. Trusted Codex usage-limit/capacity notices are explicitly excluded. Review objects and inline comments bind through immutable `commit_id`/`original_commit_id`; Codex result comments must name the exact `Reviewed commit`. Task summaries, unbound reactions, and timing-only surfaces never become affirmative review signals, because asynchronous old-head work can complete after a new push. Authenticated head epochs still preserve A→B→A boundaries and trusted-sync grace, but no longer upgrade an unmarked result to current-head review. Trusted sync grace-green applies only to zero-signal trusted sync PRs after the server-observed grace window.
 
 ### `merge-bot.yml`
 
@@ -205,12 +215,13 @@ paywall-bot sync PR #89 was closed unmerged and its stale
 
 Verified current facts only:
 
-- paywall-bot PR #94 exact head
-  `5d65f205708435aab09ce03ace5880c30b342293` contained all seven configured
+- paywall-bot PR #96 exact head
+  `d29810b1c2f3e0a4bf425aa364cf3bbfec99aa3d` contained all seven configured
   workflows byte-identical to automation-core source, passed downstream CI,
   exact-head Codex review and Gate, and was normally auto-merged as
-  `2575f0f2b16c12ebb9b9173e8c9a8248ab529ebe`. Its Codex Gate, Claude Fixer,
-  Watchdog, and Merge Bot workflows are active.
+  `cb5cc5d87f335963e1f80db54de11fe706e3f6de`. Its Codex Gate, Claude Fixer,
+  Watchdog, and Merge Bot workflows are active. One final sync is required for
+  the delayed-result race correction in the current automation-core PR.
 - OptionsProfitTracker PR #12 is merged.
 - thai-rent-finder PR #80 is merged.
 
@@ -252,9 +263,9 @@ A. Recovery documentation and expression-safety work completed in this pass:
   step/job `env` without changing gate or fixer semantics;
 - validation now scans every tracked YAML workflow, rejects any direct
   expression in a `github-script` body, and syntax-checks every extracted body;
-- the changed source/mirror workflow pairs are byte-identical; after this pass
-  merges, paywall-bot needs one final normal sync for the three changed synced
-  pairs.
+- the changed source/mirror workflow pairs are byte-identical; paywall-bot PR
+  #96 delivered the expression-safety changes, and one final normal sync is
+  required for the delayed-result race correction.
 
 B. Claude-budget-blocked runtime verification:
 

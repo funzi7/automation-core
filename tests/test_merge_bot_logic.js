@@ -551,6 +551,34 @@ test('quota notices cannot satisfy any current-head Codex signal consumer', () =
   }
 });
 
+test('delayed task summaries and unbound reactions cannot satisfy exact-head review', () => {
+  for (const name of ['codex-gate.yml', 'claude-fallback-watchdog.yml', 'merge-bot.yml']) {
+    const workflow = fs.readFileSync(
+      path.join(__dirname, '..', 'workflows', name),
+      'utf8',
+    );
+    assert.match(workflow, /function isCodexTaskResult\(body\)/, name);
+    assert.match(workflow, /\[View task/, name);
+    assert.match(workflow, /if \(isCodexTaskResult\(item\?\.body\)\) return false/, name);
+    assert.doesNotMatch(workflow, /signalAt > observedAt/, name);
+  }
+  const gate = fs.readFileSync(
+    path.join(__dirname, '..', 'workflows', 'codex-gate.yml'),
+    'utf8',
+  );
+  const watchdog = fs.readFileSync(
+    path.join(__dirname, '..', 'workflows', 'claude-fallback-watchdog.yml'),
+    'utf8',
+  );
+  const merge = fs.readFileSync(
+    path.join(__dirname, '..', 'workflows', 'merge-bot.yml'),
+    'utf8',
+  );
+  assert.doesNotMatch(gate, /codexThumbsUpOnHead/);
+  assert.doesNotMatch(watchdog, /reactions\.some\(\(item\) => item\.content === '\+1'/);
+  assert.doesNotMatch(merge, /reactions\.some\(\(item\) =>/);
+});
+
 test('only synced automation infrastructure is in the central allow-list', () => {
   const config = JSON.parse(fs.readFileSync(
     path.join(__dirname, '..', 'sync-config.json'),

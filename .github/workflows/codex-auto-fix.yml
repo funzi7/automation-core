@@ -159,8 +159,14 @@ jobs:
             const REVIEWED_COMMIT_PATTERN = /(?:^|\n)\*\*Reviewed commit:\*\*\s*`([a-f0-9]{10,40})`(?:\s|$)/i;
             const HEAD_EPOCH_MARKER_PATTERN = /<!--\s*codex-head-epoch:v3\s+run=(\d+)\s+attempt=(\d+)\s+pr=(\d+)\s+head=([a-f0-9]{40})\s*-->/i;
             const markerHead = (body) => String(body || '').match(/<!--\s*ai-loop:v1\b[^>]*\bhead=([a-f0-9]{40})\b[^>]*-->/i)?.[1];
+            const isCodexTaskResult = (body) => {
+              const text = String(body || '');
+              return /(?:^|\n)#{2,3}\s+Summary(?:\s|$)/i.test(text) &&
+                /\[View task(?:\s*(?:→|->))?\s*\]\(/i.test(text);
+            };
             let headObservedAt = null;
             const signalTargetsHead = (item, dateField = 'created_at') => {
+              if (isCodexTaskResult(item?.body)) return false;
               const originalCommit = String(item?.original_commit_id || '').toLowerCase();
               if (originalCommit) return originalCommit === headSha.toLowerCase();
               const commit = String(item?.commit_id || '').toLowerCase();
@@ -169,10 +175,7 @@ jobs:
               if (reviewed) return headSha.toLowerCase().startsWith(reviewed);
               const loopHead = markerHead(item?.body)?.toLowerCase();
               if (loopHead) return loopHead === headSha.toLowerCase();
-              const signalAt = new Date(item?.[dateField] || 0).getTime();
-              const observedAt = new Date(headObservedAt || 0).getTime();
-              return Number.isFinite(signalAt) && Number.isFinite(observedAt) &&
-                observedAt > 0 && signalAt > observedAt;
+              return false;
             };
 
             // Top-level issue comments have no commit_id. Reuse the Gate's

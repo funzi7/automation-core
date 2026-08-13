@@ -40,6 +40,15 @@ Paywall-bot sync PR #94 received the final seven byte-identical workflows,
 green application CI, a clean exact-head Codex review and Gate, and was normally
 auto-merged by Merge Bot as `2575f0f2b16c12ebb9b9173e8c9a8248ab529ebe`.
 
+Later expression-safety PR #52 normally auto-merged as
+`961b51d9ff23edd215ff026d8dc0845f9a8124a9`, and downstream sync PR #96 normally
+auto-merged as `cb5cc5d87f335963e1f80db54de11fe706e3f6de`. Paywall documentation PR #97
+then exposed another exact-head race: a Codex task summary started on the old
+head arrived after a new push and the Gate accepted its later timestamp as a
+review of the new head, merging PR #97 before that head's review completed.
+The current correction rejects task summaries/reactions/timing-only signals;
+only commit-bearing review/result surfaces can satisfy exact-head freshness.
+
 Code architecture base: fix #27 plus the Codex backup hardening and the
 2026-08-11 reconciliation of paywall-bot's reviewed Codex Gate/watchdog fixes
 back into the central workflow source.
@@ -47,12 +56,11 @@ back into the central workflow source.
 Documentation base: final post-fix #27 normalization commit `11ba6a6bf13c91b1be61d4292b853dd15c37063b`, plus this upstream fix record.
 
 Runtime status: paywall-bot PR #93 proved the old failure mode, and stale sync
-PR #89 was closed unmerged with its branch deleted. The completed replacement
-rollout is PR #94: all seven current workflows passed downstream application
-CI, exact-head Codex review and Gate, then the normal Merge Bot squash-merged
-them as `2575f0f2b16c12ebb9b9173e8c9a8248ab529ebe`. The central source and
-paywall-bot now carry the reviewed thread-state, trusted-base, exact-head check
-publication, provenance, credential-isolation, and bounded-watchdog behavior.
+PR #89 was closed unmerged with its branch deleted. PR #94 delivered the
+provenance/security rollout; PR #96 delivered the final expression transport
+hardening after exact-head CI/review/Gate and normal Merge Bot auto-merge. PR
+#97 then exposed the delayed old-head task-result race described above. The
+current central fix must be normally reviewed/merged and synced once more.
 
 Current delivery-judged ladder:
 
@@ -130,7 +138,7 @@ Synced workflows listed in `sync-config.json`: `codex-auto-fix.yml`, `codex-gate
 - Green requires Codex has reviewed the current head and no active P1/P2 remains.
 - Usage-limit and capacity notices from the trusted Codex actor are explicitly non-review signals.
 - P1 and P2 both block; this must match bridge-trigger severity. Historical P1-only behavior is SUPERSEDED.
-- Freshness is never inferred from Git author/committer dates. Review objects and Codex result comments bind directly to the exact SHA; unmarked surfaces count only after the server-observed start of the current contiguous head-SHA epoch. Each epoch marker is merely an index to an immutable Actions run attempt: consumers accept it only when GitHub proves the referenced attempt is this repository's `pull_request_target` Codex Gate run, associated with the same PR, and the bot comment was created inside that attempt. SHA/time come from the attempt, not comment text or the mutable live PR association. Consumers validate newest-first only through the first different-head boundary, while recent PR-run history is combined conservatively with verified markers. Thus A→B→A starts fresh, long-lived epochs survive the repository-wide search cap, and verification cost does not grow with the PR lifetime. Repointable inline `commit_id` values alone do not waive current-head review.
+- Freshness is never inferred from Git author/committer dates or from a signal timestamp after the observed head transition. Review objects and inline comments bind through immutable `commit_id`/`original_commit_id`; Codex result comments must name the exact `Reviewed commit`. Task summaries, unbound reactions, and other unmarked surfaces are not affirmative review signals because old-head asynchronous work can finish after a new push. Authenticated head-epoch evidence remains authoritative for trusted-sync grace and A→B→A boundaries, not for upgrading an unmarked result into a review.
 - Trusted-sync grace-green is limited to zero-Codex-signal sync PRs older than `SYNC_GRACE_MINUTES`.
 - The old in-run self-rerun poll is gone; the watchdog sweep handles late Codex signals and override-label dispatches.
 
@@ -191,7 +199,7 @@ Synced workflows listed in `sync-config.json`: `codex-auto-fix.yml`, `codex-gate
 | Repo | Status | Notes |
 |---|---|---|
 | automation-core | loop installed and live | Public source of truth and test bed. |
-| paywall-bot | current seven-workflow sync merged | PR #94 normally auto-merged as `2575f0f2b16c12ebb9b9173e8c9a8248ab529ebe`; exact-head CI/review/Gate were green and the four loop workflows are enabled. |
+| paywall-bot | expression-safety sync merged; final race fix pending | PR #96 normally auto-merged as `cb5cc5d87f335963e1f80db54de11fe706e3f6de`; all seven workflows matched automation-core then. PR #97 exposed the delayed-task-result race, so one final sync is required after this correction merges. |
 | OptionsProfitTracker | onboarding PR #12 merged | Verified fact only. Current sync/secrets/variables/permissions/runtime health not checked in this pass. |
 | thai-rent-finder | onboarding PR #80 merged | Verified fact only. Current sync/secrets/variables/permissions/runtime health not checked in this pass. |
 | other downstream repos | via sync where bootstrapped | Do not claim synced or healthy without checking current evidence. |
@@ -215,7 +223,7 @@ Synced workflows listed in `sync-config.json`: `codex-auto-fix.yml`, `codex-gate
 - The validator now examines every tracked YAML workflow, rejects any direct
   expression in a `github-script` body, and syntax-checks all extracted scripts.
 - The source/mirror workflow pairs remain byte-identical. Paywall-bot received
-  the seven-workflow version from PR #94; the three newly hardened synced pairs
-  require one final normal downstream sync after this change merges.
+  the expression-safety version through PR #96; the exact-head race correction
+  requires one final normal downstream sync after this change merges.
 - No application repository logic was changed.
 - No force push, browser automation, Playwright, session-cookie automation, UI automation, or fake Codex Cloud Update-branch implementation was used.
