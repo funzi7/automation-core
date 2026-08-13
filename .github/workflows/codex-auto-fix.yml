@@ -191,11 +191,11 @@ jobs:
                   commentId: Number(comment.id || 0),
                 }];
               }).sort((a, b) => b.commentAt - a.commentAt || b.commentId - a.commentId);
-              const currentEpoch = [];
-              const verified = new Set();
+              const verifiedRuns = [];
+              const verifiedKeys = new Set();
               for (const ref of refs) {
                 const key = `${ref.runId}/${ref.attempt}`;
-                if (verified.has(key)) continue;
+                if (verifiedKeys.has(key)) continue;
                 let run;
                 try {
                   ({ data: run } = await github.request(
@@ -220,12 +220,26 @@ jobs:
                   Number(run.run_attempt) !== ref.attempt ||
                   !belongsToPr || !commentInsideRun
                 ) continue;
-                verified.add(key);
+                verifiedKeys.add(key);
                 const observedAt = new Date(run.created_at || 0).getTime();
                 const runHead = String(run.head_sha || '').toLowerCase();
                 if (!/^[a-f0-9]{40}$/.test(runHead) || !Number.isFinite(observedAt) || observedAt <= 0) continue;
-                if (runHead !== exactHead) break;
-                currentEpoch.push(observedAt);
+                verifiedRuns.push({
+                  head: runHead,
+                  observedAt,
+                  id: Number(run.id || ref.runId),
+                });
+              }
+              // Marker comments from a manually re-run old attempt are new,
+              // but the immutable run they authenticate is still old. Order
+              // the boundary by verified run creation, never comment time.
+              verifiedRuns.sort((a, b) =>
+                b.observedAt - a.observedAt || b.id - a.id);
+              if (!verifiedRuns.length || verifiedRuns[0].head !== exactHead) return null;
+              const currentEpoch = [];
+              for (const run of verifiedRuns) {
+                if (run.head !== exactHead) break;
+                currentEpoch.push(run.observedAt);
               }
               return currentEpoch.length ? new Date(Math.min(...currentEpoch)) : null;
             }

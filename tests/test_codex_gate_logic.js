@@ -462,7 +462,10 @@ test('bridge preserves unmarked current-head top-level findings via verified gat
   assert.match(bridge, /run\.event !== 'pull_request_target'/);
   assert.match(bridge, /Number\(run\.run_attempt\) !== ref\.attempt/);
   assert.match(bridge, /!belongsToPr \|\| !commentInsideRun/);
-  assert.match(bridge, /if \(runHead !== exactHead\) break/);
+  assert.match(bridge, /verifiedRuns\.sort\(\(a, b\) =>/);
+  assert.match(bridge, /b\.observedAt - a\.observedAt \|\| b\.id - a\.id/);
+  assert.match(bridge, /verifiedRuns\[0\]\.head !== exactHead/);
+  assert.match(bridge, /if \(run\.head !== exactHead\) break/);
   assert.match(bridge, /headObservedAt = await observedHeadTransition\(issueComments\)/);
   assert.match(bridge, /signalAt > observedAt/);
   assert.doesNotMatch(bridge, /prData\?\.updated_at/);
