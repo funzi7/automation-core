@@ -4,6 +4,16 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
 
 ---
 
+## [2026-08-13 UTC] Emergency Gate repair, provenance hardening, and paywall rollout
+- Emergency bootstrap: PR #40, merge `fd16f6ad875726386f4f7c029993639cafebaa01`.
+- Root cause: direct `${{ ... }}` interpolation inside a roughly 25 KB `actions/github-script` scalar exceeded GitHub's 21,000-character expression ceiling after template expansion. Inputs now travel through `env`; deterministic validation rejects this class in large scripts.
+- Spam repair: Gate/update-branch/backup dispatch failures use durable trusted markers keyed by repository, PR, exact head, operation, and normalized error fingerprint. First material failure alerts once; identical scheduled repeats log without another Telegram; a new head or error class can alert once.
+- CI Doctor: internal automation is identified by authoritative workflow path as well as display name. Issue #39 was closed only after the repaired Gate was production-verified; no equivalent Issue reappeared.
+- PR #38: the old head was accidentally auto-merged as `cdf4c94528fdfd81ab00742c549355912355bcc1` after the old Gate accepted a Codex quota notice. Forward security PR #41 merged as `dd9a9de615eb0613e314b26e989d82375c808e66`; reviewed follow-ups #42-#51 completed credential isolation, authenticated provenance/head epochs, real-delivery activation, fail-closed label races, and complete finding context.
+- Production proof: Gate dispatch `31681859499` parsed and succeeded. Scheduled Watchdog runs `31687590924` and `31692340712` succeeded without the former expression/dispatch/Telegram error. Codex review quota was available for the forward fixes.
+- Downstream: normal sync continuously updated existing paywall-bot PR #94. Its final head `5d65f205708435aab09ce03ace5880c30b342293` contained only the seven byte-identical synced workflows, passed full CI, clean exact-head Codex review, zero unresolved threads, and green Gate. Re-enabled Merge Bot normally auto-merged it as `2575f0f2b16c12ebb9b9173e8c9a8248ab529ebe`.
+- Current state: automation-core and paywall-bot Claude Fixer, Codex Gate, Watchdog, and Merge Bot are enabled. No owner merge, `codex-p1-acknowledged`, force push, or application/state change was used.
+
 ## [2026-08-11 UTC] Reconcile gate drift and make exact-head-green owner PRs hands-off
 - PR: current `agent/owner-green-automerge` change; exact PR/merge SHA is recorded by GitHub and agent-memory after bootstrap validation.
 - Branch: `agent/owner-green-automerge`

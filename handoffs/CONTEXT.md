@@ -21,14 +21,25 @@ The repository preserves a direct-to-main operating convention for automation-co
 
 ## 2. Current Architecture Snapshot
 
-2026-08-13 emergency status: bootstrap PR #40 restored Codex Gate parsing in
+2026-08-13 completed emergency recovery: bootstrap PR #40 restored Codex Gate parsing in
 merge `fd16f6ad875726386f4f7c029993639cafebaa01`, added durable Watchdog
 Telegram failure dedupe, and made CI Doctor ignore internal automation paths.
 The repaired dispatch then exposed a separate flaw: a Codex usage-limit notice
 was accepted as a current-head review signal, and PR #38 auto-merged as
-`cdf4c94528fdfd81ab00742c549355912355bcc1`. Draft PR #41 is the forward
-security correction. Claude Fixer and Merge Bot are disabled during review;
-Claude Fallback Watchdog is enabled.
+`cdf4c94528fdfd81ab00742c549355912355bcc1`. Forward security PR #41 and
+review-driven follow-ups #42-#51 are merged; they isolate Issue-mode Claude
+from PAT credentials and interpreters, reject capacity notices, authenticate
+head epochs, require real delivery, preserve permanent/manual stops through
+label races, and include every trusted finding channel in fixer context.
+All four loop workflows are enabled in automation-core and paywall-bot.
+
+Production evidence: Gate dispatch `31681859499` succeeded after bootstrap;
+scheduled Watchdog runs `31687590924` and `31692340712` completed without the
+old parse/dispatch/Telegram failure; CI Doctor did not recreate closed Issue
+#39. Paywall-bot PR #94 ended at exact head
+`5d65f205708435aab09ce03ace5880c30b342293`, passed application CI, clean Codex
+review and Gate, then Merge Bot auto-merged it as
+`2575f0f2b16c12ebb9b9173e8c9a8248ab529ebe`.
 
 Code architecture base: fix #27 implementation commit `93f6acb9d2e0396afad3e10854503024843c32de`.
 

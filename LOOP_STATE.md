@@ -25,10 +25,20 @@ CI Doctor identifies internal workflows by authoritative path as well as name.
 The first repaired Gate dispatch succeeded, but exposed an independent safety
 bug: the old Gate treated Codex's usage-limit comment as an affirmative review
 signal and Merge Bot auto-merged PR #38 at
-`cdf4c94528fdfd81ab00742c549355912355bcc1`. Claude Fixer and Merge Bot are
-temporarily disabled while draft forward-fix PR #41 restores Issue-mode
-credential isolation, rejects quota/capacity notices in every signal consumer,
-and repairs partial transient-label provenance. The watchdog is enabled.
+`cdf4c94528fdfd81ab00742c549355912355bcc1`. Forward security PR #41 was then
+exact-head reviewed and normally auto-merged as
+`dd9a9de615eb0613e314b26e989d82375c808e66`; follow-up reviewed corrections
+#42-#51 completed the provenance, head-epoch, delivery, label-race, backup
+context, and fixer-digest design. Current automation-core main is the source
+of truth. Claude Fixer, Codex Gate, Watchdog, and Merge Bot are enabled.
+
+Production verification: Gate dispatch `31681859499` parsed and succeeded;
+Watchdog schedule runs `31687590924` and `31692340712` both completed without
+the expression parse failure, gate-dispatch failure, or runtime Telegram error.
+Issue #39 was factually closed after repair and CI Doctor did not recreate it.
+Paywall-bot sync PR #94 received the final seven byte-identical workflows,
+green application CI, a clean exact-head Codex review and Gate, and was normally
+auto-merged by Merge Bot as `2575f0f2b16c12ebb9b9173e8c9a8248ab529ebe`.
 
 Code architecture base: fix #27 plus the Codex backup hardening and the
 2026-08-11 reconciliation of paywall-bot's reviewed Codex Gate/watchdog fixes
@@ -81,8 +91,7 @@ is the permanent human opt-out and is never removed by automation.
 
 1. **Claude-budget-blocked runtime verification:** after Anthropic credit is restored, create one harmless same-repo PR with an active P1 or P2 finding, trigger `@claude fix`, verify a commit reaches the original PR head branch, verify no secondary branch/PR appears, verify the watchdog recognizes delivery, and verify no `no_delivery` marker remains after the successful push.
 2. **OpenAI API quota-blocked verification:** after OpenAI quota is restored, set `CODEX_BACKUP_ENABLED='true'` only on a controlled test repo and verify Codex API `requested` -> real PR-head push and terminal states, including that `codex_agent_failed` posts only the intended `api_error` marker and never enters the normal patch download/apply path.
-3. **paywall-bot PR #73 sync refresh:** this upstream fix addresses the downstream Codex P2 finding, but paywall-bot was not modified directly. Refresh PR #73 through the normal sync, then re-check it before merge.
-4. **Downstream audit:** OPT PR #12 and TRF PR #80 are merged. Do not claim downstream workflow sync, secrets, variables, Actions permissions, or runtime health until checked from each repo's latest sync PR/current workflow contents and settings evidence.
+3. **Downstream audit:** paywall-bot PR #94 is merged with the seven current workflows. OPT PR #12 and TRF PR #80 are merged. Do not claim other downstream workflow sync, secrets, variables, Actions permissions, or runtime health until checked from each repo's latest sync PR/current workflow contents and settings evidence.
 5. **Codex Cloud limitation:** View task, task diff, Created commit hint, or ready diff is not delivery unless the PR branch gets a newer commit after the Cloud marker. No browser/UI automation or fake Update branch API workaround exists.
 6. **Longer-term:** update minutes-guard target coverage after downstream audit; keep direct-to-main and branch-protection decisions explicit.
 
@@ -176,7 +185,7 @@ Synced workflows listed in `sync-config.json`: `codex-auto-fix.yml`, `codex-gate
 | Repo | Status | Notes |
 |---|---|---|
 | automation-core | loop installed and live | Public source of truth and test bed. |
-| paywall-bot | sync refresh needed | PR #73 surfaced the Codex P2 fixed upstream on 2026-07-09; refresh by normal sync before merge. Current secrets/variables/runtime not checked in this pass. |
+| paywall-bot | current seven-workflow sync merged | PR #94 normally auto-merged as `2575f0f2b16c12ebb9b9173e8c9a8248ab529ebe`; exact-head CI/review/Gate were green and the four loop workflows are enabled. |
 | OptionsProfitTracker | onboarding PR #12 merged | Verified fact only. Current sync/secrets/variables/permissions/runtime health not checked in this pass. |
 | thai-rent-finder | onboarding PR #80 merged | Verified fact only. Current sync/secrets/variables/permissions/runtime health not checked in this pass. |
 | other downstream repos | via sync where bootstrapped | Do not claim synced or healthy without checking current evidence. |
