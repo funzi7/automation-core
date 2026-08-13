@@ -186,6 +186,43 @@ jobs:
             core.setOutput('branch_heads_json', JSON.stringify(baselines));
             core.info(`Captured ${Object.keys(baselines).length} Claude branch baseline(s) before model execution.`);
 
+      - name: Revoke stale Issue-mode automerge before retry
+        if: steps.keycheck.outputs.has_key == 'true' && steps.pr_context.outputs.is_pr_comment != 'true'
+        uses: actions/github-script@v8
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const issueNum = Number(context.payload.issue?.number || 0);
+            if (!issueNum) throw new Error('Issue number missing before Claude retry');
+            const open = await github.paginate(github.rest.pulls.list, {
+              owner, repo, state: 'open', per_page: 100,
+            });
+            const trustedIssuePr = open.filter((pr) => {
+              const sameRepo = pr.head?.repo?.full_name === `${owner}/${repo}`;
+              const claudeBranch = String(pr.head?.ref || '').startsWith('claude/');
+              const linkedIssue = new RegExp(`(?:^|\\n)Fixes #${issueNum}(?:\\s|$)`, 'i')
+                .test(String(pr.body || ''));
+              return sameRepo && claudeBranch && linkedIssue;
+            });
+            for (const pr of trustedIssuePr) {
+              try {
+                await github.rest.issues.removeLabel({
+                  owner, repo, issue_number: pr.number, name: 'automerge',
+                });
+                core.info(`Revoked stale automerge from Claude PR #${pr.number} before retry.`);
+              } catch (e) {
+                if (e.status !== 404) throw e;
+              }
+              const { data: live } = await github.rest.pulls.get({
+                owner, repo, pull_number: pr.number,
+              });
+              if ((live.labels || []).some((entry) => entry.name === 'automerge')) {
+                throw new Error(`PR #${pr.number}: stale automerge remained before Claude retry`);
+              }
+            }
+
       - name: Run Claude Code (Issue/new-PR path)
         id: claude_issue
         if: steps.keycheck.outputs.has_key == 'true' && steps.pr_context.outputs.is_pr_comment != 'true'

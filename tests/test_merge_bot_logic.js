@@ -530,6 +530,15 @@ test('Claude PR provenance records on failure while automerge remains success-on
   assert.match(workflow, /name: Capture Issue-mode branch baselines/);
   assert.match(workflow, /github\.rest\.git\.listMatchingRefs/);
   assert.match(workflow, /core\.setOutput\('branch_heads_json', JSON\.stringify\(baselines\)\)/);
+  assert.match(workflow, /name: Revoke stale Issue-mode automerge before retry/);
+  assert.match(workflow, /linkedIssue = new RegExp/);
+  assert.match(workflow, /sameRepo && claudeBranch && linkedIssue/);
+  assert.match(workflow, /stale automerge remained before Claude retry/);
+  assert.ok(
+    workflow.indexOf('Revoke stale Issue-mode automerge before retry') <
+      workflow.indexOf('Run Claude Code (Issue/new-PR path)'),
+    'stale automerge must be revoked before model execution',
+  );
   assert.match(workflow, /ISSUE_BRANCH_BASELINES_JSON: \$\{\{ steps\.issue_branch_baseline\.outputs\.branch_heads_json \}\}/);
   assert.match(workflow, /IS_PR_COMMENT: \$\{\{ steps\.pr_context\.outputs\.is_pr_comment \}\}/);
   assert.match(workflow, /if \(process\.env\.IS_PR_COMMENT !== 'true'\)/);
