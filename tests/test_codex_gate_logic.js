@@ -163,6 +163,22 @@ test('verified gate runs preserve the current contiguous epoch beyond run-search
   assert.equal(currentHeadEpochFromVerifiedRuns(markers, headB), null);
 });
 
+test('rerun comment order cannot move an old authenticated epoch ahead', () => {
+  const headA = 'a'.repeat(40);
+  const headB = 'b'.repeat(40);
+  // The old-A marker appears first as if its rerun comment were newest. The
+  // authenticated run times still prove B and then the restored A epoch.
+  const markerCommentOrder = [
+    { head: headA, observedAt: '2026-08-11T10:00:00Z', id: 1 },
+    { head: headA, observedAt: '2026-08-11T12:00:00Z', id: 3 },
+    { head: headB, observedAt: '2026-08-11T11:00:00Z', id: 2 },
+  ];
+  assert.equal(
+    currentHeadEpochFromVerifiedRuns(markerCommentOrder, headA).toISOString(),
+    '2026-08-11T12:00:00.000Z',
+  );
+});
+
 test('authenticated marker epoch wins when bounded run history starts later', () => {
   const markerEpoch = new Date('2026-08-11T13:00:00Z');
   const truncatedRunEpoch = new Date('2026-08-11T14:00:00Z');
@@ -339,10 +355,14 @@ test('authoritative workflow keeps gate policy inline', () => {
   assert.match(workflow, /run\.event !== 'pull_request_target'/);
   assert.match(workflow, /Number\(run\.run_attempt\) !== attempt \|\| !belongsToPr \|\| !commentInsideRun/);
   assert.match(workflow, /const head = markerHead/);
-  assert.match(workflow, /const refs = \[\]/);
-  assert.match(workflow, /if \(accepted\.has\(key\)\) continue/);
-  assert.doesNotMatch(workflow, /refs\.set\(/);
-  assert.match(workflow, /if \(head !== exactHead\) break/);
+  assert.match(workflow, /const MAX_EPOCH_MARKER_CANDIDATES = 16/);
+  assert.match(workflow, /const refsByRun = new Map\(\)/);
+  assert.match(workflow, /refsByRun\.set\(ref\.runId, ref\)/);
+  assert.match(workflow, /\.sort\(\(a, b\) => b\.runId - a\.runId\)\s*\.slice\(0, MAX_EPOCH_MARKER_CANDIDATES\)/);
+  assert.doesNotMatch(workflow, /accepted\.has\(/);
+  assert.match(workflow, /return markers\.sort\(\(a, b\) =>\s*b\.observedAt - a\.observedAt \|\| b\.id - a\.id\)/);
+  assert.doesNotMatch(workflow, /refs\.sort\(/);
+  assert.doesNotMatch(workflow, /if \(head !== exactHead\) break/);
   assert.match(workflow, /issues: write/);
   assert.ok(
     workflow.indexOf('comments = await ensureHeadEpochMarker') <
@@ -398,10 +418,15 @@ test('watchdog rechecks changed red thread state from the trusted base ref', () 
   assert.match(watchdog, /const \[markers, runs\] = await Promise\.all/);
   assert.match(watchdog, /return markerEpoch \|\| runEpoch/);
   assert.match(watchdog, /runEvidence\.hasBoundary/);
-  assert.match(watchdog, /if \(accepted\.has\(key\)\) continue/);
-  assert.doesNotMatch(watchdog, /refs\.set\(/);
+  assert.match(watchdog, /const MAX_EPOCH_MARKER_CANDIDATES = 16/);
+  assert.match(watchdog, /const refsByRun = new Map\(\)/);
+  assert.match(watchdog, /refsByRun\.set\(ref\.runId, ref\)/);
+  assert.match(watchdog, /\.sort\(\(a, b\) => b\.runId - a\.runId\)\s*\.slice\(0, MAX_EPOCH_MARKER_CANDIDATES\)/);
+  assert.doesNotMatch(watchdog, /accepted\.has\(/);
   assert.match(watchdog, /roPage\(`https:\/\/api\.github\.com\/repos\/\$\{owner\}\/\$\{repo\}\/actions\/runs\/\$\{runId\}\/attempts\/\$\{attempt\}`\)/);
-  assert.match(watchdog, /if \(head !== exactHead\) break/);
+  assert.match(watchdog, /return markers\.sort\(\(a, b\) =>\s*b\.observedAt - a\.observedAt \|\| b\.id - a\.id\)/);
+  assert.doesNotMatch(watchdog, /refs\.sort\(/);
+  assert.doesNotMatch(watchdog, /if \(head !== exactHead\) break/);
   assert.match(
     watchdog,
     /!overrideCandidate && !redThreadStateChanged/,
@@ -460,6 +485,10 @@ test('bridge preserves unmarked current-head top-level findings via verified gat
     'utf8',
   );
   assert.match(bridge, /const HEAD_EPOCH_MARKER_PATTERN =/);
+  assert.match(bridge, /const MAX_EPOCH_MARKER_CANDIDATES = 16/);
+  assert.match(bridge, /const refsByRun = new Map\(\)/);
+  assert.match(bridge, /refsByRun\.set\(ref\.runId, ref\)/);
+  assert.match(bridge, /\.sort\(\(a, b\) => b\.runId - a\.runId\)\s*\.slice\(0, MAX_EPOCH_MARKER_CANDIDATES\)/);
   assert.match(bridge, /markerPr: Number\(match\[3\]\)/);
   assert.match(bridge, /markerHead: match\[4\]\.toLowerCase\(\)/);
   assert.match(bridge, /const runHead = ref\.markerHead/);

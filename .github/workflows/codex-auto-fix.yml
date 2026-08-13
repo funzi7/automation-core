@@ -178,27 +178,37 @@ jobs:
             // Top-level issue comments have no commit_id. Reuse the Gate's
             // authenticated head-epoch marker as the timestamp floor instead
             // of dropping a real current-head P1/P2 or trusting PR/commit time.
+            const MAX_EPOCH_MARKER_CANDIDATES = 16;
             async function observedHeadTransition(comments) {
               const exactHead = headSha.toLowerCase();
-              const refs = (comments || []).flatMap((comment) => {
-                if ((comment.user?.login || '') !== 'github-actions[bot]') return [];
+              const refsByRun = new Map();
+              for (const comment of comments || []) {
+                if ((comment.user?.login || '') !== 'github-actions[bot]') continue;
                 const match = String(comment.body || '').match(HEAD_EPOCH_MARKER_PATTERN);
-                if (!match) return [];
-                return [{
+                if (!match || Number(match[3]) !== Number(prNumber)) continue;
+                const ref = {
                   runId: Number(match[1]),
                   attempt: Number(match[2]),
                   markerPr: Number(match[3]),
                   markerHead: match[4].toLowerCase(),
                   commentAt: new Date(comment.created_at || 0).getTime(),
                   commentId: Number(comment.id || 0),
-                }];
-              }).sort((a, b) => b.commentAt - a.commentAt || b.commentId - a.commentId);
+                };
+                const previous = refsByRun.get(ref.runId);
+                if (!previous || ref.commentAt > previous.commentAt ||
+                    (ref.commentAt === previous.commentAt && ref.commentId > previous.commentId)) {
+                  refsByRun.set(ref.runId, ref);
+                }
+              }
+              const refs = [...refsByRun.values()]
+                .sort((a, b) => b.runId - a.runId)
+                .slice(0, MAX_EPOCH_MARKER_CANDIDATES);
+              if (refsByRun.size > refs.length) {
+                core.info(`PR #${prNumber}: bounded epoch verification to ${refs.length} newest run candidates.`);
+              }
               const verifiedRuns = [];
-              const verifiedKeys = new Set();
               for (const ref of refs) {
-                if (ref.markerPr !== Number(prNumber)) continue;
                 const key = `${ref.runId}/${ref.attempt}`;
-                if (verifiedKeys.has(key)) continue;
                 let run;
                 try {
                   ({ data: run } = await github.request(
@@ -223,7 +233,6 @@ jobs:
                   Number(run.run_attempt) !== ref.attempt ||
                   !belongsToPr || !commentInsideRun
                 ) continue;
-                verifiedKeys.add(key);
                 const observedAt = new Date(run.created_at || 0).getTime();
                 // pull_request_target run.head_sha is the base SHA. Trust
                 // the payload head stored inside the verified Gate attempt.
