@@ -10,7 +10,25 @@
 
 ---
 
-## Current Snapshot (owner exact-head auto-merge rollout, updated 2026-08-11)
+## Current Snapshot (emergency gate recovery, updated 2026-08-13)
+
+Emergency bootstrap PR #40 repaired the GitHub-unparseable Codex Gate and was
+squash-merged as `fd16f6ad875726386f4f7c029993639cafebaa01`. The root cause was
+direct `${{ ... }}` interpolation inside a roughly 25 KB `github-script`
+scalar, which crossed GitHub's 21,000-character expression ceiling after
+template expansion. Large scripts now receive values through `env`, and the
+validation suite rejects direct expression interpolation in large script
+scalars. Watchdog dispatch/update/backup failures now alert once per exact
+repository/PR/head/operation/normalized-error marker instead of once per tick.
+CI Doctor identifies internal workflows by authoritative path as well as name.
+
+The first repaired Gate dispatch succeeded, but exposed an independent safety
+bug: the old Gate treated Codex's usage-limit comment as an affirmative review
+signal and Merge Bot auto-merged PR #38 at
+`cdf4c94528fdfd81ab00742c549355912355bcc1`. Claude Fixer and Merge Bot are
+temporarily disabled while draft forward-fix PR #41 restores Issue-mode
+credential isolation, rejects quota/capacity notices in every signal consumer,
+and repairs partial transient-label provenance. The watchdog is enabled.
 
 Code architecture base: fix #27 plus the Codex backup hardening and the
 2026-08-11 reconciliation of paywall-bot's reviewed Codex Gate/watchdog fixes
@@ -81,7 +99,7 @@ Synced workflows listed in `sync-config.json`: `codex-auto-fix.yml`, `codex-gate
 - Fork-headed PR comments are skipped before writable checkout or Claude execution, labeled `needs-owner`, and marked `agent=claude state=fixer_error`.
 - Comment-triggered public-repo runs require the owner-authored comment guard: `github.event.comment.user.login == github.repository_owner`.
 - `ANTHROPIC_API_KEY` missing is fail-soft. Anthropic credit is currently exhausted in recent runs, so runtime delivery is blocked.
-- `--max-turns 50` and the current broad allowlist are intentional after the historical `error_max_turns`/permission-denial incidents.
+- Issue-mode uses `github.token`, `persist-credentials: false`, signed API commits, and only `Read,Glob,Grep`; a mandatory post-model scrub precedes every PAT-backed trusted step. Existing same-repo PR mode intentionally retains its writable branch credential and broader validation tools.
 
 ### `codex-auto-fix.yml` — Bridge + Codex summary archive
 
@@ -95,6 +113,7 @@ Synced workflows listed in `sync-config.json`: `codex-auto-fix.yml`, `codex-gate
 
 - `check-codex-status` is the blocking check.
 - Green requires Codex has reviewed the current head and no active P1/P2 remains.
+- Usage-limit and capacity notices from the trusted Codex actor are explicitly non-review signals.
 - P1 and P2 both block; this must match bridge-trigger severity. Historical P1-only behavior is SUPERSEDED.
 - Freshness is never inferred from Git author/committer dates. Review objects and Codex result comments bind directly to the exact SHA; unmarked surfaces count only after the server-observed start of the current contiguous head-SHA epoch. Each epoch marker is merely an index to an immutable Actions run attempt: consumers accept it only when GitHub proves the referenced attempt is this repository's `pull_request_target` Codex Gate run, associated with the same PR, and the bot comment was created inside that attempt. SHA/time come from the attempt, not comment text or the mutable live PR association. Consumers validate newest-first only through the first different-head boundary, while recent PR-run history is combined conservatively with verified markers. Thus A→B→A starts fresh, long-lived epochs survive the repository-wide search cap, and verification cost does not grow with the PR lifetime. Repointable inline `commit_id` values alone do not waive current-head review.
 - Trusted-sync grace-green is limited to zero-Codex-signal sync PRs older than `SYNC_GRACE_MINUTES`.
@@ -109,6 +128,7 @@ Synced workflows listed in `sync-config.json`: `codex-auto-fix.yml`, `codex-gate
 - Codex Cloud ready diff / View task is terminal non-delivery unless a real PR-head commit lands.
 - Claude proxy is implemented after Cloud non-delivery only when the original Claude failure was genuine `no_delivery`; it is runtime-unverified after fix #27.
 - Dispatch failures before the Codex API agent starts are `dispatch_failed`, retryable, and non-attempt-consuming.
+- Gate-dispatch, update-branch, and backup-dispatch errors use durable per-PR/head/operation/error fingerprints: the first material failure alerts, identical scheduled repeats only log, and a new head or error class alerts once again.
 
 ### `codex-backup-fix.yml` — Codex API backup
 

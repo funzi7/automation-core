@@ -11,10 +11,23 @@ const {
   currentHeadEpochStart,
   currentHeadEpochFromVerifiedRuns,
   selectHeadEpoch,
+  isCodexCapacityNotice,
 } = require('../tools/codex_gate_logic');
 
 const CODEX = 'chatgpt-codex-connector';
 const CODEX_REST = 'chatgpt-codex-connector[bot]';
+
+test('Codex quota/capacity notices are not affirmative review signals', () => {
+  assert.equal(isCodexCapacityNotice(
+    'You have reached your Codex usage limits for code reviews. You can see your limits in the dashboard.'
+  ), true);
+  assert.equal(isCodexCapacityNotice(
+    'Codex is currently at capacity and unable to complete this code review.'
+  ), true);
+  assert.equal(isCodexCapacityNotice(
+    '**Reviewed commit:** `abcdef1234`\n\nNo P1/P2 findings.'
+  ), false);
+});
 
 function thread({
   body = '**P2** fix the scheduler',

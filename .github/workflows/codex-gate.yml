@@ -197,6 +197,12 @@ jobs:
             }
 
             const REVIEWED_COMMIT_PATTERN = /(?:^|\n)\*\*Reviewed commit:\*\*\s*`([a-f0-9]{10,40})`(?:\s|$)/i;
+
+            function isCodexCapacityNotice(body) {
+              const text = String(body || '').trim();
+              return /^You have reached your Codex usage limits for code reviews\./i.test(text) ||
+                /^Codex (?:is|was) (?:currently )?(?:at capacity|unable to (?:complete|perform) (?:this )?code review)/i.test(text);
+            }
             const HEAD_EPOCH_MARKER_PATTERN = /<!--\s*codex-head-epoch:v2\s+run=(\d+)\s+attempt=(\d+)\s*-->/i;
             function signalTargetsHead(item, headSha, headObservedAt, dateField = 'created_at') {
               const exactHead = String(headSha || '').toLowerCase();
@@ -582,9 +588,14 @@ jobs:
                     : null;
                 } while (threadCursor);
 
-                const codexReviews = reviews.filter(r => isCodex(r.user));
-                const codexComments = comments.filter(c => isCodex(c.user));
-                const codexReviewComments = reviewComments.filter(c => isCodex(c.user));
+                // A trusted-actor quota/capacity notice proves no review
+                // occurred. It must never become an affirmative head signal.
+                const codexReviews = reviews.filter(r =>
+                  isCodex(r.user) && !isCodexCapacityNotice(r.body));
+                const codexComments = comments.filter(c =>
+                  isCodex(c.user) && !isCodexCapacityNotice(c.body));
+                const codexReviewComments = reviewComments.filter(c =>
+                  isCodex(c.user) && !isCodexCapacityNotice(c.body));
                 // fix #21: total Codex signals of ANY kind (any date) — reviews,
                 // review comments, issue comments, and issue-level reactions. Zero
                 // means Codex never engaged at all (the trusted-sync grace precondition).

@@ -240,6 +240,12 @@ jobs:
             }
 
             const REVIEWED_COMMIT_PATTERN = /(?:^|\n)\*\*Reviewed commit:\*\*\s*`([a-f0-9]{10,40})`(?:\s|$)/i;
+
+            function isCodexCapacityNotice(body) {
+              const text = String(body || '').trim();
+              return /^You have reached your Codex usage limits for code reviews\./i.test(text) ||
+                /^Codex (?:is|was) (?:currently )?(?:at capacity|unable to (?:complete|perform) (?:this )?code review)/i.test(text);
+            }
             const HEAD_EPOCH_MARKER_PATTERN = /<!--\s*codex-head-epoch:v2\s+run=(\d+)\s+attempt=(\d+)\s*-->/i;
             function signalTargetsHead(item, headSha, headObservedAt, dateField = 'created_at') {
               const exactHead = String(headSha || '').toLowerCase();
@@ -437,6 +443,7 @@ jobs:
               const headObservedAt = await observedHeadTransition(prNumber, headSha, comments);
               const trustedAfterHead = (item, dateField) =>
                 TRUSTED_CODEX_LOGINS.has(item.user?.login || '') &&
+                !isCodexCapacityNotice(item.body) &&
                 signalTargetsHead(item, headSha, headObservedAt, dateField);
               return (
                 reviews.some((item) => trustedAfterHead(item, 'submitted_at')) ||
@@ -597,6 +604,26 @@ jobs:
                 return;
               }
 
+              // A partially completed clear can leave only the companion.
+              // Remove it before rebuilding the ordered bot-attributed pair;
+              // otherwise no fresh needs-owner-auto label event exists to
+              // prove that the restored hard stop belongs to automation.
+              if (currentLabels.has(LABEL_ESCALATE_AUTO)) {
+                await github.rest.issues.removeLabel({
+                  owner, repo, issue_number: prNumber,
+                  name: LABEL_ESCALATE_AUTO,
+                });
+              }
+
+              const { data: beforeAdd } = await github.rest.pulls.get({
+                owner, repo, pull_number: prNumber,
+              });
+              if (beforeAdd.state !== 'open') return;
+              if (labelNames(beforeAdd).has(LABEL_ESCALATE)) {
+                core.warning(`#${prNumber}: needs-owner appeared while rebuilding transient provenance; preserving it as manual/unknown`);
+                return;
+              }
+
               const definitions = [
                 { name: LABEL_ESCALATE, color: 'd93f0b', description: 'Escalation — automation stopped, human needed' },
                 { name: LABEL_ESCALATE_AUTO, color: 'fbca04', description: 'Provenance: needs-owner was added by temporary PR automation escalation' },
@@ -608,11 +635,28 @@ jobs:
                   if (e.status !== 422) throw e;
                 }
               }
-              await actionLabelRequest(
-                'POST',
-                `/repos/${owner}/${repo}/issues/${prNumber}/labels`,
-                { labels: definitions.map((label) => label.name) },
-              );
+              // Add sequentially so timeline authority has an ordered
+              // github-actions[bot] needs-owner -> needs-owner-auto pair.
+              for (const label of definitions) {
+                await actionLabelRequest(
+                  'POST',
+                  `/repos/${owner}/${repo}/issues/${prNumber}/labels`,
+                  { labels: [label.name] },
+                );
+              }
+              const restoredProvenance = await escalationProvenance(prNumber);
+              if (!restoredProvenance.companion) {
+                try {
+                  await github.rest.issues.removeLabel({
+                    owner, repo, issue_number: prNumber,
+                    name: LABEL_ESCALATE_AUTO,
+                  });
+                } catch (e) {
+                  if (e.status !== 404) throw e;
+                }
+                core.warning(`#${prNumber}: restored hard stop lacked exact bot provenance; removed companion and left needs-owner fail-closed`);
+                return;
+              }
               core.info(`#${prNumber}: restored transient escalation after merge did not complete`);
             }
 

@@ -21,6 +21,15 @@ The repository preserves a direct-to-main operating convention for automation-co
 
 ## 2. Current Architecture Snapshot
 
+2026-08-13 emergency status: bootstrap PR #40 restored Codex Gate parsing in
+merge `fd16f6ad875726386f4f7c029993639cafebaa01`, added durable Watchdog
+Telegram failure dedupe, and made CI Doctor ignore internal automation paths.
+The repaired dispatch then exposed a separate flaw: a Codex usage-limit notice
+was accepted as a current-head review signal, and PR #38 auto-merged as
+`cdf4c94528fdfd81ab00742c549355912355bcc1`. Draft PR #41 is the forward
+security correction. Claude Fixer and Merge Bot are disabled during review;
+Claude Fallback Watchdog is enabled.
+
 Code architecture base: fix #27 implementation commit `93f6acb9d2e0396afad3e10854503024843c32de`.
 
 Previous documentation reconciliation: `ff57a73220faa5dbb563edc7b035fc6cc653c509`.
@@ -104,7 +113,14 @@ The archive job writes Codex summaries to agent-memory when configured; it is fa
 
 ### `claude.yml`
 
-Claude fixes `claude-fix` Issues by creating a new branch/PR with `Fixes #N`. For same-repo existing PR comments, fix #27 checks out the original PR head SHA/branch and instructs Claude to commit/push only there, with no new branch and no second PR. Fork-headed PR comments are skipped safely.
+Claude fixes `claude-fix` Issues by creating a new branch/PR with `Fixes #N`.
+Issue mode receives only `github.token`, checks out without persisted
+credentials, grants no shell/interpreter tools, uses constrained signed API
+file operations, and must pass a git-credential scrub before any trusted
+PAT-backed post-step. For same-repo existing PR comments, fix #27 checks out
+the original PR head SHA/branch and intentionally permits its writable branch
+credential and validation tools, with no new branch and no second PR.
+Fork-headed PR comments are skipped safely.
 
 Claude is default-on unless `CLAUDE_ENABLED == 'false'`. Current Anthropic credit is exhausted in recent runs, so this path is implemented but not runtime-proven after fix #27.
 
@@ -128,7 +144,7 @@ The Codex API backup is dormant by default and requires OpenAI quota plus `CODEX
 
 ### `codex-gate.yml`
 
-The gate blocks until Codex has reviewed the current head and no active P1/P2 remains. Review objects and Codex result comments bind directly to the exact SHA; unmarked signals must follow the server-observed current contiguous head-SHA epoch, and Git commit dates are never treated as push times. Epoch comments contain only a run ID/attempt index. Gate, watchdog, and merge bot fetch that exact attempt, require the repository's `pull_request_target` Codex Gate path plus same-PR association, require the comment timestamp to fall inside the attempt, and derive SHA/time from the immutable attempt fields rather than comment text or the mutable live PR association. Valid markers are scanned newest-first only to the first different-head boundary, then conservatively combined with recent PR-run history. This prevents shared-actor forgery and duplicate poisoning, preserves A→B→A, survives the repository-wide search cap, and keeps recheck cost bounded. Repointable inline `commit_id` values alone do not waive review. Trusted sync grace-green only applies to zero-signal trusted sync PRs after the server-observed grace window.
+The gate blocks until Codex has reviewed the current head and no active P1/P2 remains. Trusted Codex usage-limit/capacity notices are explicitly excluded from review signals. Review objects and Codex result comments bind directly to the exact SHA; unmarked signals must follow the server-observed current contiguous head-SHA epoch, and Git commit dates are never treated as push times. Epoch comments contain only a run ID/attempt index. Gate, watchdog, and merge bot fetch that exact attempt, require the repository's `pull_request_target` Codex Gate path plus same-PR association, require the comment timestamp to fall inside the attempt, and derive SHA/time from the immutable attempt fields rather than comment text or the mutable live PR association. Valid markers are scanned newest-first only to the first different-head boundary, then conservatively combined with recent PR-run history. This prevents shared-actor forgery and duplicate poisoning, preserves A→B→A, survives the repository-wide search cap, and keeps recheck cost bounded. Repointable inline `commit_id` values alone do not waive review. Trusted sync grace-green only applies to zero-signal trusted sync PRs after the server-observed grace window.
 
 ### `merge-bot.yml`
 

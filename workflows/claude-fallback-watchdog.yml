@@ -638,6 +638,11 @@ jobs:
               return P1_PATTERN.test(semantic) || P2_PATTERN.test(semantic);
             };
             const REVIEWED_COMMIT_PATTERN = /(?:^|\n)\*\*Reviewed commit:\*\*\s*`([a-f0-9]{10,40})`(?:\s|$)/i;
+            function isCodexCapacityNotice(body) {
+              const text = String(body || '').trim();
+              return /^You have reached your Codex usage limits for code reviews\./i.test(text) ||
+                /^Codex (?:is|was) (?:currently )?(?:at capacity|unable to (?:complete|perform) (?:this )?code review)/i.test(text);
+            }
             const HEAD_EPOCH_MARKER_PATTERN = /<!--\s*codex-head-epoch:v2\s+run=(\d+)\s+attempt=(\d+)\s*-->/i;
             const signalTargetsHead = (item, headSha, headObservedAt, dateField = 'created_at') => {
               const exactHead = String(headSha || '').toLowerCase();
@@ -1011,7 +1016,8 @@ jobs:
                   ]);
                   const comments = issueComments;
                   const onHead = (item, dateField) =>
-                    isCodex(item.user) && signalTargetsHead(item, headSha, headObservedAt, dateField);
+                    isCodex(item.user) && !isCodexCapacityNotice(item.body) &&
+                    signalTargetsHead(item, headSha, headObservedAt, dateField);
                   const freshSignal =
                     reviews.some((item) => onHead(item, 'submitted_at')) ||
                     comments.some((item) => onHead(item, 'created_at')) ||
