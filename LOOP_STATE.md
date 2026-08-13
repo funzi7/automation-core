@@ -46,13 +46,13 @@ back into the central workflow source.
 
 Documentation base: final post-fix #27 normalization commit `11ba6a6bf13c91b1be61d4292b853dd15c37063b`, plus this upstream fix record.
 
-Runtime status: paywall-bot PR #93 proved the failure mode: its exact head was
-fully green and mergeable, but an automation-added `needs-owner` stranded the
-old Merge Bot. PR #89, the stale downstream sync that proposed obsolete gate
-and watchdog files, was closed unmerged and its stale branch deleted. The
-central source now carries the downstream-reviewed thread-state, trusted-base,
-exact-head check publication, and bounded watchdog behavior before the new
-merge policy is rolled out.
+Runtime status: paywall-bot PR #93 proved the old failure mode, and stale sync
+PR #89 was closed unmerged with its branch deleted. The completed replacement
+rollout is PR #94: all seven current workflows passed downstream application
+CI, exact-head Codex review and Gate, then the normal Merge Bot squash-merged
+them as `2575f0f2b16c12ebb9b9173e8c9a8248ab529ebe`. The central source and
+paywall-bot now carry the reviewed thread-state, trusted-base, exact-head check
+publication, provenance, credential-isolation, and bounded-watchdog behavior.
 
 Current delivery-judged ladder:
 

@@ -108,7 +108,8 @@ Runtime-unverified after fix #27:
 - Claude proxy applying a Codex Cloud ready diff to the original PR head.
 - Codex API backup delivery while OpenAI quota is unavailable.
 
-Unknown / not checked in this pass:
+Unknown / not checked in this pass for downstream repositories other than the
+verified paywall-bot rollout recorded below:
 
 - Downstream repo secrets, Actions variables, workflow permissions, and current runtime health.
 - Whether each downstream has the latest synced workflow contents.
@@ -198,17 +199,24 @@ paywall-bot sync PR #89 was closed unmerged and its stale
 
 Verified current facts only:
 
+- paywall-bot PR #94 exact head
+  `5d65f205708435aab09ce03ace5880c30b342293` contained all seven configured
+  workflows byte-identical to automation-core source, passed downstream CI,
+  exact-head Codex review and Gate, and was normally auto-merged as
+  `2575f0f2b16c12ebb9b9173e8c9a8248ab529ebe`. Its Codex Gate, Claude Fixer,
+  Watchdog, and Merge Bot workflows are active.
 - OptionsProfitTracker PR #12 is merged.
 - thai-rent-finder PR #80 is merged.
 
-Not verified in this pass:
+Not verified in this pass for downstream repositories other than paywall-bot:
 
 - downstream secrets;
 - Actions variables;
 - workflow permissions;
 - current synced workflow contents;
 - current CI/runtime health;
-- whether any downstream is fully in sync beyond specific PR facts above.
+- whether those other downstream repositories are fully in sync beyond the
+  specific PR facts above.
 
 Do not claim a downstream is synced or healthy without fresh evidence from the repo's latest sync PR/current workflow contents and settings.
 
