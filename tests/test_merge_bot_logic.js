@@ -531,10 +531,17 @@ test('Claude PR provenance records on failure while automerge remains success-on
   assert.match(workflow, /github\.rest\.git\.listMatchingRefs/);
   assert.match(workflow, /core\.setOutput\('branch_heads_json', JSON\.stringify\(baselines\)\)/);
   assert.match(workflow, /ISSUE_BRANCH_BASELINES_JSON: \$\{\{ steps\.issue_branch_baseline\.outputs\.branch_heads_json \}\}/);
+  assert.match(workflow, /IS_PR_COMMENT: \$\{\{ steps\.pr_context\.outputs\.is_pr_comment \}\}/);
+  assert.match(workflow, /if \(process\.env\.IS_PR_COMMENT !== 'true'\)/);
   assert.match(workflow, /const before = String\(baselines\[branch\] \|\| process\.env\.ISSUE_BASE_SHA \|\| ''\)\.toLowerCase\(\)/);
   assert.match(workflow, /after !== before/);
   assert.match(workflow, /CLAUDE_DELIVERED: \$\{\{ steps\.delivery\.outputs\.delivered \}\}/);
   assert.match(workflow, /const delivered = process\.env\.CLAUDE_ACTION_OUTCOME === 'success' &&\s*process\.env\.CLAUDE_DELIVERED === 'true'/);
+  const provenanceStep = workflow.slice(
+    workflow.indexOf('Record Claude PR provenance and conditionally auto-merge'),
+  );
+  assert.match(provenanceStep, /CLAUDE_ACTION_OUTCOME: \$\{\{ steps\.claude_issue\.outcome \}\}/);
+  assert.match(provenanceStep, /CLAUDE_DELIVERED: \$\{\{ steps\.delivery\.outputs\.delivered \}\}/);
   assert.doesNotMatch(workflow, /No trigger comment .* treat as delivered/);
   assert.match(workflow, /labels: delivered \? \['claude-generated', 'automerge'\] : \['claude-generated'\]/);
   assert.match(workflow, /github-token: \$\{\{ github\.token \}\}/);

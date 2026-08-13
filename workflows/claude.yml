@@ -345,6 +345,7 @@ jobs:
           ISSUE_BRANCH_BASELINES_JSON: ${{ steps.issue_branch_baseline.outputs.branch_heads_json }}
           ISSUE_BASE_SHA: ${{ steps.issue_branch_baseline.outputs.base_sha }}
           CLAUDE_ISSUE_BRANCH: ${{ steps.claude_issue.outputs.branch_name }}
+          IS_PR_COMMENT: ${{ steps.pr_context.outputs.is_pr_comment }}
         with:
           github-token: ${{ secrets.AUTOMATION_PAT || github.token }}
           script: |
@@ -352,7 +353,7 @@ jobs:
             const repo = context.repo.repo;
             const comment = context.payload.comment;
             let delivered = false;
-            if (!comment) {
+            if (process.env.IS_PR_COMMENT !== 'true') {
               // Issue-mode retries may reuse an existing partial branch while the
               // action reports success on a no-op. Grant delivery only when this
               // invocation moved the exact action-controlled branch head.
@@ -530,8 +531,6 @@ jobs:
         uses: actions/github-script@v8
         env:
           CLAUDE_BRANCH_NAME: ${{ steps.claude_issue.outputs.branch_name }}
-          CLAUDE_ACTION_OUTCOME: ${{ steps.claude_issue.outcome }}
-          CLAUDE_DELIVERED: ${{ steps.delivery.outputs.delivered }}
         with:
           # PAT-authored creation wakes CI/Codex Gate. The exact branch is an
           # action output and must retain the action-controlled prefix.
@@ -576,6 +575,8 @@ jobs:
         uses: actions/github-script@v8
         env:
           CLAUDE_BRANCH_NAME: ${{ steps.claude_issue.outputs.branch_name }}
+          CLAUDE_ACTION_OUTCOME: ${{ steps.claude_issue.outcome }}
+          CLAUDE_DELIVERED: ${{ steps.delivery.outputs.delivered }}
         with:
           # Use the default token so the durable claude-generated label event is
           # attributable to github-actions[bot], independently of PAT-authored
