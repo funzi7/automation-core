@@ -355,9 +355,11 @@ test('authoritative workflow keeps gate policy inline', () => {
   assert.match(workflow, /run\.event !== 'pull_request_target'/);
   assert.match(workflow, /Number\(run\.run_attempt\) !== attempt \|\| !belongsToPr \|\| !commentInsideRun/);
   assert.match(workflow, /const head = markerHead/);
-  assert.match(workflow, /const refs = \[\]/);
-  assert.match(workflow, /if \(accepted\.has\(key\)\) continue/);
-  assert.doesNotMatch(workflow, /refs\.set\(/);
+  assert.match(workflow, /const MAX_EPOCH_MARKER_CANDIDATES = 16/);
+  assert.match(workflow, /const refsByRun = new Map\(\)/);
+  assert.match(workflow, /refsByRun\.set\(ref\.runId, ref\)/);
+  assert.match(workflow, /\.sort\(\(a, b\) => b\.runId - a\.runId\)\s*\.slice\(0, MAX_EPOCH_MARKER_CANDIDATES\)/);
+  assert.doesNotMatch(workflow, /accepted\.has\(/);
   assert.match(workflow, /return markers\.sort\(\(a, b\) =>\s*b\.observedAt - a\.observedAt \|\| b\.id - a\.id\)/);
   assert.doesNotMatch(workflow, /refs\.sort\(/);
   assert.doesNotMatch(workflow, /if \(head !== exactHead\) break/);
@@ -416,8 +418,11 @@ test('watchdog rechecks changed red thread state from the trusted base ref', () 
   assert.match(watchdog, /const \[markers, runs\] = await Promise\.all/);
   assert.match(watchdog, /return markerEpoch \|\| runEpoch/);
   assert.match(watchdog, /runEvidence\.hasBoundary/);
-  assert.match(watchdog, /if \(accepted\.has\(key\)\) continue/);
-  assert.doesNotMatch(watchdog, /refs\.set\(/);
+  assert.match(watchdog, /const MAX_EPOCH_MARKER_CANDIDATES = 16/);
+  assert.match(watchdog, /const refsByRun = new Map\(\)/);
+  assert.match(watchdog, /refsByRun\.set\(ref\.runId, ref\)/);
+  assert.match(watchdog, /\.sort\(\(a, b\) => b\.runId - a\.runId\)\s*\.slice\(0, MAX_EPOCH_MARKER_CANDIDATES\)/);
+  assert.doesNotMatch(watchdog, /accepted\.has\(/);
   assert.match(watchdog, /roPage\(`https:\/\/api\.github\.com\/repos\/\$\{owner\}\/\$\{repo\}\/actions\/runs\/\$\{runId\}\/attempts\/\$\{attempt\}`\)/);
   assert.match(watchdog, /return markers\.sort\(\(a, b\) =>\s*b\.observedAt - a\.observedAt \|\| b\.id - a\.id\)/);
   assert.doesNotMatch(watchdog, /refs\.sort\(/);
@@ -480,6 +485,10 @@ test('bridge preserves unmarked current-head top-level findings via verified gat
     'utf8',
   );
   assert.match(bridge, /const HEAD_EPOCH_MARKER_PATTERN =/);
+  assert.match(bridge, /const MAX_EPOCH_MARKER_CANDIDATES = 16/);
+  assert.match(bridge, /const refsByRun = new Map\(\)/);
+  assert.match(bridge, /refsByRun\.set\(ref\.runId, ref\)/);
+  assert.match(bridge, /\.sort\(\(a, b\) => b\.runId - a\.runId\)\s*\.slice\(0, MAX_EPOCH_MARKER_CANDIDATES\)/);
   assert.match(bridge, /markerPr: Number\(match\[3\]\)/);
   assert.match(bridge, /markerHead: match\[4\]\.toLowerCase\(\)/);
   assert.match(bridge, /const runHead = ref\.markerHead/);

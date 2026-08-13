@@ -270,24 +270,38 @@ jobs:
             }
 
             const epochRunCache = new Map();
+            const MAX_EPOCH_MARKER_CANDIDATES = 16;
             async function trustedHeadMarkers(comments, prNumber) {
-              const refs = [];
+              const refsByRun = new Map();
               for (const comment of comments || []) {
                 if ((comment.user?.login || '') !== 'github-actions[bot]') continue;
                 const match = String(comment.body || '').match(HEAD_EPOCH_MARKER_PATTERN);
-                if (match) refs.push({
+                if (!match || Number(match[3]) !== Number(prNumber)) continue;
+                const ref = {
                   runId: Number(match[1]), attempt: Number(match[2]),
                   markerPr: Number(match[3]), markerHead: match[4].toLowerCase(),
                   commentAt: new Date(comment.created_at || 0).getTime(),
                   commentId: Number(comment.id || 0),
-                });
+                };
+                const previous = refsByRun.get(ref.runId);
+                if (!previous || ref.commentAt > previous.commentAt ||
+                    (ref.commentAt === previous.commentAt && ref.commentId > previous.commentId)) {
+                  refsByRun.set(ref.runId, ref);
+                }
+              }
+              // Run IDs are used only to bound the newest candidate suffix;
+              // authenticated run.created_at remains authoritative for epochs.
+              // Truncation is fail-closed: it can require a newer review, never
+              // revive evidence from an older head epoch.
+              const candidates = [...refsByRun.values()]
+                .sort((a, b) => b.runId - a.runId)
+                .slice(0, MAX_EPOCH_MARKER_CANDIDATES);
+              if (refsByRun.size > candidates.length) {
+                core.info(`#${prNumber}: bounded epoch verification to ${candidates.length} newest run candidates.`);
               }
               const markers = [];
-              const accepted = new Set();
-              for (const { runId, attempt, markerPr, markerHead, commentAt } of refs) {
-                if (markerPr !== Number(prNumber)) continue;
+              for (const { runId, attempt, markerHead, commentAt } of candidates) {
                 const key = `${runId}/${attempt}`;
-                if (accepted.has(key)) continue;
                 if (!epochRunCache.has(key)) {
                   epochRunCache.set(key,
                     roPage(`https://api.github.com/repos/${owner}/${repo}/actions/runs/${runId}/attempts/${attempt}`).then(({ data }) => data));
@@ -305,7 +319,6 @@ jobs:
                     run.event !== 'pull_request_target' ||
                     Number(run.run_attempt) !== attempt || !belongsToPr || !commentInsideRun
                   ) continue;
-                  accepted.add(key);
                   const observedAt = new Date(run.created_at || 0).getTime();
                   // pull_request_target run.head_sha is the base SHA. Trust
                   // the payload head stored inside the verified Gate attempt.
