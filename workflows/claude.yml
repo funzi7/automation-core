@@ -578,6 +578,8 @@ jobs:
         uses: actions/github-script@v8
         env:
           CLAUDE_BRANCH_NAME: ${{ steps.claude_issue.outputs.branch_name }}
+          CLAUDE_ACTION_OUTCOME: ${{ steps.claude_issue.outcome }}
+          CLAUDE_DELIVERED: ${{ steps.delivery.outputs.delivered }}
         with:
           # PAT-authored creation wakes CI/Codex Gate. The exact branch is an
           # action output and must retain the action-controlled prefix.
@@ -587,12 +589,41 @@ jobs:
             const repo = context.repo.repo;
             const branch = String(process.env.CLAUDE_BRANCH_NAME || '');
             if (!branch.startsWith('claude/')) throw new Error(`Refusing untrusted Claude branch: ${branch}`);
+            const trustedDelivery = process.env.CLAUDE_ACTION_OUTCOME === 'success' &&
+              process.env.CLAUDE_DELIVERED === 'true';
             const issueNum = context.payload.issue?.number;
             if (!issueNum) throw new Error('Issue number missing for Claude PR creation');
             const existing = await github.paginate(github.rest.pulls.list, {
               owner, repo, state: 'open', head: `${owner}:${branch}`, per_page: 100,
             });
             if (existing.length) {
+              if (trustedDelivery) {
+                // The model-facing action uses github.token, so its push cannot
+                // start new workflow runs. Add a trusted empty child commit with
+                // the post-model PAT to produce a real synchronize event. The
+                // ref update is non-force and fails closed on any concurrent move.
+                const { data: ref } = await github.rest.git.getRef({
+                  owner, repo, ref: `heads/${branch}`,
+                });
+                const deliveredHead = String(ref.object?.sha || '').toLowerCase();
+                if (!/^[a-f0-9]{40}$/.test(deliveredHead)) {
+                  throw new Error(`Invalid delivered head for ${branch}`);
+                }
+                const { data: deliveredCommit } = await github.rest.git.getCommit({
+                  owner, repo, commit_sha: deliveredHead,
+                });
+                const { data: activation } = await github.rest.git.createCommit({
+                  owner, repo,
+                  message: 'chore: activate trusted Claude delivery',
+                  tree: deliveredCommit.tree.sha,
+                  parents: [deliveredHead],
+                });
+                await github.rest.git.updateRef({
+                  owner, repo, ref: `heads/${branch}`,
+                  sha: activation.sha, force: false,
+                });
+                core.info(`Activated existing Claude PR #${existing[0].number} at ${activation.sha}.`);
+              }
               core.info(`Claude PR #${existing[0].number} already exists for ${branch}.`);
               return;
             }
