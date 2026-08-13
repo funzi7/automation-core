@@ -448,3 +448,29 @@ test('review-thread changes have a supported PAT-independent gate sweep', () => 
   assert.match(gate, /state: 'open', per_page: 100/);
   assert.match(gate, /anyBlocked && context\.eventName !== 'schedule'/);
 });
+
+test('bridge preserves unmarked current-head top-level findings via verified gate epoch', () => {
+  const bridge = fs.readFileSync(
+    path.join(__dirname, '..', 'workflows', 'codex-auto-fix.yml'),
+    'utf8',
+  );
+  assert.match(bridge, /const HEAD_EPOCH_MARKER_PATTERN =/);
+  assert.match(bridge, /permissions:[\s\S]*actions: read/);
+  assert.match(bridge, /async function observedHeadTransition\(comments\)/);
+  assert.match(bridge, /comment\.user\?\.login \|\| ''\) !== 'github-actions\[bot\]'/);
+  assert.match(bridge, /run\.path !== '\.github\/workflows\/codex-gate\.yml'/);
+  assert.match(bridge, /run\.event !== 'pull_request_target'/);
+  assert.match(bridge, /Number\(run\.run_attempt\) !== ref\.attempt/);
+  assert.match(bridge, /!belongsToPr \|\| !commentInsideRun/);
+  assert.match(bridge, /const epochEvidence = \(timeline\) =>/);
+  assert.match(bridge, /b\.observedAt - a\.observedAt \|\| \(b\.id \|\| 0\) - \(a\.id \|\| 0\)/);
+  assert.match(bridge, /ordered\[0\]\.head !== exactHead/);
+  assert.match(bridge, /if \(run\.head !== exactHead\) \{/);
+  assert.match(bridge, /github\.rest\.actions\.listWorkflowRunsForRepo/);
+  assert.match(bridge, /event: 'pull_request', per_page: 100/);
+  assert.match(bridge, /markerEvidence\.epoch \|\| runEvidence\.epoch/);
+  assert.match(bridge, /headObservedAt = await observedHeadTransition\(issueComments\)/);
+  assert.match(bridge, /signalAt > observedAt/);
+  assert.doesNotMatch(bridge, /prData\?\.updated_at/);
+  assert.doesNotMatch(bridge, /commit dates.*transition timestamp/i);
+});
