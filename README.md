@@ -6,7 +6,7 @@ Central source of truth for CI/CD automation across all of @funzi7's repositorie
 
 `workflows/` — generic GitHub Actions workflows synced to every participating repo:
 - `codex-auto-fix.yml` — triggers Codex to fix flagged P1/P2 reviews automatically
-- `codex-gate.yml` — blocks PR merge until Codex signals (review with no P1, 👍 reaction, or fix Summary after P1)
+- `codex-gate.yml` — blocks PR merge until a valid current-head Codex review signal exists and no P1/P2 remains; quota/capacity notices never count
 - `claude.yml` — **Claude Fixer**: Claude Code fixes a `claude-fix` Issue (or an `@claude` mention) on a branch and opens a PR
 - `ci-doctor.yml` — **CI Doctor**: detects failed runs on the default branch and opens `claude-fix` Issues
 - `merge-bot.yml` — **Merge Bot**: squash-merges fully-green PRs once codex-gate passes
@@ -37,9 +37,10 @@ workflows above plus the existing `codex-gate`:
                   closes the ci-doctor Issue
 ```
 
-Every cross-workflow write (Issue create, re-label, merge) uses
-`AUTOMATION_PAT` — events made with the default `GITHUB_TOKEN` do not trigger
-other workflows (GitHub loop protection), which would silently kill the loop.
+Trusted cross-workflow writes use `AUTOMATION_PAT` because default-token events
+do not trigger other workflows. The Issue-mode Claude model is the deliberate
+exception: it receives only `github.token`; only a later trusted post-step may
+receive the PAT.
 
 **Scheduling (kept light to restrain Actions-minute cost):** CI Doctor runs on
 a cron **twice a day** (06:00 & 18:00 UTC) to sweep the default branch for
@@ -69,7 +70,7 @@ still happen within minutes — the crons are just the backstop.
 |--------|-------------|-------|
 | `ANTHROPIC_API_KEY` | `claude.yml` | **Required for the fixer.** If absent, Claude Fixer exits green (fail-soft) — no fix, no red runs, ~0 minutes. Set only on the repos you want auto-fixed (cost control). |
 | `CROSS_REPO_PAT` | `bootstrap.yml` (onboarding / auto-enrollment), `minutes-guard.yml` | automation-core only. Cross-repo fine-grained PAT (Contents/PRs/Workflows write, Metadata read; all repos). If absent, auto-enrollment exits green with a notice (fail-soft). |
-| `AUTOMATION_PAT` | `ci-doctor.yml`, `merge-bot.yml`, and `claude.yml` PR creation | **Required for the loop to chain.** Events created with the default `GITHUB_TOKEN` do not trigger other workflows (GitHub loop protection), so Issue/label/merge writes use this PAT. If absent, those workflows exit green (fail-soft) and the loop is inert in that repo. Needs Contents/PRs/Issues write, Metadata read. |
+| `AUTOMATION_PAT` | `ci-doctor.yml`, `merge-bot.yml`, and trusted post-Claude PR creation | **Required for the loop to chain.** It is never passed to Issue-mode Claude or its model-facing checkout. If absent, trusted writes exit green (fail-soft). Needs Contents/PRs/Issues write, Metadata read. |
 | `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` | optional | Escalation pings on `needs-owner` / protected-path blocks. Messages use `parse_mode: HTML` (Markdown underscores broke us before). Skipped silently if unset. |
 
 ### fail-soft behaviour
@@ -91,9 +92,11 @@ full exact-head CI, trusted Codex review/gate, active-thread, mergeability, and
 SHA-pinned merge requirements pass. Add `no-automerge` for an explicit human
 hold. Because `AUTOMATION_PAT` can make a Claude-created PR appear owner-authored,
 the trusted Claude workflow records durable `claude-generated` provenance using
-the Actions identity. On Issue runs, the action controls the `claude/*` branch,
-Claude cannot create or switch branches or open PRs, and a trusted post-step
-creates the PR from the action's exact branch output. The branch therefore
+the Actions identity. On Issue runs, checkout uses `github.token` with
+credential persistence disabled; the model has no shell, generic interpreter,
+or generic write tool; the action uses constrained file operations and signed
+API commits; and a mandatory scrub removes its git credential before a trusted
+PAT-backed post-step creates the PR from the exact branch output. The branch therefore
 provides immediate provenance at PR creation, with the durable label following.
 The exact same-repository automation-core sync signature remains trusted when
 no Claude provenance exists.
@@ -109,7 +112,8 @@ supported. Fork titles and branch names never establish trust.
 The candidate is merged only when every latest relevant check/status is
 terminal-green, the authoritative `check-codex-status` success exists on the
 exact current head, no active trusted P1/P2 thread exists, and GitHub reports
-the PR mergeable. The squash call is pinned to that evaluated SHA; a moved
+the PR mergeable. Codex quota/capacity notices are not review signals. The
+squash call is pinned to that evaluated SHA; a moved
 head fails closed. A successful same-repo merge is followed by branch
 deletion, and the PAT-authored merge continues to trigger downstream
 workflows.
