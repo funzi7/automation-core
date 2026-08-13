@@ -83,17 +83,18 @@ jobs:
       - name: Bootstrap / auto-enroll eligible repos
         if: steps.token.outputs.token != ''
         uses: actions/github-script@v8
+        env:
+          DRY_RUN: ${{ inputs.dry_run || false }}
+          TARGET_REPO: ${{ inputs.target_repo || '' }}
         with:
           github-token: ${{ steps.token.outputs.token }}
           script: |
             const fs = require('fs');
 
-            // On a `schedule` event there are no workflow inputs, so the input
-            // expressions below render empty — guard with defaults so the script
-            // stays valid JS and the scheduled sweep runs for-real (DRY_RUN
-            // false) over all repos (TARGET_REPO empty).
-            const DRY_RUN = ${{ inputs.dry_run || false }};
-            const TARGET_REPO = '${{ inputs.target_repo || '' }}';
+            // On a `schedule` event there are no workflow inputs. The env
+            // defaults keep the sweep real (not dry-run) and target all repos.
+            const DRY_RUN = process.env.DRY_RUN === 'true';
+            const TARGET_REPO = process.env.TARGET_REPO || '';
             const OWNER = context.repo.owner;
             const SOURCE_REPO = context.repo.repo;
 

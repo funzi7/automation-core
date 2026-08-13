@@ -45,7 +45,9 @@ receive the PAT.
 The 2026-08-13 Gate incident is closed. Large `github-script` bodies receive
 workflow values through `env`, and validation scans all tracked workflow YAML
 to reject direct `${{ ... }}` interpolation that could exceed GitHub's
-expression limit. Scheduled Watchdog
+expression limit. Unquoted or template-literal expressions in executable
+JavaScript also fail closed instead of being syntax-checked against a fake
+replacement value. Scheduled Watchdog
 dispatch/update/backup failures alert once per repository/PR/exact-head/
 operation/normalized-error marker; identical retries keep logging without
 repeating Telegram. CI Doctor also ignores internal automation by workflow

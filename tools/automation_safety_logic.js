@@ -44,6 +44,48 @@ function largeGithubScriptHasDirectExpression(
     String(script || '').includes('${{');
 }
 
+function githubScriptHasUnquotedExpression(script) {
+  const source = String(script || '');
+  let state = 'code';
+  for (let index = 0; index < source.length; index += 1) {
+    const pair = source.slice(index, index + 2);
+    if (state === 'code') {
+      if (source.startsWith('${{', index)) return true;
+      if (pair === '//') {
+        state = 'line-comment';
+        index += 1;
+      } else if (pair === '/*') {
+        state = 'block-comment';
+        index += 1;
+      } else if (source[index] === "'" || source[index] === '"') {
+        state = source[index];
+      } else if (source[index] === '`') {
+        state = 'template';
+      }
+    } else if (state === "'" || state === '"') {
+      if (source.startsWith('${{', index)) {
+        const end = source.indexOf('}}', index + 3);
+        if (end < 0) return true;
+        index = end + 1;
+      } else if (source[index] === '\\') {
+        index += 1;
+      } else if (source[index] === state) {
+        state = 'code';
+      }
+    } else if (state === 'template') {
+      if (source.startsWith('${{', index)) return true;
+      if (source[index] === '\\') index += 1;
+      else if (source[index] === '`') state = 'code';
+    } else if (state === 'line-comment') {
+      if (source[index] === '\n') state = 'code';
+    } else if (state === 'block-comment' && pair === '*/') {
+      state = 'code';
+      index += 1;
+    }
+  }
+  return false;
+}
+
 function normalizeFailure(error) {
   const rawStatus = Number(error?.status);
   const status = Number.isFinite(rawStatus) ? String(rawStatus) : 'unknown';
@@ -128,6 +170,7 @@ module.exports = {
   INTERNAL_AUTOMATION_NAMES,
   INTERNAL_AUTOMATION_PATHS,
   largeGithubScriptHasDirectExpression,
+  githubScriptHasUnquotedExpression,
   normalizeFailure,
   failureFingerprint,
   parseLoopMarkers,

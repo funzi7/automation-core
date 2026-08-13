@@ -8,7 +8,6 @@ checks each github-script block without executing it.
 
 from __future__ import annotations
 
-import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -20,7 +19,6 @@ import yaml
 # a large scalar contains a direct `${{ ... }}` interpolation. Keep large
 # github-script programs data-only and pass workflow values through step env.
 LARGE_SCRIPT_EXPRESSION_THRESHOLD = 10_000
-GITHUB_EXPRESSION = re.compile(r"\$\{\{.*?\}\}", re.DOTALL)
 
 
 class WorkflowLoader(yaml.SafeLoader):
@@ -59,6 +57,60 @@ def validate_expression_safety(workflow_path: Path, location: str, script: str) 
     print(f"  expression safe: {workflow_path}:{location} ({size} bytes)")
 
 
+def has_unquoted_github_expression(script: str) -> bool:
+    """Return true when an expression appears in executable JS, not a quote/comment."""
+    state = "code"
+    index = 0
+    while index < len(script):
+        pair = script[index : index + 2]
+        if state == "code":
+            if script.startswith("${{", index):
+                return True
+            if pair == "//":
+                state = "line_comment"
+                index += 2
+                continue
+            if pair == "/*":
+                state = "block_comment"
+                index += 2
+                continue
+            if script[index] in ("'", '"'):
+                state = script[index]
+            elif script[index] == "`":
+                state = "template"
+        elif state in ("'", '"'):
+            if script.startswith("${{", index):
+                end = script.find("}}", index + 3)
+                if end < 0:
+                    return True
+                index = end + 2
+                continue
+            if script[index] == "\\":
+                index += 2
+                continue
+            if script[index] == state:
+                state = "code"
+        elif state == "template":
+            # A GitHub expression in template text can inject a backtick or a
+            # `${...}` sequence, so require env transport here as well.
+            if script.startswith("${{", index):
+                return True
+            if script[index] == "\\":
+                index += 2
+                continue
+            if script[index] == "`":
+                state = "code"
+        elif state == "line_comment":
+            if script[index] == "\n":
+                state = "code"
+        elif state == "block_comment" and pair == "*/":
+            state = "code"
+            index += 2
+            continue
+        index += 1
+    return False
+
+
 # Scan every tracked workflow candidate on every run. This deliberately covers
 # synced source/mirror pairs, active hub-only workflows, and workflow templates;
 # limiting the scan to sync-config would leave large hub-only github-script
@@ -81,15 +133,19 @@ for workflow_path in workflow_paths:
         if not script.strip():
             raise SystemExit(f"empty github-script block: {workflow_path}:{location}")
         validate_expression_safety(workflow_path, location, script)
+        if has_unquoted_github_expression(script):
+            raise SystemExit(
+                "unsafe unquoted GitHub expression in github-script block: "
+                f"{workflow_path}:{location}; pass typed values via env"
+            )
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".js", encoding="utf-8"
         ) as handle:
             handle.write("async function __validate__() {\n")
-            # GitHub replaces expressions before JavaScript is parsed. Small
-            # scripts may still use that supported form, so substitute a
-            # neutral JS literal for syntax checking. Large scripts containing
-            # any expression have already failed closed above.
-            handle.write(GITHUB_EXPRESSION.sub("null", script))
+            # Quoted expressions remain literal JavaScript strings during this
+            # syntax check. Unquoted/template expressions fail closed above
+            # instead of being replaced with a universally valid fake value.
+            handle.write(script)
             handle.write("\n}\n")
             handle.flush()
             subprocess.run(["node", "--check", handle.name], check=True)
