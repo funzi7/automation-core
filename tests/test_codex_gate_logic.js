@@ -530,6 +530,14 @@ test('bridge preserves unmarked current-head top-level findings via verified gat
   assert.match(bridge, /signalAt > observedAt/);
   assert.doesNotMatch(bridge, /prData\?\.updated_at/);
   assert.doesNotMatch(bridge, /commit dates.*transition timestamp/i);
+  const digest = bridge.slice(
+    bridge.indexOf('const digestBullets = []'),
+    bridge.indexOf('// Cap the WHOLE digest'),
+  );
+  assert.match(digest, /for \(const c of issueComments\)/);
+  assert.match(bridge, /const isCodexCapacityNotice = \(body\) =>/);
+  assert.match(digest, /c\.user\?\.login === CODEX && isP12\(c\.body\) && signalTargetsHead\(c\)/);
+  assert.match(digest, /!isCodexCapacityNotice\(c\.body\)/);
 });
 
 test('backup fixer includes trusted current-head top-level findings', () => {
