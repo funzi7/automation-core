@@ -432,7 +432,9 @@ test('workflow preserves exact-SHA squash merge and same-repo branch deletion', 
   assert.match(workflow, /if \(accepted\.has\(key\)\) continue/);
   assert.doesNotMatch(workflow, /refs\.set\(/);
   assert.match(workflow, /roPage\(`https:\/\/api\.github\.com\/repos\/\$\{owner\}\/\$\{repo\}\/actions\/runs\/\$\{runId\}\/attempts\/\$\{attempt\}`\)/);
-  assert.match(workflow, /if \(head !== exactHead\) break/);
+  assert.match(workflow, /return markers\.sort\(\(a, b\) =>\s*b\.observedAt - a\.observedAt \|\| b\.id - a\.id\)/);
+  assert.doesNotMatch(workflow, /refs\.sort\(/);
+  assert.doesNotMatch(workflow, /if \(head !== exactHead\) break/);
   assert.match(workflow, /NON_BLOCKING_DIAGNOSTIC_CHECKS = new Set\(\['codex-gate-evaluator'\]\)/);
   assert.match(workflow, /\.filter\(\(c\) => !NON_BLOCKING_DIAGNOSTIC_CHECKS\.has\(c\.name\)\)/);
   assert.match(workflow, /let prWorkflowRunsPromise = null/);
