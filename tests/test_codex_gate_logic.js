@@ -395,7 +395,8 @@ test('queued PR head events are revalidated before gate evaluation', () => {
   assert.match(workflow, /payloadHead !== liveHead\.toLowerCase\(\)/);
   assert.match(workflow, /github\.rest\.actions\.getWorkflowRun/);
   assert.match(workflow, /event\.event === 'head_ref_force_pushed'/);
-  assert.match(workflow, /newestForcePushAt <= runCreatedAt/);
+  assert.match(workflow, /newestForcePushAt < runCreatedAt/);
+  assert.doesNotMatch(workflow, /context\.payload\.action !== 'synchronize'\) return true/);
   assert.match(workflow, /if \(!\(await triggeringHeadEventIsCurrent\(prNumber, headSha\)\)\)/);
   assert.match(workflow, /stale queued head event skipped/);
   assert.ok(

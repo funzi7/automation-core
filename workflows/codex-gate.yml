@@ -391,12 +391,12 @@ jobs:
               if (!/^[a-f0-9]{40}$/.test(payloadHead) || payloadHead !== liveHead.toLowerCase()) {
                 return false;
               }
-              if (context.payload.action !== 'synchronize') return true;
-
               // Repository-wide concurrency can leave an old A event queued
               // until after A -> B -> A. Payload/live SHA equality alone cannot
               // distinguish that old A event. A force-push transition newer than
               // this immutable workflow run proves the queued payload is stale.
+              // Treat equal-second timestamps as stale too: neither REST timestamp
+              // has enough precision to prove the transition preceded this run.
               try {
                 const [{ data: thisRun }, events] = await Promise.all([
                   github.rest.actions.getWorkflowRun({
@@ -413,7 +413,7 @@ jobs:
                   .map((event) => new Date(event.created_at || 0).getTime())
                   .filter((time) => Number.isFinite(time)));
                 return Number.isFinite(runCreatedAt) && runCreatedAt > 0 &&
-                  newestForcePushAt <= runCreatedAt;
+                  newestForcePushAt < runCreatedAt;
               } catch (e) {
                 core.warning(`PR #${prNumber}: queued head-event freshness lookup failed; skipping fail-closed: ${e.message}`);
                 return false;
