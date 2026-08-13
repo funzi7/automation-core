@@ -476,6 +476,29 @@ test('merge-failure restoration preserves a concurrently added manual stop', () 
   assert.doesNotMatch(workflow, /restoreTransientEscalation/);
 });
 
+test('transient clear revalidates the exact label assignments before merge', () => {
+  const workflow = fs.readFileSync(
+    path.join(__dirname, '..', 'workflows', 'merge-bot.yml'),
+    'utf8',
+  );
+  assert.match(workflow, /needsEventId: Number\(needsEvent\?\.id \|\| 0\)/);
+  assert.match(workflow, /autoEventId: Number\(autoEvent\?\.id \|\| 0\)/);
+  assert.match(workflow, /async function transientClearKeptValidatedOwnership/);
+  assert.match(workflow, /Number\(timeline\[1\]\?\.id \|\| 0\) === Number\(expectedEventId\)/);
+  assert.match(workflow, /transitionIsDirectClear\(LABEL_ESCALATE, expectedNeedsEventId\)/);
+  assert.match(workflow, /transitionIsDirectClear\(LABEL_ESCALATE_AUTO, expectedAutoEventId\)/);
+  assert.match(workflow, /const clearStillOwned = await transientClearKeptValidatedOwnership/);
+  assert.match(workflow, /if \(!clearStillOwned\) \{/);
+  assert.match(workflow, /await restoreRaceHardStopIfOpen\(prNumber\)/);
+  assert.match(workflow, /labels: \[LABEL_ESCALATE\]/);
+  assert.match(workflow, /ownership changed during clear.*skipped merge/);
+  assert.ok(
+    workflow.indexOf('const clearStillOwned = await transientClearKeptValidatedOwnership') <
+      workflow.indexOf('clearedTransient = true'),
+    'ownership must be revalidated before merge eligibility continues',
+  );
+});
+
 test('quota notices cannot satisfy any current-head Codex signal consumer', () => {
   for (const name of ['codex-gate.yml', 'claude-fallback-watchdog.yml', 'merge-bot.yml']) {
     const workflow = fs.readFileSync(
