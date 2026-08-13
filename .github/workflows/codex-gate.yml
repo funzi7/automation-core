@@ -310,20 +310,25 @@ jobs:
             }
 
             async function onlyObservedHead(prNumber, headSha, comments) {
-              const exactHead = String(headSha || '').toLowerCase();
-              const rawHeads = (comments || [])
-                .filter((comment) => (comment.user?.login || '') === 'github-actions[bot]')
-                .map((comment) => String(comment.body || '').match(HEAD_EPOCH_MARKER_PATTERN))
-                .filter((match) => match && Number(match[3]) === Number(prNumber))
-                .map((match) => String(match[4]).toLowerCase());
-              if (!rawHeads.length || rawHeads.some((head) => head !== exactHead)) return false;
-              const runs = await allPrWorkflowRuns();
-              if ((runs || []).some((run) =>
-                (run.pull_requests || []).some((pull) => Number(pull.number) === Number(prNumber)) &&
-                String(run.head_sha || '').toLowerCase() !== exactHead
-              )) return false;
-              const verified = await trustedHeadMarkers(comments, prNumber);
-              return verified.some((marker) => marker.head === exactHead);
+              try {
+                const exactHead = String(headSha || '').toLowerCase();
+                const rawHeads = (comments || [])
+                  .filter((comment) => (comment.user?.login || '') === 'github-actions[bot]')
+                  .map((comment) => String(comment.body || '').match(HEAD_EPOCH_MARKER_PATTERN))
+                  .filter((match) => match && Number(match[3]) === Number(prNumber))
+                  .map((match) => String(match[4]).toLowerCase());
+                if (!rawHeads.length || rawHeads.some((head) => head !== exactHead)) return false;
+                const runs = await allPrWorkflowRuns();
+                if ((runs || []).some((run) =>
+                  (run.pull_requests || []).some((pull) => Number(pull.number) === Number(prNumber)) &&
+                  String(run.head_sha || '').toLowerCase() !== exactHead
+                )) return false;
+                const verified = await trustedHeadMarkers(comments, prNumber);
+                return verified.some((marker) => marker.head === exactHead);
+              } catch (e) {
+                core.warning(`PR #${prNumber}: reaction head-history lookup failed; reaction stays non-binding: ${e.message}`);
+                return false;
+              }
             }
 
             function reactionTargetsOnlyObservedHead(reaction, headObservedAt, isOnlyHead) {
@@ -732,14 +737,20 @@ jobs:
                   })),
                 ].sort((a, b) => new Date(a.date) - new Date(b.date));
 
-                const reactionOnlyHead = await onlyObservedHead(
-                  prNumber, headSha, comments,
+                let codexReactionOnHead = false;
+                const hasTrustedCleanReaction = codexReactions.some(
+                  (reaction) => reaction.content === '+1',
                 );
-                const codexReactionOnHead = codexReactions.some((reaction) =>
-                  reactionTargetsOnlyObservedHead(
-                    reaction, headObservedAt, reactionOnlyHead,
-                  )
-                );
+                if (hasTrustedCleanReaction) {
+                  const reactionOnlyHead = await onlyObservedHead(
+                    prNumber, headSha, comments,
+                  );
+                  codexReactionOnHead = codexReactions.some((reaction) =>
+                    reactionTargetsOnlyObservedHead(
+                      reaction, headObservedAt, reactionOnlyHead,
+                    )
+                  );
+                }
 
                 // Has Codex actually reviewed the CURRENT head? = any Codex
                 // review result explicitly bound to the SHA. A reaction-only
