@@ -578,7 +578,9 @@ jobs:
               );
               const protectedReason = comments.some((comment) => {
                 const body = String(comment.body || '');
+                const marker = trustedLoopMarker(comment);
                 return (
+                  (marker && /\bstate=clear_race\b/i.test(marker.attributes)) ||
                   /Auto-merge blocked: this PR touches protected path/i.test(body) ||
                   /skipped this fork-headed PR/i.test(body) ||
                   /fork-headed PR[^\n]*Escalated to needs-owner/is.test(body)
@@ -599,16 +601,19 @@ jobs:
               // that each deleted assignment was still the exact event validated
               // above. Any intervening human remove/re-add changes adjacency and
               // must abort the merge even when the label is absent again.
-              const [events, currentResponse] = await Promise.all([
-                github.paginate(
-                  'GET /repos/{owner}/{repo}/issues/{issue_number}/events',
-                  { owner, repo, issue_number: prNumber, per_page: 100 },
-                ),
-                github.rest.pulls.get({ owner, repo, pull_number: prNumber }),
-              ]);
+              // Serialize these reads so the event timeline is the final
+              // ownership snapshot. A parallel, earlier timeline could miss an
+              // add/remove transition visible only after the label snapshot.
+              const currentResponse = await github.rest.pulls.get({
+                owner, repo, pull_number: prNumber,
+              });
               const currentLabels = labelNames(currentResponse.data);
               if (currentLabels.has(LABEL_ESCALATE) ||
                   currentLabels.has(LABEL_ESCALATE_AUTO)) return false;
+              const events = await github.paginate(
+                'GET /repos/{owner}/{repo}/issues/{issue_number}/events',
+                { owner, repo, issue_number: prNumber, per_page: 100 },
+              );
 
               const transitionIsDirectClear = (labelName, expectedEventId) => {
                 const timeline = events
@@ -645,10 +650,35 @@ jobs:
                 });
               }
               if (!currentLabels.has(LABEL_ESCALATE)) {
+                try {
+                  await github.rest.issues.addLabels({
+                    owner, repo, issue_number: prNumber,
+                    labels: [LABEL_ESCALATE],
+                  });
+                } catch (e) {
+                  // If the ordinary hard stop cannot be restored, fall back to
+                  // the policy's permanent stop before surfacing the error.
+                  await github.rest.issues.addLabels({
+                    owner, repo, issue_number: prNumber,
+                    labels: [LABEL_NO_AUTOMERGE],
+                  });
+                  throw e;
+                }
+              }
+              // Persist why this restored stop must never be treated as a
+              // nearby watchdog-owned legacy escalation on a later pass. If
+              // marker persistence fails, attach the permanent policy stop.
+              try {
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: prNumber,
+                  body: `<!-- ai-loop:v1 root_pr=${prNumber} head=${current.head.sha} agent=merge-bot state=clear_race -->\nMerge Bot detected a concurrent needs-owner transition while clearing an automated escalation. The restored needs-owner is a permanent manual/unknown hard stop.`,
+                });
+              } catch (e) {
                 await github.rest.issues.addLabels({
                   owner, repo, issue_number: prNumber,
-                  labels: [LABEL_ESCALATE],
+                  labels: [LABEL_NO_AUTOMERGE],
                 });
+                throw e;
               }
             }
 
