@@ -455,6 +455,7 @@ test('bridge preserves unmarked current-head top-level findings via verified gat
     'utf8',
   );
   assert.match(bridge, /const HEAD_EPOCH_MARKER_PATTERN =/);
+  assert.match(bridge, /permissions:[\s\S]*actions: read/);
   assert.match(bridge, /async function observedHeadTransition\(comments\)/);
   assert.match(bridge, /comment\.user\?\.login \|\| ''\) !== 'github-actions\[bot\]'/);
   assert.match(bridge, /run\.path !== '\.github\/workflows\/codex-gate\.yml'/);

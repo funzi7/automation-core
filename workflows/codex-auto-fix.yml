@@ -57,6 +57,8 @@ permissions:
   # for the review-event payload access.
   issues: write
   pull-requests: write
+  # Verified head-epoch markers resolve their immutable Gate run attempt.
+  actions: read
 
 jobs:
   trigger_codex_fix:
