@@ -485,6 +485,7 @@ test('transient clear revalidates the exact label assignments before merge', () 
   assert.match(workflow, /autoEventId: Number\(autoEvent\?\.id \|\| 0\)/);
   assert.match(workflow, /async function transientClearKeptValidatedOwnership/);
   assert.match(workflow, /const currentResponse = await github\.rest\.pulls\.get/);
+  assert.match(workflow, /if \(currentLabels\.has\(LABEL_NO_AUTOMERGE\) \|\|/);
   assert.match(workflow, /const events = await github\.paginate/);
   assert.ok(
     workflow.indexOf('const currentResponse = await github.rest.pulls.get',

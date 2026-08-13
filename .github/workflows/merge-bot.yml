@@ -608,7 +608,8 @@ jobs:
                 owner, repo, pull_number: prNumber,
               });
               const currentLabels = labelNames(currentResponse.data);
-              if (currentLabels.has(LABEL_ESCALATE) ||
+              if (currentLabels.has(LABEL_NO_AUTOMERGE) ||
+                  currentLabels.has(LABEL_ESCALATE) ||
                   currentLabels.has(LABEL_ESCALATE_AUTO)) return false;
               const events = await github.paginate(
                 'GET /repos/{owner}/{repo}/issues/{issue_number}/events',
