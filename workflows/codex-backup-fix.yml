@@ -50,7 +50,9 @@ jobs:
     # push credentials. Fork escalation and terminal markers are emitted by
     # apply-and-push, the only write-capable job.
     permissions:
+      actions: read
       contents: read
+      issues: read
       pull-requests: read
     outputs:
       proceed: ${{ steps.guard.outputs.proceed }}
@@ -92,6 +94,9 @@ jobs:
       - name: Gather the active Codex finding for this head
         if: steps.guard.outputs.proceed == 'true'
         uses: actions/github-script@v8
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
+          TARGET_HEAD: ${{ inputs.head_sha }}
         with:
           github-token: ${{ github.token }}
           script: |
@@ -101,10 +106,117 @@ jobs:
             // capture the patch) never includes it.
             const owner = context.repo.owner;
             const repo = context.repo.repo;
-            const prNumber = parseInt("${{ inputs.pr_number }}", 10);
+            const prNumber = parseInt(process.env.PR_NUMBER || '', 10);
             const CODEX = 'chatgpt-codex-connector[bot]';
-            const targetHead = String("${{ inputs.head_sha }}").toLowerCase();
-            const [rc, rv] = await Promise.all([
+            const targetHead = String(process.env.TARGET_HEAD || '').toLowerCase();
+            const REVIEWED_COMMIT_PATTERN = /(?:^|\n)\*\*Reviewed commit:\*\*\s*`([a-f0-9]{10,40})`(?:\s|$)/i;
+            const HEAD_EPOCH_MARKER_PATTERN = /<!--\s*codex-head-epoch:v3\s+run=(\d+)\s+attempt=(\d+)\s+pr=(\d+)\s+head=([a-f0-9]{40})\s*-->/i;
+            const MAX_EPOCH_MARKER_CANDIDATES = 16;
+            let headObservedAt = null;
+
+            const epochEvidence = (timeline) => {
+              const ordered = timeline
+                .filter((run) => /^[a-f0-9]{40}$/.test(run.head) &&
+                  Number.isFinite(run.observedAt) && run.observedAt > 0)
+                .sort((a, b) =>
+                  b.observedAt - a.observedAt || (b.id || 0) - (a.id || 0));
+              if (!ordered.length || ordered[0].head !== targetHead) {
+                return { epoch: null, hasBoundary: false };
+              }
+              const currentEpoch = [];
+              for (const run of ordered) {
+                if (run.head !== targetHead) {
+                  return {
+                    epoch: currentEpoch.length ? new Date(Math.min(...currentEpoch)) : null,
+                    hasBoundary: true,
+                  };
+                }
+                currentEpoch.push(run.observedAt);
+              }
+              return {
+                epoch: currentEpoch.length ? new Date(Math.min(...currentEpoch)) : null,
+                hasBoundary: false,
+              };
+            };
+
+            async function observedHeadTransition(comments) {
+              const refsByRun = new Map();
+              for (const comment of comments || []) {
+                if ((comment.user?.login || '') !== 'github-actions[bot]') continue;
+                const match = String(comment.body || '').match(HEAD_EPOCH_MARKER_PATTERN);
+                if (!match || Number(match[3]) !== prNumber) continue;
+                const ref = {
+                  runId: Number(match[1]),
+                  attempt: Number(match[2]),
+                  markerHead: match[4].toLowerCase(),
+                  commentAt: new Date(comment.created_at || 0).getTime(),
+                  commentId: Number(comment.id || 0),
+                };
+                const previous = refsByRun.get(ref.runId);
+                if (!previous || ref.commentAt > previous.commentAt ||
+                    (ref.commentAt === previous.commentAt && ref.commentId > previous.commentId)) {
+                  refsByRun.set(ref.runId, ref);
+                }
+              }
+
+              const refs = [...refsByRun.values()]
+                .sort((a, b) => b.runId - a.runId)
+                .slice(0, MAX_EPOCH_MARKER_CANDIDATES);
+              const verifiedRuns = [];
+              for (const ref of refs) {
+                let run;
+                try {
+                  ({ data: run } = await github.request(
+                    'GET /repos/{owner}/{repo}/actions/runs/{run_id}/attempts/{attempt_number}',
+                    { owner, repo, run_id: ref.runId, attempt_number: ref.attempt },
+                  ));
+                } catch (e) {
+                  core.warning(`PR #${prNumber}: head epoch ${ref.runId}/${ref.attempt} verification failed: ${e.message}`);
+                  continue;
+                }
+                const belongsToPr = (run.pull_requests || [])
+                  .some((pull) => Number(pull.number) === prNumber);
+                const startedAt = new Date(run.run_started_at || run.created_at || 0).getTime();
+                const finishedAt = new Date(run.updated_at || 0).getTime();
+                const commentInsideRun = Number.isFinite(ref.commentAt) &&
+                  ref.commentAt >= startedAt - 5000 &&
+                  (run.status !== 'completed' || ref.commentAt <= finishedAt + 5000);
+                if (run.path !== '.github/workflows/codex-gate.yml' ||
+                    run.event !== 'pull_request_target' ||
+                    Number(run.run_attempt) !== ref.attempt || !belongsToPr || !commentInsideRun) {
+                  continue;
+                }
+                const observedAt = new Date(run.created_at || 0).getTime();
+                if (!/^[a-f0-9]{40}$/.test(ref.markerHead) ||
+                    !Number.isFinite(observedAt) || observedAt <= 0) continue;
+                verifiedRuns.push({ head: ref.markerHead, observedAt, id: Number(run.id || ref.runId) });
+              }
+              const markerEvidence = epochEvidence(verifiedRuns);
+
+              const prRuns = await github.paginate(
+                github.rest.actions.listWorkflowRunsForRepo,
+                { owner, repo, event: 'pull_request', per_page: 100 },
+              );
+              const runEvidence = epochEvidence((prRuns || [])
+                .filter((run) => (run.pull_requests || [])
+                  .some((pull) => Number(pull.number) === prNumber))
+                .map((run) => ({
+                  head: String(run.head_sha || '').toLowerCase(),
+                  observedAt: new Date(run.created_at || 0).getTime(),
+                  id: Number(run.id || 0),
+                })));
+              if (markerEvidence.epoch && runEvidence.epoch && runEvidence.hasBoundary) {
+                return new Date(Math.max(
+                  markerEvidence.epoch.getTime(), runEvidence.epoch.getTime(),
+                ));
+              }
+              return markerEvidence.epoch || runEvidence.epoch;
+            }
+
+            const [ic, rc, rv] = await Promise.all([
+              github.paginate(github.rest.issues.listComments, {
+                owner, repo, issue_number: prNumber, per_page: 100,
+              }),
               github.paginate(github.rest.pulls.listReviewComments, {
                 owner, repo, pull_number: prNumber, per_page: 100,
               }),
@@ -112,23 +224,35 @@ jobs:
                 owner, repo, pull_number: prNumber, per_page: 100,
               }),
             ]);
+            headObservedAt = await observedHeadTransition(ic);
             // Mirror the gate's exact-head model. Review objects bind by exact
             // commit_id; inline comments bind by original_commit_id so GitHub's
             // repointing of still-applicable comments cannot revive an old finding.
-            const REVIEWED_COMMIT_PATTERN = /(?:^|\n)\*\*Reviewed commit:\*\*\s*`([a-f0-9]{10,40})`(?:\s|$)/i;
-            const targetsHead = (item) => {
+            // Top-level comments bind only after the authenticated current-head
+            // epoch established by Gate/run evidence.
+            const targetsHead = (item, dateField = 'created_at') => {
               const originalCommit = String(item?.original_commit_id || '').toLowerCase();
               if (originalCommit) return originalCommit === targetHead;
               const commit = String(item?.commit_id || '').toLowerCase();
               if (commit) return commit === targetHead;
               const marker = String(item?.body || '').match(REVIEWED_COMMIT_PATTERN)?.[1]?.toLowerCase();
-              return !!marker && targetHead.startsWith(marker);
+              if (marker) return targetHead.startsWith(marker);
+              const signalAt = new Date(item?.[dateField] || 0).getTime();
+              const observedAt = new Date(headObservedAt || 0).getTime();
+              return Number.isFinite(signalAt) && Number.isFinite(observedAt) &&
+                observedAt > 0 && signalAt > observedAt;
             };
             const isCodex = (c) => (c.user && c.user.login) === CODEX;
             const hasSev = (b) => b.includes("P1") || b.includes("P2");
+            const isCapacityNotice = (body) => {
+              const text = String(body || '').trim();
+              return /^You have reached your Codex usage limits for code reviews\./i.test(text) ||
+                /^Codex is currently at capacity and unable to complete this code review\./i.test(text);
+            };
             const texts = [
-              ...rc.filter((c) => isCodex(c) && targetsHead(c) && hasSev(c.body || "")),
-              ...rv.filter((c) => isCodex(c) && targetsHead(c) && hasSev(c.body || "")),
+              ...ic.filter((c) => isCodex(c) && targetsHead(c) && hasSev(c.body || "") && !isCapacityNotice(c.body)),
+              ...rc.filter((c) => isCodex(c) && targetsHead(c) && hasSev(c.body || "") && !isCapacityNotice(c.body)),
+              ...rv.filter((c) => isCodex(c) && targetsHead(c) && hasSev(c.body || "") && !isCapacityNotice(c.body)),
             ].map((c) => c.body || "");
             const fs = require('fs');
             const out = texts.join("\n\n---\n\n").slice(0, 8000) ||
