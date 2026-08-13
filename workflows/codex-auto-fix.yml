@@ -558,13 +558,18 @@ jobs:
           # fix #13: pass the Codex P1/P2 finding digest via env — SAFE for
           # arbitrary markdown (no ${{ }} interpolation into the JS string).
           FINDINGS_DIGEST: ${{ steps.check_review.outputs.findings_digest }}
+          PR_NUMBER: ${{ steps.check_review.outputs.pr_number }}
+          SEVERITY_LABEL: ${{ steps.check_review.outputs.severity_label }}
+          FINDING_COUNT: ${{ steps.check_review.outputs.finding_count }}
+          ATTEMPT: ${{ steps.check_review.outputs.attempt }}
+          TARGET_HEAD: ${{ steps.check_review.outputs.head_sha }}
         with:
           # AUTOMATION_PAT so the posted @claude comment actually triggers
           # claude.yml (GITHUB_TOKEN-authored comments don't start workflows).
           github-token: ${{ secrets.AUTOMATION_PAT }}
           script: |
             const prNumber = parseInt(
-              "${{ steps.check_review.outputs.pr_number }}",
+              process.env.PR_NUMBER || '',
               10,
             );
             const eventName = context.eventName;
@@ -581,8 +586,8 @@ jobs:
             // finding count from the check step. Kept on a LATER line so the
             // literal "@claude fix" first line and the "[auto-triggered]" marker
             // the circuit-breaker counts both stay byte-exact.
-            const sevLabel = "${{ steps.check_review.outputs.severity_label }}" || "P1/P2";
-            const findingCount = "${{ steps.check_review.outputs.finding_count }}" || "1";
+            const sevLabel = process.env.SEVERITY_LABEL || "P1/P2";
+            const findingCount = process.env.FINDING_COUNT || "1";
             // fix #13: inline the actual Codex P1/P2 finding text (read via env,
             // safe for arbitrary markdown) so Claude — which CANNOT read inline
             // review threads from its run context — has the specifics to act on.
@@ -596,8 +601,8 @@ jobs:
             // disturb the "@claude fix" mention parser or the [auto-triggered]
             // breaker marker). state=requested agent=claude lets the watchdog see
             // Claude was asked on THIS head and count the attempt.
-            const attempt = "${{ steps.check_review.outputs.attempt }}" || "1";
-            const markerHead = "${{ steps.check_review.outputs.head_sha }}";
+            const attempt = process.env.ATTEMPT || "1";
+            const markerHead = process.env.TARGET_HEAD || '';
             const loopMarker =
               `<!-- ai-loop:v1 root_pr=${prNumber} head=${markerHead} attempt=${attempt} agent=claude state=requested -->`;
             const baseBody = `${loopMarker}\n@claude fix\n\n[auto-triggered]\n\n${triggerNote}`;

@@ -50,7 +50,7 @@ for f in tools/*.js; do
 done
 node --test tests/*.js
 
-echo "Checking every github-script block in changed synced workflows..."
+echo "Checking every github-script block in tracked workflow YAML..."
 python3 scripts/validate_github_scripts.py
 
 if command -v actionlint >/dev/null 2>&1; then

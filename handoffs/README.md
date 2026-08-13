@@ -4,7 +4,15 @@ This directory holds handoff logs, one file per Claude Chat session. Claude Code
 
 ## Cross-repo rule (important)
 
-Claude Code tasks that operate on OTHER repos (OPT, TRF, paywall-bot — which are private and unreadable by Claude Chat) must STILL write their handoff summary to `handoffs/<chat-topic>.md` here in **automation-core** (this public repo), **NOT** to the private repo. Claude Code has `AUTOMATION_PAT` with all-repos access, so it can write cross-repo. This is the whole point: the summary always lands in the public automation-core where Claude Chat can read it, even when the actual work was on a private repo.
+Tasks that operate on OTHER repos (OPT, TRF, paywall-bot — which may be
+private and unreadable by Claude Chat) must still keep the canonical handoff
+summary in `handoffs/<chat-topic>.md` here in **automation-core**. A task may
+also update a downstream repository's own handoff when explicitly requested.
+Do not give a model-facing Issue/new-PR step `AUTOMATION_PAT` or a persisted
+cross-repository git credential. If cross-repository handoff publishing needs
+that PAT, only trusted post-model workflow code or the trusted coordinator may
+receive it. The canonical summary remains public so Claude Chat can read it
+even when the implementation repository is private.
 
 ## Entry template
 

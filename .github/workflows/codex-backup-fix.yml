@@ -63,12 +63,14 @@ jobs:
       - name: Fork-PR security guard (no agent or secrets on forks)
         id: guard
         uses: actions/github-script@v8
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
         with:
           github-token: ${{ github.token }}
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
-            const prNumber = parseInt("${{ inputs.pr_number }}", 10);
+            const prNumber = parseInt(process.env.PR_NUMBER || '', 10);
             const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
             const sameRepo =
               pr.head && pr.head.repo && pr.head.repo.full_name === `${owner}/${repo}`;
@@ -331,6 +333,10 @@ jobs:
       contents: write
       pull-requests: write
       issues: write
+    env:
+      PR_NUMBER: ${{ inputs.pr_number }}
+      TARGET_HEAD: ${{ inputs.head_sha }}
+      ATTEMPT: ${{ inputs.attempt }}
     steps:
       - name: Classify apply-and-push path
         id: path
@@ -355,9 +361,9 @@ jobs:
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
-            const prNumber = parseInt("${{ inputs.pr_number }}", 10);
-            const headSha = "${{ inputs.head_sha }}";
-            const attempt = "${{ inputs.attempt }}";
+            const prNumber = parseInt(process.env.PR_NUMBER || '', 10);
+            const headSha = process.env.TARGET_HEAD || '';
+            const attempt = process.env.ATTEMPT || '';
             try {
               await github.rest.issues.createLabel({
                 owner, repo, name: 'needs-owner', color: 'd93f0b',
@@ -385,9 +391,9 @@ jobs:
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
-            const prNumber = parseInt("${{ inputs.pr_number }}", 10);
-            const headSha = "${{ inputs.head_sha }}";
-            const attempt = "${{ inputs.attempt }}";
+            const prNumber = parseInt(process.env.PR_NUMBER || '', 10);
+            const headSha = process.env.TARGET_HEAD || '';
+            const attempt = process.env.ATTEMPT || '';
             core.error("Codex API agent failed before producing a patch — see the generate-patch job log.");
             try {
               await github.rest.issues.createComment({
@@ -407,8 +413,8 @@ jobs:
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
-            const prNumber = parseInt("${{ inputs.pr_number }}", 10);
-            const inputSha = "${{ inputs.head_sha }}";
+            const prNumber = parseInt(process.env.PR_NUMBER || '', 10);
+            const inputSha = process.env.TARGET_HEAD || '';
             const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
             // STALE-HEAD GUARD: if the head advanced while Codex worked, the patch
             // is against an old tree — do NOT apply it. A fresh review on the new
@@ -464,8 +470,8 @@ jobs:
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
-            const prNumber = parseInt("${{ inputs.pr_number }}", 10);
-            const attempt = "${{ inputs.attempt }}";
+            const prNumber = parseInt(process.env.PR_NUMBER || '', 10);
+            const attempt = process.env.ATTEMPT || '';
             const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
             const newSha = pr.head.sha;
             await github.rest.issues.createComment({
@@ -486,8 +492,8 @@ jobs:
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
-            const prNumber = parseInt("${{ inputs.pr_number }}", 10);
-            const attempt = "${{ inputs.attempt }}";
+            const prNumber = parseInt(process.env.PR_NUMBER || '', 10);
+            const attempt = process.env.ATTEMPT || '';
             const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
             const newSha = pr.head.sha;
             core.notice(`Codex backup produced no changes (empty patch) on PR #${prNumber} — not counted as a fix.`);
@@ -508,8 +514,8 @@ jobs:
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
-            const prNumber = parseInt("${{ inputs.pr_number }}", 10);
-            const attempt = "${{ inputs.attempt }}";
+            const prNumber = parseInt(process.env.PR_NUMBER || '', 10);
+            const attempt = process.env.ATTEMPT || '';
             core.error("Codex backup patch failed to apply/push — see run log.");
             try {
               const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
@@ -530,9 +536,9 @@ jobs:
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
-            const prNumber = parseInt("${{ inputs.pr_number }}", 10);
-            const inputSha = "${{ inputs.head_sha }}";
-            const attempt = "${{ inputs.attempt }}";
+            const prNumber = parseInt(process.env.PR_NUMBER || '', 10);
+            const inputSha = process.env.TARGET_HEAD || '';
+            const attempt = process.env.ATTEMPT || '';
             core.warning(
               `PR #${prNumber}: head advanced while Codex worked — skipping the stale patch (a fresh review on the new head starts a new cycle).`,
             );

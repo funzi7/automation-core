@@ -21,20 +21,35 @@ The repository preserves a direct-to-main operating convention for automation-co
 
 ## 2. Current Architecture Snapshot
 
-2026-08-13 emergency status: bootstrap PR #40 restored Codex Gate parsing in
+2026-08-13 completed emergency recovery: bootstrap PR #40 restored Codex Gate parsing in
 merge `fd16f6ad875726386f4f7c029993639cafebaa01`, added durable Watchdog
 Telegram failure dedupe, and made CI Doctor ignore internal automation paths.
 The repaired dispatch then exposed a separate flaw: a Codex usage-limit notice
 was accepted as a current-head review signal, and PR #38 auto-merged as
-`cdf4c94528fdfd81ab00742c549355912355bcc1`. Draft PR #41 is the forward
-security correction. Claude Fixer and Merge Bot are disabled during review;
-Claude Fallback Watchdog is enabled.
+`cdf4c94528fdfd81ab00742c549355912355bcc1`. Forward security PR #41 and
+review-driven follow-ups #42-#51 are merged; they isolate Issue-mode Claude
+from PAT credentials and interpreters, reject capacity notices, authenticate
+head epochs, require real delivery, preserve permanent/manual stops through
+label races, and include every trusted finding channel in fixer context.
+All four loop workflows are enabled in automation-core and paywall-bot.
+
+Production evidence: Gate dispatch `31681859499` succeeded after bootstrap;
+scheduled Watchdog runs `31687590924` and `31692340712` completed without the
+old parse/dispatch/Telegram failure; CI Doctor did not recreate closed Issue
+#39. Paywall-bot PR #94 ended at exact head
+`5d65f205708435aab09ce03ace5880c30b342293`, passed application CI, clean Codex
+review and Gate, then Merge Bot auto-merged it as
+`2575f0f2b16c12ebb9b9173e8c9a8248ab529ebe`.
 
 Code architecture base: fix #27 implementation commit `93f6acb9d2e0396afad3e10854503024843c32de`.
 
 Previous documentation reconciliation: `ff57a73220faa5dbb563edc7b035fc6cc653c509`.
 
-This final normalization is documentation-only. It does not change workflow logic.
+This recovery pass also hardens workflow expression transport and its validator.
+It moves values out of every `actions/github-script` body and into step/job
+`env` in `bootstrap.yml` plus the source/mirror copies of `claude.yml`,
+`codex-auto-fix.yml`, and `codex-backup-fix.yml`. The gate/fixer semantics are
+unchanged, and the source/mirror pairs remain byte-identical.
 
 Current fixer ladder:
 
@@ -99,8 +114,11 @@ Runtime-unverified after fix #27:
 
 Unknown / not checked in this pass:
 
-- Downstream repo secrets, Actions variables, workflow permissions, and current runtime health.
-- Whether each downstream has the latest synced workflow contents.
+- Downstream repo secrets, Actions variables, workflow permissions, and broader
+  runtime health, including paywall-bot beyond the exact evidence recorded
+  below.
+- Whether downstream repositories other than paywall-bot have the latest
+  synced workflow contents.
 - Any current Codex Cloud product behavior beyond the documented limitation: a ready diff is not delivery unless the PR head branch receives a commit.
 
 ## 4. Workflow Summary
@@ -187,17 +205,26 @@ paywall-bot sync PR #89 was closed unmerged and its stale
 
 Verified current facts only:
 
+- paywall-bot PR #94 exact head
+  `5d65f205708435aab09ce03ace5880c30b342293` contained all seven configured
+  workflows byte-identical to automation-core source, passed downstream CI,
+  exact-head Codex review and Gate, and was normally auto-merged as
+  `2575f0f2b16c12ebb9b9173e8c9a8248ab529ebe`. Its Codex Gate, Claude Fixer,
+  Watchdog, and Merge Bot workflows are active.
 - OptionsProfitTracker PR #12 is merged.
 - thai-rent-finder PR #80 is merged.
 
-Not verified in this pass:
+Not verified in this pass for every downstream, including paywall-bot:
 
 - downstream secrets;
 - Actions variables;
 - workflow permissions;
+- broader current CI/runtime health beyond the exact facts above.
+
+Also not verified for downstream repositories other than paywall-bot:
+
 - current synced workflow contents;
-- current CI/runtime health;
-- whether any downstream is fully in sync beyond specific PR facts above.
+- whether they are fully in sync beyond the specific PR facts above.
 
 Do not claim a downstream is synced or healthy without fresh evidence from the repo's latest sync PR/current workflow contents and settings.
 
@@ -211,17 +238,23 @@ These are preserved as incident records. They are not current operating instruct
 - HISTORICAL: Cloud View task / Created commit summaries once looked actionable enough to wait on. Current rule: they are non-delivery unless a real PR-head commit lands.
 - HISTORICAL: prior onboarding notes described OPT #12 and TRF #80 before merge. Current verified facts: both are merged.
 - HISTORICAL: old escalation-label migration notes exist in git history. Current rule: only `needs-owner` is valid; do not reintroduce any prior name.
-- HISTORICAL: manually applied YAML/script edits once broke workflow parsing. Current rule: validate YAML/actionlint/script syntax before workflow changes. This task did not change workflows.
+- HISTORICAL: manually applied YAML/script edits once broke workflow parsing. Current rule: validate YAML/actionlint/script syntax before workflow changes. This pass changed expression transport in four workflow definitions and validated every tracked workflow/script body.
 
 ## 7. Current Open TODO
 
-A. Documentation/state work completed in this pass:
+A. Recovery documentation and expression-safety work completed in this pass:
 
 - stale current-tense claims normalized;
 - Claude PR-head delivery and Claude proxy described as implemented but runtime-unverified;
 - disabled Codex API backup behavior corrected to skipped, not immediate escalation;
 - OPT #12 and TRF #80 recorded as merged;
-- no workflow logic changed.
+- GitHub expression values were moved from inline `github-script` bodies to
+  step/job `env` without changing gate or fixer semantics;
+- validation now scans every tracked YAML workflow, rejects any direct
+  expression in a `github-script` body, and syntax-checks every extracted body;
+- the changed source/mirror workflow pairs are byte-identical; after this pass
+  merges, paywall-bot needs one final normal sync for the three changed synced
+  pairs.
 
 B. Claude-budget-blocked runtime verification:
 

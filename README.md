@@ -30,7 +30,7 @@ workflows above plus the existing `codex-gate`:
   claude.yml      Claude diagnoses, fixes on a branch, opens a PR (Fixes #N)
           │
           ▼  (PR opened)
-  codex-gate.yml  check-codex-status must pass (no unresolved P1)
+  codex-gate.yml  check-codex-status must pass (no unresolved P1/P2)
           │
           ▼  (all green)
   merge-bot.yml   squash-merges the exact checked head, deletes its branch,
@@ -41,6 +41,16 @@ Trusted cross-workflow writes use `AUTOMATION_PAT` because default-token events
 do not trigger other workflows. The Issue-mode Claude model is the deliberate
 exception: it receives only `github.token`; only a later trusted post-step may
 receive the PAT.
+
+The 2026-08-13 Gate incident is closed. Large `github-script` bodies receive
+workflow values through `env`, and validation scans all tracked workflow YAML
+to reject every direct `${{ ... }}` interpolation inside `github-script`
+bodies. This prevents expression-size failures and string/type injection; Node
+syntax checks therefore inspect the exact script body. Scheduled Watchdog
+dispatch/update/backup failures alert once per repository/PR/exact-head/
+operation/normalized-error marker; identical retries keep logging without
+repeating Telegram. CI Doctor also ignores internal automation by workflow
+path, including parse-failed runs whose display name degrades to the YAML path.
 
 **Scheduling (kept light to restrain Actions-minute cost):** CI Doctor runs on
 a cron **twice a day** (06:00 & 18:00 UTC) to sweep the default branch for

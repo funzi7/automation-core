@@ -44,6 +44,10 @@ function largeGithubScriptHasDirectExpression(
     String(script || '').includes('${{');
 }
 
+function githubScriptHasDirectExpression(script) {
+  return String(script || '').includes('${{');
+}
+
 function normalizeFailure(error) {
   const rawStatus = Number(error?.status);
   const status = Number.isFinite(rawStatus) ? String(rawStatus) : 'unknown';
@@ -128,6 +132,7 @@ module.exports = {
   INTERNAL_AUTOMATION_NAMES,
   INTERNAL_AUTOMATION_PATHS,
   largeGithubScriptHasDirectExpression,
+  githubScriptHasDirectExpression,
   normalizeFailure,
   failureFingerprint,
   parseLoopMarkers,
