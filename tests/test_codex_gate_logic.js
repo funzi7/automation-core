@@ -511,3 +511,28 @@ test('bridge preserves unmarked current-head top-level findings via verified gat
   assert.doesNotMatch(bridge, /prData\?\.updated_at/);
   assert.doesNotMatch(bridge, /commit dates.*transition timestamp/i);
 });
+
+test('backup fixer includes trusted current-head top-level findings', () => {
+  const backup = fs.readFileSync(
+    path.join(__dirname, '..', 'workflows', 'codex-backup-fix.yml'),
+    'utf8',
+  );
+  assert.match(backup, /actions: read/);
+  assert.match(backup, /issues: read/);
+  assert.match(backup, /github\.rest\.issues\.listComments/);
+  assert.match(backup, /issue_number: prNumber, per_page: 100/);
+  assert.match(backup, /const HEAD_EPOCH_MARKER_PATTERN =/);
+  assert.match(backup, /const MAX_EPOCH_MARKER_CANDIDATES = 16/);
+  assert.match(backup, /comment\.user\?\.login \|\| ''\) !== 'github-actions\[bot\]'/);
+  assert.match(backup, /run\.path !== '\.github\/workflows\/codex-gate\.yml'/);
+  assert.match(backup, /run\.event !== 'pull_request_target'/);
+  assert.match(backup, /github\.rest\.actions\.listWorkflowRunsForRepo/);
+  assert.match(backup, /headObservedAt = await observedHeadTransition\(ic\)/);
+  assert.match(backup, /signalAt > observedAt/);
+  assert.match(backup, /\.\.\.ic\.filter\(\(c\) => isCodex\(c\) && targetsHead\(c\)/);
+  assert.match(backup, /isCapacityNotice\(c\.body\)/);
+  assert.match(backup, /PR_NUMBER: \$\{\{ inputs\.pr_number \}\}/);
+  assert.match(backup, /TARGET_HEAD: \$\{\{ inputs\.head_sha \}\}/);
+  assert.match(backup, /parseInt\(process\.env\.PR_NUMBER \|\| '', 10\)/);
+  assert.match(backup, /String\(process\.env\.TARGET_HEAD \|\| ''\)/);
+});
