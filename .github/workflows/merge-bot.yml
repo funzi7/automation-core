@@ -618,6 +618,15 @@ jobs:
                 'GET /repos/{owner}/{repo}/issues/{issue_number}/events',
                 { owner, repo, issue_number: prNumber, per_page: 100 },
               );
+              const latestNoAutomergeEvent = events
+                .filter((event) => (
+                  (event.event === 'labeled' || event.event === 'unlabeled') &&
+                  event.label?.name === LABEL_NO_AUTOMERGE
+                ))
+                .sort((a, b) =>
+                  new Date(b.created_at || 0) - new Date(a.created_at || 0) ||
+                  Number(b.id || 0) - Number(a.id || 0))[0];
+              if (latestNoAutomergeEvent?.event === 'labeled') return false;
 
               const transitionIsDirectClear = (labelName, expectedEventId) => {
                 const timeline = events
