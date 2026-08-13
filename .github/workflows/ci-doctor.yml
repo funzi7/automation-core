@@ -75,6 +75,29 @@ jobs:
               'Bootstrap repos',
               'Loop Morning Report',
             ]);
+            const IGNORE_WORKFLOW_PATHS = new Set([
+              '.github/workflows/codex-gate.yml',
+              '.github/workflows/codex-auto-fix.yml',
+              '.github/workflows/claude.yml',
+              '.github/workflows/ci-doctor.yml',
+              '.github/workflows/merge-bot.yml',
+              '.github/workflows/claude-fallback-watchdog.yml',
+              '.github/workflows/codex-backup-fix.yml',
+              '.github/workflows/bootstrap.yml',
+              '.github/workflows/sync-automation-core.yml',
+              '.github/workflows/minutes-guard.yml',
+              '.github/workflows/telegram-morning-report.yml',
+            ]);
+            const normalizeWorkflowPath = (value) => String(value || '')
+              .trim()
+              .split('@')[0]
+              .replace(/\\/g, '/')
+              .replace(/^\.\//, '')
+              .replace(/^\/+/, '');
+            const isInternalAutomationRun = (run) =>
+              IGNORE_WORKFLOWS.has(String(run.name || '')) ||
+              IGNORE_WORKFLOW_PATHS.has(normalizeWorkflowPath(run.path)) ||
+              IGNORE_WORKFLOW_PATHS.has(normalizeWorkflowPath(run.name));
 
             const { data: repoInfo } = await github.rest.repos.get({ owner, repo });
             const defaultBranch = repoInfo.default_branch;
@@ -135,7 +158,10 @@ jobs:
 
             for (const run of runs) {
               if (run.conclusion !== 'failure') continue;          // cancelled/skipped → skip
-              if (IGNORE_WORKFLOWS.has(run.name)) continue;
+              if (isInternalAutomationRun(run)) {
+                core.info(`Ignoring internal automation failure: ${run.path || run.name}`);
+                continue;
+              }
               const sha7 = (run.head_sha || '').substring(0, 7);
               const key = `${run.name} @ ${sha7}`;
               if (seen.has(key)) continue;

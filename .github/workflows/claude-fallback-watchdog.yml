@@ -208,6 +208,58 @@ jobs:
                     });
                   } catch (e) { core.info(`Telegram failed (ignored): ${e.message}`); }
                 }
+                function normalizeFailure(error) {
+                  const rawStatus = Number(error?.status);
+                  const status = Number.isFinite(rawStatus) ? String(rawStatus) : 'unknown';
+                  const message = String(error?.message || error || 'error')
+                    .toLowerCase()
+                    .replace(/https?:\/\/\S+/g, '<url>')
+                    .replace(/\(\s*line:\s*\d+\s*,\s*col:\s*\d+\s*\)/g, '(line:<n>,col:<n>)')
+                    .replace(/\b[0-9a-f]{40}\b/g, '<sha>')
+                    .replace(/\b\d{6,}\b/g, '<n>')
+                    .replace(/\s+/g, ' ')
+                    .trim()
+                    .slice(0, 500);
+                  return `${status}:${message}`;
+                }
+                function failureFingerprint(error) {
+                  const normalized = normalizeFailure(error);
+                  let hash = 2166136261;
+                  for (let index = 0; index < normalized.length; index += 1) {
+                    hash ^= normalized.charCodeAt(index);
+                    hash = Math.imul(hash, 16777619);
+                  }
+                  return (hash >>> 0).toString(16).padStart(8, '0');
+                }
+                async function notifyFailureOnce(operation, error, text, note) {
+                  const fingerprint = failureFingerprint(error);
+                  const alreadyAlerted = issueComments.some((comment) => {
+                    if (![owner, 'github-actions[bot]'].includes(comment.user?.login || '')) return false;
+                    return parseMarkers(comment.body).some((marker) =>
+                      marker.root_pr === String(prNumber) &&
+                      marker.head === headSha &&
+                      marker.agent === 'watchdog' &&
+                      marker.state === 'failure_alerted' &&
+                      marker.op === operation &&
+                      marker.error === fingerprint
+                    );
+                  });
+                  if (alreadyAlerted) {
+                    core.warning(`PR #${prNumber}: ${operation} failure ${fingerprint} persists; Telegram alert suppressed by durable marker.`);
+                    return false;
+                  }
+                  const marker = `<!-- ai-loop:v1 root_pr=${prNumber} head=${headSha} agent=watchdog state=failure_alerted op=${operation} error=${fingerprint} -->`;
+                  try {
+                    const { data: created } = await github.rest.issues.createComment({
+                      owner, repo, issue_number: prNumber, body: `${marker}\n${note}`,
+                    });
+                    issueComments.push(created);
+                  } catch (markerError) {
+                    core.info(`${operation} failure marker failed (ignored): ${markerError.message}`);
+                  }
+                  await notify(text);
+                  return true;
+                }
                 async function escalate(reasonText, tgText) {
                   if (marked.some((a) => a.agent === 'watchdog' && a.state === 'escalated' && a.head === headSha)) return;
 
@@ -358,11 +410,11 @@ jobs:
                     } catch (e) {
                       // Loud-fail (unchanged): dispatch_failed marker, NO burned attempt.
                       core.error(`PR #${prNumber}: codex-api dispatch failed — ${e.message}`);
-                      await notify(`⚠️ ${repo} PR #${prNumber}: codex-api dispatch failed — ${e.message}`);
-                      const alreadyFlagged = marked.some((a) => a.agent === 'watchdog' && a.state === 'dispatch_failed' && a.head === headSha);
-                      if (!alreadyFlagged) {
-                        try { await github.rest.issues.createComment({ owner, repo, issue_number: prNumber, body: `<!-- ai-loop:v1 root_pr=${prNumber} head=${headSha} agent=watchdog state=dispatch_failed -->\nBackup dispatch was blocked (see run logs / annotations). The watchdog will retry automatically once resolved; no attempt was consumed.` }); } catch (e2) { core.info(`marker comment failed (ignored): ${e2.message}`); }
-                      }
+                      await notifyFailureOnce(
+                        'backup_dispatch', e,
+                        `⚠️ ${repo} PR #${prNumber}: codex-api dispatch failed — ${e.message}`,
+                        'Backup dispatch was blocked (see run logs / annotations). The watchdog will retry automatically once resolved; no attempt was consumed.',
+                      );
                       continue;
                     }
                     try { await github.rest.issues.createComment({ owner, repo, issue_number: prNumber, body: `<!-- ai-loop:v1 root_pr=${prNumber} head=${headSha} attempt=${attempt} agent=codex state=requested -->\nClaude didn't deliver on the current head — dispatched the Codex API backup fixer (attempt ${attempt}).` }); } catch (e) { core.info(`marker comment failed (ignored): ${e.message}`); }
@@ -768,6 +820,72 @@ jobs:
                 });
               } catch (e) { core.info(`Telegram failed (ignored): ${e.message}`); }
             }
+            function parseMarkers(body) {
+              const out = [];
+              const pattern = /<!--\s*ai-loop:v1\b([^>]*)-->/g;
+              let match;
+              while ((match = pattern.exec(body || '')) !== null) {
+                const attributes = {};
+                for (const part of match[1].trim().split(/\s+/)) {
+                  const equals = part.indexOf('=');
+                  if (equals > 0) attributes[part.slice(0, equals)] = part.slice(equals + 1);
+                }
+                out.push(attributes);
+              }
+              return out;
+            }
+            function normalizeFailure(error) {
+              const rawStatus = Number(error?.status);
+              const status = Number.isFinite(rawStatus) ? String(rawStatus) : 'unknown';
+              const message = String(error?.message || error || 'error')
+                .toLowerCase()
+                .replace(/https?:\/\/\S+/g, '<url>')
+                .replace(/\(\s*line:\s*\d+\s*,\s*col:\s*\d+\s*\)/g, '(line:<n>,col:<n>)')
+                .replace(/\b[0-9a-f]{40}\b/g, '<sha>')
+                .replace(/\b\d{6,}\b/g, '<n>')
+                .replace(/\s+/g, ' ')
+                .trim()
+                .slice(0, 500);
+              return `${status}:${message}`;
+            }
+            function failureFingerprint(error) {
+              const normalized = normalizeFailure(error);
+              let hash = 2166136261;
+              for (let index = 0; index < normalized.length; index += 1) {
+                hash ^= normalized.charCodeAt(index);
+                hash = Math.imul(hash, 16777619);
+              }
+              return (hash >>> 0).toString(16).padStart(8, '0');
+            }
+            async function notifyFailureOnce(comments, prNumber, headSha, operation, error, text, note) {
+              const fingerprint = failureFingerprint(error);
+              const alreadyAlerted = comments.some((comment) => {
+                if (![owner, 'github-actions[bot]'].includes(comment.user?.login || '')) return false;
+                return parseMarkers(comment.body).some((marker) =>
+                  marker.root_pr === String(prNumber) &&
+                  marker.head === headSha &&
+                  marker.agent === 'watchdog' &&
+                  marker.state === 'failure_alerted' &&
+                  marker.op === operation &&
+                  marker.error === fingerprint
+                );
+              });
+              if (alreadyAlerted) {
+                core.warning(`PR #${prNumber}: ${operation} failure ${fingerprint} persists; Telegram alert suppressed by durable marker.`);
+                return false;
+              }
+              const marker = `<!-- ai-loop:v1 root_pr=${prNumber} head=${headSha} agent=watchdog state=failure_alerted op=${operation} error=${fingerprint} -->`;
+              try {
+                const { data: created } = await github.rest.issues.createComment({
+                  owner, repo, issue_number: prNumber, body: `${marker}\n${note}`,
+                });
+                comments.push(created);
+              } catch (markerError) {
+                core.info(`${operation} failure marker failed (ignored): ${markerError.message}`);
+              }
+              await telegram(text);
+              return true;
+            }
 
             try {
               const prs = await github.paginate(github.rest.pulls.list, {
@@ -792,6 +910,9 @@ jobs:
                   const prNumber = pr.number;
                   const headSha = pr.head.sha;
                   const head7 = headSha.substring(0, 7);
+                  const issueComments = await github.paginate(github.rest.issues.listComments, {
+                    owner, repo, issue_number: prNumber, per_page: 100,
+                  });
 
                   // fix #23 Part C: auto update-branch for a STALE loop PR so the
                   // fixer AND the gate always work the CURRENT head — the update
@@ -808,11 +929,10 @@ jobs:
                     const sameRepo = !!(pr.head && pr.head.repo && pr.head.repo.full_name === `${owner}/${repo}`);
                     let loopPr = (!!(pr.head && pr.head.ref && pr.head.ref.startsWith('claude/'))) || isTrustedSync(pr);
                     if (!loopPr) {
-                      const [ic, rc] = await Promise.all([
-                        github.paginate(github.rest.issues.listComments, { owner, repo, issue_number: prNumber, per_page: 100 }),
-                        github.paginate(github.rest.pulls.listReviewComments, { owner, repo, pull_number: prNumber, per_page: 100 }),
-                      ]);
-                      loopPr = [...ic, ...rc].some((c) => /ai-loop:v1/.test(c.body || ''));
+                      const rc = await github.paginate(github.rest.pulls.listReviewComments, {
+                        owner, repo, pull_number: prNumber, per_page: 100,
+                      });
+                      loopPr = [...issueComments, ...rc].some((c) => /ai-loop:v1/.test(c.body || ''));
                     }
                     if (loopPr && !hasNeedsOwner && sameRepo) {
                       const { data: full } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
@@ -822,15 +942,16 @@ jobs:
                           core.info(`auto update-branch: PR #${prNumber}`);
                         } catch (e) {
                           core.error(`auto update-branch failed for PR #${prNumber} — ${e.message}`);
-                          await telegram(`⚠️ ${repo} PR #${prNumber}: auto update-branch failed — ${e.message}`);
+                          await notifyFailureOnce(
+                            issueComments, prNumber, headSha, 'update_branch', e,
+                            `⚠️ ${repo} PR #${prNumber}: auto update-branch failed — ${e.message}`,
+                            'Automatic branch update failed. The watchdog will retry while the same PR head and normalized failure persist.',
+                          );
                         }
                       }
                     }
                   } catch (e) { core.info(`update-branch check PR #${prNumber} (ignored): ${e.message}`); }
 
-                  const issueComments = await github.paginate(github.rest.issues.listComments, {
-                    owner, repo, issue_number: prNumber, per_page: 100,
-                  });
                   let headObservedAt = null;
                   try {
                     headObservedAt = await observedHeadTransition(prNumber, headSha, issueComments);
@@ -935,7 +1056,11 @@ jobs:
                   } catch (e) {
                     // fix #4 loud-fail: annotate + Telegram; never crash the sweep.
                     core.error(`sweep: gate dispatch failed for PR #${prNumber} @ ${head7} — ${e.message}`);
-                    await telegram(`⚠️ ${repo} PR #${prNumber}: sweep gate dispatch failed — ${e.message}`);
+                    await notifyFailureOnce(
+                      issueComments, prNumber, headSha, 'gate_dispatch', e,
+                      `⚠️ ${repo} PR #${prNumber}: sweep gate dispatch failed — ${e.message}`,
+                      'Codex Gate dispatch failed. The watchdog will keep logging the persistent failure but will not repeat Telegram for this PR head and normalized error.',
+                    );
                   }
                 } catch (e) {
                   core.info(`late-signal sweep: PR #${pr.number} error (ignored): ${e.message}`);

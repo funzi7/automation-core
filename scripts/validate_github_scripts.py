@@ -16,6 +16,12 @@ from pathlib import Path
 import yaml
 
 
+# GitHub template expansion can reject a workflow before it creates jobs when
+# a large scalar contains a direct `${{ ... }}` interpolation. Keep large
+# github-script programs data-only and pass workflow values through step env.
+LARGE_SCRIPT_EXPRESSION_THRESHOLD = 10_000
+
+
 class WorkflowLoader(yaml.SafeLoader):
     pass
 
@@ -38,6 +44,18 @@ def github_scripts(workflow: dict) -> list[tuple[str, str]]:
             script = str((step.get("with") or {}).get("script") or "")
             scripts.append((f"{job_name}:{index}:{step.get('name', 'unnamed')}", script))
     return scripts
+
+
+def validate_expression_safety(workflow_path: Path, location: str, script: str) -> None:
+    size = len(script.encode("utf-8"))
+    if size < LARGE_SCRIPT_EXPRESSION_THRESHOLD:
+        return
+    if "${{" in script:
+        raise SystemExit(
+            "unsafe direct GitHub expression in large github-script block: "
+            f"{workflow_path}:{location} ({size} bytes); pass the value via env"
+        )
+    print(f"  expression safe: {workflow_path}:{location} ({size} bytes)")
 
 
 config = json.loads(Path("sync-config.json").read_text())
@@ -83,6 +101,7 @@ for workflow_path in workflow_paths:
     for location, script in github_scripts(workflow):
         if not script.strip():
             raise SystemExit(f"empty github-script block: {workflow_path}:{location}")
+        validate_expression_safety(workflow_path, location, script)
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".js", encoding="utf-8"
         ) as handle:
