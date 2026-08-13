@@ -98,8 +98,8 @@ is the permanent human opt-out and is never removed by automation.
    For downstreams other than paywall-bot, workflow-sync state is also
    unverified until checked from each repository's latest sync PR and current
    workflow contents.
-5. **Codex Cloud limitation:** View task, task diff, Created commit hint, or ready diff is not delivery unless the PR branch gets a newer commit after the Cloud marker. No browser/UI automation or fake Update branch API workaround exists.
-6. **Longer-term:** update minutes-guard target coverage after downstream audit; keep direct-to-main and branch-protection decisions explicit.
+4. **Codex Cloud limitation:** View task, task diff, Created commit hint, or ready diff is not delivery unless the PR branch gets a newer commit after the Cloud marker. No browser/UI automation or fake Update branch API workaround exists.
+5. **Longer-term:** update minutes-guard target coverage after downstream audit; keep direct-to-main and branch-protection decisions explicit.
 
 Older items below are history. If they conflict with this section, treat them as HISTORICAL or SUPERSEDED and follow this section.
 
