@@ -448,3 +448,22 @@ test('review-thread changes have a supported PAT-independent gate sweep', () => 
   assert.match(gate, /state: 'open', per_page: 100/);
   assert.match(gate, /anyBlocked && context\.eventName !== 'schedule'/);
 });
+
+test('bridge preserves unmarked current-head top-level findings via verified gate epoch', () => {
+  const bridge = fs.readFileSync(
+    path.join(__dirname, '..', 'workflows', 'codex-auto-fix.yml'),
+    'utf8',
+  );
+  assert.match(bridge, /const HEAD_EPOCH_MARKER_PATTERN =/);
+  assert.match(bridge, /async function observedHeadTransition\(comments\)/);
+  assert.match(bridge, /comment\.user\?\.login \|\| ''\) !== 'github-actions\[bot\]'/);
+  assert.match(bridge, /run\.path !== '\.github\/workflows\/codex-gate\.yml'/);
+  assert.match(bridge, /run\.event !== 'pull_request_target'/);
+  assert.match(bridge, /Number\(run\.run_attempt\) !== ref\.attempt/);
+  assert.match(bridge, /!belongsToPr \|\| !commentInsideRun/);
+  assert.match(bridge, /if \(runHead !== exactHead\) break/);
+  assert.match(bridge, /headObservedAt = await observedHeadTransition\(issueComments\)/);
+  assert.match(bridge, /signalAt > observedAt/);
+  assert.doesNotMatch(bridge, /prData\?\.updated_at/);
+  assert.doesNotMatch(bridge, /commit dates.*transition timestamp/i);
+});
