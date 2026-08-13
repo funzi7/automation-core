@@ -253,7 +253,7 @@ jobs:
               return /^You have reached your Codex usage limits for code reviews\./i.test(text) ||
                 /^Codex (?:is|was) (?:currently )?(?:at capacity|unable to (?:complete|perform) (?:this )?code review)/i.test(text);
             }
-            const HEAD_EPOCH_MARKER_PATTERN = /<!--\s*codex-head-epoch:v2\s+run=(\d+)\s+attempt=(\d+)\s*-->/i;
+            const HEAD_EPOCH_MARKER_PATTERN = /<!--\s*codex-head-epoch:v3\s+run=(\d+)\s+attempt=(\d+)\s+pr=(\d+)\s+head=([a-f0-9]{40})\s*-->/i;
             function signalTargetsHead(item, headSha, headObservedAt, dateField = 'created_at') {
               const exactHead = String(headSha || '').toLowerCase();
               if (!/^[a-f0-9]{40}$/.test(exactHead)) return false;
@@ -278,6 +278,7 @@ jobs:
                 const match = String(comment.body || '').match(HEAD_EPOCH_MARKER_PATTERN);
                 if (match) refs.push({
                   runId: Number(match[1]), attempt: Number(match[2]),
+                  markerPr: Number(match[3]), markerHead: match[4].toLowerCase(),
                   commentAt: new Date(comment.created_at || 0).getTime(),
                   commentId: Number(comment.id || 0),
                 });
@@ -285,7 +286,8 @@ jobs:
               refs.sort((a, b) => b.commentAt - a.commentAt || b.commentId - a.commentId);
               const markers = [];
               const accepted = new Set();
-              for (const { runId, attempt, commentAt } of refs) {
+              for (const { runId, attempt, markerPr, markerHead, commentAt } of refs) {
+                if (markerPr !== Number(prNumber)) continue;
                 const key = `${runId}/${attempt}`;
                 if (accepted.has(key)) continue;
                 if (!epochRunCache.has(key)) {
@@ -307,7 +309,9 @@ jobs:
                   ) continue;
                   accepted.add(key);
                   const observedAt = new Date(run.created_at || 0).getTime();
-                  const head = String(run.head_sha || '').toLowerCase();
+                  // pull_request_target run.head_sha is the base SHA. Trust
+                  // the payload head stored inside the verified Gate attempt.
+                  const head = markerHead;
                   if (/^[a-f0-9]{40}$/.test(head) && Number.isFinite(observedAt) && observedAt > 0) {
                     markers.push({ head, observedAt, id: Number(run.id || runId) });
                     if (head !== exactHead) break;
