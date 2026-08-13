@@ -542,6 +542,10 @@ test('Claude PR provenance records on failure while automerge remains success-on
   );
   assert.match(provenanceStep, /CLAUDE_ACTION_OUTCOME: \$\{\{ steps\.claude_issue\.outcome \}\}/);
   assert.match(provenanceStep, /CLAUDE_DELIVERED: \$\{\{ steps\.delivery\.outputs\.delivered \}\}/);
+  assert.match(provenanceStep, /if \(!delivered\) \{/);
+  assert.match(provenanceStep, /await github\.rest\.issues\.removeLabel\(\{/);
+  assert.match(provenanceStep, /name: 'automerge'/);
+  assert.match(provenanceStep, /stale automerge remained after undelivered retry/);
   assert.doesNotMatch(workflow, /No trigger comment .* treat as delivered/);
   assert.match(workflow, /labels: delivered \? \['claude-generated', 'automerge'\] : \['claude-generated'\]/);
   assert.match(workflow, /github-token: \$\{\{ github\.token \}\}/);

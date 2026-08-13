@@ -605,6 +605,22 @@ jobs:
             }
 
             async function label(prNumber) {
+              if (!delivered) {
+                try {
+                  await github.rest.issues.removeLabel({
+                    owner, repo, issue_number: prNumber, name: 'automerge',
+                  });
+                  core.info(`Removed stale automerge from PR #${prNumber} after an undelivered retry.`);
+                } catch (e) {
+                  if (e.status !== 404) throw e;
+                }
+                const { data: live } = await github.rest.pulls.get({
+                  owner, repo, pull_number: prNumber,
+                });
+                if ((live.labels || []).some((entry) => entry.name === 'automerge')) {
+                  throw new Error(`PR #${prNumber}: stale automerge remained after undelivered retry`);
+                }
+              }
               await github.rest.issues.addLabels({
                 owner, repo, issue_number: prNumber,
                 labels: delivered ? ['claude-generated', 'automerge'] : ['claude-generated'],
