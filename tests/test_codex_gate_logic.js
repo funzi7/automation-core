@@ -535,6 +535,7 @@ test('bridge preserves unmarked current-head top-level findings via verified gat
     bridge.indexOf('// Cap the WHOLE digest'),
   );
   assert.match(digest, /for \(const c of issueComments\)/);
+  assert.match(bridge, /const isCodexCapacityNotice = \(body\) =>/);
   assert.match(digest, /c\.user\?\.login === CODEX && isP12\(c\.body\) && signalTargetsHead\(c\)/);
   assert.match(digest, /!isCodexCapacityNotice\(c\.body\)/);
 });
