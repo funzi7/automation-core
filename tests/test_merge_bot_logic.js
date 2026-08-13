@@ -574,6 +574,12 @@ test('Claude PR provenance records on failure while automerge remains success-on
   assert.match(workflow, /branch_prefix: "claude\/"/);
   assert.match(workflow, /if \(!branch\.startsWith\('claude\/'\)\) throw new Error/);
   assert.match(workflow, /await github\.rest\.pulls\.create/);
+  assert.match(workflow, /const trustedDelivery = process\.env\.CLAUDE_ACTION_OUTCOME === 'success' &&\s*process\.env\.CLAUDE_DELIVERED === 'true'/);
+  assert.match(workflow, /message: 'chore: activate trusted Claude delivery'/);
+  assert.match(workflow, /tree: deliveredCommit\.tree\.sha/);
+  assert.match(workflow, /parents: \[deliveredHead\]/);
+  assert.match(workflow, /await github\.rest\.git\.updateRef\(\{/);
+  assert.match(workflow, /sha: activation\.sha, force: false/);
   assert.match(workflow, /head: `\$\{owner\}:\$\{claudeBranch\}`/);
   const issuePath = workflow.slice(
     workflow.indexOf('Run Claude Code (Issue/new-PR path)'),
