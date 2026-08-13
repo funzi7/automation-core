@@ -91,7 +91,13 @@ is the permanent human opt-out and is never removed by automation.
 
 1. **Claude-budget-blocked runtime verification:** after Anthropic credit is restored, create one harmless same-repo PR with an active P1 or P2 finding, trigger `@claude fix`, verify a commit reaches the original PR head branch, verify no secondary branch/PR appears, verify the watchdog recognizes delivery, and verify no `no_delivery` marker remains after the successful push.
 2. **OpenAI API quota-blocked verification:** after OpenAI quota is restored, set `CODEX_BACKUP_ENABLED='true'` only on a controlled test repo and verify Codex API `requested` -> real PR-head push and terminal states, including that `codex_agent_failed` posts only the intended `api_error` marker and never enters the normal patch download/apply path.
-3. **Downstream audit:** paywall-bot PR #94 is merged with the seven current workflows. OPT PR #12 and TRF PR #80 are merged. Do not claim other downstream workflow sync, secrets, variables, Actions permissions, or runtime health until checked from each repo's latest sync PR/current workflow contents and settings evidence.
+3. **Downstream audit:** paywall-bot PR #94 is merged with the seven current
+   workflows and its four loop workflows were observed active; OPT PR #12 and
+   TRF PR #80 are merged. Secrets, variables, Actions permissions, and broader
+   runtime health remain unverified for paywall-bot and every other downstream.
+   For downstreams other than paywall-bot, workflow-sync state is also
+   unverified until checked from each repository's latest sync PR and current
+   workflow contents.
 5. **Codex Cloud limitation:** View task, task diff, Created commit hint, or ready diff is not delivery unless the PR branch gets a newer commit after the Cloud marker. No browser/UI automation or fake Update branch API workaround exists.
 6. **Longer-term:** update minutes-guard target coverage after downstream audit; keep direct-to-main and branch-protection decisions explicit.
 
