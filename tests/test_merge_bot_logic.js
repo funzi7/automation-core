@@ -73,6 +73,19 @@ test('normal same-repo owner fix PR with exact-head green is eligible', () => {
   assert.equal(decide().eligible, true);
 });
 
+test('final snapshot must remain an automerge candidate', () => {
+  const workflow = fs.readFileSync(
+    path.join(__dirname, '..', 'workflows', 'merge-bot.yml'),
+    'utf8',
+  );
+  const finalSnapshot = workflow.slice(
+    workflow.indexOf('const { data: finalPr }'),
+    workflow.indexOf('// Squash-merge with the PAT'),
+  );
+  assert.match(finalSnapshot, /!isAutoMergeCandidate\(finalPr\)/);
+  assert.match(finalSnapshot, /automerge eligibility or PR\/head changed/);
+});
+
 test('one running current check blocks merge', () => {
   const result = decide({ checkRuns: [...greenChecks(), check('lint', null, 'in_progress', 3)] });
   assert.equal(result.reason, 'running_check');

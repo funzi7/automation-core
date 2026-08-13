@@ -379,6 +379,47 @@ jobs:
               return [...comments, marker];
             }
 
+            async function triggeringHeadEventIsCurrent(prNumber, liveHead) {
+              if (
+                context.eventName !== 'pull_request_target' ||
+                Number(context.payload.pull_request?.number) !== Number(prNumber) ||
+                !new Set(['opened', 'synchronize', 'reopened']).has(context.payload.action)
+              ) return true;
+              const payloadHead = String(
+                context.payload.pull_request?.head?.sha || '',
+              ).toLowerCase();
+              if (!/^[a-f0-9]{40}$/.test(payloadHead) || payloadHead !== liveHead.toLowerCase()) {
+                return false;
+              }
+              if (context.payload.action !== 'synchronize') return true;
+
+              // Repository-wide concurrency can leave an old A event queued
+              // until after A -> B -> A. Payload/live SHA equality alone cannot
+              // distinguish that old A event. A force-push transition newer than
+              // this immutable workflow run proves the queued payload is stale.
+              try {
+                const [{ data: thisRun }, events] = await Promise.all([
+                  github.rest.actions.getWorkflowRun({
+                    owner, repo, run_id: Number(context.runId),
+                  }),
+                  github.paginate(
+                    'GET /repos/{owner}/{repo}/issues/{issue_number}/events',
+                    { owner, repo, issue_number: prNumber, per_page: 100 },
+                  ),
+                ]);
+                const runCreatedAt = new Date(thisRun.created_at || 0).getTime();
+                const newestForcePushAt = Math.max(0, ...(events || [])
+                  .filter((event) => event.event === 'head_ref_force_pushed')
+                  .map((event) => new Date(event.created_at || 0).getTime())
+                  .filter((time) => Number.isFinite(time)));
+                return Number.isFinite(runCreatedAt) && runCreatedAt > 0 &&
+                  newestForcePushAt <= runCreatedAt;
+              } catch (e) {
+                core.warning(`PR #${prNumber}: queued head-event freshness lookup failed; skipping fail-closed: ${e.message}`);
+                return false;
+              }
+            }
+
             async function observedHeadTransition(prNumber, headSha, comments = []) {
               const [markers, runs] = await Promise.all([
                 trustedHeadMarkers(comments, prNumber),
@@ -530,6 +571,11 @@ jobs:
                 });
                 headSha = pr.head.sha;
                 const head7 = headSha.substring(0, 7);
+                if (!(await triggeringHeadEventIsCurrent(prNumber, headSha))) {
+                  core.info(`PR #${prNumber}: stale queued head event does not match the latest live head epoch; evaluation skipped`);
+                  results.push(`PR #${prNumber}: ⏭️ stale queued head event skipped`);
+                  continue;
+                }
 
                 // Codex feedback across all three channels, fully paginated
                 // (the default 30/page silently drops the first Codex review

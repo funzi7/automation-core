@@ -1040,10 +1040,10 @@ jobs:
               });
               const finalLabels = labelNames(finalPr);
               if (
-                finalPr.state !== 'open' || finalPr.draft ||
+                !isAutoMergeCandidate(finalPr) ||
                 finalPr.mergeable !== true || finalPr.head.sha !== headSha
               ) {
-                core.info(`#${prNumber}: PR/head changed after validation, skip`);
+                core.info(`#${prNumber}: automerge eligibility or PR/head changed after validation, skip`);
                 continue;
               }
               if (finalLabels.has(LABEL_NO_AUTOMERGE)) {
