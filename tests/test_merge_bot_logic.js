@@ -447,7 +447,26 @@ test('merge-failure restoration preserves a concurrently added manual stop', () 
   assert.match(workflow, /original transient escalation is still intact/);
   assert.match(workflow, /could not classify live transient pair.*preserving both labels/);
   assert.match(workflow, /preserving it as a manual\/unknown hard stop/);
+  assert.match(workflow, /partially completed clear can leave only the companion/);
+  assert.match(workflow, /if \(currentLabels\.has\(LABEL_ESCALATE_AUTO\)\)/);
+  assert.match(workflow, /const \{ data: beforeAdd \} = await github\.rest\.pulls\.get/);
+  assert.match(workflow, /for \(const label of definitions\)/);
+  assert.match(workflow, /\{ labels: \[label\.name\] \}/);
+  assert.match(workflow, /const restoredProvenance = await escalationProvenance\(prNumber\)/);
+  assert.match(workflow, /restored hard stop lacked exact bot provenance/);
   assert.doesNotMatch(workflow, /restoreTransientEscalation/);
+});
+
+test('quota notices cannot satisfy any current-head Codex signal consumer', () => {
+  for (const name of ['codex-gate.yml', 'claude-fallback-watchdog.yml', 'merge-bot.yml']) {
+    const workflow = fs.readFileSync(
+      path.join(__dirname, '..', 'workflows', name),
+      'utf8',
+    );
+    assert.match(workflow, /function isCodexCapacityNotice\(body\)/, name);
+    assert.match(workflow, /You have reached your Codex usage limits for code reviews/, name);
+    assert.match(workflow, /!isCodexCapacityNotice\(/, name);
+  }
 });
 
 test('only synced automation infrastructure is in the central allow-list', () => {
@@ -502,10 +521,29 @@ test('Claude PR provenance records on failure while automerge remains success-on
     workflow.indexOf('Run Claude Code (Issue/new-PR path)'),
     workflow.indexOf('Run Claude Code (existing PR head path)'),
   );
+  const issueExecutionPath = workflow.slice(
+    workflow.indexOf('Checkout repository for Issue/new-PR path'),
+    workflow.indexOf('Checkout existing PR head branch'),
+  );
   assert.match(issuePath, /github_token: \$\{\{ github\.token \}\}/);
-  assert.doesNotMatch(issuePath, /secrets\.AUTOMATION_PAT/);
-  assert.doesNotMatch(issuePath, /Bash\(git:\*\)/);
-  assert.doesNotMatch(issuePath, /Bash\(gh pr:\*\)/);
+  assert.match(issuePath, /use_commit_signing: true/);
+  assert.match(issuePath, /--allowedTools "Read,Glob,Grep"/);
+  assert.match(issueExecutionPath, /token: \$\{\{ github\.token \}\}[\s\S]*persist-credentials: false/);
+  assert.doesNotMatch(issueExecutionPath, /secrets\.AUTOMATION_PAT/);
+  assert.doesNotMatch(issuePath, /Bash\(/);
+  assert.doesNotMatch(issuePath, /(?:^|,)\s*(?:Edit|Write|MultiEdit)(?:,|$)/m);
+  assert.match(issuePath, /name: Scrub Issue-mode model credentials/);
+  assert.match(issuePath, /git config --local --unset-all/);
+  assert.match(issuePath, /git remote set-url origin/);
+  assert.match(issuePath, /x-access-token\|authorization/);
+  assert.match(workflow, /steps\.scrub_issue_credentials\.outcome == 'success'/);
+  assert.ok(
+    workflow.indexOf('Scrub Issue-mode model credentials') <
+      workflow.indexOf('token: ${{ secrets.AUTOMATION_PAT || github.token }}'),
+    'the first PAT-backed step must follow the Issue-mode credential scrub',
+  );
+  const trustedPost = workflow.slice(workflow.indexOf('Create Claude PR from trusted branch'));
+  assert.match(trustedPost, /secrets\.AUTOMATION_PAT \|\| github\.token/);
 });
 
 test('synced review freshness never uses the removed latest-commit-date model', () => {

@@ -11,10 +11,10 @@ name: Claude Fixer
 # file to a key-less repo never produces failures and burns ~0 minutes.
 #
 # Loop-trigger trap: a PR opened with the default GITHUB_TOKEN does NOT
-# trigger other workflows (GitHub loop protection), so codex-gate would
-# never run on Claude's PR. We therefore hand the action AUTOMATION_PAT
-# as github_token (falling back to the default token when the PAT is
-# absent, so the action still works in fail-soft repos).
+# trigger other workflows (GitHub loop protection). Issue-mode Claude uses
+# only the short-lived repository token and API commit signing; after the
+# model step a trusted scrub removes its git credential, then a trusted
+# post-step alone uses AUTOMATION_PAT to open the exact controlled branch PR.
 
 on:
   issue_comment:
@@ -154,31 +154,8 @@ jobs:
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
-          token: ${{ secrets.AUTOMATION_PAT || github.token }}
-
-      - name: Checkout existing PR head branch
-        if: steps.keycheck.outputs.has_key == 'true' && steps.pr_context.outputs.same_repo_pr == 'true'
-        uses: actions/checkout@v5
-        with:
-          ref: ${{ steps.pr_context.outputs.head_sha }}
-          token: ${{ secrets.AUTOMATION_PAT || github.token }}
-          fetch-depth: 0
-
-      - name: Attach checkout to original PR head branch
-        if: steps.keycheck.outputs.has_key == 'true' && steps.pr_context.outputs.same_repo_pr == 'true'
-        env:
-          HEAD_REF: ${{ steps.pr_context.outputs.head_ref }}
-          HEAD_SHA: ${{ steps.pr_context.outputs.head_sha }}
-        run: |
-          set -euo pipefail
-          git checkout -B "${HEAD_REF}" "${HEAD_SHA}"
-          git branch --set-upstream-to="origin/${HEAD_REF}" "${HEAD_REF}" 2>/dev/null || true
-          current="$(git rev-parse HEAD)"
-          if [ "${current}" != "${HEAD_SHA}" ]; then
-            echo "::error::Checked out ${current}, expected PR head ${HEAD_SHA}."
-            exit 1
-          fi
-          echo "Checked out original PR head branch ${HEAD_REF} at ${HEAD_SHA}."
+          token: ${{ github.token }}
+          persist-credentials: false
 
       - name: Run Claude Code (Issue/new-PR path)
         id: claude_issue
@@ -189,6 +166,9 @@ jobs:
           # Issue-mode Claude never receives AUTOMATION_PAT. The trusted
           # post-step alone uses it to create the exact action-controlled PR.
           github_token: ${{ github.token }}
+          # The action creates commits through its constrained GitHub file-ops
+          # MCP server, so Issue-mode needs no generic shell/interpreter tool.
+          use_commit_signing: true
           trigger_phrase: "@claude"
           label_trigger: "claude-fix"
           branch_prefix: "claude/"
@@ -202,18 +182,17 @@ jobs:
           # reports permission_denials_count but hides WHICH tools were denied, so
           # the count alone can't tune --allowedTools), then flip it back.
           show_full_output: ${{ vars.CLAUDE_SHOW_FULL_OUTPUT == 'true' }}
-          # --max-turns 50 + the common inspector/test allowlist (fix #7). The previous
+          # --max-turns 50 + a no-shell Issue-mode allowlist. The previous
           # --max-turns 20 + narrow per-subcommand list caused error_max_turns
           # on paywall-bot #49: the fixer kept trying tools OUTSIDE the allowlist
           # (11 permission_denials), burning all 20 turns on denial churn without
-          # delivering a fix. Now: 50 turns; common interpreters/inspectors
-          # (python/python3/pytest/pip/node/npm + ls/cat/find/head/tail/sed/
-          # mkdir/cp/mv); plus MultiEdit. The action supplies its own constrained
-          # commit/push tools. Claude cannot create/switch branches or open PRs.
-          # The PR's CI (codex-gate) remains the real validation gate.
+          # delivering a fix. The action supplies constrained workspace edits
+          # and API commit tools. No Bash, interpreter, package runner, generic
+          # write tool, git CLI, or gh CLI is granted in this untrusted Issue/log
+          # path. The PR's CI remains the executable-code validation boundary.
           claude_args: |
             --max-turns 50
-            --allowedTools "Read,Glob,Grep,Edit,Write,MultiEdit,Bash(python:*),Bash(python3:*),Bash(pytest:*),Bash(pip:*),Bash(node:*),Bash(npm:*),Bash(ls:*),Bash(cat:*),Bash(find:*),Bash(head:*),Bash(tail:*),Bash(sed:*),Bash(mkdir:*),Bash(cp:*),Bash(mv:*),Bash(gh issue:*),Bash(actionlint)"
+            --allowedTools "Read,Glob,Grep"
           additional_permissions: |
             actions: read
           prompt: |
@@ -240,6 +219,48 @@ jobs:
             If triggered by an @claude mention on an Issue, follow the request
             in the comment on the action-controlled branch. Commit and push; the
             trusted post-step opens the PR. Do not merge it yourself.
+
+      - name: Scrub Issue-mode model credentials
+        id: scrub_issue_credentials
+        if: ${{ always() && steps.keycheck.outputs.has_key == 'true' && steps.pr_context.outputs.is_pr_comment != 'true' && steps.claude_issue.outcome != 'skipped' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --local --unset-all "http.${GITHUB_SERVER_URL}/.extraheader" 2>/dev/null || true
+          git config --local --unset-all credential.helper 2>/dev/null || true
+          git remote set-url origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          if grep -Eqi '(x-access-token|authorization[[:space:]]*=|credential\.helper)' .git/config; then
+            echo "::error::A model-facing git credential remains after Issue-mode Claude."
+            exit 1
+          fi
+          echo "Issue-mode git credentials removed before trusted post-steps."
+
+      # Existing-PR mode intentionally writes to an already-approved same-repo
+      # head branch. Its PAT checkout and broader validation tools are isolated
+      # after the Issue-mode model has exited and its credentials were scrubbed.
+      - name: Checkout existing PR head branch
+        if: steps.keycheck.outputs.has_key == 'true' && steps.pr_context.outputs.same_repo_pr == 'true'
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.pr_context.outputs.head_sha }}
+          token: ${{ secrets.AUTOMATION_PAT || github.token }}
+          fetch-depth: 0
+
+      - name: Attach checkout to original PR head branch
+        if: steps.keycheck.outputs.has_key == 'true' && steps.pr_context.outputs.same_repo_pr == 'true'
+        env:
+          HEAD_REF: ${{ steps.pr_context.outputs.head_ref }}
+          HEAD_SHA: ${{ steps.pr_context.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          git checkout -B "${HEAD_REF}" "${HEAD_SHA}"
+          git branch --set-upstream-to="origin/${HEAD_REF}" "${HEAD_REF}" 2>/dev/null || true
+          current="$(git rev-parse HEAD)"
+          if [ "${current}" != "${HEAD_SHA}" ]; then
+            echo "::error::Checked out ${current}, expected PR head ${HEAD_SHA}."
+            exit 1
+          fi
+          echo "Checked out original PR head branch ${HEAD_REF} at ${HEAD_SHA}."
 
       - name: Run Claude Code (existing PR head path)
         id: claude_pr
@@ -449,7 +470,7 @@ jobs:
             }
 
       - name: Create Claude PR from trusted branch
-        if: ${{ always() && steps.claude_issue.outcome != 'skipped' && steps.claude_issue.outputs.branch_name != '' }}
+        if: ${{ always() && steps.claude_issue.outcome != 'skipped' && steps.scrub_issue_credentials.outcome == 'success' && steps.claude_issue.outputs.branch_name != '' }}
         uses: actions/github-script@v8
         env:
           CLAUDE_BRANCH_NAME: ${{ steps.claude_issue.outputs.branch_name }}
@@ -493,7 +514,7 @@ jobs:
         # Provenance must survive a run that creates a PR and then fails or is
         # cancelled. `automerge` remains success-only; a failed delivery gets
         # only the durable claude-generated marker.
-        if: ${{ always() && steps.claude_issue.outcome != 'skipped' }}
+        if: ${{ always() && steps.claude_issue.outcome != 'skipped' && steps.scrub_issue_credentials.outcome == 'success' }}
         uses: actions/github-script@v8
         env:
           CLAUDE_BRANCH_NAME: ${{ steps.claude_issue.outputs.branch_name }}

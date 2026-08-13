@@ -21,6 +21,12 @@ const P2_PATTERN = /(?:P2-yellow|(?:^|\n)[\s>*\-_#`]*(?:\*\*\s*P2\s*\*\*|\[P2\]|
 const REVIEWED_COMMIT_PATTERN = /(?:^|\n)\*\*Reviewed commit:\*\*\s*`([a-f0-9]{10,40})`(?:\s|$)/i;
 const HEAD_EPOCH_MARKER_PATTERN = /<!--\s*codex-head-epoch:v2\s+run=(\d+)\s+attempt=(\d+)\s*-->/i;
 
+function isCodexCapacityNotice(body) {
+  const text = String(body || '').trim();
+  return /^You have reached your Codex usage limits for code reviews\./i.test(text) ||
+    /^Codex (?:is|was) (?:currently )?(?:at capacity|unable to (?:complete|perform) (?:this )?code review)/i.test(text);
+}
+
 function signalTargetsHead(item, headSha, headObservedAt = null, dateField = 'created_at') {
   const exactHead = String(headSha || '').toLowerCase();
   if (!/^[a-f0-9]{40}$/.test(exactHead)) return false;
@@ -206,6 +212,7 @@ module.exports = {
   P2_PATTERN,
   REVIEWED_COMMIT_PATTERN,
   HEAD_EPOCH_MARKER_PATTERN,
+  isCodexCapacityNotice,
   signalTargetsHead,
   currentHeadEpochStart,
   currentHeadEpochFromVerifiedRuns,
