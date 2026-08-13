@@ -658,10 +658,7 @@ jobs:
                 } catch (e) {
                   // If the ordinary hard stop cannot be restored, fall back to
                   // the policy's permanent stop before surfacing the error.
-                  await github.rest.issues.addLabels({
-                    owner, repo, issue_number: prNumber,
-                    labels: [LABEL_NO_AUTOMERGE],
-                  });
+                  await persistPermanentStop(prNumber, 'needs-owner restore failed');
                   throw e;
                 }
               }
@@ -674,12 +671,17 @@ jobs:
                   body: `<!-- ai-loop:v1 root_pr=${prNumber} head=${current.head.sha} agent=merge-bot state=clear_race -->\nMerge Bot detected a concurrent needs-owner transition while clearing an automated escalation. The restored needs-owner is a permanent manual/unknown hard stop.`,
                 });
               } catch (e) {
-                await github.rest.issues.addLabels({
-                  owner, repo, issue_number: prNumber,
-                  labels: [LABEL_NO_AUTOMERGE],
-                });
+                await persistPermanentStop(prNumber, 'clear-race marker persistence failed');
                 throw e;
               }
+            }
+
+            async function persistPermanentStop(prNumber, reason) {
+              await github.rest.issues.addLabels({
+                owner, repo, issue_number: prNumber,
+                labels: [LABEL_NO_AUTOMERGE],
+              });
+              core.warning(`#${prNumber}: persisted no-automerge because ${reason}`);
             }
 
             async function restoreTransientIfOpen(prNumber) {
@@ -1088,6 +1090,9 @@ jobs:
                       await restoreRaceHardStopIfOpen(prNumber);
                     } catch (restoreError) {
                       core.warning(`#${prNumber}: raced hard-stop restore failed: ${restoreError.message}`);
+                      // Do not suppress restoration failure until a durable
+                      // permanent stop exists for all later merge-bot runs.
+                      await persistPermanentStop(prNumber, 'raced hard-stop restoration failed');
                     }
                     core.warning(`#${prNumber}: needs-owner ownership changed during clear; restored a fail-closed hard stop and skipped merge`);
                     continue;
@@ -1099,6 +1104,7 @@ jobs:
                     await restoreTransientIfOpen(prNumber);
                   } catch (restoreError) {
                     core.warning(`#${prNumber}: transient-label restore failed: ${restoreError.message}`);
+                    await persistPermanentStop(prNumber, 'transient-label restoration failed');
                   }
                   core.warning(`#${prNumber}: transient-label clear failed; skip: ${e.message}`);
                   continue;

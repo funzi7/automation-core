@@ -504,6 +504,10 @@ test('transient clear revalidates the exact label assignments before merge', () 
   assert.match(workflow, /marker && \/\\bstate=clear_race/);
   assert.match(workflow, /marker persistence fails, attach the permanent policy stop/);
   assert.match(workflow, /labels: \[LABEL_NO_AUTOMERGE\]/);
+  assert.match(workflow, /async function persistPermanentStop\(prNumber, reason\)/);
+  assert.match(workflow, /await persistPermanentStop\(prNumber, 'raced hard-stop restoration failed'\)/);
+  assert.match(workflow, /await persistPermanentStop\(prNumber, 'transient-label restoration failed'\)/);
+  assert.match(workflow, /Do not suppress restoration failure until a durable/);
   assert.match(workflow, /ownership changed during clear.*skipped merge/);
   assert.ok(
     workflow.indexOf('const clearStillOwned = await transientClearKeptValidatedOwnership') <
