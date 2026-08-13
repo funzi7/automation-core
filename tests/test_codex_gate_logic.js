@@ -386,6 +386,26 @@ test('authoritative workflow keeps gate policy inline', () => {
   assert.match(workflow, /'chatgpt-codex-connector'/);
 });
 
+test('queued PR head events are revalidated before gate evaluation', () => {
+  const workflow = fs.readFileSync(
+    path.join(__dirname, '..', 'workflows', 'codex-gate.yml'),
+    'utf8',
+  );
+  assert.match(workflow, /async function triggeringHeadEventIsCurrent\(prNumber, liveHead\)/);
+  assert.match(workflow, /payloadHead !== liveHead\.toLowerCase\(\)/);
+  assert.match(workflow, /github\.rest\.actions\.getWorkflowRun/);
+  assert.match(workflow, /event\.event === 'head_ref_force_pushed'/);
+  assert.match(workflow, /newestForcePushAt < runCreatedAt/);
+  assert.doesNotMatch(workflow, /context\.payload\.action !== 'synchronize'\) return true/);
+  assert.match(workflow, /if \(!\(await triggeringHeadEventIsCurrent\(prNumber, headSha\)\)\)/);
+  assert.match(workflow, /stale queued head event skipped/);
+  assert.ok(
+    workflow.indexOf('await triggeringHeadEventIsCurrent(prNumber, headSha)') <
+      workflow.indexOf('comments = await ensureHeadEpochMarker(prNumber, comments)'),
+    'stale event must stop before marker publication and evaluation',
+  );
+});
+
 
 
 test('trusted evaluator publishes the authoritative check on the PR head', () => {
