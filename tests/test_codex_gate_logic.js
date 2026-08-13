@@ -327,10 +327,12 @@ test('authoritative workflow keeps gate policy inline', () => {
   assert.match(workflow, /context\.eventName === 'schedule'/);
   assert.match(workflow, /async function observedHeadTransition\(prNumber, headSha, comments = \[\]\)/);
   assert.match(workflow, /codex-head-epoch:v3/);
-  assert.match(workflow, /pr=\$\{prNumber\} head=\$\{headSha\}/);
+  assert.match(workflow, /pr=\$\{prNumber\} head=\$\{markerHead\}/);
   assert.match(workflow, /const head = markerHead/);
   assert.doesNotMatch(workflow, /const head = String\(run\.head_sha \|\| ''\)\.toLowerCase\(\)/);
-  assert.match(workflow, /async function ensureHeadEpochMarker\(prNumber, headSha, comments\)/);
+  assert.match(workflow, /async function ensureHeadEpochMarker\(prNumber, comments\)/);
+  assert.match(workflow, /context\.payload\.pull_request\?\.head\?\.sha/);
+  assert.match(workflow, /String\(match\[4\]\)\.toLowerCase\(\) === markerHead/);
   assert.match(workflow, /if \(\(comment\.user\?\.login \|\| ''\) !== 'github-actions\[bot\]'\) return false/);
   assert.match(workflow, /actions\/runs\/\{run_id\}\/attempts\/\{attempt_number\}/);
   assert.match(workflow, /run\.path !== '\.github\/workflows\/codex-gate\.yml'/);

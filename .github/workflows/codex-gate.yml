@@ -331,12 +331,22 @@ jobs:
               return currentHeadEpochEvidenceFromTimeline(timeline, headSha);
             }
 
-            async function ensureHeadEpochMarker(prNumber, headSha, comments) {
+            async function ensureHeadEpochMarker(prNumber, comments) {
               if (
                 context.eventName !== 'pull_request_target' ||
                 Number(context.payload.pull_request?.number) !== Number(prNumber) ||
                 !new Set(['opened', 'synchronize', 'reopened']).has(context.payload.action)
               ) return comments;
+              // Runs may queue behind repository-wide concurrency while the PR
+              // moves again. Authenticate the immutable triggering payload head,
+              // never the freshly re-fetched live PR head.
+              const markerHead = String(
+                context.payload.pull_request?.head?.sha || '',
+              ).toLowerCase();
+              if (!/^[a-f0-9]{40}$/.test(markerHead)) {
+                core.warning(`PR #${prNumber}: triggering payload head unavailable; epoch marker skipped.`);
+                return comments;
+              }
               const runId = Number(context.runId);
               const attempt = Number(process.env.GITHUB_RUN_ATTEMPT || 1);
               const alreadyRecorded = (comments || []).some((comment) => {
@@ -344,12 +354,12 @@ jobs:
                 const match = String(comment.body || '').match(HEAD_EPOCH_MARKER_PATTERN);
                 return match && Number(match[1]) === runId && Number(match[2]) === attempt &&
                   Number(match[3]) === Number(prNumber) &&
-                  String(match[4]).toLowerCase() === String(headSha).toLowerCase();
+                  String(match[4]).toLowerCase() === markerHead;
               });
               if (alreadyRecorded) return comments;
               const { data: marker } = await github.rest.issues.createComment({
                 owner, repo, issue_number: prNumber,
-                body: `<!-- codex-head-epoch:v3 run=${runId} attempt=${attempt} pr=${prNumber} head=${headSha} -->`,
+                body: `<!-- codex-head-epoch:v3 run=${runId} attempt=${attempt} pr=${prNumber} head=${markerHead} -->`,
               });
               core.info(`PR #${prNumber}: indexed trusted head epoch run ${runId}/${attempt}`);
               return [...comments, marker];
@@ -517,7 +527,7 @@ jobs:
                   owner, repo, issue_number: prNumber, per_page: 100,
                 });
                 try {
-                  comments = await ensureHeadEpochMarker(prNumber, headSha, comments);
+                  comments = await ensureHeadEpochMarker(prNumber, comments);
                 } catch (e) {
                   core.warning(`PR #${prNumber}: trusted head marker publish failed; markerless signals stay fail-closed: ${e.message}`);
                 }
