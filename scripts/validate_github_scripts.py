@@ -8,7 +8,7 @@ checks each github-script block without executing it.
 
 from __future__ import annotations
 
-import json
+import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -20,6 +20,7 @@ import yaml
 # a large scalar contains a direct `${{ ... }}` interpolation. Keep large
 # github-script programs data-only and pass workflow values through step env.
 LARGE_SCRIPT_EXPRESSION_THRESHOLD = 10_000
+GITHUB_EXPRESSION = re.compile(r"\$\{\{.*?\}\}", re.DOTALL)
 
 
 class WorkflowLoader(yaml.SafeLoader):
@@ -58,42 +59,20 @@ def validate_expression_safety(workflow_path: Path, location: str, script: str) 
     print(f"  expression safe: {workflow_path}:{location} ({size} bytes)")
 
 
-config = json.loads(Path("sync-config.json").read_text())
-changed = {
-    line.strip()
+# Scan every tracked workflow candidate on every run. This deliberately covers
+# synced source/mirror pairs, active hub-only workflows, and workflow templates;
+# limiting the scan to sync-config would leave large hub-only github-script
+# bodies vulnerable to the same pre-job GitHub template-expansion failure.
+workflow_paths = [
+    Path(line)
     for line in subprocess.run(
-        ["git", "diff", "--name-only", "origin/main...HEAD"],
+        ["git", "ls-files", "*.yml", "*.yaml"],
         check=True,
         capture_output=True,
         text=True,
     ).stdout.splitlines()
-}
-changed.update(
-    line.strip()
-    for line in subprocess.run(
-        ["git", "diff", "--name-only"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.splitlines()
-)
-
-workflow_paths = []
-for name in config["synced_workflows"]:
-    source = Path("workflows") / name
-    mirror = Path(".github/workflows") / name
-    if str(source) in changed or str(mirror) in changed:
-        workflow_paths.extend([source, mirror])
-
-# A push on main has no remaining diff against origin/main. Validate every
-# synced source/mirror in that case instead of treating "no changed blocks" as
-# proof, so the post-merge run remains meaningful.
-if not workflow_paths:
-    for name in config["synced_workflows"]:
-        workflow_paths.extend([
-            Path("workflows") / name,
-            Path(".github/workflows") / name,
-        ])
+    if line.strip()
+]
 
 checked = 0
 for workflow_path in workflow_paths:
@@ -106,7 +85,11 @@ for workflow_path in workflow_paths:
             mode="w", suffix=".js", encoding="utf-8"
         ) as handle:
             handle.write("async function __validate__() {\n")
-            handle.write(script)
+            # GitHub replaces expressions before JavaScript is parsed. Small
+            # scripts may still use that supported form, so substitute a
+            # neutral JS literal for syntax checking. Large scripts containing
+            # any expression have already failed closed above.
+            handle.write(GITHUB_EXPRESSION.sub("null", script))
             handle.write("\n}\n")
             handle.flush()
             subprocess.run(["node", "--check", handle.name], check=True)
