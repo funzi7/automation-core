@@ -222,6 +222,13 @@ jobs:
               const claudeBranch = sameRepo && !!(
                 pr.head && pr.head.ref && pr.head.ref.startsWith('claude/')
               );
+              const claudeGenerated = byClaudeBot || claudeBranch ||
+                labels.has(CLAUDE_GENERATED_LABEL);
+              // The trusted Claude workflow records provenance even when the
+              // model step fails, but grants automerge only on successful
+              // delivery. Owner-looking PAT authorship must not bypass that
+              // success-only signal.
+              if (claudeGenerated && !explicitlyLabeled) return false;
               return (
                 isOwnerSameRepo(pr) || byClaudeBot || explicitlyLabeled ||
                 isTrustedSync(pr) || claudeBranch

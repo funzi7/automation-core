@@ -68,6 +68,9 @@ function isAutoMergeCandidate(pr, repositoryFullName) {
   const byClaudeBot = sameRepo && isClaudeBot(pr?.user?.login);
   const explicitlyLabeled = labels.has(LABEL_AUTOMERGE);
   const claudeBranch = sameRepo && String(pr?.head?.ref || '').startsWith('claude/');
+  const claudeGenerated = byClaudeBot || claudeBranch ||
+    labels.has(CLAUDE_GENERATED_LABEL);
+  if (claudeGenerated && !explicitlyLabeled) return false;
   return (
     isOwnerSameRepo(pr, repositoryFullName) || byClaudeBot ||
     explicitlyLabeled || isTrustedSync(pr, repositoryFullName) || claudeBranch

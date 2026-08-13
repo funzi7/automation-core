@@ -316,6 +316,20 @@ test('protected-path PAT-owner Claude PR remains escalated', () => {
   );
 });
 
+test('failed Claude delivery is not a candidate without success-only automerge', () => {
+  const failedClaude = pr({
+    head: { ref: 'claude/partial-fix' },
+    labels: [{ name: 'claude-generated' }],
+  });
+  assert.equal(isAutoMergeCandidate(failedClaude, REPOSITORY), false);
+  assert.equal(decide({ pr: failedClaude }).reason, 'not_candidate');
+  const deliveredClaude = pr({
+    head: { ref: 'claude/delivered-fix' },
+    labels: [{ name: 'claude-generated' }, { name: 'automerge' }],
+  });
+  assert.equal(isAutoMergeCandidate(deliveredClaude, REPOSITORY), true);
+});
+
 test('durable Claude provenance blocks protected arbitrary owner branch', () => {
   const arbitrary = pr({ head: { ref: 'fix/claude-chose-this-name' } });
   assert.equal(decide({ pr: arbitrary, protectedPathHit: true }).eligible, true);
@@ -333,7 +347,7 @@ test('durable Claude provenance blocks protected arbitrary owner branch', () => 
   });
   assert.equal(
     decide({ pr: labeled, protectedPathHit: true }).reason,
-    'protected_path_untrusted',
+    'not_candidate',
   );
 });
 
@@ -381,7 +395,7 @@ test('sync title alone cannot grant trusted protected-path provenance', () => {
   });
   assert.equal(
     decide({ pr: claudeSpoof, protectedPathHit: true }).reason,
-    'protected_path_untrusted',
+    'not_candidate',
   );
 });
 
