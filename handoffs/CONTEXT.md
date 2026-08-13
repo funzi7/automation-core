@@ -47,9 +47,10 @@ normally auto-merged as `cb5cc5d87f335963e1f80db54de11fe706e3f6de`.
 Documentation PR #97 exposed a separate delayed-result race: a Codex task
 summary initiated on the old head arrived after a new push, and timestamp-only
 binding let it green the new head before that head's review completed. The
-current repair admits only review/result surfaces explicitly bound by
-`commit_id`, `original_commit_id`, or `Reviewed commit`; task summaries,
-unbound reactions, and timing-only signals are non-review evidence.
+current repair admits review/result surfaces explicitly bound by `commit_id`,
+`original_commit_id`, or `Reviewed commit`; task summaries and timing-only
+signals are non-review evidence. Reaction-only clean is accepted only while
+authenticated marker history proves the PR has had one observed head.
 
 Code architecture base: fix #27 implementation commit `93f6acb9d2e0396afad3e10854503024843c32de`.
 
@@ -172,7 +173,7 @@ The Codex API backup is dormant by default and requires OpenAI quota plus `CODEX
 
 ### `codex-gate.yml`
 
-The gate blocks until Codex has reviewed the current head and no active P1/P2 remains. Trusted Codex usage-limit/capacity notices are explicitly excluded. Review objects and inline comments bind through immutable `commit_id`/`original_commit_id`; Codex result comments must name the exact `Reviewed commit`. Task summaries, unbound reactions, and timing-only surfaces never become affirmative review signals, because asynchronous old-head work can complete after a new push. Authenticated head epochs still preserve A→B→A boundaries and trusted-sync grace, but no longer upgrade an unmarked result to current-head review. Trusted sync grace-green applies only to zero-signal trusted sync PRs after the server-observed grace window.
+The gate blocks until Codex has reviewed the current head and no active P1/P2 remains. Trusted Codex usage-limit/capacity notices are explicitly excluded. Review objects and inline comments bind through immutable `commit_id`/`original_commit_id`; Codex result comments must name the exact `Reviewed commit`. Task summaries and timing-only surfaces never become affirmative review signals, because asynchronous old-head work can complete after a new push. Reaction-only clean is accepted only when authenticated Gate marker history proves there has been no other observed head; after a transition, immutable commit-bearing evidence is mandatory. Authenticated head epochs also preserve A→B→A boundaries and trusted-sync grace. Trusted sync grace-green applies only to zero-signal trusted sync PRs after the server-observed grace window.
 
 ### `merge-bot.yml`
 

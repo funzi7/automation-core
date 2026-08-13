@@ -13,6 +13,7 @@ const {
   selectHeadEpoch,
   isCodexCapacityNotice,
   isCodexTaskResult,
+  reactionTargetsOnlyObservedHead,
 } = require('../tools/codex_gate_logic');
 
 const CODEX = 'chatgpt-codex-connector';
@@ -128,6 +129,22 @@ test('explicit reviewed-commit result binds only to its exact head', () => {
   assert.equal(isCodexTaskResult(result.body), false);
   assert.equal(signalTargetsHead(result, 'c'.repeat(40)), true);
   assert.equal(signalTargetsHead(result, 'd'.repeat(40)), false);
+});
+
+test('reaction-only clean signal is limited to a PR with one observed head', () => {
+  const reaction = { content: '+1', created_at: '2026-08-13T14:05:00Z' };
+  assert.equal(
+    reactionTargetsOnlyObservedHead(reaction, '2026-08-13T14:00:00Z', true),
+    true,
+  );
+  assert.equal(
+    reactionTargetsOnlyObservedHead(reaction, '2026-08-13T14:00:00Z', false),
+    false,
+  );
+  assert.equal(
+    reactionTargetsOnlyObservedHead(reaction, '2026-08-13T14:06:00Z', true),
+    false,
+  );
 });
 
 test('an explicit mismatched commit never falls back to a later timestamp', () => {

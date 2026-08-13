@@ -339,6 +339,29 @@ jobs:
               return markers.sort((a, b) =>
                 b.observedAt - a.observedAt || b.id - a.id);
             }
+            async function onlyObservedHead(prNumber, headSha, comments) {
+              const exactHead = String(headSha || '').toLowerCase();
+              const rawHeads = (comments || [])
+                .filter((comment) => (comment.user?.login || '') === 'github-actions[bot]')
+                .map((comment) => String(comment.body || '').match(HEAD_EPOCH_MARKER_PATTERN))
+                .filter((match) => match && Number(match[3]) === Number(prNumber))
+                .map((match) => String(match[4]).toLowerCase());
+              if (!rawHeads.length || rawHeads.some((head) => head !== exactHead)) return false;
+              const runs = await allPrWorkflowRuns();
+              if ((runs || []).some((run) =>
+                (run.pull_requests || []).some((pull) => Number(pull.number) === Number(prNumber)) &&
+                String(run.head_sha || '').toLowerCase() !== exactHead
+              )) return false;
+              const verified = await trustedHeadMarkers(comments, prNumber);
+              return verified.some((marker) => marker.head === exactHead);
+            }
+            function reactionTargetsOnlyObservedHead(reaction, headObservedAt, isOnlyHead) {
+              if (!isOnlyHead || reaction?.content !== '+1') return false;
+              const reactionAt = new Date(reaction?.created_at || 0).getTime();
+              const observedAt = new Date(headObservedAt || 0).getTime();
+              return Number.isFinite(reactionAt) && Number.isFinite(observedAt) &&
+                observedAt > 0 && reactionAt > observedAt;
+            }
 
             function currentHeadEpochFromTimeline(timeline, headSha) {
               return currentHeadEpochEvidenceFromTimeline(timeline, headSha).epoch;
@@ -454,7 +477,7 @@ jobs:
             }
 
             async function hasCurrentHeadCodexSignal(prNumber, headSha) {
-              const [reviews, comments, reviewComments] = await Promise.all([
+              const [reviews, comments, reviewComments, reactions] = await Promise.all([
                 github.paginate(github.rest.pulls.listReviews, {
                   owner, repo, pull_number: prNumber, per_page: 100,
                 }),
@@ -463,6 +486,9 @@ jobs:
                 }),
                 github.paginate(github.rest.pulls.listReviewComments, {
                   owner, repo, pull_number: prNumber, per_page: 100,
+                }),
+                github.paginate(github.rest.reactions.listForIssue, {
+                  owner, repo, issue_number: prNumber, per_page: 100,
                 }),
               ]);
               const headObservedAt = await observedHeadTransition(prNumber, headSha, comments);
@@ -473,7 +499,14 @@ jobs:
               return (
                 reviews.some((item) => trustedAfterHead(item, 'submitted_at')) ||
                 comments.some((item) => trustedAfterHead(item, 'created_at')) ||
-                reviewComments.some((item) => trustedAfterHead(item, 'created_at'))
+                reviewComments.some((item) => trustedAfterHead(item, 'created_at')) ||
+                (
+                  await onlyObservedHead(prNumber, headSha, comments) &&
+                  reactions.some((item) =>
+                    TRUSTED_CODEX_LOGINS.has(item.user?.login || '') &&
+                    reactionTargetsOnlyObservedHead(item, headObservedAt, true)
+                  )
+                )
               );
             }
 
