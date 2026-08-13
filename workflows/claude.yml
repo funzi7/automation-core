@@ -196,30 +196,40 @@ jobs:
             const repo = context.repo.repo;
             const issueNum = Number(context.payload.issue?.number || 0);
             if (!issueNum) throw new Error('Issue number missing before Claude retry');
-            const open = await github.paginate(github.rest.pulls.list, {
-              owner, repo, state: 'open', per_page: 100,
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number: issueNum, per_page: 100,
             });
-            const trustedIssuePr = open.filter((pr) => {
-              const sameRepo = pr.head?.repo?.full_name === `${owner}/${repo}`;
-              const claudeBranch = String(pr.head?.ref || '').startsWith('claude/');
-              const linkedIssue = new RegExp(`(?:^|\\n)Fixes #${issueNum}(?:\\s|$)`, 'i')
-                .test(String(pr.body || ''));
-              return sameRepo && claudeBranch && linkedIssue;
-            });
-            for (const pr of trustedIssuePr) {
+            const provenancePattern = /<!--\s*claude-pr-provenance:v1\s+issue=(\d+)\s+pr=(\d+)\s*-->/i;
+            const linkedPrNumbers = new Set();
+            for (const comment of comments) {
+              if ((comment.user?.login || '') !== 'github-actions[bot]') continue;
+              const marker = String(comment.body || '').match(provenancePattern);
+              if (marker && Number(marker[1]) === issueNum) {
+                linkedPrNumbers.add(Number(marker[2]));
+              }
+            }
+            for (const prNumber of linkedPrNumbers) {
+              const { data: pr } = await github.rest.pulls.get({
+                owner, repo, pull_number: prNumber,
+              });
+              const trustedClaudePr = pr.state === 'open' &&
+                pr.head?.repo?.full_name === `${owner}/${repo}` &&
+                String(pr.head?.ref || '').startsWith('claude/') &&
+                (pr.labels || []).some((entry) => entry.name === 'claude-generated');
+              if (!trustedClaudePr) continue;
               try {
                 await github.rest.issues.removeLabel({
-                  owner, repo, issue_number: pr.number, name: 'automerge',
+                  owner, repo, issue_number: prNumber, name: 'automerge',
                 });
-                core.info(`Revoked stale automerge from Claude PR #${pr.number} before retry.`);
+                core.info(`Revoked stale automerge from Claude PR #${prNumber} before retry.`);
               } catch (e) {
                 if (e.status !== 404) throw e;
               }
               const { data: live } = await github.rest.pulls.get({
-                owner, repo, pull_number: pr.number,
+                owner, repo, pull_number: prNumber,
               });
               if ((live.labels || []).some((entry) => entry.name === 'automerge')) {
-                throw new Error(`PR #${pr.number}: stale automerge remained before Claude retry`);
+                throw new Error(`PR #${prNumber}: stale automerge remained before Claude retry`);
               }
             }
 
@@ -662,6 +672,21 @@ jobs:
                 owner, repo, issue_number: prNumber,
                 labels: delivered ? ['claude-generated', 'automerge'] : ['claude-generated'],
               });
+              const issueNum = Number(context.payload.issue?.number || 0);
+              if (!issueNum) throw new Error('Issue number missing for Claude PR provenance');
+              const marker = `<!-- claude-pr-provenance:v1 issue=${issueNum} pr=${prNumber} -->`;
+              const issueComments = await github.paginate(github.rest.issues.listComments, {
+                owner, repo, issue_number: issueNum, per_page: 100,
+              });
+              const alreadyLinked = issueComments.some((comment) =>
+                (comment.user?.login || '') === 'github-actions[bot]' &&
+                String(comment.body || '').includes(marker));
+              if (!alreadyLinked) {
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: issueNum,
+                  body: `${marker}\nTrusted Claude workflow linkage to PR #${prNumber}.`,
+                });
+              }
               core.info(`Labeled PR #${prNumber} claude-generated${delivered ? ' + automerge' : ' (delivery not successful)'}.`);
             }
 

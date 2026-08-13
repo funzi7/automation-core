@@ -531,8 +531,16 @@ test('Claude PR provenance records on failure while automerge remains success-on
   assert.match(workflow, /github\.rest\.git\.listMatchingRefs/);
   assert.match(workflow, /core\.setOutput\('branch_heads_json', JSON\.stringify\(baselines\)\)/);
   assert.match(workflow, /name: Revoke stale Issue-mode automerge before retry/);
-  assert.match(workflow, /linkedIssue = new RegExp/);
-  assert.match(workflow, /sameRepo && claudeBranch && linkedIssue/);
+  assert.match(workflow, /const provenancePattern = \/<!--\\s\*claude-pr-provenance:v1/);
+  assert.match(workflow, /comment\.user\?\.login \|\| ''\) !== 'github-actions\[bot\]'/);
+  assert.match(workflow, /linkedPrNumbers\.add\(Number\(marker\[2\]\)\)/);
+  assert.match(workflow, /pr\.head\?\.repo\?\.full_name === `\$\{owner\}\/\$\{repo\}`/);
+  assert.match(workflow, /entry\.name === 'claude-generated'/);
+  const preModelRevocation = workflow.slice(
+    workflow.indexOf('Revoke stale Issue-mode automerge before retry'),
+    workflow.indexOf('Run Claude Code (Issue/new-PR path)'),
+  );
+  assert.doesNotMatch(preModelRevocation, /Fixes #/);
   assert.match(workflow, /stale automerge remained before Claude retry/);
   assert.ok(
     workflow.indexOf('Revoke stale Issue-mode automerge before retry') <
@@ -555,6 +563,9 @@ test('Claude PR provenance records on failure while automerge remains success-on
   assert.match(provenanceStep, /await github\.rest\.issues\.removeLabel\(\{/);
   assert.match(provenanceStep, /name: 'automerge'/);
   assert.match(provenanceStep, /stale automerge remained after undelivered retry/);
+  assert.match(provenanceStep, /const marker = `<!-- claude-pr-provenance:v1 issue=\$\{issueNum\} pr=\$\{prNumber\} -->`/);
+  assert.match(provenanceStep, /\(comment\.user\?\.login \|\| ''\) === 'github-actions\[bot\]'/);
+  assert.match(provenanceStep, /Trusted Claude workflow linkage to PR #\$\{prNumber\}/);
   assert.doesNotMatch(workflow, /No trigger comment .* treat as delivered/);
   assert.match(workflow, /labels: delivered \? \['claude-generated', 'automerge'\] : \['claude-generated'\]/);
   assert.match(workflow, /github-token: \$\{\{ github\.token \}\}/);
