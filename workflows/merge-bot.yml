@@ -340,20 +340,25 @@ jobs:
                 b.observedAt - a.observedAt || b.id - a.id);
             }
             async function onlyObservedHead(prNumber, headSha, comments) {
-              const exactHead = String(headSha || '').toLowerCase();
-              const rawHeads = (comments || [])
-                .filter((comment) => (comment.user?.login || '') === 'github-actions[bot]')
-                .map((comment) => String(comment.body || '').match(HEAD_EPOCH_MARKER_PATTERN))
-                .filter((match) => match && Number(match[3]) === Number(prNumber))
-                .map((match) => String(match[4]).toLowerCase());
-              if (!rawHeads.length || rawHeads.some((head) => head !== exactHead)) return false;
-              const runs = await allPrWorkflowRuns();
-              if ((runs || []).some((run) =>
-                (run.pull_requests || []).some((pull) => Number(pull.number) === Number(prNumber)) &&
-                String(run.head_sha || '').toLowerCase() !== exactHead
-              )) return false;
-              const verified = await trustedHeadMarkers(comments, prNumber);
-              return verified.some((marker) => marker.head === exactHead);
+              try {
+                const exactHead = String(headSha || '').toLowerCase();
+                const rawHeads = (comments || [])
+                  .filter((comment) => (comment.user?.login || '') === 'github-actions[bot]')
+                  .map((comment) => String(comment.body || '').match(HEAD_EPOCH_MARKER_PATTERN))
+                  .filter((match) => match && Number(match[3]) === Number(prNumber))
+                  .map((match) => String(match[4]).toLowerCase());
+                if (!rawHeads.length || rawHeads.some((head) => head !== exactHead)) return false;
+                const runs = await allPrWorkflowRuns();
+                if ((runs || []).some((run) =>
+                  (run.pull_requests || []).some((pull) => Number(pull.number) === Number(prNumber)) &&
+                  String(run.head_sha || '').toLowerCase() !== exactHead
+                )) return false;
+                const verified = await trustedHeadMarkers(comments, prNumber);
+                return verified.some((marker) => marker.head === exactHead);
+              } catch (e) {
+                core.warning(`PR #${prNumber}: reaction head-history lookup failed; reaction stays non-binding: ${e.message}`);
+                return false;
+              }
             }
             function reactionTargetsOnlyObservedHead(reaction, headObservedAt, isOnlyHead) {
               if (!isOnlyHead || reaction?.content !== '+1') return false;
@@ -496,11 +501,16 @@ jobs:
                 TRUSTED_CODEX_LOGINS.has(item.user?.login || '') &&
                 !isCodexCapacityNotice(item.body) &&
                 signalTargetsHead(item, headSha, headObservedAt, dateField);
+              const hasTrustedCleanReaction = reactions.some((item) =>
+                TRUSTED_CODEX_LOGINS.has(item.user?.login || '') &&
+                item.content === '+1'
+              );
               return (
                 reviews.some((item) => trustedAfterHead(item, 'submitted_at')) ||
                 comments.some((item) => trustedAfterHead(item, 'created_at')) ||
                 reviewComments.some((item) => trustedAfterHead(item, 'created_at')) ||
                 (
+                  hasTrustedCleanReaction &&
                   await onlyObservedHead(prNumber, headSha, comments) &&
                   reactions.some((item) =>
                     TRUSTED_CODEX_LOGINS.has(item.user?.login || '') &&

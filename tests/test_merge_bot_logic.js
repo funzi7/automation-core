@@ -566,6 +566,7 @@ test('delayed tasks and changed-head reactions cannot satisfy exact-head review'
     assert.match(workflow, /String\(run\.head_sha \|\| ''\)\.toLowerCase\(\) !== exactHead/, name);
     assert.match(workflow, /await trustedHeadMarkers\(comments, prNumber\)/, name);
     assert.match(workflow, /function reactionTargetsOnlyObservedHead\(/, name);
+    assert.match(workflow, /reaction head-history lookup failed; reaction stays non-binding/, name);
   }
   const gate = fs.readFileSync(
     path.join(__dirname, '..', 'workflows', 'codex-gate.yml'),
@@ -579,9 +580,12 @@ test('delayed tasks and changed-head reactions cannot satisfy exact-head review'
     path.join(__dirname, '..', 'workflows', 'merge-bot.yml'),
     'utf8',
   );
-  assert.match(gate, /const codexReactionOnHead = codexReactions\.some/);
+  assert.match(gate, /let codexReactionOnHead = false/);
+  assert.match(gate, /if \(hasTrustedCleanReaction\) \{/);
   assert.match(watchdog, /await onlyObservedHead\(prNumber, headSha, comments\)/);
+  assert.match(watchdog, /hasTrustedCleanReaction &&\s*await onlyObservedHead/);
   assert.match(merge, /await onlyObservedHead\(prNumber, headSha, comments\)/);
+  assert.match(merge, /hasTrustedCleanReaction &&\s*await onlyObservedHead/);
 });
 
 test('only synced automation infrastructure is in the central allow-list', () => {
