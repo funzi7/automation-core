@@ -347,7 +347,7 @@ test('durable Claude provenance blocks protected arbitrary owner branch', () => 
   });
   assert.equal(
     decide({ pr: labeled, protectedPathHit: true }).reason,
-    'protected_path_untrusted',
+    'not_candidate',
   );
 });
 
@@ -395,7 +395,7 @@ test('sync title alone cannot grant trusted protected-path provenance', () => {
   });
   assert.equal(
     decide({ pr: claudeSpoof, protectedPathHit: true }).reason,
-    'protected_path_untrusted',
+    'not_candidate',
   );
 });
 
