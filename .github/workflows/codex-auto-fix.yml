@@ -233,15 +233,54 @@ jobs:
               // Marker comments from a manually re-run old attempt are new,
               // but the immutable run they authenticate is still old. Order
               // the boundary by verified run creation, never comment time.
-              verifiedRuns.sort((a, b) =>
-                b.observedAt - a.observedAt || b.id - a.id);
-              if (!verifiedRuns.length || verifiedRuns[0].head !== exactHead) return null;
-              const currentEpoch = [];
-              for (const run of verifiedRuns) {
-                if (run.head !== exactHead) break;
-                currentEpoch.push(run.observedAt);
+              const epochEvidence = (timeline) => {
+                const ordered = timeline
+                  .filter((run) => /^[a-f0-9]{40}$/.test(run.head) &&
+                    Number.isFinite(run.observedAt) && run.observedAt > 0)
+                  .sort((a, b) =>
+                    b.observedAt - a.observedAt || (b.id || 0) - (a.id || 0));
+                if (!ordered.length || ordered[0].head !== exactHead) {
+                  return { epoch: null, hasBoundary: false };
+                }
+                const currentEpoch = [];
+                for (const run of ordered) {
+                  if (run.head !== exactHead) {
+                    return {
+                      epoch: currentEpoch.length ? new Date(Math.min(...currentEpoch)) : null,
+                      hasBoundary: true,
+                    };
+                  }
+                  currentEpoch.push(run.observedAt);
+                }
+                return {
+                  epoch: currentEpoch.length ? new Date(Math.min(...currentEpoch)) : null,
+                  hasBoundary: false,
+                };
+              };
+              const markerEvidence = epochEvidence(verifiedRuns);
+
+              // A pre-marker PR or a failed marker write still has immutable
+              // pull_request workflow runs. Match Gate's conservative fallback:
+              // run history supplies the epoch, and advances marker evidence
+              // only when it proves an intervening different-head boundary.
+              const prRuns = await github.paginate(
+                github.rest.actions.listWorkflowRunsForRepo,
+                { owner, repo, event: 'pull_request', per_page: 100 },
+              );
+              const runEvidence = epochEvidence((prRuns || [])
+                .filter((run) => (run.pull_requests || [])
+                  .some((pull) => Number(pull.number) === Number(prNumber)))
+                .map((run) => ({
+                  head: String(run.head_sha || '').toLowerCase(),
+                  observedAt: new Date(run.created_at || 0).getTime(),
+                  id: Number(run.id || 0),
+                })));
+              if (markerEvidence.epoch && runEvidence.epoch && runEvidence.hasBoundary) {
+                return new Date(Math.max(
+                  markerEvidence.epoch.getTime(), runEvidence.epoch.getTime(),
+                ));
               }
-              return currentEpoch.length ? new Date(Math.min(...currentEpoch)) : null;
+              return markerEvidence.epoch || runEvidence.epoch;
             }
 
             // Pull EVERY feedback channel, fully paginated. Codex inline notes
