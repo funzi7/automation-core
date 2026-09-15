@@ -186,7 +186,7 @@ Trust, all fail-closed:
 - `codex-p1-acknowledged`, owner override and reaction acknowledgement keep
   their own semantics and are never used to represent a fallback.
 
-Acceptance coverage lives in `tests/test_review_evidence.js` (39 tests,
+Acceptance coverage lives in `tests/test_review_evidence.js` (43 tests,
 numbered `1`..`15` to match the mandated matrix one-for-one): the
 full mandatory matrix, the paywall-bot PR #103 regression built on that PR's
 real timestamps, the shipped inline block from all three consumers executed

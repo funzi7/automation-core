@@ -902,9 +902,6 @@ jobs:
                   accepted: true, blocking: false, severity: null,
                   reason: 'structured_fallback_clean',
                   episodeReason: candidateEpisode.reason,
-                  // When this evidence was recorded. Consumers use it to avoid
-                  // re-dispatching work that already ran after the attestation.
-                  attestedAt: candidate.commentAt,
                 };
               }
               return best;

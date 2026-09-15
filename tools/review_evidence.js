@@ -427,8 +427,7 @@ function decideReviewEvidence({
     authority,
     fallbackReason,
     quotaEpisode: episode,
-    // When the accepted evidence was recorded; consumers use it to avoid
-    // repeating work that already ran after the attestation.
+    // Echoed back for diagnostics only; the shipped consumers do not read it.
     attestedAt: fallbackAccepted ? attestedAt : null,
     provenance: reviewEvidenceProvenance(authority),
   };

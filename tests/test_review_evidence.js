@@ -625,6 +625,21 @@ test('14e: a quota notice that also carries a finding cannot open an episode', a
   });
   assert.equal(inputs.quotaNotices.length, 0,
     'a notice carrying P1/P2 is a finding, not proof of unavailability');
+  // It must land in realActivity, which is what makes it CLOSE an episode —
+  // otherwise it would vanish from both lists and count for nothing.
+  assert.equal(inputs.realActivity.length, 1,
+    'a severity-carrying notice still counts as Codex activity');
+  const episode = api.evaluateQuotaEpisode(
+    [{ created_at: '2026-09-09T09:00:00Z' }],
+    {
+      headObservedAt: new Date('2026-09-09T08:00:00Z'),
+      realActivity: inputs.realActivity,
+      attestedAt: new Date('2026-09-09T11:00:00Z').getTime(),
+    },
+  );
+  assert.equal(episode.active, false);
+  assert.equal(episode.reason, 'quota_episode_closed',
+    'a later severity-carrying message means Codex is answering again');
 });
 
 test('14b: provenance never attributes a Claude review to Codex', () => {
@@ -1030,9 +1045,9 @@ test('inline: free-form prose parses to no attestation in the shipped block', as
 // Finding: the mandated precedence was asserted only against the mirror.
 // Prove it against the SHIPPED gate path instead.
 // ---------------------------------------------------------------------------
-function inlineFunctionSource(name, fnName) {
+function inlineFunctionSource(name, fnName, prefix = 'function') {
   const body = workflow(name);
-  const head = `            function ${fnName}(`;
+  const head = `            ${prefix} ${fnName}(`;
   const start = body.indexOf(head);
   assert.ok(start >= 0, `${name} must define ${fnName} inline`);
   const end = body.indexOf('\n            }\n', start);
@@ -1162,8 +1177,15 @@ test('13: the watchdog stops chasing Codex once a fallback goes green', () => {
   const body = workflow('claude-fallback-watchdog.yml');
   // An accepted fallback is a review signal, so the gate is dispatched while
   // the verdict is still pending...
-  assert.match(body, /const fallbackDispatchNeeded = fallbackSatisfiesReview && !verdictGreen;/);
+  assert.match(body, /const fallbackDispatchNeeded = fallbackSatisfiesReview &&\s*!verdictGreen &&/);
   assert.match(body, /const freshSignal = codexSignalOnHead \|\| fallbackDispatchNeeded;/);
+  // ...bounded by the verdict's AGE, so one transient pending verdict cannot
+  // suppress the head forever and a persistent disagreement cannot re-dispatch
+  // the gate every tick.
+  assert.match(body, /const FALLBACK_REDISPATCH_MIN_AGE_MS = 10 \* 60 \* 1000;/);
+  assert.match(body, /verdictAgeMs >= FALLBACK_REDISPATCH_MIN_AGE_MS/);
+  assert.doesNotMatch(body, /verdictAt < Number\(fallbackEvidence\.attestedAt/,
+    'ordering-based suppression must not come back');
 
   // ...and the no-spam property is structural: once the verdict is green,
   // isCandidate is already false, so the sweep stops on its own. Pin that, or
@@ -1189,6 +1211,89 @@ test('13: the watchdog stops chasing Codex once a fallback goes green', () => {
     workflow('codex-gate.yml').includes(`'${pending[1]}'`),
     `codex-gate.yml must still publish the exact title ${pending[1]} the watchdog matches`,
   );
+});
+
+// P2-B: the two new outdated-thread predicates are security-relevant and sit
+// one `!` away from their sibling hasActiveTrustedFinding. Execute them.
+function loadOutdatedHelper(name, pages) {
+  const source = inlineFunctionSource(name, 'hasOutdatedUnresolvedTrustedFinding', 'async function')
+    .split('\n')
+    .map((line) => line.slice(12))
+    .join('\n');
+  let call = 0;
+  const github = {
+    graphql: async () => {
+      const page = pages[call] || { nodes: [], hasNextPage: false };
+      call += 1;
+      return {
+        repository: {
+          pullRequest: {
+            reviewThreads: {
+              pageInfo: { hasNextPage: !!page.hasNextPage, endCursor: 'c' },
+              nodes: page.nodes,
+            },
+          },
+        },
+      };
+    },
+  };
+  const fn = new Function(
+    'github', 'owner', 'repo', 'TRUSTED_CODEX_LOGINS', 'isCodex', 'hasSeverity',
+    `${source}\nreturn hasOutdatedUnresolvedTrustedFinding;`,
+  )(
+    github, 'funzi7', 'example',
+    new Set([CODEX, CODEX_REST]),
+    (user) => [CODEX, CODEX_REST].includes(String(user?.login || '')),
+    (body) => /\*\*\s*P[12]\s*\*\*/.test(String(body || '')),
+  );
+  return { fn, calls: () => call };
+}
+
+function thread({ resolved, outdated, author = CODEX, body = '**P1** unsafe' }) {
+  return {
+    isResolved: resolved,
+    isOutdated: outdated,
+    comments: { nodes: [{ body, author: { login: author } }] },
+  };
+}
+
+test('the outdated-thread predicate selects exactly unresolved-and-outdated', async () => {
+  for (const name of ['merge-bot.yml', 'claude-fallback-watchdog.yml']) {
+    const cases = [
+      ['unresolved + outdated', { resolved: false, outdated: true }, true],
+      ['resolved + outdated', { resolved: true, outdated: true }, false],
+      ['unresolved + current', { resolved: false, outdated: false }, false],
+      ['resolved + current', { resolved: true, outdated: false }, false],
+    ];
+    for (const [label, shape, expected] of cases) {
+      const { fn } = loadOutdatedHelper(name, [{ nodes: [thread(shape)] }]);
+      assert.equal(await fn(7), expected, `${name}: ${label}`);
+    }
+
+    // An untrusted author never contributes a finding.
+    const untrusted = loadOutdatedHelper(name, [{
+      nodes: [thread({ resolved: false, outdated: true, author: 'funzi7' })],
+    }]);
+    assert.equal(await untrusted.fn(7), false, `${name}: untrusted author is not a Codex finding`);
+
+    // A thread with no severity marker is not a finding.
+    const noSeverity = loadOutdatedHelper(name, [{
+      nodes: [thread({ resolved: false, outdated: true, body: 'nit: rename this' })],
+    }]);
+    assert.equal(await noSeverity.fn(7), false, `${name}: a nit is not P1/P2`);
+
+    // The cursor loop must reach a finding on a later page.
+    const paged = loadOutdatedHelper(name, [
+      { nodes: [thread({ resolved: true, outdated: true })], hasNextPage: true },
+      { nodes: [thread({ resolved: false, outdated: true })] },
+    ]);
+    assert.equal(await paged.fn(7), true, `${name}: must paginate to a later page`);
+    assert.equal(paged.calls(), 2, `${name}: must actually request the second page`);
+
+    // No threads at all is not a finding.
+    const empty = loadOutdatedHelper(name, [{ nodes: [] }]);
+    assert.equal(await empty.fn(7), false, `${name}: no threads means no finding`);
+  }
 });
 
 test('the shipped wiring that consumes the evidence is pinned', () => {
@@ -1228,6 +1333,200 @@ test('the shipped wiring that consumes the evidence is pinned', () => {
   }
 });
 
+function producerScript() {
+  const body = workflow('claude-fallback-review.yml');
+  const marker = body.indexOf('          script: |\n');
+  assert.ok(marker >= 0, 'producer must have a github-script body');
+  return body
+    .slice(marker + '          script: |\n'.length)
+    .split('\n')
+    .map((line) => line.slice(12))
+    .join('\n');
+}
+
+async function attemptAttestation(overrides = {}) {
+  const {
+    enabled = 'true',
+    ref = 'refs/heads/main',
+    defaultBranch = 'main',
+    prState = 'open',
+    liveHead = HEAD,
+    reviewedHead = HEAD,
+    comments = [quotaNotice({ at: '2026-09-09T09:50:28Z' })],
+    reviews = [],
+    reviewComments = [],
+    threads = [],
+    validation = 'passed/suite-661-green',
+    p1 = '0',
+    p2 = '0',
+    found = '6',
+    fixed = '6',
+  } = overrides;
+
+  const posted = [];
+  let failure = null;
+  const core = {
+    setFailed: (m) => { failure = m; },
+    info: () => {},
+    warning: () => {},
+    summary: { addHeading: () => core.summary, addList: () => core.summary, write: () => {} },
+  };
+  const github = {
+    rest: {
+      pulls: { get: async () => ({ data: { state: prState, head: { sha: liveHead } } }) },
+      issues: { createComment: async (args) => { posted.push(args); } },
+    },
+    paginate: async (fn) => fn(),
+    graphql: async () => ({
+      repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage: false }, nodes: threads } } },
+    }),
+  };
+  // github.paginate is called with the listing function; return the fixtures.
+  github.rest.pulls.listReviews = () => reviews;
+  github.rest.issues.listComments = () => comments;
+  github.rest.pulls.listReviewComments = () => reviewComments;
+
+  const fn = new Function(
+    'github', 'context', 'core', 'process',
+    `return (async () => {\n${producerScript()}\n})();`,
+  );
+  await fn(
+    github,
+    { repo: { owner: 'funzi7', repo: 'automation-core' }, ref },
+    core,
+    {
+      env: {
+        PR_NUMBER: '103',
+        REVIEWED_HEAD: reviewedHead,
+        FINDINGS_FOUND: found,
+        FINDINGS_FIXED: fixed,
+        UNRESOLVED_P1: p1,
+        UNRESOLVED_P2: p2,
+        VALIDATION: validation,
+        RUN_ID: '4242',
+        RUN_ATTEMPT: '1',
+        CLAUDE_FALLBACK_REVIEW_ENABLED: enabled,
+        DEFAULT_BRANCH: defaultBranch,
+      },
+    },
+  );
+  return { posted, failure };
+}
+
+test('producer: attests only when every canonical precondition holds', async () => {
+  const ok = await attemptAttestation();
+  assert.equal(ok.failure, null, `unexpected refusal: ${ok.failure}`);
+  assert.equal(ok.posted.length, 1, 'exactly one attestation comment');
+  const body = ok.posted[0].body;
+  assert.match(body, /claude-fallback-review:v1/);
+  assert.match(body, new RegExp(`reviewed_head=${HEAD}`));
+  assert.match(body, /provider=claude_code_fallback/);
+  assert.match(body, /verdict=clean/);
+  assert.match(body, /unresolved_p1=0 unresolved_p2=0/);
+  assert.match(body, /reason=codex_quota_unavailable/);
+  assert.match(body, /not a Codex review/i, 'the comment must not read as a Codex review');
+  // The parsed marker must satisfy the consumers' own validation.
+  const parsed = parseFallbackAttestations(body)[0];
+  assert.equal(
+    evaluateFallbackAttestation(parsed, HEAD).accepted, true,
+    'what the producer mints must be what consumers accept',
+  );
+});
+
+test('producer: refuses every unsafe attestation', async () => {
+  const cases = {
+    'policy disabled': { enabled: 'false' },
+    'dispatched from a non-default ref': { ref: 'refs/heads/claude/some-pr' },
+    'unknown default branch': { defaultBranch: '' },
+    'reviewed head is not the live head': { reviewedHead: PREVIOUS_HEAD },
+    'malformed reviewed head': { reviewedHead: 'not-a-sha' },
+    'closed PR': { prState: 'closed' },
+    'no trusted quota notice': { comments: [] },
+    'untrusted quota claim': { comments: [quotaNotice({ login: 'funzi7' })] },
+    'unresolved P1 declared': { p1: '1' },
+    'unresolved P2 declared': { p2: '3' },
+    'more fixed than found': { found: '2', fixed: '5' },
+    'non-passed validation': { validation: 'failed/suite-red' },
+    'unstructured validation': { validation: 'suite-661-green' },
+    'non-numeric counts': { found: 'many' },
+  };
+  for (const [label, override] of Object.entries(cases)) {
+    const result = await attemptAttestation(override);
+    assert.ok(result.failure, `producer must refuse: ${label}`);
+    assert.equal(result.posted.length, 0, `producer must post nothing: ${label}`);
+  }
+});
+
+test('producer: refuses when Codex is available or still has active findings', async () => {
+  // A genuine Codex result on this exact head.
+  const codexOnHead = await attemptAttestation({
+    comments: [
+      quotaNotice({ at: '2026-09-09T09:50:28Z' }),
+      {
+        user: { login: CODEX_REST },
+        created_at: '2026-09-09T10:00:00Z',
+        body: `**Reviewed commit:** \`${HEAD}\`\n\nNo findings.`,
+      },
+    ],
+  });
+  assert.ok(codexOnHead.failure, 'must defer to a genuine Codex result on this head');
+  assert.equal(codexOnHead.posted.length, 0);
+
+  // An active unresolved trusted Codex thread.
+  const activeFinding = await attemptAttestation({
+    threads: [{
+      isResolved: false,
+      isOutdated: false,
+      path: 'core/x.py',
+      line: 7,
+      comments: { nodes: [{ body: '**P1** unsafe', author: { login: CODEX } }] },
+    }],
+  });
+  assert.ok(activeFinding.failure, 'must refuse while a trusted Codex P1 is active');
+  assert.equal(activeFinding.posted.length, 0);
+
+  // Outdated is NOT resolved. Pushing a cosmetic change over an unaddressed
+  // P1 strands it in an outdated thread; a fallback must not clear that.
+  const outdatedFinding = await attemptAttestation({
+    threads: [{
+      isResolved: false,
+      isOutdated: true,
+      path: 'core/x.py',
+      line: 7,
+      comments: { nodes: [{ body: '**P1** unsafe', author: { login: CODEX } }] },
+    }],
+  });
+  assert.ok(outdatedFinding.failure,
+    'must refuse while a trusted Codex P1 is unresolved, even when outdated');
+  assert.match(outdatedFinding.failure, /outdated/i);
+  assert.equal(outdatedFinding.posted.length, 0);
+
+  // A resolved thread does not block — that is the PR #103 shape.
+  const resolved = await attemptAttestation({
+    threads: [{
+      isResolved: true,
+      isOutdated: true,
+      path: 'core/x.py',
+      line: 7,
+      comments: { nodes: [{ body: '**P2** fixed', author: { login: CODEX } }] },
+    }],
+  });
+  assert.equal(resolved.failure, null, `resolved threads must not block: ${resolved.failure}`);
+  assert.equal(resolved.posted.length, 1);
+
+  // A thread too long to read in one page cannot be proven clean.
+  const truncated = await attemptAttestation({
+    threads: [{
+      isResolved: true,
+      isOutdated: false,
+      path: 'core/x.py',
+      line: 7,
+      comments: { nodes: Array.from({ length: 100 }, () => ({ body: 'note', author: { login: CODEX } })) },
+    }],
+  });
+  assert.ok(truncated.failure, 'an unreadable thread must fail closed');
+  assert.equal(truncated.posted.length, 0);
+});
 test('the canonical producing workflow validates before it attests', () => {
   const producer = workflow('claude-fallback-review.yml');
   assert.match(producer, /workflow_dispatch/);

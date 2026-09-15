@@ -1083,9 +1083,6 @@ jobs:
                   accepted: true, blocking: false, severity: null,
                   reason: 'structured_fallback_clean',
                   episodeReason: candidateEpisode.reason,
-                  // When this evidence was recorded. Consumers use it to avoid
-                  // re-dispatching work that already ran after the attestation.
-                  attestedAt: candidate.commentAt,
                 };
               }
               return best;
@@ -1619,7 +1616,19 @@ jobs:
                   // A new head invalidates the attestation, and a materially new
                   // Codex availability state closes the quota episode, so both
                   // re-open evaluation through the branches below.
-                  const fallbackDispatchNeeded = fallbackSatisfiesReview && !verdictGreen;
+                  // Bounded by AGE, not by ordering: ordering could suppress a
+                  // head forever after one transient pending verdict, while an
+                  // unbounded retry would re-dispatch the gate every tick if the
+                  // gate and the watchdog ever disagreed persistently. Waiting
+                  // for a verdict to be a few minutes old costs one cycle and
+                  // caps the damage of any such disagreement.
+                  const FALLBACK_REDISPATCH_MIN_AGE_MS = 10 * 60 * 1000;
+                  const verdictAgeMs = newestVerdict
+                    ? Date.now() - recency(newestVerdict)
+                    : Infinity;
+                  const fallbackDispatchNeeded = fallbackSatisfiesReview &&
+                    !verdictGreen &&
+                    (!Number.isFinite(verdictAgeMs) || verdictAgeMs >= FALLBACK_REDISPATCH_MIN_AGE_MS);
                   const freshSignal = codexSignalOnHead || fallbackDispatchNeeded;
 
                   // Dispatch a pending/missing verdict for a fresh review signal,

@@ -32,7 +32,7 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
     episode; no authenticated head epoch means no episode.
   - Provenance is truthful; `codex-p1-acknowledged`, owner override and
     reaction acknowledgement are untouched and are never used for fallback.
-- Validation: 123 deterministic tests pass (39 new in
+- Validation: 127 deterministic tests pass (43 new in
   `tests/test_review_evidence.js`) — the full mandatory acceptance matrix, the
   paywall-bot PR #103 regression built on that PR's real timestamps, the
   shipped inline block from all three consumers executed directly across the
@@ -82,7 +82,21 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
   green. Ten mutations that previously survived, including
   `currentHeadSignal: true` (which would have greened every PR) and disabling
   Merge Bot's three evidence guards, are now all killed by the suite; that was
-  re-verified locally on a scratch copy with the real tree untouched. The same
+  re-verified locally on a scratch copy with the real tree untouched.
+- A third pass confirmed by execution that both post-mint attack sequences are
+  blocked end to end and that the watchdog rewrite does not repeat dispatches,
+  and found two coverage regressions rather than live holes: the previous
+  commit had silently deleted the producer's test harness (every producer
+  precondition could be removed with the suite green, and the truncated-thread
+  guard has no consumer counterpart), and the two new outdated-thread helpers
+  shipped untested one `!` away from their sibling. Both are fixed: the harness
+  is restored and extended, and the helpers are now executed directly over
+  resolved/outdated/author/severity shapes and a two-page cursor. Ten further
+  mutations — including the copy-paste `!` slip and every producer precondition
+  — are now killed in clean isolation. The dead `attestedAt` field was dropped,
+  the severity-carrying-notice classification is asserted, and the watchdog's
+  pending-verdict dispatch is bounded by verdict age rather than ordering, so
+  neither permanent suppression nor per-tick re-dispatch is possible. The same
   pass also confirmed the Route A no-TTL decision is correct and withdrew that
   suggestion.
 - Real consumer scenario, read-only, no mutation: the shipped inline block was
