@@ -975,7 +975,15 @@ jobs:
               // Checked on every evaluation, not only when the attestation was
               // minted: a resolved thread can be re-opened, and a late Codex
               // finding can arrive already-outdated, both without a new commit.
-              if (settings.outdatedUnresolvedFinding) {
+              //
+              // Consumers may pass a function so the extra thread lookup only
+              // happens after the cheap preconditions above have passed — a
+              // repository with fallback disabled must not pay for it at all.
+              const outdatedUnresolved =
+                typeof settings.outdatedUnresolvedFinding === 'function'
+                  ? await settings.outdatedUnresolvedFinding()
+                  : settings.outdatedUnresolvedFinding;
+              if (outdatedUnresolved) {
                 return none('outdated_finding_needs_resolution');
               }
 
@@ -1582,7 +1590,8 @@ jobs:
                     quotaNotices: evidenceInputs.quotaNotices,
                     realActivity: evidenceInputs.realActivity,
                     defaultBranch: pr.base?.repo?.default_branch,
-                    outdatedUnresolvedFinding: await hasOutdatedUnresolvedTrustedFinding(prNumber),
+                    // Lazy: a repository with fallback disabled never pays for it.
+                    outdatedUnresolvedFinding: () => hasOutdatedUnresolvedTrustedFinding(prNumber),
                     codexSignalOnHead,
                     // fix #18 pattern: Actions reads run on GITHUB_TOKEN; this
                     // step's default client is AUTOMATION_PAT.

@@ -1212,14 +1212,20 @@ test('the shipped wiring that consumes the evidence is pinned', () => {
     'Merge Bot must skip without accepted exact-head review evidence');
   assert.match(mergeBot, /if \(finalEvidence\.blocking \|\| !finalEvidence\.accepted\) \{/,
     'Merge Bot must revalidate the final candidate through the same decision');
-  assert.match(mergeBot, /outdatedUnresolvedFinding,/,
+  assert.match(mergeBot, /outdatedUnresolvedFinding: \(\) => hasOutdatedUnresolvedTrustedFinding\(prNumber\)/,
     'Merge Bot must tell the decision about outdated unresolved findings');
   assert.match(mergeBot, /reviewEvidenceProvenance\(reviewEvidence\.authority\)/,
     'the merge log must record the real review authority');
 
   const watchdog = workflow('claude-fallback-watchdog.yml');
-  assert.match(watchdog, /outdatedUnresolvedFinding: await hasOutdatedUnresolvedTrustedFinding\(prNumber\)/,
+  assert.match(watchdog, /outdatedUnresolvedFinding: \(\) => hasOutdatedUnresolvedTrustedFinding\(prNumber\)/,
     'the watchdog must tell the decision about outdated unresolved findings');
+  // The lookup must stay lazy so a repository with fallback disabled never
+  // pays for an extra GraphQL round trip on the normal Codex path.
+  for (const [name, body] of [['merge-bot.yml', mergeBot], ['claude-fallback-watchdog.yml', watchdog]]) {
+    assert.doesNotMatch(body, /await hasOutdatedUnresolvedTrustedFinding\(/,
+      `${name} must resolve the outdated lookup lazily, not eagerly`);
+  }
 });
 
 test('the canonical producing workflow validates before it attests', () => {
