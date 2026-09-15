@@ -134,6 +134,72 @@ Unknown / not checked in this pass:
 
 ## 4. Workflow Summary
 
+### Canonical exact-head review evidence (contract)
+
+The old assumption `valid review == Codex review` is retired. The contract is:
+
+```
+valid exact-head review evidence ==
+  normal Codex evidence
+  OR approved Claude fallback evidence when Codex is provably unavailable
+```
+
+Codex Gate, Merge Bot and the Claude Fallback Watchdog carry the identical
+`CANONICAL EXACT-HEAD REVIEW EVIDENCE` block verbatim; a test asserts the three
+copies are byte-identical and that `tools/review_evidence.js` mirrors its reason
+codes, so the three deciders cannot drift.
+
+Structured attestation (one atomic marker, all fields inside it):
+
+```
+<!-- claude-fallback-review:v1 run=<id> attempt=<n> pr=<n>
+     provider=claude_code_fallback reviewed_head=<40-char SHA> verdict=clean
+     findings_found=<N> findings_fixed=<N> unresolved_p1=0 unresolved_p2=0
+     validation=passed/<reference> reason=codex_quota_unavailable -->
+```
+
+Trust, all fail-closed:
+
+- Only `claude-fallback-review.yml` mints it: dispatch-only, default-branch
+  only, policy-gated, no checkout, verdict derived not accepted.
+- Consumers require `github-actions[bot]` authorship AND re-authenticate the
+  run+attempt through the Actions API: the run must be that workflow, event
+  `workflow_dispatch`, `head_branch` the default branch, and the comment must
+  fall inside the run window. Any lookup failure ignores the attestation, and
+  the whole evidence call is wrapped so it can never reach the Gate's technical
+  fail-soft green.
+- Exact-head binding: `reviewed_head` must equal the live head. Any new commit
+  invalidates it; a previous-head attestation fails.
+- Trusted quota episode: the Codex connector identity must have posted its own
+  code-review usage-limit notice. Route A = the decline landed on this head
+  epoch. Route B = the decline predates this head epoch, Codex has posted
+  nothing since, and the attestation happened within 24 h of it. Any genuine
+  Codex activity newer than the newest notice closes the episode. No
+  authenticated head epoch means no episode at all.
+- Precedence: override/fail-soft, then active Codex findings, then a fallback
+  declaring unresolved P1/P2, then genuine current-head Codex evidence, then an
+  accepted fallback, else pending. A fallback can never bypass a real Codex
+  finding, and a returning Codex review on the current head is the authority.
+- Provenance is truthful: `Codex exact-head review accepted` or
+  `Claude Code fallback review accepted for exact head; Codex quota
+  unavailable`. Never "Codex reviewed" for a Claude review.
+- `codex-p1-acknowledged`, owner override and reaction acknowledgement keep
+  their own semantics and are never used to represent a fallback.
+
+Acceptance coverage lives in `tests/test_review_evidence.js` (43 tests,
+numbered `1`..`15` to match the mandated matrix one-for-one): the
+full mandatory matrix, the paywall-bot PR #103 regression built on that PR's
+real timestamps, the shipped inline block from all three consumers executed
+directly across the trust matrix, the producer executed against its refusal
+matrix, and proof that the Codex-only path is unchanged when the policy switch
+is off. Rationale: `docs/adr/0001-canonical-review-evidence.md`.
+
+### `claude-fallback-review.yml`
+
+Canonical attestation producer. See the contract above and README for the
+operator command. Fallback stays off until a repository sets
+`CLAUDE_FALLBACK_REVIEW_ENABLED` to `true`; Actions variables are not synced.
+
 ### `codex-auto-fix.yml`
 
 The bridge watches trusted Codex reviews/comments. It posts exactly one owner-authored `@claude fix` per current-head review wave when there is active P1 or P2. P3 does not trigger paid fixing. It inlines finding text because Claude's run context cannot reliably read inline review threads. Sync PRs are suppressed so downstream workflow copies are not patched locally.
@@ -253,6 +319,17 @@ These are preserved as incident records. They are not current operating instruct
 - HISTORICAL: manually applied YAML/script edits once broke workflow parsing. Current rule: validate YAML/actionlint/script syntax before workflow changes. This pass changed expression transport in four workflow definitions and validated every tracked workflow/script body.
 
 ## 7. Current Open TODO
+
+A0. Canonical Claude fallback review evidence (this pass):
+
+- implemented centrally in automation-core and covered deterministically;
+- physically pending: consumer repositories must receive the new workflow
+  through the normal sync, and each must set `CLAUDE_FALLBACK_REVIEW_ENABLED`
+  to `true` before any fallback evidence is honoured there;
+- no production attestation has been minted or honoured yet;
+- OptionsProfitTracker PR #19 still cannot pass: every trusted quota notice on
+  it predates its current head, so it needs either fresh current-head quota
+  evidence plus a new exact-head fallback review, or a normal Codex review.
 
 A. Recovery documentation and expression-safety work completed in this pass:
 

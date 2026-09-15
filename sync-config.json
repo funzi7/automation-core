@@ -6,7 +6,8 @@
     "ci-doctor.yml",
     "merge-bot.yml",
     "claude-fallback-watchdog.yml",
-    "codex-backup-fix.yml"
+    "codex-backup-fix.yml",
+    "claude-fallback-review.yml"
   ],
   "removed_workflows": []
 }

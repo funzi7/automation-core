@@ -4,6 +4,129 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
 
 ---
 
+## [2026-09-15 UTC] Canonical Claude fallback review evidence
+- PR: <https://github.com/funzi7/automation-core/pull/56>
+- Branch: `claude/canonical-fallback-review-evidence`
+- Status: opened — exact-head CI green, Gate red pending review evidence
+- What changed:
+  - The central contract is now `valid exact-head review evidence == normal
+    Codex evidence OR approved Claude fallback evidence when Codex is provably
+    unavailable`. Implemented in automation-core, not as a consumer patch.
+  - New `workflows/claude-fallback-review.yml` is the only sanctioned producer
+    of a structured `claude-fallback-review:v1` attestation: dispatch-only,
+    default-branch only, gated on `CLAUDE_FALLBACK_REVIEW_ENABLED`, no checkout,
+    verdict derived rather than accepted, and it refuses to attest unless the
+    SHA is the live head, a trusted Codex quota notice exists, Codex has no
+    result on that head, and no trusted Codex P1/P2 is still active.
+  - Codex Gate, Merge Bot and the watchdog now carry one verbatim-shared
+    `CANONICAL EXACT-HEAD REVIEW EVIDENCE` block; a test asserts the three
+    inline copies are byte-identical and that `tools/review_evidence.js`
+    mirrors its reason codes.
+  - Consumers re-authenticate every attestation against the producing run
+    (workflow path, `workflow_dispatch` event, default-branch `head_branch`,
+    attempt, comment-inside-run-window) and fail closed on any lookup error;
+    the evidence call cannot throw into the Gate's technical fail-soft green.
+  - Quota episodes are bound to real evidence: Route A (decline on this head
+    epoch) or Route B (decline predates it, Codex silent since, attested within
+    24 h). Genuine Codex activity newer than the newest notice closes the
+    episode; no authenticated head epoch means no episode.
+  - Provenance is truthful; `codex-p1-acknowledged`, owner override and
+    reaction acknowledgement are untouched and are never used for fallback.
+- Validation: 127 deterministic tests pass (43 new in
+  `tests/test_review_evidence.js`) — the full mandatory acceptance matrix, the
+  paywall-bot PR #103 regression built on that PR's real timestamps, the
+  shipped inline block from all three consumers executed directly across the
+  whole trust matrix, and the producer script executed against its refusal
+  matrix (it mints exactly what the consumers accept, and refuses malformed
+  inputs, a disabled policy, a non-default dispatch ref, a stale or malformed
+  head, a closed PR, missing or untrusted quota evidence, declared unresolved
+  P1/P2, a non-passed validation, a genuine Codex result on the head, an
+  unresolved Codex thread whether or not it is outdated, and a review thread
+  too long to read in one page). `bash scripts/validate.sh` green — every tracked YAML parses,
+  all synced source/`.github` mirrors byte-identical, all 59 `github-script`
+  bodies expression-safe and syntax-checked; `git diff --check` clean.
+  Real GitHub Actions validation: `actionlint` 1.7.7 reports zero findings
+  across every workflow, including the new producer.
+- Two defects were caught and fixed during self-review: the gate's reworded
+  pending check title would have broken the watchdog's exact `PENDING_TITLE`
+  match (title restored, and a test now pins the two together), and the pure
+  mirror did not short-circuit fallback evaluation on a current-head Codex
+  signal the way the inline block does, so a stale attestation could have
+  blocked a Codex-reviewed head in the mirror only.
+- The independent Opus review raised no P1 and six P2s, all fixed: an outdated
+  (not resolved) Codex P1/P2 could be cleared by a fallback — the producer now
+  refuses while any trusted Codex thread is unresolved, outdated or not; the
+  three consumers fed the byte-identical block three different evidence sets —
+  a shared `collectReviewEvidenceInputs` collector now builds them, and a test
+  drives all three shipped blocks over a fixture matrix; attestation runs that
+  were queued or had refused to attest still authenticated, and an edited
+  comment body still passed — the run must now be completed+successful, the
+  window is bounded at both ends, an unknown default branch fails closed, and
+  an edited attestation is rejected; the "Gate and Merge Bot agree" test called
+  one pure function twice and was vacuous — it now compares the three shipped
+  inline blocks; the mandated precedence and the PR #103 regression were proven
+  only against the mirror — both are now also proven against the shipped gate
+  path, with the gate's inline `decideCodexGate` pinned equivalent to the tested
+  module; and the mirror's signature and Route B timing semantics now match the
+  inline copy. Nits fixed too: a quota notice carrying a P1/P2 no longer opens
+  an episode, a review thread too long to read in one page fails closed, the
+  success summary no longer reports a Codex-sounding reason for a Claude
+  review, and Merge Bot paginates each PR once instead of three times.
+- A second independent Opus pass verified those fixes by mutation testing on a
+  scratch copy and found three more P2s, all fixed: producer-side enforcement of
+  the outdated-thread rule was NOT sufficient (a resolved thread can be
+  re-opened, and a late Codex finding can arrive already-outdated, both without
+  a new commit), so the rule is now enforced on every evaluation by Gate, Merge
+  Bot and the watchdog; the run-authentication hardening and the wiring that
+  consumes the decision were both untested — deleting either left the suite
+  green. Ten mutations that previously survived, including
+  `currentHeadSignal: true` (which would have greened every PR) and disabling
+  Merge Bot's three evidence guards, are now all killed by the suite; that was
+  re-verified locally on a scratch copy with the real tree untouched.
+- A third pass confirmed by execution that both post-mint attack sequences are
+  blocked end to end and that the watchdog rewrite does not repeat dispatches,
+  and found two coverage regressions rather than live holes: the previous
+  commit had silently deleted the producer's test harness (every producer
+  precondition could be removed with the suite green, and the truncated-thread
+  guard has no consumer counterpart), and the two new outdated-thread helpers
+  shipped untested one `!` away from their sibling. Both are fixed: the harness
+  is restored and extended, and the helpers are now executed directly over
+  resolved/outdated/author/severity shapes and a two-page cursor. Ten further
+  mutations — including the copy-paste `!` slip and every producer precondition
+  — are now killed in clean isolation. The dead `attestedAt` field was dropped,
+  the severity-carrying-notice classification is asserted, and the watchdog's
+  pending-verdict dispatch is bounded by verdict age rather than ordering, so
+  neither permanent suppression nor per-tick re-dispatch is possible. The same
+  pass also confirmed the Route A no-TTL decision is correct and withdrew that
+  suggestion.
+- Real consumer scenario, read-only, no mutation: the shipped inline block was
+  run against OptionsProfitTracker PR #19's actual comment history. It found
+  exactly the four genuine `chatgpt-codex-connector[bot]` usage-limit notices
+  (2026-09-07 ×2, 2026-09-09 ×2) and zero real Codex activity, and returned
+  `no_attestation` as it stands. Given a hypothetical valid exact-head
+  attestation it returns `stale_quota_evidence`, because every notice predates
+  the current head `074de86e…` (pushed 2026-09-14T19:45:26Z) and the Route B
+  window is 24 h. Adding a current-head notice flips it to
+  `structured_fallback_clean`. That is the contract behaving exactly as
+  specified on real data.
+- NOT validated in production: `pull_request_target` loads Codex Gate from the
+  base branch, so the gate run on this PR executed main's OLD code. The new
+  gate/merge-bot/watchdog paths take effect only after merge; no production
+  fallback attestation has been minted or honoured yet.
+- Review provider for this change: `review_provider = claude_code_fallback`,
+  `reason = codex_quota_unavailable` — an independent Opus reviewer. Codex
+  posted a genuine usage-limit notice on this PR at 2026-09-15T12:49:40Z, so
+  normal Codex review is unavailable. The new central mechanism is NOT claimed
+  as authoritative for its own PR: it did not exist before it, and
+  automation-core has not set `CLAUDE_FALLBACK_REVIEW_ENABLED`.
+- Needs from the owner: merge, then set `CLAUDE_FALLBACK_REVIEW_ENABLED=true` on
+  each repository that should honour fallback evidence (Actions variables are
+  not synced, so the Codex-only contract stays in force until it is set).
+- Next: normal sync delivers the new workflow to consumers, including
+  OptionsProfitTracker. OPT PR #19 still needs current-head quota evidence plus
+  a fresh exact-head fallback review, or a normal Codex review, before it can
+  pass — its existing notices all predate its current head.
+
 ## [2026-08-13 UTC] Reject delayed old-head task results
 - Production trigger: paywall-bot PR #97 head `29b7c16d29749ba35b371a6a17068b4ee6746e0c` was pushed at 13:39 UTC. A Codex task summary initiated on the prior head arrived at 13:40 and the timestamp fallback treated it as current-head review, allowing merge `0c4ae03fdbc7c7bf79b41c4fb31dd19db0c10e10` before the actual current-head Codex review at 13:41.
 - Correction: Gate, Merge Bot, Watchdog, bridge, and backup fixer reject task summaries and timing-only result binding. Review/result surfaces use immutable `commit_id`/`original_commit_id`, explicit `Reviewed commit`, or trusted `ai-loop` head markers where applicable. Reaction-only clean remains supported only when authenticated Gate marker history proves the PR has had exactly one observed head; after a transition, commit-bearing evidence is mandatory.

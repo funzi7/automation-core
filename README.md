@@ -10,6 +10,7 @@ Central source of truth for CI/CD automation across all of @funzi7's repositorie
 - `claude.yml` — **Claude Fixer**: Claude Code fixes a `claude-fix` Issue (or an `@claude` mention) on a branch and opens a PR
 - `ci-doctor.yml` — **CI Doctor**: detects failed runs on the default branch and opens `claude-fix` Issues
 - `merge-bot.yml` — **Merge Bot**: squash-merges fully-green PRs once codex-gate passes
+- `claude-fallback-review.yml` — **Claude Fallback Review Attestation**: the only sanctioned way to record a structured Claude Code fallback review when Codex code-review quota is exhausted
 
 `template/` — files a repo copies into its own root (not auto-synced):
 - `sync-automation-core.yml` — the per-repo sync workflow (installed by Bootstrap)
@@ -89,6 +90,61 @@ still happen within minutes — the crons are just the backstop.
 | `CROSS_REPO_PAT` | `bootstrap.yml` (onboarding / auto-enrollment), `minutes-guard.yml` | automation-core only. Cross-repo fine-grained PAT (Contents/PRs/Workflows write, Metadata read; all repos). If absent, auto-enrollment exits green with a notice (fail-soft). |
 | `AUTOMATION_PAT` | `ci-doctor.yml`, `merge-bot.yml`, and trusted post-Claude PR creation | **Required for the loop to chain.** It is never passed to Issue-mode Claude or its model-facing checkout. If absent, trusted writes exit green (fail-soft). Needs Contents/PRs/Issues write, Metadata read. |
 | `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` | optional | Escalation pings on `needs-owner` / protected-path blocks. Messages use `parse_mode: HTML` (Markdown underscores broke us before). Skipped silently if unset. |
+
+### Repository variables
+
+| Variable | Used by | Notes |
+|----------|---------|-------|
+| `CLAUDE_FALLBACK_REVIEW_ENABLED` | `codex-gate.yml`, `merge-bot.yml`, `claude-fallback-watchdog.yml`, `claude-fallback-review.yml` | Opt-in switch for Claude fallback review evidence. Unset or anything other than `true` means the repo keeps the Codex-only contract. Variables are **not** synced — set it per repo. |
+| `CODEX_BACKUP_ENABLED` | `claude-fallback-watchdog.yml` | Enables the OpenAI-quota-dependent Codex API backup fixer stage. |
+| `CODEX_CLOUD_ENABLED` | `claude-fallback-watchdog.yml` | Enables the `@codex fix` Codex Cloud fixer stage. |
+
+### Claude fallback review (Codex quota exhausted)
+
+Normally the gate requires genuine Codex review evidence bound to the exact
+head. When the ChatGPT Codex connector reports that its **code-review quota**
+is exhausted, that head can never receive a Codex result. The canonical
+contract is therefore:
+
+```
+valid exact-head review evidence ==
+  normal Codex evidence
+  OR approved Claude fallback evidence when Codex is provably unavailable
+```
+
+Operator steps, once `CLAUDE_FALLBACK_REVIEW_ENABLED` is `true` on the repo:
+
+1. Perform a **full** Claude Code review of the exact current head and fix
+   every finding. There must be no unresolved P1/P2 left, from Codex or Claude.
+2. Record it from the repository's default branch:
+
+   ```bash
+   gh workflow run claude-fallback-review.yml --repo <owner>/<repo> \
+     -f pr_number=<n> \
+     -f reviewed_head=<full 40-char SHA> \
+     -f findings_found=<N> -f findings_fixed=<N> \
+     -f unresolved_p1=0 -f unresolved_p2=0 \
+     -f validation=passed/<reference>
+   ```
+
+3. The workflow refuses to attest unless the SHA is the live head, a trusted
+   Codex quota notice exists, Codex has no result on that head, and no trusted
+   Codex P1/P2 is still active. It then posts one structured attestation.
+4. Codex Gate, Merge Bot and the watchdog independently re-authenticate that
+   attestation and publish truthful provenance —
+   `Claude Code fallback review accepted for exact head; Codex quota unavailable`.
+   The gate never reports "Codex reviewed" for a Claude review.
+
+Rules worth remembering:
+
+- **Any new commit invalidates the attestation.** Review the head that merges.
+- A free-form "Claude reviewed this" comment is never authority.
+- A real unresolved Codex P1/P2 still blocks, fallback or not; and if Codex
+  comes back on the current head, Codex becomes the authority again.
+- This is not an acknowledgement: it never replaces `codex-p1-acknowledged`,
+  an owner override, or a reaction.
+
+See `docs/adr/0001-canonical-review-evidence.md` for the full rationale.
 
 ### fail-soft behaviour
 

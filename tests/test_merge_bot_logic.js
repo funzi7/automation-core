@@ -433,7 +433,11 @@ test('workflow preserves exact-SHA squash merge and same-repo branch deletion', 
   assert.match(workflow, /Number\(root\[1\]\) !== prNumber/);
   assert.match(workflow, /!commitShas\.has\(head\[1\]\)/);
   assert.match(workflow, /marker\.head === currentHead/);
-  assert.match(workflow, /async function hasCurrentHeadCodexSignal\(prNumber, headSha\)/);
+  // The wrapper was replaced by a single fetch shared with the canonical
+  // review-evidence decision, so the PR is paginated once per evaluation.
+  assert.match(workflow, /async function fetchCodexSurfaces\(prNumber\)/);
+  assert.match(workflow, /async function codexSignalFromSurfaces\(prNumber, headSha, surfaces, headObservedAt\)/);
+  assert.doesNotMatch(workflow, /hasCurrentHeadCodexSignal/);
   assert.match(workflow, /async function observedHeadTransition\(prNumber, headSha, comments = \[\]\)/);
   assert.match(workflow, /codex-head-epoch:v3/);
   assert.match(workflow, /const head = markerHead/);
@@ -458,7 +462,11 @@ test('workflow preserves exact-SHA squash merge and same-repo branch deletion', 
   assert.match(workflow, /runEvidence\.hasBoundary/);
   assert.match(workflow, /function signalTargetsHead\(item, headSha, headObservedAt/);
   assert.doesNotMatch(workflow, /latestCommitDate/);
-  assert.match(workflow, /override absent and current-head Codex signal missing/);
+  // The final candidate is revalidated through the canonical review-evidence
+  // decision, so a commit or a returning Codex finding between the two checks
+  // still stops the merge.
+  assert.match(workflow, /exact-head review evidence missing after validation/);
+  assert.match(workflow, /const finalEvidence = await hasCurrentHeadReviewEvidence\(\s*prNumber, headSha, finalPr\.base\?\.repo\?\.default_branch,\s*\)/);
   assert.match(workflow, /needsEvent\.actor\?\.login === 'github-actions\[bot\]'/);
   assert.match(workflow, /autoEvent\.actor\?\.login === 'github-actions\[bot\]'/);
   assert.match(workflow, /GH_LABEL_TOKEN: \$\{\{ github\.token \}\}/);
@@ -601,6 +609,8 @@ test('only synced automation infrastructure is in the central allow-list', () =>
     'merge-bot.yml',
     'claude-fallback-watchdog.yml',
     'codex-backup-fix.yml',
+    // Canonical producer of structured Claude fallback review evidence.
+    'claude-fallback-review.yml',
   ]);
   assert.equal(config.synced_workflows.some((name) => /poll|backfill|health/.test(name)), false);
 });
