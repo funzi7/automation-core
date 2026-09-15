@@ -553,9 +553,13 @@ jobs:
                 quotaNotices: all.filter((item) =>
                   evidenceIsCapacityNotice(item?.body) && !evidenceHasSeverity(item?.body)),
                 // Everything else Codex actually produced. A reaction has no
-                // body and still counts: it proves Codex is answering.
+                // body and still counts: it proves Codex is answering. A notice
+                // that carries a P1/P2 counts here too — it is not proof of
+                // unavailability, so it must at least close the episode rather
+                // than vanish from both lists.
                 realActivity: all.filter((item) =>
-                  !evidenceIsCapacityNotice(item?.body) && !evidenceIsTaskResult(item?.body)),
+                  (!evidenceIsCapacityNotice(item?.body) || evidenceHasSeverity(item?.body)) &&
+                  !evidenceIsTaskResult(item?.body)),
               };
             }
 
@@ -783,6 +787,16 @@ jobs:
               // Requirement 7/12: genuine Codex evidence on this head is the
               // authority; the quota episode is over.
               if (settings.codexSignalOnHead) return none('codex_available_on_head');
+              // Requirement 5/7: an OUTDATED thread that nobody resolved still
+              // holds a live Codex P1/P2. On the normal path a clean Codex
+              // signal clears it because Codex itself re-examined the head; a
+              // fallback performs no such re-examination, so it must not.
+              // Checked on every evaluation, not only when the attestation was
+              // minted: a resolved thread can be re-opened, and a late Codex
+              // finding can arrive already-outdated, both without a new commit.
+              if (settings.outdatedUnresolvedFinding) {
+                return none('outdated_finding_needs_resolution');
+              }
 
               const comments = settings.comments || [];
               const quotaNotices = (settings.quotaNotices || []);
@@ -960,12 +974,46 @@ jobs:
               );
             }
 
-            async function hasCurrentHeadCodexSignal(prNumber, headSha) {
-              const surfaces = await fetchCodexSurfaces(prNumber);
-              const headObservedAt = await observedHeadTransition(
-                prNumber, headSha, surfaces.comments,
-              );
-              return codexSignalFromSurfaces(prNumber, headSha, surfaces, headObservedAt);
+
+            // An OUTDATED thread that nobody resolved still holds a live Codex
+            // P1/P2. It does not block the normal Codex path (Codex re-examined
+            // the head itself), but a Claude fallback performs no such
+            // re-examination and must never clear it.
+            async function hasOutdatedUnresolvedTrustedFinding(prNumber) {
+              let cursor = null;
+              do {
+                const data = await github.graphql(
+                  `query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+                    repository(owner: $owner, name: $repo) {
+                      pullRequest(number: $number) {
+                        reviewThreads(first: 100, after: $cursor) {
+                          pageInfo { hasNextPage endCursor }
+                          nodes {
+                            isResolved
+                            isOutdated
+                            comments(first: 100) {
+                              nodes { body author { login } }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }`,
+                  { owner, repo, number: prNumber, cursor },
+                );
+                const connection = data.repository.pullRequest.reviewThreads;
+                for (const thread of connection.nodes || []) {
+                  if (thread.isResolved || !thread.isOutdated) continue;
+                  if ((thread.comments?.nodes || []).some((comment) =>
+                    TRUSTED_CODEX_LOGINS.has(comment.author?.login || '') &&
+                    hasSeverity(comment.body)
+                  )) return true;
+                }
+                cursor = connection.pageInfo.hasNextPage
+                  ? connection.pageInfo.endCursor
+                  : null;
+              } while (cursor);
+              return false;
             }
 
             // CANONICAL CONTRACT — Merge Bot must reach exactly the same
@@ -985,8 +1033,11 @@ jobs:
               }
               // Same shared collector as Codex Gate and the watchdog.
               const evidenceInputs = collectReviewEvidenceInputs(surfaces);
+              const outdatedUnresolvedFinding =
+                await hasOutdatedUnresolvedTrustedFinding(prNumber);
               const evidence = await acceptedFallbackEvidence({
                 prNumber, headSha, headObservedAt, comments,
+                outdatedUnresolvedFinding,
                 quotaNotices: evidenceInputs.quotaNotices,
                 realActivity: evidenceInputs.realActivity,
                 codexSignalOnHead: false,

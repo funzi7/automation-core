@@ -734,9 +734,13 @@ jobs:
                 quotaNotices: all.filter((item) =>
                   evidenceIsCapacityNotice(item?.body) && !evidenceHasSeverity(item?.body)),
                 // Everything else Codex actually produced. A reaction has no
-                // body and still counts: it proves Codex is answering.
+                // body and still counts: it proves Codex is answering. A notice
+                // that carries a P1/P2 counts here too — it is not proof of
+                // unavailability, so it must at least close the episode rather
+                // than vanish from both lists.
                 realActivity: all.filter((item) =>
-                  !evidenceIsCapacityNotice(item?.body) && !evidenceIsTaskResult(item?.body)),
+                  (!evidenceIsCapacityNotice(item?.body) || evidenceHasSeverity(item?.body)) &&
+                  !evidenceIsTaskResult(item?.body)),
               };
             }
 
@@ -964,6 +968,16 @@ jobs:
               // Requirement 7/12: genuine Codex evidence on this head is the
               // authority; the quota episode is over.
               if (settings.codexSignalOnHead) return none('codex_available_on_head');
+              // Requirement 5/7: an OUTDATED thread that nobody resolved still
+              // holds a live Codex P1/P2. On the normal path a clean Codex
+              // signal clears it because Codex itself re-examined the head; a
+              // fallback performs no such re-examination, so it must not.
+              // Checked on every evaluation, not only when the attestation was
+              // minted: a resolved thread can be re-opened, and a late Codex
+              // finding can arrive already-outdated, both without a new commit.
+              if (settings.outdatedUnresolvedFinding) {
+                return none('outdated_finding_needs_resolution');
+              }
 
               const comments = settings.comments || [];
               const quotaNotices = (settings.quotaNotices || []);
@@ -1277,6 +1291,44 @@ jobs:
               return false;
             }
 
+            // An OUTDATED thread nobody resolved still holds a live Codex
+            // P1/P2; a Claude fallback must never clear it.
+            async function hasOutdatedUnresolvedTrustedFinding(prNumber) {
+              let cursor = null;
+              do {
+                const data = await github.graphql(
+                  `query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+                    repository(owner: $owner, name: $repo) {
+                      pullRequest(number: $number) {
+                        reviewThreads(first: 100, after: $cursor) {
+                          pageInfo { hasNextPage endCursor }
+                          nodes {
+                            isResolved
+                            isOutdated
+                            comments(first: 100) {
+                              nodes { body author { login } }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }`,
+                  { owner, repo, number: prNumber, cursor },
+                );
+                const connection = data.repository.pullRequest.reviewThreads;
+                for (const thread of connection.nodes || []) {
+                  if (thread.isResolved || !thread.isOutdated) continue;
+                  if ((thread.comments?.nodes || []).some(
+                    (comment) => isCodex({ login: comment.author?.login }) && hasSeverity(comment.body)
+                  )) return true;
+                }
+                cursor = connection.pageInfo.hasNextPage
+                  ? connection.pageInfo.endCursor
+                  : null;
+              } while (cursor);
+              return false;
+            }
+
             async function hasCurrentHeadNonInlineFinding(prNumber, headSha, headObservedAt, comments) {
               const reviews = await github.paginate(github.rest.pulls.listReviews, {
                 owner, repo, pull_number: prNumber, per_page: 100,
@@ -1530,6 +1582,7 @@ jobs:
                     quotaNotices: evidenceInputs.quotaNotices,
                     realActivity: evidenceInputs.realActivity,
                     defaultBranch: pr.base?.repo?.default_branch,
+                    outdatedUnresolvedFinding: await hasOutdatedUnresolvedTrustedFinding(prNumber),
                     codexSignalOnHead,
                     // fix #18 pattern: Actions reads run on GITHUB_TOKEN; this
                     // step's default client is AUTOMATION_PAT.
@@ -1538,30 +1591,26 @@ jobs:
                     ).then(({ data }) => data),
                   });
                   const fallbackSatisfiesReview = fallbackEvidence.accepted;
-                  // Requirement 10: while an exact-head fallback is accepted and
-                  // the same trusted quota episode is still active, stop chasing
-                  // Codex. Dispatch the gate only until it has published a
-                  // verdict NEWER than the attestation; once it has evaluated
-                  // this evidence, its verdict stands and re-dispatching every
-                  // tick would just be noise. A new head clears the fallback
-                  // (the attestation no longer binds) and a materially new Codex
-                  // availability state re-opens evaluation below.
-                  const verdictAt = newestVerdict ? recency(newestVerdict) : 0;
-                  const fallbackDispatchNeeded = fallbackSatisfiesReview && (
-                    !newestVerdict ||
-                    !Number.isFinite(verdictAt) ||
-                    verdictAt < Number(fallbackEvidence.attestedAt || 0)
-                  );
-                  if (
-                    fallbackSatisfiesReview && !fallbackDispatchNeeded &&
-                    !codexSignalOnHead && !overrideCandidate &&
-                    !redThreadStateChanged && !greenHeadNewFinding
-                  ) {
-                    core.info(
-                      `PR #${prNumber} @ ${head7}: exact-head Claude fallback review already evaluated by the gate and the Codex quota episode is still active — not chasing Codex again.`,
-                    );
-                    continue;
-                  }
+                  // Requirement 10: do not keep chasing Codex once an exact-head
+                  // Claude fallback is accepted.
+                  //
+                  // The sweep's only action here is dispatching the trusted gate
+                  // so it can publish a verdict for this evidence — it posts no
+                  // Codex review request and raises no missing-review alert. The
+                  // no-spam property is structural rather than a separate guard:
+                  // once the gate publishes 🟢, `isCandidate` above is already
+                  // false for that head (no missing verdict, not PENDING_TITLE,
+                  // no override, no red-thread change, no new finding), so the
+                  // sweep stops on its own and never re-dispatches. Conditioning
+                  // on `!verdictGreen` therefore keeps this reachable while a
+                  // verdict is still pending — including after a transient
+                  // pending caused by the producer run not yet being complete —
+                  // instead of suppressing the dispatch for that head forever.
+                  //
+                  // A new head invalidates the attestation, and a materially new
+                  // Codex availability state closes the quota episode, so both
+                  // re-open evaluation through the branches below.
+                  const fallbackDispatchNeeded = fallbackSatisfiesReview && !verdictGreen;
                   const freshSignal = codexSignalOnHead || fallbackDispatchNeeded;
 
                   // Dispatch a pending/missing verdict for a fresh review signal,

@@ -674,9 +674,13 @@ jobs:
                 quotaNotices: all.filter((item) =>
                   evidenceIsCapacityNotice(item?.body) && !evidenceHasSeverity(item?.body)),
                 // Everything else Codex actually produced. A reaction has no
-                // body and still counts: it proves Codex is answering.
+                // body and still counts: it proves Codex is answering. A notice
+                // that carries a P1/P2 counts here too — it is not proof of
+                // unavailability, so it must at least close the episode rather
+                // than vanish from both lists.
                 realActivity: all.filter((item) =>
-                  !evidenceIsCapacityNotice(item?.body) && !evidenceIsTaskResult(item?.body)),
+                  (!evidenceIsCapacityNotice(item?.body) || evidenceHasSeverity(item?.body)) &&
+                  !evidenceIsTaskResult(item?.body)),
               };
             }
 
@@ -904,6 +908,16 @@ jobs:
               // Requirement 7/12: genuine Codex evidence on this head is the
               // authority; the quota episode is over.
               if (settings.codexSignalOnHead) return none('codex_available_on_head');
+              // Requirement 5/7: an OUTDATED thread that nobody resolved still
+              // holds a live Codex P1/P2. On the normal path a clean Codex
+              // signal clears it because Codex itself re-examined the head; a
+              // fallback performs no such re-examination, so it must not.
+              // Checked on every evaluation, not only when the attestation was
+              // minted: a resolved thread can be re-opened, and a late Codex
+              // finding can arrive already-outdated, both without a new commit.
+              if (settings.outdatedUnresolvedFinding) {
+                return none('outdated_finding_needs_resolution');
+              }
 
               const comments = settings.comments || [];
               const quotaNotices = (settings.quotaNotices || []);
@@ -1225,6 +1239,10 @@ jobs:
                 const evidenceInputs = collectReviewEvidenceInputs({
                   reviews, comments, reviewComments, reactions,
                 });
+                // An outdated thread nobody resolved still holds a live Codex
+                // finding; a fallback may not clear it.
+                const outdatedUnresolvedFinding =
+                  classifyThreads(reviewThreads).outdated.length > 0;
                 const fallbackEvidence = await acceptedFallbackEvidence({
                   prNumber,
                   headSha,
@@ -1233,6 +1251,7 @@ jobs:
                   quotaNotices: evidenceInputs.quotaNotices,
                   realActivity: evidenceInputs.realActivity,
                   defaultBranch: pr.base?.repo?.default_branch,
+                  outdatedUnresolvedFinding,
                   codexSignalOnHead: hasCodexSignalOnHead,
                   // This evaluator's default client is GITHUB_TOKEN, which
                   // carries the declared `actions: read` permission.

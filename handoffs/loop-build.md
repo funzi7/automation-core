@@ -32,7 +32,7 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
     episode; no authenticated head epoch means no episode.
   - Provenance is truthful; `codex-p1-acknowledged`, owner override and
     reaction acknowledgement are untouched and are never used for fallback.
-- Validation: 125 deterministic tests pass (41 new in
+- Validation: 123 deterministic tests pass (39 new in
   `tests/test_review_evidence.js`) — the full mandatory acceptance matrix, the
   paywall-bot PR #103 regression built on that PR's real timestamps, the
   shipped inline block from all three consumers executed directly across the
@@ -72,6 +72,19 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
   an episode, a review thread too long to read in one page fails closed, the
   success summary no longer reports a Codex-sounding reason for a Claude
   review, and Merge Bot paginates each PR once instead of three times.
+- A second independent Opus pass verified those fixes by mutation testing on a
+  scratch copy and found three more P2s, all fixed: producer-side enforcement of
+  the outdated-thread rule was NOT sufficient (a resolved thread can be
+  re-opened, and a late Codex finding can arrive already-outdated, both without
+  a new commit), so the rule is now enforced on every evaluation by Gate, Merge
+  Bot and the watchdog; the run-authentication hardening and the wiring that
+  consumes the decision were both untested — deleting either left the suite
+  green. Ten mutations that previously survived, including
+  `currentHeadSignal: true` (which would have greened every PR) and disabling
+  Merge Bot's three evidence guards, are now all killed by the suite; that was
+  re-verified locally on a scratch copy with the real tree untouched. The same
+  pass also confirmed the Route A no-TTL decision is correct and withdrew that
+  suggestion.
 - Real consumer scenario, read-only, no mutation: the shipped inline block was
   run against OptionsProfitTracker PR #19's actual comment history. It found
   exactly the four genuine `chatgpt-codex-connector[bot]` usage-limit notices

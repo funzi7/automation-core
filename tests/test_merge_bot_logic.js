@@ -433,7 +433,11 @@ test('workflow preserves exact-SHA squash merge and same-repo branch deletion', 
   assert.match(workflow, /Number\(root\[1\]\) !== prNumber/);
   assert.match(workflow, /!commitShas\.has\(head\[1\]\)/);
   assert.match(workflow, /marker\.head === currentHead/);
-  assert.match(workflow, /async function hasCurrentHeadCodexSignal\(prNumber, headSha\)/);
+  // The wrapper was replaced by a single fetch shared with the canonical
+  // review-evidence decision, so the PR is paginated once per evaluation.
+  assert.match(workflow, /async function fetchCodexSurfaces\(prNumber\)/);
+  assert.match(workflow, /async function codexSignalFromSurfaces\(prNumber, headSha, surfaces, headObservedAt\)/);
+  assert.doesNotMatch(workflow, /hasCurrentHeadCodexSignal/);
   assert.match(workflow, /async function observedHeadTransition\(prNumber, headSha, comments = \[\]\)/);
   assert.match(workflow, /codex-head-epoch:v3/);
   assert.match(workflow, /const head = markerHead/);

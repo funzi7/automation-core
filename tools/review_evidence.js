@@ -315,6 +315,7 @@ function decideReviewEvidence({
   verifiedAttestations = [],
   quotaNotices = [],
   realActivity = [],
+  outdatedUnresolvedFinding = false,
   // No default: production measures the Route B window from when the
   // attestation was written, never from evaluation time.
   attestedAt = null,
@@ -327,6 +328,11 @@ function decideReviewEvidence({
     headObservedAt, realActivity, attestedAt, codexSignalOnHead,
   });
 
+  // An outdated thread nobody resolved still holds a live Codex finding, and a
+  // fallback performs no re-examination of it, so it can never clear one.
+  // Checked on every evaluation: a resolved thread can be re-opened and a late
+  // Codex finding can arrive already-outdated, both without a new commit.
+  const outdatedBlocksFallback = !!outdatedUnresolvedFinding;
   // Genuine Codex evidence on this head is the authority, so the fallback is
   // not consulted at all — matching the inline block, which short-circuits on
   // the same condition. Without this, a leftover attestation could still block
@@ -354,6 +360,10 @@ function decideReviewEvidence({
   if (fallbackAccepted && !episode.active) {
     fallbackAccepted = false;
     fallbackReason = episode.reason;
+  }
+  if (fallbackAccepted && outdatedBlocksFallback) {
+    fallbackAccepted = false;
+    fallbackReason = 'outdated_finding_needs_resolution';
   }
 
   // A self-declared unresolved exact-head P1/P2 blocks before anything else
