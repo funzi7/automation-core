@@ -166,7 +166,10 @@ jobs:
             // to have executed from the default branch, so refuse early rather
             // than mint a marker that can never be honoured.
             const defaultBranch = String(process.env.DEFAULT_BRANCH || '');
-            if (defaultBranch && context.ref !== `refs/heads/${defaultBranch}`) {
+            if (!defaultBranch) {
+              return refuse('could not determine the default branch; failing closed.');
+            }
+            if (context.ref !== `refs/heads/${defaultBranch}`) {
               return refuse(
                 `this workflow must be dispatched from the default branch (${defaultBranch}).`,
               );

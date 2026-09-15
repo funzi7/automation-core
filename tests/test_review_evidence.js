@@ -1267,6 +1267,7 @@ test('producer: refuses every unsafe attestation', async () => {
   const cases = {
     'policy disabled': { enabled: 'false' },
     'dispatched from a non-default ref': { ref: 'refs/heads/claude/some-pr' },
+    'unknown default branch': { defaultBranch: '' },
     'reviewed head is not the live head': { reviewedHead: PREVIOUS_HEAD },
     'malformed reviewed head': { reviewedHead: 'not-a-sha' },
     'closed PR': { prState: 'closed' },
