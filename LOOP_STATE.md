@@ -184,11 +184,13 @@ Synced workflows listed in `sync-config.json`: `codex-auto-fix.yml`, `codex-gate
 
 ### `claude-fallback-watchdog.yml` — Delivery-judged fixer ladder
 
-- The late-signal sweep uses the identical shared block. An accepted exact-head
-  fallback counts as a review signal, so the gate is dispatched once to publish
-  its verdict; while that fallback holds and the same quota episode is active
-  the sweep stops chasing Codex, so no repeated nudges or alerts. A new head
-  invalidates the fallback and re-opens evaluation.
+- The late-signal sweep uses the identical shared block and the same shared
+  input collector. An accepted exact-head fallback counts as a review signal, so
+  the gate is dispatched while the verdict is still pending and publishes its
+  green verdict. The sweep posts no Codex review request and no missing-review
+  alert on that path, and once the verdict is green its own `isCandidate` test
+  already excludes the head, so it stops rather than re-dispatching every tick.
+  A new head invalidates the fallback and re-opens evaluation.
 
 - Current ladder is delivery-only: Claude -> Codex API if enabled -> Codex Cloud unless disabled -> Claude proxy only for genuine Claude `no_delivery` -> `needs-owner`.
 - A disabled Codex API backup is skipped, not escalation.
