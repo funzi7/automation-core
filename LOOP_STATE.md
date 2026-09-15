@@ -109,14 +109,21 @@ is the permanent human opt-out and is never removed by automation.
    unverified until checked from each repository's latest sync PR and current
    workflow contents.
 4. **Codex Cloud limitation:** View task, task diff, Created commit hint, or ready diff is not delivery unless the PR branch gets a newer commit after the Cloud marker. No browser/UI automation or fake Update branch API workaround exists.
-5. **Canonical Claude fallback review evidence — rollout pending.** The central
-   contract is implemented and deterministically covered in automation-core
-   (see `docs/adr/0001-canonical-review-evidence.md`). What remains physically
-   pending: (a) each consumer repository must receive the new workflow through
-   the normal sync, and (b) `CLAUDE_FALLBACK_REVIEW_ENABLED` must be set to
-   `true` per repository — Actions variables are not synced, so until it is set
-   every repo keeps the Codex-only contract unchanged. No production fallback
-   attestation has been minted or honoured yet.
+5. **Canonical Claude fallback review evidence — merge and rollout pending.**
+   The central contract is implemented and deterministically covered in
+   automation-core (see `docs/adr/0001-canonical-review-evidence.md`). What
+   remains physically pending: (a) **PR #56 is not merged** — its Gate is red
+   because Codex cannot review the head while its quota is exhausted and
+   fallback is not enabled here, and Merge Bot will not touch a `claude/` branch
+   touching protected paths, so it needs the owner or Codex quota to return;
+   (b) each consumer repository must then receive the new workflow through the
+   normal sync, which clones automation-core main and so must wait for the
+   merge; and (c) `CLAUDE_FALLBACK_REVIEW_ENABLED` must be set to `true` per
+   repository — Actions variables are not synced, so until it is set every repo
+   keeps the Codex-only contract unchanged. No production fallback attestation
+   has been minted or honoured yet, and because `pull_request_target` loads the
+   Gate from the base branch, the new gate/merge-bot/watchdog paths have not run
+   in production at all.
 6. **OptionsProfitTracker PR #19 — not yet passable.** Its trusted quota notices
    (2026-09-07 and 2026-09-09) all predate its current head
    `074de86e52f2a168b89dc21ff32a851570f1b144`, pushed 2026-09-14T19:45:26Z, and
