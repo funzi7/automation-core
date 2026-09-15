@@ -728,7 +728,7 @@ function loadInlineEvidence(name) {
   );
   return {
     warnings,
-    make: ({ enabled = true, run = null, throws = false } = {}) => factory(
+    make: ({ enabled = true } = {}) => factory(
       {},
       'funzi7',
       'automation-core',
@@ -886,6 +886,161 @@ test('13: the watchdog stops chasing Codex once the gate evaluated the fallback'
     workflow('codex-gate.yml').includes(`'${pending[1]}'`),
     `codex-gate.yml must still publish the exact title ${pending[1]} the watchdog matches`,
   );
+});
+
+// ---------------------------------------------------------------------------
+// Execute the producer's shipped script against its refusal matrix.
+// ---------------------------------------------------------------------------
+function producerScript() {
+  const body = workflow('claude-fallback-review.yml');
+  const marker = body.indexOf('          script: |\n');
+  assert.ok(marker >= 0, 'producer must have a github-script body');
+  return body
+    .slice(marker + '          script: |\n'.length)
+    .split('\n')
+    .map((line) => line.slice(12))
+    .join('\n');
+}
+
+async function attemptAttestation(overrides = {}) {
+  const {
+    enabled = 'true',
+    ref = 'refs/heads/main',
+    defaultBranch = 'main',
+    prState = 'open',
+    liveHead = HEAD,
+    reviewedHead = HEAD,
+    comments = [quotaNotice({ at: '2026-09-09T09:50:28Z' })],
+    reviews = [],
+    reviewComments = [],
+    threads = [],
+    validation = 'passed/suite-661-green',
+    p1 = '0',
+    p2 = '0',
+    found = '6',
+    fixed = '6',
+  } = overrides;
+
+  const posted = [];
+  let failure = null;
+  const core = {
+    setFailed: (m) => { failure = m; },
+    info: () => {},
+    warning: () => {},
+    summary: { addHeading: () => core.summary, addList: () => core.summary, write: () => {} },
+  };
+  const github = {
+    rest: {
+      pulls: { get: async () => ({ data: { state: prState, head: { sha: liveHead } } }) },
+      issues: { createComment: async (args) => { posted.push(args); } },
+    },
+    paginate: async (fn) => fn(),
+    graphql: async () => ({
+      repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage: false }, nodes: threads } } },
+    }),
+  };
+  // github.paginate is called with the listing function; return the fixtures.
+  github.rest.pulls.listReviews = () => reviews;
+  github.rest.issues.listComments = () => comments;
+  github.rest.pulls.listReviewComments = () => reviewComments;
+
+  const fn = new Function(
+    'github', 'context', 'core', 'process',
+    `return (async () => {\n${producerScript()}\n})();`,
+  );
+  await fn(
+    github,
+    { repo: { owner: 'funzi7', repo: 'automation-core' }, ref },
+    core,
+    {
+      env: {
+        PR_NUMBER: '103',
+        REVIEWED_HEAD: reviewedHead,
+        FINDINGS_FOUND: found,
+        FINDINGS_FIXED: fixed,
+        UNRESOLVED_P1: p1,
+        UNRESOLVED_P2: p2,
+        VALIDATION: validation,
+        RUN_ID: '4242',
+        RUN_ATTEMPT: '1',
+        CLAUDE_FALLBACK_REVIEW_ENABLED: enabled,
+        DEFAULT_BRANCH: defaultBranch,
+      },
+    },
+  );
+  return { posted, failure };
+}
+
+test('producer: attests only when every canonical precondition holds', async () => {
+  const ok = await attemptAttestation();
+  assert.equal(ok.failure, null, `unexpected refusal: ${ok.failure}`);
+  assert.equal(ok.posted.length, 1, 'exactly one attestation comment');
+  const body = ok.posted[0].body;
+  assert.match(body, /claude-fallback-review:v1/);
+  assert.match(body, new RegExp(`reviewed_head=${HEAD}`));
+  assert.match(body, /provider=claude_code_fallback/);
+  assert.match(body, /verdict=clean/);
+  assert.match(body, /unresolved_p1=0 unresolved_p2=0/);
+  assert.match(body, /reason=codex_quota_unavailable/);
+  assert.match(body, /not a Codex review/i, 'the comment must not read as a Codex review');
+  // The parsed marker must satisfy the consumers' own validation.
+  const parsed = parseFallbackAttestations(body)[0];
+  assert.equal(
+    evaluateFallbackAttestation(parsed, { headSha: HEAD }).accepted, true,
+    'what the producer mints must be what consumers accept',
+  );
+});
+
+test('producer: refuses every unsafe attestation', async () => {
+  const cases = {
+    'policy disabled': { enabled: 'false' },
+    'dispatched from a non-default ref': { ref: 'refs/heads/claude/some-pr' },
+    'reviewed head is not the live head': { reviewedHead: PREVIOUS_HEAD },
+    'malformed reviewed head': { reviewedHead: 'not-a-sha' },
+    'closed PR': { prState: 'closed' },
+    'no trusted quota notice': { comments: [] },
+    'untrusted quota claim': { comments: [quotaNotice({ login: 'funzi7' })] },
+    'unresolved P1 declared': { p1: '1' },
+    'unresolved P2 declared': { p2: '3' },
+    'more fixed than found': { found: '2', fixed: '5' },
+    'non-passed validation': { validation: 'failed/suite-red' },
+    'unstructured validation': { validation: 'suite-661-green' },
+    'non-numeric counts': { found: 'many' },
+  };
+  for (const [label, override] of Object.entries(cases)) {
+    const result = await attemptAttestation(override);
+    assert.ok(result.failure, `producer must refuse: ${label}`);
+    assert.equal(result.posted.length, 0, `producer must post nothing: ${label}`);
+  }
+});
+
+test('producer: refuses when Codex is available or still has active findings', async () => {
+  // A genuine Codex result on this exact head.
+  const codexOnHead = await attemptAttestation({
+    comments: [
+      quotaNotice({ at: '2026-09-09T09:50:28Z' }),
+      {
+        user: { login: CODEX_REST },
+        created_at: '2026-09-09T10:00:00Z',
+        body: `**Reviewed commit:** \`${HEAD}\`\n\nNo findings.`,
+      },
+    ],
+  });
+  assert.ok(codexOnHead.failure, 'must defer to a genuine Codex result on this head');
+  assert.equal(codexOnHead.posted.length, 0);
+
+  // An active unresolved trusted Codex thread.
+  const activeFinding = await attemptAttestation({
+    threads: [{
+      isResolved: false,
+      isOutdated: false,
+      path: 'core/x.py',
+      line: 7,
+      comments: { nodes: [{ body: '**P1** unsafe', author: { login: CODEX } }] },
+    }],
+  });
+  assert.ok(activeFinding.failure, 'must refuse while a trusted Codex P1 is active');
+  assert.equal(activeFinding.posted.length, 0);
 });
 
 test('the canonical producing workflow validates before it attests', () => {
