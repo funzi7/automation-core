@@ -1313,6 +1313,48 @@ test('producer: refuses when Codex is available or still has active findings', a
   });
   assert.ok(activeFinding.failure, 'must refuse while a trusted Codex P1 is active');
   assert.equal(activeFinding.posted.length, 0);
+
+  // Outdated is NOT resolved. Pushing a cosmetic change over an unaddressed
+  // P1 strands it in an outdated thread; a fallback must not clear that.
+  const outdatedFinding = await attemptAttestation({
+    threads: [{
+      isResolved: false,
+      isOutdated: true,
+      path: 'core/x.py',
+      line: 7,
+      comments: { nodes: [{ body: '**P1** unsafe', author: { login: CODEX } }] },
+    }],
+  });
+  assert.ok(outdatedFinding.failure,
+    'must refuse while a trusted Codex P1 is unresolved, even when outdated');
+  assert.match(outdatedFinding.failure, /outdated/i);
+  assert.equal(outdatedFinding.posted.length, 0);
+
+  // A resolved thread does not block — that is the PR #103 shape.
+  const resolved = await attemptAttestation({
+    threads: [{
+      isResolved: true,
+      isOutdated: true,
+      path: 'core/x.py',
+      line: 7,
+      comments: { nodes: [{ body: '**P2** fixed', author: { login: CODEX } }] },
+    }],
+  });
+  assert.equal(resolved.failure, null, `resolved threads must not block: ${resolved.failure}`);
+  assert.equal(resolved.posted.length, 1);
+
+  // A thread too long to read in one page cannot be proven clean.
+  const truncated = await attemptAttestation({
+    threads: [{
+      isResolved: true,
+      isOutdated: false,
+      path: 'core/x.py',
+      line: 7,
+      comments: { nodes: Array.from({ length: 100 }, () => ({ body: 'note', author: { login: CODEX } })) },
+    }],
+  });
+  assert.ok(truncated.failure, 'an unreadable thread must fail closed');
+  assert.equal(truncated.posted.length, 0);
 });
 
 test('the canonical producing workflow validates before it attests', () => {

@@ -66,6 +66,16 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
   an episode, a review thread too long to read in one page fails closed, the
   success summary no longer reports a Codex-sounding reason for a Claude
   review, and Merge Bot paginates each PR once instead of three times.
+- Real consumer scenario, read-only, no mutation: the shipped inline block was
+  run against OptionsProfitTracker PR #19's actual comment history. It found
+  exactly the four genuine `chatgpt-codex-connector[bot]` usage-limit notices
+  (2026-09-07 ×2, 2026-09-09 ×2) and zero real Codex activity, and returned
+  `no_attestation` as it stands. Given a hypothetical valid exact-head
+  attestation it returns `stale_quota_evidence`, because every notice predates
+  the current head `074de86e…` (pushed 2026-09-14T19:45:26Z) and the Route B
+  window is 24 h. Adding a current-head notice flips it to
+  `structured_fallback_clean`. That is the contract behaving exactly as
+  specified on real data.
 - NOT validated in production: `pull_request_target` loads Codex Gate from the
   base branch, so the gate run on this PR executed main's OLD code. The new
   gate/merge-bot/watchdog paths take effect only after merge; no production
