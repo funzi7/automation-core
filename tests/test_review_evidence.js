@@ -471,6 +471,57 @@ test('12b: fallback stays disabled unless repository policy enables it', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Requirement 12: the normal Codex path must not be weakened. With the policy
+// switch off — the default in every repository — every decision must be
+// exactly what the pre-existing gate logic produced.
+// ---------------------------------------------------------------------------
+test('policy off reproduces the pre-existing Codex-only decision exactly', () => {
+  const { decideCodexGate } = require('../tools/codex_gate_logic');
+  const scenarios = [
+    { threads: [], nonInlineFindings: [], codexSignalOnHead: true },
+    { threads: [], nonInlineFindings: [], codexSignalOnHead: false },
+    { threads: [codexThread()], codexSignalOnHead: true },
+    { threads: [codexThread({ resolved: true })], codexSignalOnHead: true },
+    { threads: [codexThread({ resolved: true })], codexSignalOnHead: false },
+    { threads: [codexThread({ outdated: true })], codexSignalOnHead: false },
+    { threads: [codexThread({ outdated: true })], codexSignalOnHead: true },
+    {
+      nonInlineFindings: [{ severity: 'P1', path: '(review body)', line: null, startLine: null, threadId: '' }],
+      codexSignalOnHead: true,
+    },
+    { threads: [], override: true },
+    { threads: [], technicalError: true },
+  ];
+  for (const scenario of scenarios) {
+    const legacy = decideCodexGate({
+      threads: scenario.threads || [],
+      nonInlineFindings: scenario.nonInlineFindings || [],
+      currentHeadSignal: !!scenario.codexSignalOnHead,
+      override: !!scenario.override,
+      technicalError: !!scenario.technicalError,
+    });
+    // Fallback disabled, yet every fallback input is present and tempting.
+    const now = decideReviewEvidence({
+      headSha: HEAD,
+      headObservedAt: HEAD_OBSERVED_AT,
+      attestedAt: NOW,
+      fallbackPolicyEnabled: false,
+      verifiedAttestations: [attestation()],
+      quotaNotices: trustedQuotaNotices([quotaNotice()]),
+      threads: scenario.threads || [],
+      nonInlineFindings: scenario.nonInlineFindings || [],
+      codexSignalOnHead: !!scenario.codexSignalOnHead,
+      override: !!scenario.override,
+      technicalError: !!scenario.technicalError,
+    });
+    assert.equal(now.status, legacy.status, `status drift for ${JSON.stringify(scenario)}`);
+    assert.equal(now.reason, legacy.reason, `reason drift for ${JSON.stringify(scenario)}`);
+    assert.deepEqual(now.activeFindings, legacy.activeFindings);
+    assert.notEqual(now.authority, 'claude_code_fallback');
+  }
+});
+
+// ---------------------------------------------------------------------------
 // 14. Gate and Merge Bot reach identical decisions
 // ---------------------------------------------------------------------------
 test('14: identical inputs yield identical Gate and Merge Bot decisions', () => {

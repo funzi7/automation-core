@@ -5,9 +5,9 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
 ---
 
 ## [2026-09-15 UTC] Canonical Claude fallback review evidence
-- PR: (to be opened from `claude/canonical-fallback-review-evidence`)
+- PR: <https://github.com/funzi7/automation-core/pull/56>
 - Branch: `claude/canonical-fallback-review-evidence`
-- Status: opened
+- Status: opened — exact-head CI green, Gate red pending review evidence
 - What changed:
   - The central contract is now `valid exact-head review evidence == normal
     Codex evidence OR approved Claude fallback evidence when Codex is provably
@@ -32,16 +32,31 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
     episode; no authenticated head epoch means no episode.
   - Provenance is truthful; `codex-p1-acknowledged`, owner override and
     reaction acknowledgement are untouched and are never used for fallback.
-- Validation: 114 deterministic tests pass (30 new in
-  `tests/test_review_evidence.js`, covering the full mandatory matrix and the
-  paywall-bot PR #103 regression built on that PR's real timestamps);
-  `bash scripts/validate.sh` green — every tracked YAML parses, all synced
-  source/`.github` mirrors byte-identical, all 59 `github-script` bodies
-  expression-safe and syntax-checked; `git diff --check` clean.
-  Review provider for this change: `review_provider = claude_code_fallback`,
-  `reason = codex_quota_unavailable` — an independent Opus reviewer, because the
-  central mechanism did not exist before this PR and therefore cannot be claimed
-  as already authoritative for it.
+- Validation: 120 deterministic tests pass (36 new in
+  `tests/test_review_evidence.js`) — the full mandatory acceptance matrix, the
+  paywall-bot PR #103 regression built on that PR's real timestamps, the
+  shipped inline block from all three consumers executed directly across the
+  whole trust matrix, and the producer script executed against its refusal
+  matrix (it mints exactly what the consumers accept and refuses all fifteen
+  unsafe cases). `bash scripts/validate.sh` green — every tracked YAML parses,
+  all synced source/`.github` mirrors byte-identical, all 59 `github-script`
+  bodies expression-safe and syntax-checked; `git diff --check` clean.
+- Two defects were caught and fixed during self-review: the gate's reworded
+  pending check title would have broken the watchdog's exact `PENDING_TITLE`
+  match (title restored, and a test now pins the two together), and the pure
+  mirror did not short-circuit fallback evaluation on a current-head Codex
+  signal the way the inline block does, so a stale attestation could have
+  blocked a Codex-reviewed head in the mirror only.
+- NOT validated in production: `pull_request_target` loads Codex Gate from the
+  base branch, so the gate run on this PR executed main's OLD code. The new
+  gate/merge-bot/watchdog paths take effect only after merge; no production
+  fallback attestation has been minted or honoured yet.
+- Review provider for this change: `review_provider = claude_code_fallback`,
+  `reason = codex_quota_unavailable` — an independent Opus reviewer. Codex
+  posted a genuine usage-limit notice on this PR at 2026-09-15T12:49:40Z, so
+  normal Codex review is unavailable. The new central mechanism is NOT claimed
+  as authoritative for its own PR: it did not exist before it, and
+  automation-core has not set `CLAUDE_FALLBACK_REVIEW_ENABLED`.
 - Needs from the owner: merge, then set `CLAUDE_FALLBACK_REVIEW_ENABLED=true` on
   each repository that should honour fallback evidence (Actions variables are
   not synced, so the Codex-only contract stays in force until it is set).
