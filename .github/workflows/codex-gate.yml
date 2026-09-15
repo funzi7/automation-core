@@ -868,10 +868,9 @@ jobs:
               return true;
             }
 
-            // The single canonical question every consumer asks.
-            // Returns { accepted, blocking, severity, reason, episodeReason }.
-            // The single canonical question every consumer asks. It must never
-            // throw: an exception escaping here would reach the Gate's
+            // The single canonical question every consumer asks. Returns
+            // { accepted, blocking, severity, reason, episodeReason }. It must
+            // never throw: an exception escaping here would reach the Gate's
             // technical fail-soft branch, which publishes GREEN. Absence of
             // evidence must look like absence of evidence, not like success.
             async function acceptedFallbackEvidence(options) {
