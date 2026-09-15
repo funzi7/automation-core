@@ -37,10 +37,16 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
   paywall-bot PR #103 regression built on that PR's real timestamps, the
   shipped inline block from all three consumers executed directly across the
   whole trust matrix, and the producer script executed against its refusal
-  matrix (it mints exactly what the consumers accept and refuses all fifteen
-  unsafe cases). `bash scripts/validate.sh` green — every tracked YAML parses,
+  matrix (it mints exactly what the consumers accept, and refuses malformed
+  inputs, a disabled policy, a non-default dispatch ref, a stale or malformed
+  head, a closed PR, missing or untrusted quota evidence, declared unresolved
+  P1/P2, a non-passed validation, a genuine Codex result on the head, an
+  unresolved Codex thread whether or not it is outdated, and a review thread
+  too long to read in one page). `bash scripts/validate.sh` green — every tracked YAML parses,
   all synced source/`.github` mirrors byte-identical, all 59 `github-script`
   bodies expression-safe and syntax-checked; `git diff --check` clean.
+  Real GitHub Actions validation: `actionlint` 1.7.7 reports zero findings
+  across every workflow, including the new producer.
 - Two defects were caught and fixed during self-review: the gate's reworded
   pending check title would have broken the watchdog's exact `PENDING_TITLE`
   match (title restored, and a test now pins the two together), and the pure
