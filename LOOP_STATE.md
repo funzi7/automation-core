@@ -109,13 +109,44 @@ is the permanent human opt-out and is never removed by automation.
    unverified until checked from each repository's latest sync PR and current
    workflow contents.
 4. **Codex Cloud limitation:** View task, task diff, Created commit hint, or ready diff is not delivery unless the PR branch gets a newer commit after the Cloud marker. No browser/UI automation or fake Update branch API workaround exists.
-5. **Longer-term:** update minutes-guard target coverage after downstream audit; keep direct-to-main and branch-protection decisions explicit.
+5. **Canonical Claude fallback review evidence — rollout pending.** The central
+   contract is implemented and deterministically covered in automation-core
+   (see `docs/adr/0001-canonical-review-evidence.md`). What remains physically
+   pending: (a) each consumer repository must receive the new workflow through
+   the normal sync, and (b) `CLAUDE_FALLBACK_REVIEW_ENABLED` must be set to
+   `true` per repository — Actions variables are not synced, so until it is set
+   every repo keeps the Codex-only contract unchanged. No production fallback
+   attestation has been minted or honoured yet.
+6. **OptionsProfitTracker PR #19 — not yet passable.** Its trusted quota notices
+   (2026-09-07 and 2026-09-09) all predate its current head
+   `074de86e52f2a168b89dc21ff32a851570f1b144`, pushed 2026-09-14T19:45:26Z, and
+   the PR carries `no-automerge` plus `needs-owner`. Under the canonical rules
+   the Route B window has long expired, so a pass requires either a current
+   Codex quota notice on this head followed by a fresh exact-head fallback
+   review and attestation, or a normal Codex review once quota returns. Do not
+   claim it passes before that evidence exists.
+7. **Longer-term:** update minutes-guard target coverage after downstream audit; keep direct-to-main and branch-protection decisions explicit.
 
 Older items below are history. If they conflict with this section, treat them as HISTORICAL or SUPERSEDED and follow this section.
 
 ## Workflows
 
-Synced workflows listed in `sync-config.json`: `codex-auto-fix.yml`, `codex-gate.yml`, `claude.yml`, `ci-doctor.yml`, `merge-bot.yml`, `claude-fallback-watchdog.yml`, `codex-backup-fix.yml`.
+Synced workflows listed in `sync-config.json`: `codex-auto-fix.yml`, `codex-gate.yml`, `claude.yml`, `ci-doctor.yml`, `merge-bot.yml`, `claude-fallback-watchdog.yml`, `codex-backup-fix.yml`, `claude-fallback-review.yml`.
+
+### `claude-fallback-review.yml` — Claude Fallback Review Attestation
+
+- The ONLY sanctioned producer of structured Claude Code fallback review
+  evidence. `workflow_dispatch` only, so GitHub restricts it to actors with
+  write access; it checks out nothing.
+- Refuses unless `CLAUDE_FALLBACK_REVIEW_ENABLED == 'true'`, unless dispatched
+  from the default branch, unless `reviewed_head` is the live PR head, unless a
+  trusted Codex code-review quota notice exists, if Codex already has a genuine
+  result on that head, or if any trusted Codex P1/P2 is still active.
+- Derives `verdict` itself; `unresolved_p1`/`unresolved_p2` must both be 0 and
+  `validation` must be `passed/<reference>`.
+- Posts one atomic `claude-fallback-review:v1` marker as `github-actions[bot]`.
+- The attestation is necessary, never sufficient: Gate, Merge Bot and the
+  watchdog re-authenticate it independently.
 
 ### `claude.yml` — Claude Fixer
 
@@ -136,6 +167,13 @@ Synced workflows listed in `sync-config.json`: `codex-auto-fix.yml`, `codex-gate
 
 ### `codex-gate.yml` — Codex Gate
 
+- Consumes the shared `CANONICAL EXACT-HEAD REVIEW EVIDENCE` block: exact-head
+  review evidence is normal Codex evidence OR an approved Claude fallback
+  attestation when Codex is provably unavailable. Findings are still evaluated
+  first, so a fallback can never bypass a real Codex P1/P2, and a fallback that
+  declares unresolved P1/P2 blocks. The published check states truthful
+  provenance and never claims "Codex reviewed" for a Claude review.
+
 - `check-codex-status` is the blocking check.
 - Green requires Codex has reviewed the current head and no active P1/P2 remains.
 - Usage-limit and capacity notices from the trusted Codex actor are explicitly non-review signals.
@@ -145,6 +183,12 @@ Synced workflows listed in `sync-config.json`: `codex-auto-fix.yml`, `codex-gate
 - The old in-run self-rerun poll is gone; the watchdog sweep handles late Codex signals and override-label dispatches.
 
 ### `claude-fallback-watchdog.yml` — Delivery-judged fixer ladder
+
+- The late-signal sweep uses the identical shared block. An accepted exact-head
+  fallback counts as a review signal, so the gate is dispatched once to publish
+  its verdict; while that fallback holds and the same quota episode is active
+  the sweep stops chasing Codex, so no repeated nudges or alerts. A new head
+  invalidates the fallback and re-opens evaluation.
 
 - Current ladder is delivery-only: Claude -> Codex API if enabled -> Codex Cloud unless disabled -> Claude proxy only for genuine Claude `no_delivery` -> `needs-owner`.
 - A disabled Codex API backup is skipped, not escalation.
@@ -165,6 +209,11 @@ Synced workflows listed in `sync-config.json`: `codex-auto-fix.yml`, `codex-gate
 - Honest terminal states: `api_error`, `fixer_error`, `no_change`, `patch_failed`, `stale`, and `pushed`. Only a real branch commit after the request marker is delivery.
 
 ### `merge-bot.yml` — Merge Bot
+
+- Uses `hasCurrentHeadReviewEvidence`, which wraps the identical shared block,
+  so Merge Bot and the Gate cannot disagree. Both the initial and the final
+  candidate revalidation go through it, and the merge log records the real
+  review authority.
 
 - Candidates include normal same-repository PRs authored by `funzi7`, plus
   established Claude, explicit `automerge`, and trusted sync paths. A fork is

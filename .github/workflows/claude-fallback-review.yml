@@ -1,0 +1,381 @@
+name: Claude Fallback Review Attestation
+
+# Canonical producer of structured Claude Code fallback review evidence.
+#
+# The canonical contract is:
+#
+#   valid exact-head review evidence ==
+#     normal Codex evidence
+#     OR approved Claude fallback evidence when Codex is provably unavailable
+#
+# This workflow is the ONLY sanctioned way to mint that fallback evidence. It
+# emits one atomic `claude-fallback-review:v1` marker comment authored by the
+# trusted github-actions[bot] identity. A free-form comment claiming a Claude
+# review is never authority, and nothing here substitutes for
+# `codex-p1-acknowledged`, an owner override, or a reaction acknowledgement —
+# those are different semantics and remain unavailable to this path.
+#
+# SECURITY / DIVISION OF AUTHORITY
+# - workflow_dispatch is restricted by GitHub to actors with write access, so
+#   untrusted PR content can never start this workflow or choose its inputs.
+# - No step checks out or executes PR-controlled code. Untrusted text is never
+#   interpolated into executable script; every input crosses the step boundary
+#   through `env`.
+# - The checks below are the FIRST line of validation. Codex Gate, Merge Bot and
+#   the watchdog independently re-validate the exact-head binding, the trusted
+#   quota episode against authenticated head-epoch history, and the live Codex
+#   finding state before the attestation is ever honoured. An attestation is a
+#   necessary condition, never a sufficient one.
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number the fallback review covers'
+        required: true
+        type: string
+      reviewed_head:
+        description: 'Full 40-character SHA that was actually reviewed'
+        required: true
+        type: string
+      findings_found:
+        description: 'Total findings the fallback review raised'
+        required: true
+        type: string
+      findings_fixed:
+        description: 'How many of those findings were fixed'
+        required: true
+        type: string
+      unresolved_p1:
+        description: 'Unresolved P1 findings (must be 0)'
+        required: true
+        type: string
+      unresolved_p2:
+        description: 'Unresolved P2 findings (must be 0)'
+        required: true
+        type: string
+      validation:
+        description: 'Validation status/reference, e.g. passed/suite-661-green'
+        required: true
+        type: string
+
+concurrency:
+  group: claude-fallback-review-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pull-requests: read
+  # Post the attestation marker as the trusted automation identity.
+  issues: write
+
+jobs:
+  attest:
+    name: claude-fallback-review-attestation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate the fallback review and post the attestation
+        uses: actions/github-script@v8
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
+          REVIEWED_HEAD: ${{ inputs.reviewed_head }}
+          FINDINGS_FOUND: ${{ inputs.findings_found }}
+          FINDINGS_FIXED: ${{ inputs.findings_fixed }}
+          UNRESOLVED_P1: ${{ inputs.unresolved_p1 }}
+          UNRESOLVED_P2: ${{ inputs.unresolved_p2 }}
+          VALIDATION: ${{ inputs.validation }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          # Requirement 1: only where repository policy explicitly opts in.
+          CLAUDE_FALLBACK_REVIEW_ENABLED: ${{ vars.CLAUDE_FALLBACK_REVIEW_ENABLED }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            // ---- canonical constants — must match codex-gate.yml /
+            // merge-bot.yml / claude-fallback-watchdog.yml and
+            // tools/review_evidence.js — keep in sync.
+            const FALLBACK_PROVIDER = 'claude_code_fallback';
+            const FALLBACK_REASON = 'codex_quota_unavailable';
+            const FALLBACK_VERDICT = 'clean';
+            const FALLBACK_ATTESTATION_WORKFLOW_PATH =
+              '.github/workflows/claude-fallback-review.yml';
+            // `<status>/<reference>`; only a PASSED status may carry evidence.
+            const VALIDATION_TOKEN_PATTERN = /^passed\/[A-Za-z0-9._:#=,;+()-]{1,180}$/;
+            const TRUSTED_CODEX_LOGINS = new Set([
+              'chatgpt-codex-connector',
+              'chatgpt-codex-connector[bot]',
+            ]);
+            const P1_PATTERN = /(?:P1-orange|(?:^|\n)[\s>*\-_#`]*(?:\*\*\s*P1\s*\*\*|\[P1\]|P1:))/i;
+            const P2_PATTERN = /(?:P2-yellow|(?:^|\n)[\s>*\-_#`]*(?:\*\*\s*P2\s*\*\*|\[P2\]|P2:))/i;
+            const REVIEWED_COMMIT_PATTERN = /(?:^|\n)\*\*Reviewed commit:\*\*\s*`([a-f0-9]{10,40})`(?:\s|$)/i;
+
+            function isCodexCapacityNotice(body) {
+              const text = String(body || '').trim();
+              return /^You have reached your Codex usage limits for code reviews\./i.test(text) ||
+                /^Codex (?:is|was) (?:currently )?(?:at capacity|unable to (?:complete|perform) (?:this )?code review)/i.test(text);
+            }
+            function isCodexTaskResult(body) {
+              const text = String(body || '');
+              return /(?:^|\n)#{2,3}\s+Summary(?:\s|$)/i.test(text) &&
+                /\[View task(?:\s*(?:→|->))?\s*\]\(/i.test(text);
+            }
+            function stripSummarySections(body) {
+              if (!body) return '';
+              return String(body)
+                .replace(/(?:^|\n)#{2,3}\s+Summary[\s\S]*?(?=\n#{2,3}\s|\n---|$)/gi, '')
+                .replace(/(?:^|\n)#{2,3}\s+Testing[\s\S]*?(?=\n#{2,3}\s|\n---|$)/gi, '');
+            }
+            function severity(body) {
+              const semantic = stripSummarySections(body);
+              if (P1_PATTERN.test(semantic)) return 'P1';
+              if (P2_PATTERN.test(semantic)) return 'P2';
+              return null;
+            }
+            function signalTargetsHead(item, headSha) {
+              const exactHead = String(headSha || '').toLowerCase();
+              if (!/^[a-f0-9]{40}$/.test(exactHead)) return false;
+              if (isCodexTaskResult(item?.body)) return false;
+              const originalCommit = String(item?.original_commit_id || '').toLowerCase();
+              if (originalCommit) return originalCommit === exactHead;
+              const commit = String(item?.commit_id || '').toLowerCase();
+              if (commit) return commit === exactHead;
+              const marker = String(item?.body || '').match(REVIEWED_COMMIT_PATTERN)?.[1]?.toLowerCase();
+              if (marker) return exactHead.startsWith(marker);
+              return false;
+            }
+            const isCodex = (user) =>
+              TRUSTED_CODEX_LOGINS.has(String(user?.login || ''));
+
+            const refuse = (message) => {
+              core.setFailed(`Refusing to attest: ${message}`);
+            };
+
+            // ---- policy + trusted-ref preconditions -------------------------
+            // Requirement 1: fallback evidence exists only where the repository
+            // explicitly enables it.
+            if (String(process.env.CLAUDE_FALLBACK_REVIEW_ENABLED || '') !== 'true') {
+              return refuse(
+                'CLAUDE_FALLBACK_REVIEW_ENABLED is not "true" for this repository; ' +
+                'Claude fallback review evidence is disabled here.',
+              );
+            }
+            // Defence in depth: consumers additionally require the producing run
+            // to have executed from the default branch, so refuse early rather
+            // than mint a marker that can never be honoured.
+            const defaultBranch = String(process.env.DEFAULT_BRANCH || '');
+            if (defaultBranch && context.ref !== `refs/heads/${defaultBranch}`) {
+              return refuse(
+                `this workflow must be dispatched from the default branch (${defaultBranch}).`,
+              );
+            }
+
+            // ---- input validation -------------------------------------------
+            const prNumber = Number.parseInt(process.env.PR_NUMBER || '', 10);
+            if (!Number.isFinite(prNumber) || prNumber <= 0) {
+              return refuse('pr_number is not a positive integer.');
+            }
+            const reviewedHead = String(process.env.REVIEWED_HEAD || '').trim().toLowerCase();
+            if (!/^[a-f0-9]{40}$/.test(reviewedHead)) {
+              return refuse('reviewed_head must be a full 40-character SHA.');
+            }
+            const counts = {};
+            for (const field of ['FINDINGS_FOUND', 'FINDINGS_FIXED', 'UNRESOLVED_P1', 'UNRESOLVED_P2']) {
+              const raw = String(process.env[field] || '').trim();
+              if (!/^\d{1,9}$/.test(raw)) {
+                return refuse(`${field.toLowerCase()} must be a non-negative integer.`);
+              }
+              counts[field] = Number(raw);
+            }
+            if (counts.FINDINGS_FIXED > counts.FINDINGS_FOUND) {
+              return refuse('findings_fixed cannot exceed findings_found.');
+            }
+            // A fallback that still carries unresolved P1/P2 is a FAIL, never
+            // evidence. It must be fixed and re-reviewed instead.
+            if (counts.UNRESOLVED_P1 !== 0 || counts.UNRESOLVED_P2 !== 0) {
+              return refuse('unresolved_p1 and unresolved_p2 must both be 0.');
+            }
+            const validation = String(process.env.VALIDATION || '').trim();
+            if (!VALIDATION_TOKEN_PATTERN.test(validation)) {
+              return refuse(
+                'validation must be `passed/<reference>`; a failed or unknown '
+                + 'validation can never mint review evidence.',
+              );
+            }
+
+            // ---- exact-head binding -----------------------------------------
+            const { data: pr } = await github.rest.pulls.get({
+              owner, repo, pull_number: prNumber,
+            });
+            if (pr.state !== 'open') {
+              return refuse(`PR #${prNumber} is not open.`);
+            }
+            const headSha = String(pr.head?.sha || '').toLowerCase();
+            if (headSha !== reviewedHead) {
+              return refuse(
+                `reviewed_head ${reviewedHead.slice(0, 7)} is not the live head ` +
+                `${headSha.slice(0, 7)}; review the exact current head and retry.`,
+              );
+            }
+
+            // ---- Codex availability + finding state -------------------------
+            const [reviews, comments, reviewComments] = await Promise.all([
+              github.paginate(github.rest.pulls.listReviews, {
+                owner, repo, pull_number: prNumber, per_page: 100,
+              }),
+              github.paginate(github.rest.issues.listComments, {
+                owner, repo, issue_number: prNumber, per_page: 100,
+              }),
+              github.paginate(github.rest.pulls.listReviewComments, {
+                owner, repo, pull_number: prNumber, per_page: 100,
+              }),
+            ]);
+
+            // Trusted quota evidence: the real Codex connector identity saying
+            // its CODE REVIEW quota is exhausted. A user, Claude or any other
+            // bot writing "Codex unavailable" is never this.
+            const quotaNotices = [...reviews, ...comments].filter((item) =>
+              isCodex(item.user) && isCodexCapacityNotice(item.body));
+            if (!quotaNotices.length) {
+              return refuse(
+                'no trusted Codex code-review quota notice on this PR; ' +
+                'fallback requires provable Codex unavailability.',
+              );
+            }
+
+            // If Codex actually reviewed this exact head, Codex is the
+            // authority and no fallback may be minted.
+            const codexOnHead = [
+              ...reviews.filter((item) => isCodex(item.user) && !isCodexCapacityNotice(item.body) && signalTargetsHead(item, headSha)),
+              ...comments.filter((item) => isCodex(item.user) && !isCodexCapacityNotice(item.body) && signalTargetsHead(item, headSha)),
+              ...reviewComments.filter((item) => isCodex(item.user) && !isCodexCapacityNotice(item.body) && signalTargetsHead(item, headSha)),
+            ];
+            if (codexOnHead.length) {
+              return refuse(
+                'Codex has a genuine result on this exact head; use the normal ' +
+                'Codex review path instead of a fallback.',
+              );
+            }
+            // The newest Codex review-relevant signal must be the quota notice,
+            // otherwise the quota episode does not describe the current state.
+            const newestAt = (items) => items.reduce((newest, item) => {
+              const at = new Date(item.submitted_at || item.created_at || 0).getTime();
+              return Number.isFinite(at) && at > newest ? at : newest;
+            }, 0);
+            const otherCodexSignals = [...reviews, ...comments, ...reviewComments].filter((item) =>
+              isCodex(item.user) && !isCodexCapacityNotice(item.body) && !isCodexTaskResult(item.body));
+            if (newestAt(otherCodexSignals) > newestAt(quotaNotices)) {
+              return refuse(
+                'a genuine Codex signal is newer than the quota notice; the ' +
+                'quota episode is not current.',
+              );
+            }
+
+            // A real unresolved Codex P1/P2 keeps the gate red no matter what
+            // a fallback says, so refuse to mint evidence that cannot help.
+            const threads = [];
+            let cursor = null;
+            do {
+              const data = await github.graphql(
+                `query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+                  repository(owner: $owner, name: $repo) {
+                    pullRequest(number: $number) {
+                      reviewThreads(first: 100, after: $cursor) {
+                        pageInfo { hasNextPage endCursor }
+                        nodes {
+                          isResolved
+                          isOutdated
+                          path
+                          line
+                          comments(first: 100) { nodes { body author { login } } }
+                        }
+                      }
+                    }
+                  }
+                }`,
+                { owner, repo, number: prNumber, cursor },
+              );
+              const connection = data.repository.pullRequest.reviewThreads;
+              threads.push(...connection.nodes);
+              cursor = connection.pageInfo.hasNextPage ? connection.pageInfo.endCursor : null;
+            } while (cursor);
+
+            const activeCodexFindings = threads.filter((thread) =>
+              thread.isResolved !== true && thread.isOutdated !== true &&
+              (thread.comments?.nodes || []).some((comment) =>
+                TRUSTED_CODEX_LOGINS.has(String(comment.author?.login || '')) &&
+                severity(comment.body))
+            );
+            if (activeCodexFindings.length) {
+              const where = activeCodexFindings
+                .slice(0, 5)
+                .map((thread) => `${thread.path || '?'}:${thread.line || '?'}`)
+                .join(', ');
+              return refuse(
+                `unresolved trusted Codex finding(s) still active: ${where}. ` +
+                'Fix and resolve them first — a fallback never bypasses them.',
+              );
+            }
+            const nonInlineFindings = [...reviews, ...comments].filter((item) =>
+              isCodex(item.user) && !isCodexCapacityNotice(item.body) &&
+              signalTargetsHead(item, headSha) && severity(item.body));
+            if (nonInlineFindings.length) {
+              return refuse(
+                'a trusted Codex P1/P2 finding is active on this exact head.',
+              );
+            }
+
+            // ---- mint the attestation ---------------------------------------
+            const runId = Number.parseInt(process.env.RUN_ID || '0', 10);
+            const runAttempt = Number.parseInt(process.env.RUN_ATTEMPT || '1', 10);
+            const marker =
+              `<!-- claude-fallback-review:v1 run=${runId} attempt=${runAttempt} ` +
+              `pr=${prNumber} provider=${FALLBACK_PROVIDER} reviewed_head=${headSha} ` +
+              `verdict=${FALLBACK_VERDICT} findings_found=${counts.FINDINGS_FOUND} ` +
+              `findings_fixed=${counts.FINDINGS_FIXED} unresolved_p1=${counts.UNRESOLVED_P1} ` +
+              `unresolved_p2=${counts.UNRESOLVED_P2} validation=${validation} ` +
+              `reason=${FALLBACK_REASON} -->`;
+
+            const head7 = headSha.slice(0, 7);
+            const body = [
+              marker,
+              '### Claude Code fallback review — structured attestation',
+              '',
+              'Codex code-review quota is exhausted for this PR, so a full Claude Code',
+              `fallback review was performed against the exact head \`${head7}\`.`,
+              '',
+              `- \`provider\`: \`${FALLBACK_PROVIDER}\``,
+              `- \`reviewed_head\`: \`${headSha}\``,
+              `- \`verdict\`: \`${FALLBACK_VERDICT}\``,
+              `- \`findings_found\`: ${counts.FINDINGS_FOUND}`,
+              `- \`findings_fixed\`: ${counts.FINDINGS_FIXED}`,
+              `- \`unresolved_p1\`: ${counts.UNRESOLVED_P1}`,
+              `- \`unresolved_p2\`: ${counts.UNRESOLVED_P2}`,
+              `- \`validation\`: \`${validation}\``,
+              `- \`reason\`: \`${FALLBACK_REASON}\``,
+              '',
+              'This is a Claude Code review, not a Codex review. It is valid only for',
+              'this exact head: any new commit invalidates it and requires a new review.',
+              'Genuine Codex findings are never bypassed by this attestation, and a',
+              'later Codex result on the current head supersedes it.',
+              '',
+              `Produced by \`${FALLBACK_ATTESTATION_WORKFLOW_PATH}\` run ${runId} (attempt ${runAttempt}).`,
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner, repo, issue_number: prNumber, body,
+            });
+            core.info(
+              `PR #${prNumber}: structured Claude fallback attestation posted for ${head7}.`,
+            );
+            core.summary
+              .addHeading('Claude Fallback Review Attestation')
+              .addList([
+                `PR #${prNumber}`,
+                `reviewed_head ${headSha}`,
+                `findings ${counts.FINDINGS_FOUND} found / ${counts.FINDINGS_FIXED} fixed`,
+                `validation ${validation}`,
+              ])
+              .write();

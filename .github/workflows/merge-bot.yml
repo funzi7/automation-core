@@ -73,6 +73,9 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Requirement 1: Claude fallback review evidence is honoured only
+          # where repository policy explicitly opts in. Must match codex-gate.yml.
+          CLAUDE_FALLBACK_REVIEW_ENABLED: ${{ vars.CLAUDE_FALLBACK_REVIEW_ENABLED }}
           # fix #17 Part C: read-only client token for the checks/statuses reads.
           # Fine-grained PATs CANNOT be granted the Checks permission at all (no
           # such option exists in the PAT UI), so checks.listForRef on the PAT
@@ -457,6 +460,366 @@ jobs:
               return false;
             }
 
+            // ===== CANONICAL EXACT-HEAD REVIEW EVIDENCE ======================
+            // Shared VERBATIM by codex-gate.yml, merge-bot.yml and
+            // claude-fallback-watchdog.yml, and mirrored by
+            // tools/review_evidence.js. tests/test_review_evidence.js asserts
+            // the three inline copies stay byte-identical, so Gate, Merge Bot
+            // and the watchdog can never drift into three different rules.
+            //
+            //   valid exact-head review evidence ==
+            //     normal Codex evidence
+            //     OR approved Claude fallback evidence when Codex is provably
+            //     unavailable
+            //
+            // Every rule fails closed:
+            //  - an attestation is ONE atomic marker written by the trusted
+            //    automation identity, minted by the canonical producer
+            //    workflow, and re-authenticated here against that run through
+            //    the Actions API; free-form prose is never authority;
+            //  - it binds to the exact 40-character head, so any new commit
+            //    invalidates it and a previous-head attestation is worthless;
+            //  - the trusted Codex code-review quota notice must belong to the
+            //    CURRENT head epoch and still sit inside the episode TTL;
+            //  - a genuine Codex result on this head ends the episode, and
+            //    normal Codex evidence remains the default authority;
+            //  - an attestation that declares unresolved P1/P2 blocks rather
+            //    than clears;
+            //  - any lookup failure produces no evidence at all.
+            //
+            // This is NOT an acknowledgement mechanism: it never substitutes
+            // for codex-p1-acknowledged, an owner override, or a reaction.
+            const FALLBACK_PROVIDER = 'claude_code_fallback';
+            const FALLBACK_REASON = 'codex_quota_unavailable';
+            const FALLBACK_VERDICT = 'clean';
+            const FALLBACK_ATTESTATION_WORKFLOW_PATH =
+              '.github/workflows/claude-fallback-review.yml';
+            const FALLBACK_ATTESTATION_AUTHOR = 'github-actions[bot]';
+            const CLAUDE_FALLBACK_MARKER_PATTERN =
+              /<!--\s*claude-fallback-review:v1\b([^>]*)-->/gi;
+            // validation is `<status>/<reference>`, and only a PASSED status
+            // can carry evidence — a failed or unknown validation must never
+            // mint a clean attestation.
+            const FALLBACK_VALIDATION_PATTERN = /^passed\/[A-Za-z0-9._:#=,;+()-]{1,180}$/;
+            // Route B bound: a decline from an earlier head epoch authorizes a
+            // fallback only this long, so stale evidence cannot authorize a
+            // later unrelated fallback forever.
+            const QUOTA_EPISODE_TTL_MS = 24 * 60 * 60 * 1000;
+            const MAX_FALLBACK_ATTESTATION_CANDIDATES = 8;
+
+            function parseFallbackAttestations(body) {
+              const found = [];
+              const pattern = new RegExp(
+                CLAUDE_FALLBACK_MARKER_PATTERN.source,
+                CLAUDE_FALLBACK_MARKER_PATTERN.flags,
+              );
+              let match;
+              while ((match = pattern.exec(String(body || ''))) !== null) {
+                const parsed = {};
+                for (const part of String(match[1] || '').trim().split(/\s+/)) {
+                  if (!part) continue;
+                  const equals = part.indexOf('=');
+                  if (equals > 0) parsed[part.slice(0, equals)] = part.slice(equals + 1);
+                }
+                found.push(parsed);
+              }
+              return found;
+            }
+
+            function fallbackCount(value) {
+              if (!/^\d{1,9}$/.test(String(value ?? ''))) return null;
+              return Number(value);
+            }
+
+            function evaluateFallbackAttestation(attestation, headSha) {
+              const exactHead = String(headSha || '').toLowerCase();
+              if (!/^[a-f0-9]{40}$/.test(exactHead)) {
+                return { accepted: false, blocking: false, reason: 'unknown_head' };
+              }
+              if (!attestation) {
+                return { accepted: false, blocking: false, reason: 'no_attestation' };
+              }
+              if (String(attestation.provider || '') !== FALLBACK_PROVIDER) {
+                return { accepted: false, blocking: false, reason: 'wrong_provider' };
+              }
+              const reviewedHead = String(attestation.reviewed_head || '').toLowerCase();
+              if (!/^[a-f0-9]{40}$/.test(reviewedHead)) {
+                return { accepted: false, blocking: false, reason: 'malformed_reviewed_head' };
+              }
+              if (reviewedHead !== exactHead) {
+                return { accepted: false, blocking: false, reason: 'reviewed_head_mismatch' };
+              }
+              if (String(attestation.reason || '') !== FALLBACK_REASON) {
+                return { accepted: false, blocking: false, reason: 'wrong_reason' };
+              }
+              const found = fallbackCount(attestation.findings_found);
+              const fixed = fallbackCount(attestation.findings_fixed);
+              const unresolvedP1 = fallbackCount(attestation.unresolved_p1);
+              const unresolvedP2 = fallbackCount(attestation.unresolved_p2);
+              if (found === null || fixed === null ||
+                  unresolvedP1 === null || unresolvedP2 === null || fixed > found) {
+                return { accepted: false, blocking: false, reason: 'malformed_counts' };
+              }
+              const validation = String(attestation.validation || '');
+              if (!FALLBACK_VALIDATION_PATTERN.test(validation)) {
+                return { accepted: false, blocking: false, reason: 'missing_validation' };
+              }
+              if (unresolvedP1 > 0 || unresolvedP2 > 0) {
+                return {
+                  accepted: false,
+                  blocking: true,
+                  reason: 'unresolved_fallback_finding',
+                  severity: unresolvedP1 > 0 ? 'P1' : 'P2',
+                };
+              }
+              if (String(attestation.verdict || '') !== FALLBACK_VERDICT) {
+                return { accepted: false, blocking: false, reason: 'verdict_not_clean' };
+              }
+              return {
+                accepted: true,
+                blocking: false,
+                reason: 'structured_fallback_clean',
+                findingsFound: found,
+                findingsFixed: fixed,
+                validation,
+              };
+            }
+
+            // Is a trusted Codex code-review quota episode open right now?
+            //
+            // `notices` are trusted-actor capacity notices; `realActivity` is
+            // every OTHER trusted Codex surface (reviews, comments, review
+            // comments, reactions) excluding non-binding task summaries.
+            // Ordinary comments can never reach either list.
+            //
+            // Two ways an episode is current, both bound to real evidence:
+            //   Route A — Codex declined on THIS head epoch. The head has not
+            //     moved and Codex has not returned, so the decline still
+            //     describes the present state.
+            //   Route B — the decline predates this head epoch, but Codex has
+            //     posted nothing since and the fallback review happened within
+            //     QUOTA_EPISODE_TTL_MS of it. Codex simply stops answering on
+            //     later pushes while its quota is out, so requiring a fresh
+            //     per-head notice would reject genuine exhaustion; the TTL plus
+            //     the closure rule keep it from authorizing anything forever.
+            // Any real Codex activity newer than the newest notice CLOSES the
+            // episode: Codex is demonstrably answering again.
+            function evaluateQuotaEpisode(notices, options) {
+              const settings = options || {};
+              const itemAt = (item) => new Date(
+                item?.created_at || item?.submitted_at || item?.at || 0,
+              ).getTime();
+              const newestOf = (items) => {
+                let newest = null;
+                for (const item of items || []) {
+                  const at = itemAt(item);
+                  if (!Number.isFinite(at) || at <= 0) continue;
+                  if (newest === null || at > newest) newest = at;
+                }
+                return newest;
+              };
+              if (settings.codexSignalOnHead) {
+                return { active: false, reason: 'codex_available_on_head', noticeAt: null };
+              }
+              const newestNotice = newestOf(notices);
+              if (newestNotice === null) {
+                return { active: false, reason: 'no_quota_notice', noticeAt: null };
+              }
+              const newestReal = newestOf(settings.realActivity);
+              if (newestReal !== null && newestReal > newestNotice) {
+                return {
+                  active: false, reason: 'quota_episode_closed',
+                  noticeAt: new Date(newestNotice),
+                };
+              }
+              const observedAt = new Date(settings.headObservedAt || 0).getTime();
+              if (!Number.isFinite(observedAt) || observedAt <= 0) {
+                return { active: false, reason: 'head_epoch_unknown', noticeAt: null };
+              }
+              if (newestNotice >= observedAt) {
+                return {
+                  active: true, reason: 'trusted_quota_episode',
+                  noticeAt: new Date(newestNotice),
+                };
+              }
+              const attestedAt = Number(settings.attestedAt);
+              if (
+                Number.isFinite(attestedAt) && attestedAt >= newestNotice &&
+                attestedAt - newestNotice <= QUOTA_EPISODE_TTL_MS
+              ) {
+                return {
+                  active: true, reason: 'trusted_quota_episode',
+                  noticeAt: new Date(newestNotice),
+                };
+              }
+              return {
+                active: false, reason: 'stale_quota_evidence',
+                noticeAt: new Date(newestNotice),
+              };
+            }
+
+            // Provenance must never credit Codex for a Claude review.
+            function reviewEvidenceProvenance(authority) {
+              if (authority === 'codex') return 'Codex exact-head review accepted';
+              if (authority === FALLBACK_PROVIDER) {
+                return 'Claude Code fallback review accepted for exact head; Codex quota unavailable';
+              }
+              return 'No accepted exact-head review evidence';
+            }
+
+            function attestationRunIsTrusted(run, attempt, commentAt, defaultBranch) {
+              if (!run) return false;
+              // Only the canonical producer workflow may mint evidence, and
+              // only when it ran from the trusted default branch through an
+              // explicit dispatch (which requires write access). A run started
+              // from a PR ref would execute PR-controlled YAML.
+              if (String(run.path || '') !== FALLBACK_ATTESTATION_WORKFLOW_PATH) return false;
+              if (String(run.event || '') !== 'workflow_dispatch') return false;
+              if (defaultBranch && String(run.head_branch || '') !== String(defaultBranch)) return false;
+              if (Number(run.run_attempt) !== Number(attempt)) return false;
+              const startedAt = new Date(run.run_started_at || run.created_at || 0).getTime();
+              const finishedAt = new Date(run.updated_at || 0).getTime();
+              const at = Number(commentAt);
+              if (!Number.isFinite(at) || !Number.isFinite(startedAt) || startedAt <= 0) return false;
+              if (at < startedAt - 5000) return false;
+              if (run.status === 'completed' && at > finishedAt + 5000) return false;
+              return true;
+            }
+
+            // The single canonical question every consumer asks.
+            // Returns { accepted, blocking, severity, reason, episodeReason }.
+            // The single canonical question every consumer asks. It must never
+            // throw: an exception escaping here would reach the Gate's
+            // technical fail-soft branch, which publishes GREEN. Absence of
+            // evidence must look like absence of evidence, not like success.
+            async function acceptedFallbackEvidence(options) {
+              try {
+                return await acceptedFallbackEvidenceUnsafe(options);
+              } catch (e) {
+                core.warning(
+                  `Claude fallback review evidence lookup failed; treating it as no evidence: ${e.message}`,
+                );
+                return {
+                  accepted: false, blocking: false, severity: null,
+                  reason: 'fallback_lookup_failed',
+                  episodeReason: 'fallback_lookup_failed',
+                };
+              }
+            }
+
+            async function acceptedFallbackEvidenceUnsafe(options) {
+              const settings = options || {};
+              const prNumber = Number(settings.prNumber);
+              const headSha = String(settings.headSha || '').toLowerCase();
+              const none = (reason) => ({
+                accepted: false, blocking: false, severity: null, reason,
+                episodeReason: reason,
+              });
+              // Requirement 1: only when repository policy explicitly allows it.
+              if (String(process.env.CLAUDE_FALLBACK_REVIEW_ENABLED || '') !== 'true') {
+                return none('fallback_policy_disabled');
+              }
+              if (!/^[a-f0-9]{40}$/.test(headSha)) return none('unknown_head');
+              // Requirement 7/12: genuine Codex evidence on this head is the
+              // authority; the quota episode is over.
+              if (settings.codexSignalOnHead) return none('codex_available_on_head');
+
+              const comments = settings.comments || [];
+              const quotaNotices = (settings.quotaNotices || []);
+              const realActivity = (settings.realActivity || []);
+              // The episode is evaluated per candidate, because Route B is
+              // bound to when the fallback review itself was attested.
+              const episodeFor = (attestedAt) => evaluateQuotaEpisode(quotaNotices, {
+                headObservedAt: settings.headObservedAt,
+                realActivity,
+                attestedAt,
+                codexSignalOnHead: false,
+              });
+              const episode = episodeFor(Date.now());
+
+              // Collect candidate attestations from trusted-identity comments
+              // only, newest run first, bounded like the epoch markers are.
+              const candidates = [];
+              for (const comment of comments) {
+                const login = String(comment?.user?.login || comment?.author?.login || '');
+                if (login !== FALLBACK_ATTESTATION_AUTHOR) continue;
+                for (const attestation of parseFallbackAttestations(comment?.body)) {
+                  if (Number(attestation.pr) !== prNumber) continue;
+                  candidates.push({
+                    attestation,
+                    runId: Number(attestation.run),
+                    attempt: Number(attestation.attempt || 1),
+                    commentAt: new Date(comment?.created_at || 0).getTime(),
+                  });
+                }
+              }
+              if (!candidates.length) return none('no_attestation');
+              candidates.sort((a, b) => b.runId - a.runId);
+              const bounded = candidates.slice(0, MAX_FALLBACK_ATTESTATION_CANDIDATES);
+
+              let best = none('no_attestation');
+              for (const candidate of bounded) {
+                const evaluated = evaluateFallbackAttestation(candidate.attestation, headSha);
+                if (!evaluated.accepted && !evaluated.blocking) {
+                  if (best.reason === 'no_attestation') best = { ...evaluated, episodeReason: episode.reason };
+                  continue;
+                }
+                // Authenticate the producing run before honouring the marker.
+                let run = null;
+                try {
+                  if (!Number.isFinite(candidate.runId) || candidate.runId <= 0) throw new Error('bad run id');
+                  // The caller injects a reader bound to a token that really
+                  // holds `actions: read`. Merge Bot and the watchdog run their
+                  // default client on AUTOMATION_PAT, which cannot be relied on
+                  // for this read, so they pass their GITHUB_TOKEN reader.
+                  if (typeof settings.fetchRunAttempt !== 'function') {
+                    throw new Error('no authenticated run reader supplied');
+                  }
+                  run = await settings.fetchRunAttempt(candidate.runId, candidate.attempt);
+                } catch (e) {
+                  // Fail closed: an unverifiable attestation is not evidence.
+                  core.warning(
+                    `PR #${prNumber}: fallback attestation run ${candidate.runId} verification failed; ignoring it: ${e.message}`,
+                  );
+                  continue;
+                }
+                if (!attestationRunIsTrusted(
+                  run, candidate.attempt, candidate.commentAt, settings.defaultBranch,
+                )) {
+                  core.warning(
+                    `PR #${prNumber}: fallback attestation run ${candidate.runId} is not the canonical producer; ignoring it.`,
+                  );
+                  continue;
+                }
+                if (evaluated.blocking) {
+                  return {
+                    accepted: false, blocking: true,
+                    severity: evaluated.severity || 'P1',
+                    reason: 'unresolved_fallback_finding',
+                    episodeReason: episode.reason,
+                  };
+                }
+                const candidateEpisode = episodeFor(candidate.commentAt);
+                if (!candidateEpisode.active) {
+                  return {
+                    accepted: false, blocking: false, severity: null,
+                    reason: candidateEpisode.reason,
+                    episodeReason: candidateEpisode.reason,
+                  };
+                }
+                return {
+                  accepted: true, blocking: false, severity: null,
+                  reason: 'structured_fallback_clean',
+                  episodeReason: candidateEpisode.reason,
+                  // When this evidence was recorded. Consumers use it to avoid
+                  // re-dispatching work that already ran after the attestation.
+                  attestedAt: candidate.commentAt,
+                };
+              }
+              return best;
+            }
+            // ===== END CANONICAL EXACT-HEAD REVIEW EVIDENCE ==================
+
             async function hasCurrentHeadNonInlineFinding(prNumber, headSha) {
               const [reviews, comments] = await Promise.all([
                 github.paginate(github.rest.pulls.listReviews, {
@@ -518,6 +881,52 @@ jobs:
                   )
                 )
               );
+            }
+
+            // CANONICAL CONTRACT — Merge Bot must reach exactly the same
+            // review-evidence verdict as Codex Gate and the watchdog:
+            // normal Codex evidence OR approved Claude fallback evidence when
+            // Codex is provably unavailable. Returns the truthful authority so
+            // the merge log never credits Codex for a Claude review.
+            async function hasCurrentHeadReviewEvidence(prNumber, headSha, defaultBranch) {
+              const codexSignal = await hasCurrentHeadCodexSignal(prNumber, headSha);
+              if (codexSignal) {
+                return { accepted: true, authority: 'codex', blocking: false, reason: 'codex_exact_head' };
+              }
+              const [reviews, comments] = await Promise.all([
+                github.paginate(github.rest.pulls.listReviews, {
+                  owner, repo, pull_number: prNumber, per_page: 100,
+                }),
+                github.paginate(github.rest.issues.listComments, {
+                  owner, repo, issue_number: prNumber, per_page: 100,
+                }),
+              ]);
+              const headObservedAt = await observedHeadTransition(prNumber, headSha, comments);
+              const trustedCodex = [...reviews, ...comments].filter((item) =>
+                TRUSTED_CODEX_LOGINS.has(item.user?.login || ''));
+              const quotaNotices = trustedCodex.filter((item) =>
+                isCodexCapacityNotice(item.body));
+              // Genuine Codex activity newer than the newest notice closes the
+              // quota episode.
+              const realActivity = trustedCodex.filter((item) =>
+                !isCodexCapacityNotice(item.body) && !isCodexTaskResult(item.body));
+              const evidence = await acceptedFallbackEvidence({
+                prNumber, headSha, headObservedAt, comments,
+                quotaNotices, realActivity, codexSignalOnHead: false,
+                defaultBranch,
+                // fix #17 Part C pattern: Actions reads run on GITHUB_TOKEN,
+                // not on AUTOMATION_PAT. Using the PAT here would fail closed
+                // and make Merge Bot disagree with the Gate.
+                fetchRunAttempt: (runId, attempt) => roPage(
+                  `https://api.github.com/repos/${owner}/${repo}/actions/runs/${runId}/attempts/${attempt}`,
+                ).then(({ data }) => data),
+              });
+              return {
+                accepted: evidence.accepted,
+                authority: evidence.accepted ? FALLBACK_PROVIDER : 'none',
+                blocking: evidence.blocking,
+                reason: evidence.reason,
+              };
             }
 
             async function hasActiveTrustedBlocker(prNumber, headSha) {
@@ -1012,13 +1421,19 @@ jobs:
               // the established grace-eligible trusted sync. This prevents a
               // persisted override-green check from surviving override label
               // removal before Codex reviews the head.
-              if (
-                !initialLabels.has(CODEX_OVERRIDE_LABEL) &&
-                !isTrustedSync(pr) &&
-                !(await hasCurrentHeadCodexSignal(prNumber, headSha))
-              ) {
-                core.info(`#${prNumber}: no trusted Codex signal on current head, skip`);
-                continue;
+              let reviewEvidence = { accepted: true, authority: 'none', blocking: false, reason: 'not_required' };
+              if (!initialLabels.has(CODEX_OVERRIDE_LABEL) && !isTrustedSync(pr)) {
+                reviewEvidence = await hasCurrentHeadReviewEvidence(
+                  prNumber, headSha, pr.base?.repo?.default_branch,
+                );
+                if (reviewEvidence.blocking) {
+                  core.info(`#${prNumber}: Claude fallback review reports unresolved P1/P2, skip`);
+                  continue;
+                }
+                if (!reviewEvidence.accepted) {
+                  core.info(`#${prNumber}: no accepted exact-head review evidence (${reviewEvidence.reason}), skip`);
+                  continue;
+                }
               }
               // The authoritative current review-thread state must also
               // contain no unresolved, non-outdated trusted P1/P2 finding.
@@ -1090,13 +1505,18 @@ jobs:
                 core.info(`#${prNumber}: no-automerge appeared after validation, hard stop`);
                 continue;
               }
-              if (
-                !finalLabels.has(CODEX_OVERRIDE_LABEL) &&
-                !isTrustedSync(finalPr) &&
-                !(await hasCurrentHeadCodexSignal(prNumber, headSha))
-              ) {
-                core.info(`#${prNumber}: override absent and current-head Codex signal missing after validation, skip`);
-                continue;
+              if (!finalLabels.has(CODEX_OVERRIDE_LABEL) && !isTrustedSync(finalPr)) {
+                // Revalidate the identical canonical decision against the final
+                // candidate: a commit or a returning Codex finding between the
+                // two checks must still stop the merge.
+                const finalEvidence = await hasCurrentHeadReviewEvidence(
+                  prNumber, headSha, finalPr.base?.repo?.default_branch,
+                );
+                if (finalEvidence.blocking || !finalEvidence.accepted) {
+                  core.info(`#${prNumber}: exact-head review evidence missing after validation (${finalEvidence.reason}), skip`);
+                  continue;
+                }
+                reviewEvidence = finalEvidence;
               }
               if (
                 !finalLabels.has(CODEX_OVERRIDE_LABEL) &&
@@ -1183,7 +1603,11 @@ jobs:
                   core.warning(`#${prNumber}: merge API did not merge: ${mergeResult.message || 'unknown reason'}`);
                   continue;
                 }
-                core.info(`#${prNumber}: merged ✅`);
+                // Truthful provenance: never record "Codex reviewed" for a
+                // merge that a Claude Code fallback review actually cleared.
+                core.info(
+                  `#${prNumber}: merged ✅ — ${reviewEvidenceProvenance(reviewEvidence.authority)}`,
+                );
               } catch (e) {
                 if (clearedTransient) {
                   try {

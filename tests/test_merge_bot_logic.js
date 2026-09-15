@@ -458,7 +458,11 @@ test('workflow preserves exact-SHA squash merge and same-repo branch deletion', 
   assert.match(workflow, /runEvidence\.hasBoundary/);
   assert.match(workflow, /function signalTargetsHead\(item, headSha, headObservedAt/);
   assert.doesNotMatch(workflow, /latestCommitDate/);
-  assert.match(workflow, /override absent and current-head Codex signal missing/);
+  // The final candidate is revalidated through the canonical review-evidence
+  // decision, so a commit or a returning Codex finding between the two checks
+  // still stops the merge.
+  assert.match(workflow, /exact-head review evidence missing after validation/);
+  assert.match(workflow, /const finalEvidence = await hasCurrentHeadReviewEvidence\(\s*prNumber, headSha, finalPr\.base\?\.repo\?\.default_branch,\s*\)/);
   assert.match(workflow, /needsEvent\.actor\?\.login === 'github-actions\[bot\]'/);
   assert.match(workflow, /autoEvent\.actor\?\.login === 'github-actions\[bot\]'/);
   assert.match(workflow, /GH_LABEL_TOKEN: \$\{\{ github\.token \}\}/);
@@ -601,6 +605,8 @@ test('only synced automation infrastructure is in the central allow-list', () =>
     'merge-bot.yml',
     'claude-fallback-watchdog.yml',
     'codex-backup-fix.yml',
+    // Canonical producer of structured Claude fallback review evidence.
+    'claude-fallback-review.yml',
   ]);
   assert.equal(config.synced_workflows.some((name) => /poll|backfill|health/.test(name)), false);
 });

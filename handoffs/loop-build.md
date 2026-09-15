@@ -4,6 +4,52 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
 
 ---
 
+## [2026-09-15 UTC] Canonical Claude fallback review evidence
+- PR: (to be opened from `claude/canonical-fallback-review-evidence`)
+- Branch: `claude/canonical-fallback-review-evidence`
+- Status: opened
+- What changed:
+  - The central contract is now `valid exact-head review evidence == normal
+    Codex evidence OR approved Claude fallback evidence when Codex is provably
+    unavailable`. Implemented in automation-core, not as a consumer patch.
+  - New `workflows/claude-fallback-review.yml` is the only sanctioned producer
+    of a structured `claude-fallback-review:v1` attestation: dispatch-only,
+    default-branch only, gated on `CLAUDE_FALLBACK_REVIEW_ENABLED`, no checkout,
+    verdict derived rather than accepted, and it refuses to attest unless the
+    SHA is the live head, a trusted Codex quota notice exists, Codex has no
+    result on that head, and no trusted Codex P1/P2 is still active.
+  - Codex Gate, Merge Bot and the watchdog now carry one verbatim-shared
+    `CANONICAL EXACT-HEAD REVIEW EVIDENCE` block; a test asserts the three
+    inline copies are byte-identical and that `tools/review_evidence.js`
+    mirrors its reason codes.
+  - Consumers re-authenticate every attestation against the producing run
+    (workflow path, `workflow_dispatch` event, default-branch `head_branch`,
+    attempt, comment-inside-run-window) and fail closed on any lookup error;
+    the evidence call cannot throw into the Gate's technical fail-soft green.
+  - Quota episodes are bound to real evidence: Route A (decline on this head
+    epoch) or Route B (decline predates it, Codex silent since, attested within
+    24 h). Genuine Codex activity newer than the newest notice closes the
+    episode; no authenticated head epoch means no episode.
+  - Provenance is truthful; `codex-p1-acknowledged`, owner override and
+    reaction acknowledgement are untouched and are never used for fallback.
+- Validation: 114 deterministic tests pass (30 new in
+  `tests/test_review_evidence.js`, covering the full mandatory matrix and the
+  paywall-bot PR #103 regression built on that PR's real timestamps);
+  `bash scripts/validate.sh` green — every tracked YAML parses, all synced
+  source/`.github` mirrors byte-identical, all 59 `github-script` bodies
+  expression-safe and syntax-checked; `git diff --check` clean.
+  Review provider for this change: `review_provider = claude_code_fallback`,
+  `reason = codex_quota_unavailable` — an independent Opus reviewer, because the
+  central mechanism did not exist before this PR and therefore cannot be claimed
+  as already authoritative for it.
+- Needs from the owner: merge, then set `CLAUDE_FALLBACK_REVIEW_ENABLED=true` on
+  each repository that should honour fallback evidence (Actions variables are
+  not synced, so the Codex-only contract stays in force until it is set).
+- Next: normal sync delivers the new workflow to consumers, including
+  OptionsProfitTracker. OPT PR #19 still needs current-head quota evidence plus
+  a fresh exact-head fallback review, or a normal Codex review, before it can
+  pass — its existing notices all predate its current head.
+
 ## [2026-08-13 UTC] Reject delayed old-head task results
 - Production trigger: paywall-bot PR #97 head `29b7c16d29749ba35b371a6a17068b4ee6746e0c` was pushed at 13:39 UTC. A Codex task summary initiated on the prior head arrived at 13:40 and the timestamp fallback treated it as current-head review, allowing merge `0c4ae03fdbc7c7bf79b41c4fb31dd19db0c10e10` before the actual current-head Codex review at 13:41.
 - Correction: Gate, Merge Bot, Watchdog, bridge, and backup fixer reject task summaries and timing-only result binding. Review/result surfaces use immutable `commit_id`/`original_commit_id`, explicit `Reviewed commit`, or trusted `ai-loop` head markers where applicable. Reaction-only clean remains supported only when authenticated Gate marker history proves the PR has had exactly one observed head; after a transition, commit-bearing evidence is mandatory.
