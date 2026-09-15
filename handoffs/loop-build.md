@@ -32,7 +32,7 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
     episode; no authenticated head epoch means no episode.
   - Provenance is truthful; `codex-p1-acknowledged`, owner override and
     reaction acknowledgement are untouched and are never used for fallback.
-- Validation: 120 deterministic tests pass (36 new in
+- Validation: 125 deterministic tests pass (41 new in
   `tests/test_review_evidence.js`) — the full mandatory acceptance matrix, the
   paywall-bot PR #103 regression built on that PR's real timestamps, the
   shipped inline block from all three consumers executed directly across the
@@ -47,6 +47,25 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
   mirror did not short-circuit fallback evaluation on a current-head Codex
   signal the way the inline block does, so a stale attestation could have
   blocked a Codex-reviewed head in the mirror only.
+- The independent Opus review raised no P1 and six P2s, all fixed: an outdated
+  (not resolved) Codex P1/P2 could be cleared by a fallback — the producer now
+  refuses while any trusted Codex thread is unresolved, outdated or not; the
+  three consumers fed the byte-identical block three different evidence sets —
+  a shared `collectReviewEvidenceInputs` collector now builds them, and a test
+  drives all three shipped blocks over a fixture matrix; attestation runs that
+  were queued or had refused to attest still authenticated, and an edited
+  comment body still passed — the run must now be completed+successful, the
+  window is bounded at both ends, an unknown default branch fails closed, and
+  an edited attestation is rejected; the "Gate and Merge Bot agree" test called
+  one pure function twice and was vacuous — it now compares the three shipped
+  inline blocks; the mandated precedence and the PR #103 regression were proven
+  only against the mirror — both are now also proven against the shipped gate
+  path, with the gate's inline `decideCodexGate` pinned equivalent to the tested
+  module; and the mirror's signature and Route B timing semantics now match the
+  inline copy. Nits fixed too: a quota notice carrying a P1/P2 no longer opens
+  an episode, a review thread too long to read in one page fails closed, the
+  success summary no longer reports a Codex-sounding reason for a Claude
+  review, and Merge Bot paginates each PR once instead of three times.
 - NOT validated in production: `pull_request_target` loads Codex Gate from the
   base branch, so the gate run on this PR executed main's OLD code. The new
   gate/merge-bot/watchdog paths take effect only after merge; no production

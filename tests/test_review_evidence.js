@@ -91,7 +91,9 @@ function decide(overrides = {}) {
   return decideReviewEvidence({
     headSha: HEAD,
     headObservedAt: HEAD_OBSERVED_AT,
-    now: NOW,
+    // The Route B window is measured from when the attestation was written,
+    // never from evaluation time, so tests must always be explicit.
+    attestedAt: NOW,
     fallbackPolicyEnabled: true,
     ...overrides,
   });
@@ -172,6 +174,7 @@ test('4c: an attestation run must be the canonical producing workflow', () => {
     run_started_at: '2026-09-09T10:00:00Z',
     updated_at: '2026-09-09T10:05:00Z',
     status: 'completed',
+    conclusion: 'success',
   };
   const commentAt = new Date('2026-09-09T10:02:00Z').getTime();
   const opts = { attempt: 1, commentAt, defaultBranch: 'main' };
@@ -192,6 +195,15 @@ test('4c: an attestation run must be the canonical producing workflow', () => {
     attestationRunIsTrusted(base,
       { ...opts, commentAt: new Date('2026-09-09T11:00:00Z').getTime() }), false,
     'a comment outside the run window is not from that run');
+  assert.equal(
+    attestationRunIsTrusted({ ...base, status: 'in_progress' }, opts), false,
+    'an unfinished run leaves an open-ended window');
+  assert.equal(
+    attestationRunIsTrusted({ ...base, conclusion: 'failure' }, opts), false,
+    'a run that refused to attest proves nothing');
+  assert.equal(
+    attestationRunIsTrusted(base, { ...opts, defaultBranch: null }), false,
+    'an unknown default branch must fail closed, not skip the check');
   assert.equal(attestationRunIsTrusted(null, opts), false);
 });
 
@@ -222,7 +234,7 @@ test('6: a commit after an accepted fallback invalidates it until re-review', ()
   const afterCommit = decideReviewEvidence({
     headSha: NEXT_HEAD,
     headObservedAt: new Date('2026-09-09T10:00:00Z'),
-    now: NOW,
+    attestedAt: NOW,
     fallbackPolicyEnabled: true,
     verifiedAttestations: [attestation()],
     quotaNotices: trustedQuotaNotices([
@@ -237,7 +249,7 @@ test('6: a commit after an accepted fallback invalidates it until re-review', ()
   const rereviewed = decideReviewEvidence({
     headSha: NEXT_HEAD,
     headObservedAt: new Date('2026-09-09T10:00:00Z'),
-    now: NOW,
+    attestedAt: NOW,
     fallbackPolicyEnabled: true,
     verifiedAttestations: [attestation({ head: NEXT_HEAD })],
     quotaNotices: trustedQuotaNotices([
@@ -339,7 +351,7 @@ test('9b: a structurally incomplete marker is rejected field by field', () => {
   for (const [options, expected] of cases) {
     const parsed = attestation(options);
     assert.equal(
-      evaluateFallbackAttestation(parsed, { headSha: HEAD }).reason, expected,
+      evaluateFallbackAttestation(parsed, HEAD).reason, expected,
     );
   }
 });
@@ -352,7 +364,8 @@ test('10: quota evidence from an earlier head epoch cannot authorize fallback', 
     quotaNotice({ at: '2026-09-07T10:45:22Z' }),
   ]);
   const episode = evaluateQuotaEpisode(stale, {
-    headObservedAt: HEAD_OBSERVED_AT, now: NOW,
+    headObservedAt: HEAD_OBSERVED_AT,
+    attestedAt: new Date('2026-09-09T10:00:00Z').getTime(),
   });
   assert.equal(episode.active, false);
   assert.equal(episode.reason, 'stale_quota_evidence');
@@ -409,7 +422,7 @@ test('10d: real Codex activity after the newest notice closes the episode', () =
 
 test('10c: an unknown head epoch fails closed', () => {
   const episode = evaluateQuotaEpisode(
-    trustedQuotaNotices([quotaNotice()]), { headObservedAt: null, now: NOW },
+    trustedQuotaNotices([quotaNotice()]), { headObservedAt: null, attestedAt: NOW },
   );
   assert.equal(episode.active, false);
   assert.equal(episode.reason, 'head_epoch_unknown');
@@ -524,23 +537,102 @@ test('policy off reproduces the pre-existing Codex-only decision exactly', () =>
 // ---------------------------------------------------------------------------
 // 14. Gate and Merge Bot reach identical decisions
 // ---------------------------------------------------------------------------
-test('14: identical inputs yield identical Gate and Merge Bot decisions', () => {
-  const inputs = [
-    { codexSignalOnHead: true },
-    { verifiedAttestations: [attestation()], quotaNotices: trustedQuotaNotices([quotaNotice()]) },
-    { verifiedAttestations: [attestation({ head: PREVIOUS_HEAD })], quotaNotices: trustedQuotaNotices([quotaNotice()]) },
-    { threads: [codexThread()], verifiedAttestations: [attestation()], quotaNotices: trustedQuotaNotices([quotaNotice()]) },
-    { verifiedAttestations: [attestation({ p1: 3 })], quotaNotices: trustedQuotaNotices([quotaNotice()]) },
-    { verifiedAttestations: [attestation()], quotaNotices: [] },
+test('14: the three SHIPPED blocks decide identically on identical evidence', async () => {
+  // The previous version of this test called one pure function twice, so it
+  // would have passed even if Gate and Merge Bot disagreed completely. Drive
+  // the actual inline blocks from all three workflows instead.
+  const apis = ['codex-gate.yml', 'merge-bot.yml', 'claude-fallback-watchdog.yml']
+    .map((name) => ({ name, api: loadInlineEvidence(name).make() }));
+
+  const base = {
+    prNumber: 103,
+    headSha: HEAD,
+    headObservedAt: new Date('2026-09-09T09:50:19Z'),
+    defaultBranch: 'main',
+    codexSignalOnHead: false,
+    fetchRunAttempt: async () => TRUSTED_RUN,
+  };
+  const surfaces = {
+    clean: {
+      reviews: [], comments: [attestationComment()],
+      reviewComments: [], reactions: [],
+    },
+  };
+
+  const matrix = [
+    ['accepted', { comments: [attestationComment()], quotaNotices: [quotaNotice({ at: '2026-09-09T09:50:28Z' })] }],
+    ['no attestation', { comments: [], quotaNotices: [quotaNotice({ at: '2026-09-09T09:50:28Z' })] }],
+    ['no quota episode', { comments: [attestationComment()], quotaNotices: [] }],
+    ['previous head', { comments: [attestationComment({ options: { head: PREVIOUS_HEAD } })], quotaNotices: [quotaNotice({ at: '2026-09-09T09:50:28Z' })] }],
+    ['unresolved fallback P1', { comments: [attestationComment({ options: { p1: 4 } })], quotaNotices: [quotaNotice({ at: '2026-09-09T09:50:28Z' })] }],
+    ['untrusted author', { comments: [attestationComment({ login: 'funzi7' })], quotaNotices: [quotaNotice({ at: '2026-09-09T09:50:28Z' })] }],
+    ['codex returned', { comments: [attestationComment()], quotaNotices: [quotaNotice({ at: '2026-09-09T09:50:28Z' })], realActivity: [{ created_at: '2026-09-09T10:10:00Z' }] }],
+    ['edited attestation', { comments: [{ ...attestationComment(), updated_at: '2026-09-09T11:00:00Z' }], quotaNotices: [quotaNotice({ at: '2026-09-09T09:50:28Z' })] }],
   ];
-  for (const input of inputs) {
-    const gate = decide(input);
-    const mergeBot = decide(input);
-    assert.deepEqual(
-      { status: gate.status, authority: gate.authority, reason: gate.reason },
-      { status: mergeBot.status, authority: mergeBot.authority, reason: mergeBot.reason },
-    );
+
+  for (const [label, override] of matrix) {
+    const results = [];
+    for (const { name, api } of apis) {
+      const out = await api.acceptedFallbackEvidence({ ...base, ...override });
+      results.push({ name, key: `${out.accepted}/${out.blocking}/${out.reason}` });
+    }
+    const first = results[0].key;
+    for (const result of results.slice(1)) {
+      assert.equal(result.key, first,
+        `${label}: ${result.name} disagreed with ${results[0].name} (${result.key} vs ${first})`);
+    }
   }
+  assert.ok(surfaces);
+});
+
+test('14d: the three SHIPPED blocks build identical evidence inputs', async () => {
+  // Byte-identical logic still drifts if the three feed it different sets.
+  const raw = {
+    reviews: [
+      { user: { login: CODEX_REST }, body: QUOTA_TEXT, submitted_at: '2026-09-09T02:13:50Z' },
+      { user: { login: CODEX_REST }, body: '**P2** something', submitted_at: '2026-09-09T02:00:00Z' },
+    ],
+    comments: [
+      { user: { login: CODEX_REST }, body: QUOTA_TEXT, created_at: '2026-09-09T09:50:28Z' },
+      { user: { login: 'funzi7' }, body: QUOTA_TEXT, created_at: '2026-09-09T09:55:00Z' },
+    ],
+    reviewComments: [
+      { user: { login: CODEX }, body: 'inline note', created_at: '2026-09-09T02:05:00Z' },
+    ],
+    reactions: [
+      { user: { login: CODEX_REST }, content: '+1', created_at: '2026-09-09T02:06:00Z' },
+    ],
+  };
+  const shapes = ['codex-gate.yml', 'merge-bot.yml', 'claude-fallback-watchdog.yml'].map((name) => {
+    const api = loadInlineEvidence(name).make();
+    const out = api.collectReviewEvidenceInputs(raw);
+    return JSON.stringify({
+      quota: out.quotaNotices.map((i) => i.created_at || i.submitted_at).sort(),
+      real: out.realActivity.map((i) => i.created_at || i.submitted_at).sort(),
+    });
+  });
+  assert.equal(shapes[1], shapes[0], 'merge-bot must build the same inputs as the gate');
+  assert.equal(shapes[2], shapes[0], 'the watchdog must build the same inputs as the gate');
+  const parsed = JSON.parse(shapes[0]);
+  assert.deepEqual(parsed.quota, ['2026-09-09T02:13:50Z', '2026-09-09T09:50:28Z'],
+    'only trusted Codex usage-limit notices count');
+  assert.ok(!parsed.real.includes('2026-09-09T09:55:00Z'),
+    'an untrusted author never contributes evidence');
+  assert.ok(parsed.real.includes('2026-09-09T02:06:00Z'),
+    'a Codex reaction is real activity even though it has no body');
+});
+
+test('14e: a quota notice that also carries a finding cannot open an episode', async () => {
+  const api = loadInlineEvidence('codex-gate.yml').make();
+  const inputs = api.collectReviewEvidenceInputs({
+    comments: [{
+      user: { login: CODEX_REST },
+      body: `${QUOTA_TEXT}\n\n**P1** unsafe direction control`,
+      created_at: '2026-09-09T09:50:28Z',
+    }],
+  });
+  assert.equal(inputs.quotaNotices.length, 0,
+    'a notice carrying P1/P2 is a finding, not proof of unavailability');
 });
 
 test('14b: provenance never attributes a Claude review to Codex', () => {
@@ -775,7 +867,7 @@ function loadInlineEvidence(name) {
   const warnings = [];
   const factory = new Function(
     'github', 'owner', 'repo', 'core', 'process',
-    `${source}\nreturn { acceptedFallbackEvidence, evaluateQuotaEpisode, evaluateFallbackAttestation, parseFallbackAttestations, reviewEvidenceProvenance, attestationRunIsTrusted };`,
+    `${source}\nreturn { acceptedFallbackEvidence, evaluateQuotaEpisode, evaluateFallbackAttestation, parseFallbackAttestations, reviewEvidenceProvenance, attestationRunIsTrusted, collectReviewEvidenceInputs };`,
   );
   return {
     warnings,
@@ -797,6 +889,7 @@ const TRUSTED_RUN = {
   run_started_at: '2026-09-09T10:00:00Z',
   updated_at: '2026-09-09T10:05:00Z',
   status: 'completed',
+  conclusion: 'success',
 };
 
 function attestationComment({ login = BOT, at = '2026-09-09T10:02:00Z', options = {} } = {}) {
@@ -912,6 +1005,134 @@ test('inline: free-form prose parses to no attestation in the shipped block', as
   });
   assert.equal(decision.accepted, false);
   assert.equal(decision.reason, 'no_attestation');
+});
+
+// ---------------------------------------------------------------------------
+// Finding: the mandated precedence was asserted only against the mirror.
+// Prove it against the SHIPPED gate path instead.
+// ---------------------------------------------------------------------------
+function inlineFunctionSource(name, fnName) {
+  const body = workflow(name);
+  const head = `            function ${fnName}(`;
+  const start = body.indexOf(head);
+  assert.ok(start >= 0, `${name} must define ${fnName} inline`);
+  const end = body.indexOf('\n            }\n', start);
+  assert.ok(end > start, `${name}: could not bound ${fnName}`);
+  return body.slice(start, end + '\n            }'.length);
+}
+
+// Compare logic, not formatting: line comments and trailing commas differ
+// harmlessly between the inline copy and the module.
+const normalize = (source) => String(source)
+  .replace(/\/\/[^\n]*/g, ' ')
+  .replace(/,(\s*[}\])])/g, '$1')
+  .replace(/\s+/g, ' ')
+  .trim();
+
+test('the gate\'s inline decideCodexGate is equivalent to the tested module', () => {
+  const { decideCodexGate } = require('../tools/codex_gate_logic');
+  const inline = normalize(inlineFunctionSource('codex-gate.yml', 'decideCodexGate'));
+  const mirrored = normalize(decideCodexGate.toString());
+  assert.equal(inline, mirrored,
+    'the gate must decide with exactly the logic the acceptance tests exercise');
+});
+
+test('shipped path: precedence holds for requirements 5, 7 and PR #103', async () => {
+  // Compose the SHIPPED evidence function with the gate's decision function
+  // (pinned equivalent by the test above) and the gate's branch ordering.
+  const { decideCodexGate } = require('../tools/codex_gate_logic');
+  const api = loadInlineEvidence('codex-gate.yml').make();
+
+  async function shippedGate({
+    threads = [], nonInlineFindings = [], codexSignalOnHead = false,
+    comments = [attestationComment()],
+    quotaNotices = [quotaNotice({ at: '2026-09-09T09:50:28Z' })],
+    realActivity = [],
+  } = {}) {
+    const fallbackEvidence = await api.acceptedFallbackEvidence({
+      prNumber: 103,
+      headSha: HEAD,
+      headObservedAt: new Date('2026-09-09T09:50:19Z'),
+      defaultBranch: 'main',
+      comments, quotaNotices, realActivity, codexSignalOnHead,
+      fetchRunAttempt: async () => TRUSTED_RUN,
+    });
+    const gateDecision = decideCodexGate({
+      threads, nonInlineFindings,
+      currentHeadSignal: codexSignalOnHead || fallbackEvidence.accepted,
+    });
+    // The gate computes reviewAuthority but only ever reports it on the clear
+    // path — it `continue`s before that on blocked/pending — so the effective
+    // authority of a non-clear verdict is none.
+    const authority = gateDecision.status !== 'clear'
+      ? 'none'
+      : codexSignalOnHead
+        ? 'codex'
+        : fallbackEvidence.accepted ? 'claude_code_fallback' : 'none';
+    // The gate's branch ordering, reproduced exactly.
+    if (gateDecision.status !== 'blocked' && fallbackEvidence.blocking) {
+      return { status: 'blocked', reason: 'unresolved_fallback_finding', authority: 'none' };
+    }
+    return { status: gateDecision.status, reason: gateDecision.reason, authority };
+  }
+
+  // Requirement 5 — a valid fallback never bypasses an unresolved Codex finding.
+  const activeThread = await shippedGate({ threads: [codexThread()] });
+  assert.equal(activeThread.status, 'blocked');
+  assert.equal(activeThread.reason, 'active_unresolved_review_thread');
+  assert.equal(activeThread.authority, 'none');
+
+  const nonInline = await shippedGate({
+    nonInlineFindings: [{ severity: 'P1', path: '(review body)', line: null, startLine: null, threadId: '' }],
+  });
+  assert.equal(nonInline.status, 'blocked');
+  assert.equal(nonInline.authority, 'none');
+
+  // Requirement 6 — an unresolved fallback finding blocks rather than clears.
+  const fallbackFinding = await shippedGate({
+    comments: [attestationComment({ options: { p1: 2 } })],
+  });
+  assert.equal(fallbackFinding.status, 'blocked');
+  assert.equal(fallbackFinding.reason, 'unresolved_fallback_finding');
+
+  // Requirement 7 — a returning Codex P1 on the current head blocks.
+  const codexReturned = await shippedGate({
+    codexSignalOnHead: true,
+    threads: [codexThread({ body: '**P1** regression introduced by this PR' })],
+  });
+  assert.equal(codexReturned.status, 'blocked');
+  assert.equal(codexReturned.authority, 'none');
+
+  // Requirement 12 — clean current Codex supersedes the fallback.
+  const codexClean = await shippedGate({ codexSignalOnHead: true });
+  assert.equal(codexClean.status, 'clear');
+  assert.equal(codexClean.authority, 'codex');
+
+  // PR #103 — passes, and only through the valid structured path.
+  const resolvedRounds = [
+    codexThread({ body: '**P2** publication accounting drifts', resolved: true }),
+    codexThread({ body: '**P2** direction control trusted too early', resolved: true }),
+    codexThread({ body: '**P2** missing truthful failure path', resolved: true }),
+    codexThread({ body: '**P2** stale source map reused', resolved: true }),
+  ];
+  const regression = await shippedGate({ threads: resolvedRounds });
+  assert.equal(regression.status, 'clear', 'PR #103 must pass on the shipped path');
+  assert.equal(regression.authority, 'claude_code_fallback');
+
+  for (const [label, override] of Object.entries({
+    'no attestation': { comments: [] },
+    'free-form prose only': {
+      comments: [{ user: { login: BOT }, created_at: '2026-09-09T10:02:00Z', body: 'Claude reviewed this fully.' }],
+    },
+    'previous head': { comments: [attestationComment({ options: { head: PREVIOUS_HEAD } })] },
+    'no quota episode': { quotaNotices: [] },
+    'Codex returned after the notice': { realActivity: [{ created_at: '2026-09-09T10:10:00Z' }] },
+    'an unresolved P2 remains': { threads: [...resolvedRounds.slice(1), codexThread()] },
+  })) {
+    const blocked = await shippedGate({ threads: resolvedRounds, ...override });
+    assert.notEqual(blocked.status, 'clear', `#103 must not pass on the shipped path: ${label}`);
+    assert.equal(blocked.authority, 'none', `#103 must not pass on the shipped path: ${label}`);
+  }
 });
 
 test('13: the watchdog stops chasing Codex once the gate evaluated the fallback', () => {
@@ -1037,7 +1258,7 @@ test('producer: attests only when every canonical precondition holds', async () 
   // The parsed marker must satisfy the consumers' own validation.
   const parsed = parseFallbackAttestations(body)[0];
   assert.equal(
-    evaluateFallbackAttestation(parsed, { headSha: HEAD }).accepted, true,
+    evaluateFallbackAttestation(parsed, HEAD).accepted, true,
     'what the producer mints must be what consumers accept',
   );
 });

@@ -628,6 +628,58 @@ jobs:
             const QUOTA_EPISODE_TTL_MS = 24 * 60 * 60 * 1000;
             const MAX_FALLBACK_ATTESTATION_CANDIDATES = 8;
 
+            // Self-contained trusted-Codex predicates. They deliberately do
+            // not reuse each workflow's ambient copies: the inputs to the
+            // canonical decision must be built identically in all three, or
+            // byte-identical logic can still reach different verdicts.
+            const EVIDENCE_CODEX_LOGINS = new Set([
+              'chatgpt-codex-connector',
+              'chatgpt-codex-connector[bot]',
+            ]);
+            const EVIDENCE_P1 = /(?:P1-orange|(?:^|\n)[\s>*\-_#`]*(?:\*\*\s*P1\s*\*\*|\[P1\]|P1:))/i;
+            const EVIDENCE_P2 = /(?:P2-yellow|(?:^|\n)[\s>*\-_#`]*(?:\*\*\s*P2\s*\*\*|\[P2\]|P2:))/i;
+            const evidenceIsCodex = (item) => EVIDENCE_CODEX_LOGINS.has(
+              String(item?.user?.login || item?.author?.login || ''),
+            );
+            function evidenceIsCapacityNotice(body) {
+              const text = String(body || '').trim();
+              return /^You have reached your Codex usage limits for code reviews\./i.test(text) ||
+                /^Codex (?:is|was) (?:currently )?(?:at capacity|unable to (?:complete|perform) (?:this )?code review)/i.test(text);
+            }
+            function evidenceIsTaskResult(body) {
+              const text = String(body || '');
+              return /(?:^|\n)#{2,3}\s+Summary(?:\s|$)/i.test(text) &&
+                /\[View task(?:\s*(?:→|->))?\s*\]\(/i.test(text);
+            }
+            function evidenceHasSeverity(body) {
+              const semantic = String(body || '')
+                .replace(/(?:^|\n)#{2,3}\s+Summary[\s\S]*?(?=\n#{2,3}\s|\n---|$)/gi, '')
+                .replace(/(?:^|\n)#{2,3}\s+Testing[\s\S]*?(?=\n#{2,3}\s|\n---|$)/gi, '');
+              return EVIDENCE_P1.test(semantic) || EVIDENCE_P2.test(semantic);
+            }
+
+            // Build the canonical inputs from the raw Codex surfaces. Every
+            // consumer MUST use this, so Gate, Merge Bot and the watchdog see
+            // the same quota episode from the same evidence.
+            function collectReviewEvidenceInputs(sources) {
+              const all = [
+                ...((sources && sources.reviews) || []),
+                ...((sources && sources.comments) || []),
+                ...((sources && sources.reviewComments) || []),
+                ...((sources && sources.reactions) || []),
+              ].filter(evidenceIsCodex);
+              return {
+                // A notice that also carries a P1/P2 is a finding, not proof of
+                // unavailability, and must never open an episode.
+                quotaNotices: all.filter((item) =>
+                  evidenceIsCapacityNotice(item?.body) && !evidenceHasSeverity(item?.body)),
+                // Everything else Codex actually produced. A reaction has no
+                // body and still counts: it proves Codex is answering.
+                realActivity: all.filter((item) =>
+                  !evidenceIsCapacityNotice(item?.body) && !evidenceIsTaskResult(item?.body)),
+              };
+            }
+
             function parseFallbackAttestations(body) {
               const found = [];
               const pattern = new RegExp(
@@ -793,17 +845,26 @@ jobs:
               // Only the canonical producer workflow may mint evidence, and
               // only when it ran from the trusted default branch through an
               // explicit dispatch (which requires write access). A run started
-              // from a PR ref would execute PR-controlled YAML.
+              // from a PR ref would execute PR-controlled YAML, so an unknown
+              // default branch fails closed rather than skipping the check.
               if (String(run.path || '') !== FALLBACK_ATTESTATION_WORKFLOW_PATH) return false;
               if (String(run.event || '') !== 'workflow_dispatch') return false;
-              if (defaultBranch && String(run.head_branch || '') !== String(defaultBranch)) return false;
+              if (!defaultBranch) return false;
+              if (String(run.head_branch || '') !== String(defaultBranch)) return false;
               if (Number(run.run_attempt) !== Number(attempt)) return false;
+              // A run that refused to attest, or has not finished, proves
+              // nothing. The producer posts its comment and then completes
+              // successfully, so requiring that costs nothing and closes the
+              // open-ended window a queued or failed run would otherwise leave.
+              if (String(run.status || '') !== 'completed') return false;
+              if (String(run.conclusion || '') !== 'success') return false;
               const startedAt = new Date(run.run_started_at || run.created_at || 0).getTime();
               const finishedAt = new Date(run.updated_at || 0).getTime();
               const at = Number(commentAt);
               if (!Number.isFinite(at) || !Number.isFinite(startedAt) || startedAt <= 0) return false;
+              if (!Number.isFinite(finishedAt) || finishedAt <= 0) return false;
               if (at < startedAt - 5000) return false;
-              if (run.status === 'completed' && at > finishedAt + 5000) return false;
+              if (at > finishedAt + 5000) return false;
               return true;
             }
 
@@ -864,6 +925,15 @@ jobs:
               for (const comment of comments) {
                 const login = String(comment?.user?.login || comment?.author?.login || '');
                 if (login !== FALLBACK_ATTESTATION_AUTHOR) continue;
+                // A comment body is mutable and editing does not move
+                // created_at, so an edited marker can no longer be tied to the
+                // run that wrote it. Treat any edit as tampering.
+                if (comment?.updated_at && comment.updated_at !== comment.created_at) {
+                  core.warning(
+                    `PR #${prNumber}: ignoring an edited Claude fallback attestation comment.`,
+                  );
+                  continue;
+                }
                 for (const attestation of parseFallbackAttestations(comment?.body)) {
                   if (Number(attestation.pr) !== prNumber) continue;
                   candidates.push({
@@ -1150,26 +1220,19 @@ jobs:
 
                 // CANONICAL CONTRACT: exact-head review evidence is normal
                 // Codex evidence OR approved Claude fallback evidence when
-                // Codex is provably unavailable. Trusted quota evidence is a
-                // Codex-connector-authored code-review usage-limit notice; it
-                // is never an affirmative review, only proof of unavailability.
-                const trustedQuotaNotices = [
-                  ...reviews.filter(r => isCodex(r.user) && isCodexCapacityNotice(r.body)),
-                  ...comments.filter(c => isCodex(c.user) && isCodexCapacityNotice(c.body)),
-                ];
-                // Any genuine Codex activity newer than the newest quota notice
-                // closes the episode: Codex is demonstrably answering again.
-                const codexRealActivity = [
-                  ...codexReviews, ...codexComments, ...codexReviewComments,
-                  ...codexReactions,
-                ];
+                // Codex is provably unavailable. The inputs are built by the
+                // shared collector so Gate, Merge Bot and the watchdog cannot
+                // reach different verdicts from different evidence sets.
+                const evidenceInputs = collectReviewEvidenceInputs({
+                  reviews, comments, reviewComments, reactions,
+                });
                 const fallbackEvidence = await acceptedFallbackEvidence({
                   prNumber,
                   headSha,
                   headObservedAt,
                   comments,
-                  quotaNotices: trustedQuotaNotices,
-                  realActivity: codexRealActivity,
+                  quotaNotices: evidenceInputs.quotaNotices,
+                  realActivity: evidenceInputs.realActivity,
                   defaultBranch: pr.base?.repo?.default_branch,
                   codexSignalOnHead: hasCodexSignalOnHead,
                   // This evaluator's default client is GITHUB_TOKEN, which
@@ -1278,10 +1341,16 @@ jobs:
                 }
 
                 // Provenance must be truthful: never report "Codex reviewed"
-                // when Claude Code actually performed the review.
+                // when Claude Code actually performed the review, and never let
+                // a reason string that reads like a Codex signal describe one.
                 const provenance = reviewEvidenceProvenance(reviewAuthority);
+                const evidenceReason = reviewAuthority === FALLBACK_PROVIDER
+                  ? (gateDecision.reason === 'outdated_findings_and_current_head_signal'
+                    ? 'outdated_findings_and_claude_fallback_attestation'
+                    : 'claude_fallback_attestation_no_active_findings')
+                  : gateDecision.reason;
                 results.push(
-                  `PR #${prNumber}: ✅ ${gateDecision.reason} on head ${head7} — ${provenance}`
+                  `PR #${prNumber}: ✅ ${evidenceReason} on head ${head7} — ${provenance}`
                 );
                 await publishGateCheck(
                   headSha,
@@ -1289,7 +1358,7 @@ jobs:
                   reviewAuthority === FALLBACK_PROVIDER
                     ? '🟢 Reviewed — clear (Claude Code fallback)'
                     : '🟢 Reviewed — clear',
-                  `${provenance}. No unresolved non-outdated trusted Codex P1/P2 thread blocks ${head7} (${gateDecision.reason}).`,
+                  `${provenance}. No unresolved non-outdated trusted Codex P1/P2 thread blocks ${head7} (${evidenceReason}).`,
                 );
               } catch (err) {
                 // fail-soft: a TECHNICAL failure (API hiccup, rate limit, etc.)

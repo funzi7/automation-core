@@ -186,9 +186,12 @@ Trust, all fail-closed:
 - `codex-p1-acknowledged`, owner override and reaction acknowledgement keep
   their own semantics and are never used to represent a fallback.
 
-Acceptance coverage lives in `tests/test_review_evidence.js` (30 tests): the
-full mandatory matrix plus the paywall-bot PR #103 regression, built on that
-PR's real timestamps. Rationale: `docs/adr/0001-canonical-review-evidence.md`.
+Acceptance coverage lives in `tests/test_review_evidence.js` (41 tests): the
+full mandatory matrix, the paywall-bot PR #103 regression built on that PR's
+real timestamps, the shipped inline block from all three consumers executed
+directly across the trust matrix, the producer executed against its refusal
+matrix, and proof that the Codex-only path is unchanged when the policy switch
+is off. Rationale: `docs/adr/0001-canonical-review-evidence.md`.
 
 ### `claude-fallback-review.yml`
 

@@ -72,8 +72,17 @@ existing `codex-head-epoch` markers:
   API to a real run of `.github/workflows/claude-fallback-review.yml`;
 - that run's event is `workflow_dispatch` and its `head_branch` is the default
   branch (a run from a PR ref would execute PR-controlled YAML);
+- the run **completed successfully** — a queued run would leave an open-ended
+  authentication window, and a run that refused to attest proves nothing;
 - the comment timestamp falls inside that run's execution window;
+- the comment has never been edited (`updated_at === created_at`), because a
+  body is mutable while `created_at` is not;
 - any lookup failure ignores the attestation.
+
+All three consumers also build the evidence inputs through the same shared
+`collectReviewEvidenceInputs` collector. Byte-identical logic still drifts if
+it is fed different sets, so the collector — not just the decision — is part of
+the shared block.
 
 ### Trusted quota episodes
 
@@ -91,7 +100,18 @@ episode is current in exactly two ways:
   far too thin to depend on.
 
 Any genuine Codex activity newer than the newest notice **closes** the episode.
-Without an authenticated head-epoch observation there is no episode at all.
+Without an authenticated head-epoch observation there is no episode at all. A
+notice that itself carries a P1/P2 marker is a finding, not proof of
+unavailability, and never opens an episode.
+
+**Route A deliberately carries no TTL.** A decline that landed on this head
+epoch stays valid while the head does not move and Codex does not answer,
+because both of those are observable facts rather than assumptions: any new
+commit invalidates the attestation outright, and any Codex activity closes the
+episode. Adding a wall-clock expiry here would turn a green PR red after a
+fixed delay with nothing having changed, which is churn without a safety gain.
+The anti-staleness requirement is met by head-binding plus Route B's 24 h bound,
+which is where an *older* episode could otherwise leak into a *later* fallback.
 
 ### One shared decision
 
@@ -112,6 +132,15 @@ Gate and Merge Bot therefore cannot drift into different verdicts.
 Findings are evaluated before any head signal, so a fallback can never erase
 or bypass a real Codex finding, and a returning Codex review on the current
 head always becomes the authority.
+
+**Outdated is not resolved.** On the normal Codex path an outdated thread plus
+a clean current-head Codex signal clears, because Codex itself re-examined the
+new head. A fallback has no such re-examination, so the producer refuses to
+mint evidence while ANY trusted Codex thread is unresolved, outdated or not:
+otherwise pushing a cosmetic change over an unaddressed P1 would strand it in
+an outdated thread that a fallback then cleared. Resolving the thread — which
+means someone actually addressed the finding — is required. PR #103 is
+unaffected: its four P2s were resolved, not merely outdated.
 
 ### Truthful provenance
 

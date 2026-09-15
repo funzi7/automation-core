@@ -122,14 +122,22 @@ function attestationRunIsTrusted(run, {
   // PR-controlled YAML.
   if (String(run.path || '') !== workflowPath) return false;
   if (String(run.event || '') !== 'workflow_dispatch') return false;
-  if (defaultBranch && String(run.head_branch || '') !== String(defaultBranch)) return false;
+  // An unknown default branch fails closed rather than skipping the check that
+  // keeps a PR-ref run — which would execute PR-controlled YAML — out.
+  if (!defaultBranch) return false;
+  if (String(run.head_branch || '') !== String(defaultBranch)) return false;
   if (Number(run.run_attempt) !== Number(attempt)) return false;
+  // A run that refused to attest, or has not finished, proves nothing and
+  // would otherwise leave an open-ended authentication window.
+  if (String(run.status || '') !== 'completed') return false;
+  if (String(run.conclusion || '') !== 'success') return false;
   const startedAt = new Date(run.run_started_at || run.created_at || 0).getTime();
   const finishedAt = new Date(run.updated_at || 0).getTime();
   const at = Number(commentAt);
   if (!Number.isFinite(at) || !Number.isFinite(startedAt) || startedAt <= 0) return false;
+  if (!Number.isFinite(finishedAt) || finishedAt <= 0) return false;
   if (at < startedAt - skewMs) return false;
-  if (run.status === 'completed' && at > finishedAt + skewMs) return false;
+  if (at > finishedAt + skewMs) return false;
   return true;
 }
 
@@ -145,7 +153,7 @@ function nonNegativeInteger(value) {
  * declares unresolved P1/P2 work: Claude reviewing its own head and reporting
  * unresolved severity is a real finding, not merely absent evidence.
  */
-function evaluateFallbackAttestation(attestation, { headSha } = {}) {
+function evaluateFallbackAttestation(attestation, headSha) {
   const exactHead = String(headSha || '').toLowerCase();
   if (!/^[a-f0-9]{40}$/.test(exactHead)) {
     return { accepted: false, blocking: false, reason: 'unknown_head' };
@@ -307,7 +315,9 @@ function decideReviewEvidence({
   verifiedAttestations = [],
   quotaNotices = [],
   realActivity = [],
-  attestedAt = Date.now(),
+  // No default: production measures the Route B window from when the
+  // attestation was written, never from evaluation time.
+  attestedAt = null,
   headObservedAt = null,
   fallbackPolicyEnabled = false,
   override = false,
@@ -326,7 +336,7 @@ function decideReviewEvidence({
     : { accepted: false, blocking: false, reason: 'no_attestation' };
   if (!codexSignalOnHead) {
     for (const attestation of verifiedAttestations || []) {
-      const evaluated = evaluateFallbackAttestation(attestation, { headSha });
+      const evaluated = evaluateFallbackAttestation(attestation, headSha);
       if (evaluated.blocking) { fallback = evaluated; break; }
       if (evaluated.accepted) fallback = evaluated;
       else if (fallback.reason === 'no_attestation') fallback = evaluated;

@@ -236,8 +236,11 @@ jobs:
             // Trusted quota evidence: the real Codex connector identity saying
             // its CODE REVIEW quota is exhausted. A user, Claude or any other
             // bot writing "Codex unavailable" is never this.
+            // A notice that also carries a P1/P2 is a finding, not proof of
+            // unavailability, and must never open an episode.
             const quotaNotices = [...reviews, ...comments].filter((item) =>
-              isCodex(item.user) && isCodexCapacityNotice(item.body));
+              isCodex(item.user) && isCodexCapacityNotice(item.body) &&
+              !severity(item.body));
             if (!quotaNotices.length) {
               return refuse(
                 'no trusted Codex code-review quota notice on this PR; ' +
@@ -302,20 +305,35 @@ jobs:
               cursor = connection.pageInfo.hasNextPage ? connection.pageInfo.endCursor : null;
             } while (cursor);
 
-            const activeCodexFindings = threads.filter((thread) =>
-              thread.isResolved !== true && thread.isOutdated !== true &&
+            // A single review thread with a full page of comments cannot be
+            // read exhaustively here, so fail closed rather than attest that
+            // nothing is unresolved.
+            const truncatedThread = threads.find((thread) =>
+              (thread.comments?.nodes || []).length >= 100);
+            if (truncatedThread) {
+              return refuse(
+                `review thread ${truncatedThread.path || '?'} has more comments than ` +
+                'can be read in one page; cannot prove no Codex finding is unresolved.',
+              );
+            }
+            // UNRESOLVED means unresolved — an outdated thread still holds a
+            // live Codex P1/P2 that nobody addressed. A fallback must never
+            // clear it; the reviewer has to fix it and resolve the thread.
+            const unresolvedCodexFindings = threads.filter((thread) =>
+              thread.isResolved !== true &&
               (thread.comments?.nodes || []).some((comment) =>
                 TRUSTED_CODEX_LOGINS.has(String(comment.author?.login || '')) &&
                 severity(comment.body))
             );
-            if (activeCodexFindings.length) {
-              const where = activeCodexFindings
+            if (unresolvedCodexFindings.length) {
+              const where = unresolvedCodexFindings
                 .slice(0, 5)
-                .map((thread) => `${thread.path || '?'}:${thread.line || '?'}`)
+                .map((thread) => `${thread.path || '?'}:${thread.line || '?'}${thread.isOutdated ? ' (outdated)' : ''}`)
                 .join(', ');
               return refuse(
-                `unresolved trusted Codex finding(s) still active: ${where}. ` +
-                'Fix and resolve them first — a fallback never bypasses them.',
+                `unresolved trusted Codex finding(s): ${where}. ` +
+                'Fix them and resolve the threads first — a fallback never ' +
+                'bypasses a Codex finding, and an outdated thread is not a resolved one.',
               );
             }
             const nonInlineFindings = [...reviews, ...comments].filter((item) =>
