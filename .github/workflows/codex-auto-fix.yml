@@ -83,6 +83,7 @@ jobs:
     # bot feedback: PR review, inline review-comment, top-level
     # issue/PR comment. This workflow does NOT listen to `issues` events.
     if: |
+      vars.CLAUDE_STANDALONE_ENABLED == 'true' && (
       (github.event_name == 'pull_request_review' &&
        github.event.review.user.login == 'chatgpt-codex-connector[bot]' &&
        (contains(github.event.review.body, 'P1') || contains(github.event.review.body, 'P2'))) ||
@@ -92,6 +93,7 @@ jobs:
       (github.event_name == 'issue_comment' &&
        github.event.comment.user.login == 'chatgpt-codex-connector[bot]' &&
        (contains(github.event.comment.body, 'P1') || contains(github.event.comment.body, 'P2')))
+      )
 
     steps:
       - name: Check if review has actionable feedback
@@ -138,6 +140,12 @@ jobs:
                 owner, repo, pull_number: prNumber,
               });
               prData = response.data;
+              if (prData.state !== 'open' || prData.draft || (prData.labels || []).some((label) =>
+                  ['no-autofix', 'review-only'].includes(label.name))) {
+                core.info(`PR #${prNumber}: automatic fixes paused; reviews remain enabled.`);
+                core.setOutput('should_trigger', 'false');
+                return;
+              }
               const headRef = (prData.head && prData.head.ref) || "";
               const prTitle = prData.title || "";
               if (headRef === 'chore/sync-automation-core' ||
@@ -146,7 +154,11 @@ jobs:
                 core.setOutput("should_trigger", "false");
                 return;
               }
-            } catch (e) { core.info(`sync-PR check failed (ignored): ${e.message}`); }
+            } catch (e) {
+              core.warning(`Live PR/pause check failed; refusing to trigger: ${e.message}`);
+              core.setOutput('should_trigger', 'false');
+              return;
+            }
 
             const MARKER = "[auto-triggered]";
             const CODEX = "chatgpt-codex-connector[bot]";
@@ -575,6 +587,12 @@ jobs:
               process.env.PR_NUMBER || '',
               10,
             );
+            const { data: livePr } = await github.rest.pulls.get({ ...context.repo, pull_number: prNumber });
+            if (livePr.state !== 'open' || livePr.draft || livePr.head.sha !== process.env.TARGET_HEAD ||
+                (livePr.labels || []).some((label) => ['no-autofix', 'review-only'].includes(label.name))) {
+              core.info('Fixer paused or head changed immediately before trigger; no comment posted.');
+              return;
+            }
             const eventName = context.eventName;
             const payload = context.payload;
             // First line is the bare phrase "@claude fix" — the

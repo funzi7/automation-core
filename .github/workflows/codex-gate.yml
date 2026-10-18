@@ -16,8 +16,9 @@ name: Codex Gate
 # are forbidden; review events are rechecked through a default-branch
 # workflow_run relay. A PAT-independent scheduled sweep covers thread-state
 # changes that have no supported Actions trigger. Trusted actor allowlisting,
-# Summary/Testing quote stripping, trusted-sync grace and intentional technical
-# fail-soft remain.
+# Summary/Testing quote stripping and intentional technical fail-soft remain.
+# Sync PRs require the same exact-head review evidence as every other PR;
+# elapsed time or absent findings never substitutes for a review.
 #
 on:
   # SECURITY: pull_request/review/review_comment workflows execute from the
@@ -152,24 +153,6 @@ jobs:
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const prNumbers = JSON.parse(process.env.PR_NUMBERS_JSON || '[]');
-
-            // fix #21: trusted-sync grace-green. A sync PR is a byte-copy of an
-            // upstream automation-core main that already passed our full validation;
-            // Codex engages on syncs inconsistently and SILENCE is not a finding, so
-            // a trusted sync with zero Codex signals auto-clears after a grace window.
-            const SYNC_GRACE_MINUTES = 30;
-            // Trusted-sync predicate — must match merge-bot.yml / codex-gate.yml — keep in sync.
-            const SYNC_TITLE_PREFIX = 'chore(automation): sync from automation-core';
-            const SYNC_BRANCH = 'chore/sync-automation-core';   // branch the sync workflow opens
-            const OWNER_LOGIN = 'funzi7';
-            const isTrustedSync = (pr) => {
-              const titleIsSync = (pr.title || '').startsWith(SYNC_TITLE_PREFIX);
-              const sameRepo = !!(pr.head && pr.head.repo && pr.head.repo.full_name === `${owner}/${repo}`);
-              return titleIsSync && (
-                (pr.user && pr.user.login === OWNER_LOGIN) ||
-                ((pr.head && pr.head.ref === SYNC_BRANCH) && sameRepo)
-              );
-            };
 
             // Strict Codex actor allowlist — must match claude-fallback-watchdog.yml — keep in sync.
             // Exact GitHub App identities: GraphQL reviewThreads omit
@@ -1097,7 +1080,7 @@ jobs:
                 try {
                   headObservedAt = await observedHeadTransition(prNumber, headSha, comments);
                 } catch (e) {
-                  core.warning(`PR #${prNumber}: exact-head transition lookup failed; unmarked review signals and sync grace stay pending: ${e.message}`);
+                  core.warning(`PR #${prNumber}: exact-head transition lookup failed; unmarked review signals stay pending: ${e.message}`);
                 }
 
                 // Inline review-thread state is authoritative for P1/P2
@@ -1154,12 +1137,6 @@ jobs:
                 const codexReviewComments = reviewComments.filter(c =>
                   isCodex(c.user) && !isCodexCapacityNotice(c.body) && !isCodexTaskResult(c.body));
                 const codexReactions = reactions.filter(r => isCodex(r.user));
-                // Total exact-bindable Codex signals of any date. Zero means
-                // no review result engaged (the trusted-sync grace precondition).
-                const codexSignalCount =
-                  codexReviews.length + codexComments.length +
-                  codexReviewComments.length + codexReactions.length;
-
                 // Exact review.commit_id / original_commit_id / Codex's Reviewed
                 // commit marker binds directly to the SHA. Unmarked comments,
                 // reactions, and task summaries are never affirmative because
@@ -1315,28 +1292,8 @@ jobs:
                 }
 
                 if (gateDecision.status === 'pending') {
-                  // Preserve trusted-sync grace only for total Codex silence.
-                  // A stale/outdated finding is evidence of engagement and
-                  // therefore can never take this bypass.
-                  const graceMs = SYNC_GRACE_MINUTES * 60 * 1000;
-                  const headAgeMs = headObservedAt
-                    ? Date.now() - headObservedAt.getTime()
-                    : 0;
-                  const silentTrustedSync =
-                    isTrustedSync(pr) && codexSignalCount === 0 &&
-                    gateDecision.reason === 'current_head_review_pending';
-                  if (silentTrustedSync && headAgeMs > graceMs) {
-                    results.push(
-                      `PR #${prNumber}: ✅ trusted sync — no Codex signal within ${SYNC_GRACE_MINUTES}m grace on head ${head7}; auto-cleared`
-                    );
-                    await publishGateCheck(
-                      headSha,
-                      'success',
-                      '🟢 Trusted sync — no Codex findings within grace window',
-                      `Validated byte-copy sync; Codex posted no signal within ${SYNC_GRACE_MINUTES} min of ${head7}.`,
-                    );
-                    continue;
-                  }
+                  // Every pending head, including automation-core syncs, waits
+                  // for valid review evidence. Silence and age cannot turn it green.
                   const reasonText =
                     gateDecision.reason === 'outdated_finding_needs_current_head_signal'
                       ? 'an outdated finding awaits a clean current-head Codex signal'

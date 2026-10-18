@@ -61,10 +61,9 @@ jobs:
           # Codex Cloud is default-ON / opt-out: unset = enabled, literal 'false' = disabled.
           # Actions variables are per-repo and are not synced by workflow sync.
           CODEX_CLOUD_ENABLED: ${{ vars.CODEX_CLOUD_ENABLED }}
-          # fix #26: Claude kill-switch. Absent var = ENABLED. When 'false' (Anthropic
-          # credit exhausted) the claude.yml job is skipped, so the watchdog pre-skips
-          # stage 1 (no ping, no window) and advances the ladder instantly.
+          # Availability must match the explicit standalone opt-in and kill-switch.
           CLAUDE_ENABLED: ${{ vars.CLAUDE_ENABLED }}
+          CLAUDE_STANDALONE_ENABLED: ${{ vars.CLAUDE_STANDALONE_ENABLED }}
           # Label attribution must be github-actions[bot] so Merge Bot can
           # distinguish temporary automation escalation from a human stop.
           GH_LABEL_TOKEN: ${{ github.token }}
@@ -104,9 +103,9 @@ jobs:
             // CODEX_CLOUD_ENABLED is default-ON / opt-out: only literal 'false' disables it.
             const codexCloudEnabled = process.env.CODEX_CLOUD_ENABLED !== 'false';
             if (!codexCloudEnabled) core.info('CODEX_CLOUD_ENABLED=false — Codex Cloud stage disabled; no @codex fix comments will be posted.');
-            // fix #26: CLAUDE_ENABLED != 'false' (absent = enabled).
-            const claudeEnabled = process.env.CLAUDE_ENABLED !== 'false';
-            if (!claudeEnabled) core.info('CLAUDE_ENABLED=false — Claude stage pre-skipped this tick (no ping/window).');
+            // Never request or wait on a CLI path that the repository has not enabled.
+            const claudeEnabled = process.env.CLAUDE_STANDALONE_ENABLED === 'true' && process.env.CLAUDE_ENABLED !== 'false';
+            if (!claudeEnabled) core.info('Standalone Claude is not opted in or is disabled — stage pre-skipped (no ping/window).');
             // Strict Codex actor allowlist — must match codex-gate.yml — keep in sync.
             const TRUSTED_CODEX_LOGINS = new Set(['chatgpt-codex-connector[bot]']);
             const isTrustedCodexUser = (user) => !!user?.login && TRUSTED_CODEX_LOGINS.has(user.login);
@@ -137,7 +136,13 @@ jobs:
             for (const pr of prs) {
               try {
                 const prNumber = pr.number;
-                const headSha = pr.head.sha;
+                const { data: liveFixTarget } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+                if (liveFixTarget.state !== 'open' || liveFixTarget.draft ||
+                    (liveFixTarget.labels || []).some((label) => ['no-autofix', 'review-only'].includes(label.name))) {
+                  core.info(`PR #${prNumber}: fixer ladder paused.`);
+                  continue;
+                }
+                const headSha = liveFixTarget.head.sha;
 
                 // Markers live in BOTH issue comments and inline review-comment
                 // replies (the bridge posts to whichever channel Codex used).
@@ -610,9 +615,7 @@ jobs:
             const PENDING_TITLE = '🟡 Waiting for Codex review';
             const GATE_WORKFLOW = 'codex-gate.yml';
             const VERDICT_CHECK = 'check-codex-status';
-            // fix #21: trusted-sync grace window (must EQUAL codex-gate.yml's).
-            const SYNC_GRACE_MINUTES = 30;
-            // Trusted-sync predicate — must match merge-bot.yml / codex-gate.yml — keep in sync.
+            // Trusted-sync predicate used only for identifying branch-update candidates.
             const SYNC_TITLE_PREFIX = 'chore(automation): sync from automation-core';
             const SYNC_BRANCH = 'chore/sync-automation-core';   // branch the sync workflow opens
             const OWNER_LOGIN = 'funzi7';
@@ -1469,6 +1472,9 @@ jobs:
                   // fix #24 fork guard: NEVER auto-update-branch a fork-headed PR —
                   // fork code is untrusted (mirrors codex-backup-fix's same-repo guard).
                   try {
+                    const { data: liveUpdateTarget } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+                    const fixPaused = liveUpdateTarget.state !== 'open' || liveUpdateTarget.draft ||
+                      (liveUpdateTarget.labels || []).some((label) => ['no-autofix', 'review-only'].includes(label.name));
                     const hasNeedsOwner = (pr.labels || []).some((l) => (l.name || l) === 'needs-owner');
                     const sameRepo = !!(pr.head && pr.head.repo && pr.head.repo.full_name === `${owner}/${repo}`);
                     let loopPr = (!!(pr.head && pr.head.ref && pr.head.ref.startsWith('claude/'))) || isTrustedSync(pr);
@@ -1478,9 +1484,10 @@ jobs:
                       });
                       loopPr = [...issueComments, ...rc].some((c) => /ai-loop:v1/.test(c.body || ''));
                     }
-                    if (loopPr && !hasNeedsOwner && sameRepo) {
+                    if (!fixPaused && loopPr && !hasNeedsOwner && sameRepo) {
                       const { data: full } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
-                      if (full.mergeable_state === 'behind') {
+                      if (full.mergeable_state === 'behind' && full.state === 'open' && !full.draft &&
+                          !(full.labels || []).some((label) => ['no-autofix', 'review-only'].includes(label.name))) {
                         try {
                           await github.rest.pulls.updateBranch({ owner, repo, pull_number: prNumber, expected_head_sha: headSha });
                           core.info(`auto update-branch: PR #${prNumber}`);
@@ -1500,7 +1507,7 @@ jobs:
                   try {
                     headObservedAt = await observedHeadTransition(prNumber, headSha, issueComments);
                   } catch (e) {
-                    core.info(`PR #${prNumber}: head-transition lookup failed; unmarked signals and sync grace remain pending: ${e.message}`);
+                    core.info(`PR #${prNumber}: head-transition lookup failed; unmarked signals remain pending: ${e.message}`);
                   }
 
                   // Newest authoritative check-codex-status run on the head (READ → GITHUB_TOKEN).
@@ -1631,18 +1638,11 @@ jobs:
                     (!Number.isFinite(verdictAgeMs) || verdictAgeMs >= FALLBACK_REDISPATCH_MIN_AGE_MS);
                   const freshSignal = codexSignalOnHead || fallbackDispatchNeeded;
 
-                  // Dispatch a pending/missing verdict for a fresh review signal,
-                  // a silent trusted-sync after grace, or an explicit override. A
-                  // changed red thread state also dispatches without a new event:
-                  // the trusted evaluator then decides clear versus pending from the
-                  // authoritative thread state and current-head signal.
-                  const graceMs = SYNC_GRACE_MINUTES * 60 * 1000;
-                  const headAgeMs = headObservedAt
-                    ? Date.now() - headObservedAt.getTime()
-                    : 0;
-                  const silentSyncStale = isTrustedSync(pr) && headAgeMs > graceMs;
+                  // Dispatch on real review evidence, an explicit override, or a
+                  // changed finding/thread state. Elapsed sync time alone never
+                  // clears a gate and no longer causes repeated timer-only runs.
                   if (
-                    !freshSignal && !silentSyncStale &&
+                    !freshSignal &&
                     !overrideCandidate && !redThreadStateChanged &&
                     !greenHeadNewFinding
                   ) continue;
@@ -1654,9 +1654,7 @@ jobs:
                     ? `thread-state sweep: dispatching gate for PR #${prNumber} @ ${head7}`
                     : fallbackSatisfiesReview && !codexSignalOnHead
                     ? `fallback-evidence sweep: dispatching gate for PR #${prNumber} @ ${head7} (Claude Code fallback review accepted; Codex quota unavailable)`
-                    : freshSignal
-                    ? `late-signal sweep: dispatching gate for PR #${prNumber} @ ${head7}`
-                    : `silent-sync grace: dispatching gate for PR #${prNumber} @ ${head7}`;
+                    : `late-signal sweep: dispatching gate for PR #${prNumber} @ ${head7}`;
 
                   // Dispatch the trusted workflow from the PR base/default branch.
                   // The evaluator fetches pr.head.sha and creates the authoritative

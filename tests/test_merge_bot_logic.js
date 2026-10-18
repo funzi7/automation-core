@@ -681,7 +681,7 @@ test('Claude PR provenance records on failure while automerge remains success-on
   assert.match(workflow, /github-token: \$\{\{ github\.token \}\}/);
   assert.match(workflow, /CLAUDE_BRANCH_NAME: \$\{\{ steps\.claude_issue\.outputs\.branch_name \}\}/);
   assert.match(workflow, /name: Create Claude PR from trusted branch/);
-  assert.match(workflow, /branch_prefix: "claude\/"/);
+  assert.match(workflow, /const branch = `claude\/issue-/);
   assert.match(workflow, /if \(!branch\.startsWith\('claude\/'\)\) throw new Error/);
   assert.match(workflow, /await github\.rest\.pulls\.create/);
   assert.match(workflow, /const trustedDelivery = process\.env\.CLAUDE_ACTION_OUTCOME === 'success' &&\s*process\.env\.CLAUDE_DELIVERED === 'true'/);
@@ -699,9 +699,12 @@ test('Claude PR provenance records on failure while automerge remains success-on
     workflow.indexOf('Checkout repository for Issue/new-PR path'),
     workflow.indexOf('Checkout existing PR head branch'),
   );
-  assert.match(issuePath, /github_token: \$\{\{ github\.token \}\}/);
-  assert.match(issuePath, /use_commit_signing: true/);
-  assert.match(issuePath, /--allowedTools "Read,Glob,Grep"/);
+  assert.match(issuePath, /github-token: \$\{\{ github\.token \}\}/);
+  assert.match(issuePath, /Publish constrained signed Issue edit plan/);
+  assert.match(issuePath, /runtime\.publishIssue/);
+  assert.match(issuePath, /FIXER_MODE: issue/);
+  assert.match(workflow, /createCommitOnBranch/);
+  assert.match(workflow, /commit\.signature\?\.wasSignedByGitHub/);
   assert.match(issueExecutionPath, /token: \$\{\{ github\.token \}\}[\s\S]*persist-credentials: false/);
   assert.doesNotMatch(issueExecutionPath, /secrets\.AUTOMATION_PAT/);
   assert.doesNotMatch(issuePath, /Bash\(/);
@@ -713,7 +716,7 @@ test('Claude PR provenance records on failure while automerge remains success-on
   assert.match(workflow, /steps\.scrub_issue_credentials\.outcome == 'success'/);
   assert.ok(
     workflow.indexOf('Scrub Issue-mode model credentials') <
-      workflow.indexOf('token: ${{ secrets.AUTOMATION_PAT || github.token }}'),
+      workflow.indexOf('GH_TOKEN: ${{ secrets.AUTOMATION_PAT || github.token }}'),
     'the first PAT-backed step must follow the Issue-mode credential scrub',
   );
   const trustedPost = workflow.slice(workflow.indexOf('Create Claude PR from trusted branch'));

@@ -245,7 +245,6 @@ function evaluateMergePolicy({
   if (!checks.eligible) return checks;
   if (
     !labels.has(CODEX_OVERRIDE_LABEL) &&
-    !isTrustedSync(pr, repositoryFullName) &&
     !currentHeadCodexSignal
   ) {
     return { eligible: false, reason: 'current_head_review_pending' };

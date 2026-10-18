@@ -77,6 +77,7 @@ still happen within minutes — the crons are just the backstop.
 | `claude-fix` | "Claude, fix this." Set by ci-doctor; triggers Claude Fixer. |
 | `automerge` | This PR may be auto-merged by Merge Bot once green. |
 | `claude-generated` | Durable provenance that the trusted Claude workflow created the PR; protected paths remain fail-closed even if PAT authorship looks human. |
+| `no-autofix` / `review-only` | Pause new fixer starts and trusted Issue delivery; reviews remain enabled. Add `no-automerge` separately to hold merging. Active runs are not retroactively cancelled. |
 | `no-automerge` | Permanent human opt-out. Merge Bot never removes it and never merges while it is present. |
 | `needs-owner` | Human/manual escalation stop. Without proven automation provenance it remains a hard stop. |
 | `needs-owner-auto` | Companion provenance for a temporary PR fixer/watchdog exhaustion. Merge Bot clears it together with `needs-owner` only after the current head is mergeable, fully green, exact-head gated, and free of active trusted P1/P2 findings. |
@@ -86,7 +87,7 @@ still happen within minutes — the crons are just the backstop.
 
 | Secret | Required by | Notes |
 |--------|-------------|-------|
-| `ANTHROPIC_API_KEY` | `claude.yml` | **Required for the fixer.** If absent, Claude Fixer exits green (fail-soft) — no fix, no red runs, ~0 minutes. Set only on the repos you want auto-fixed (cost control). |
+| `ANTHROPIC_API_KEY` | `claude.yml` | **Required for the fixer.** If absent, Claude Fixer exits green (fail-soft) — no fix, no red runs, ~0 minutes. Also requires `CLAUDE_STANDALONE_ENABLED=true`; use a key from the linked Console organization. |
 | `CROSS_REPO_PAT` | `bootstrap.yml` (onboarding / auto-enrollment), `minutes-guard.yml` | automation-core only. Cross-repo fine-grained PAT (Contents/PRs/Workflows write, Metadata read; all repos). If absent, auto-enrollment exits green with a notice (fail-soft). |
 | `AUTOMATION_PAT` | `ci-doctor.yml`, `merge-bot.yml`, and trusted post-Claude PR creation | **Required for the loop to chain.** It is never passed to Issue-mode Claude or its model-facing checkout. If absent, trusted writes exit green (fail-soft). Needs Contents/PRs/Issues write, Metadata read. |
 | `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` | optional | Escalation pings on `needs-owner` / protected-path blocks. Messages use `parse_mode: HTML` (Markdown underscores broke us before). Skipped silently if unset. |
@@ -95,6 +96,8 @@ still happen within minutes — the crons are just the backstop.
 
 | Variable | Used by | Notes |
 |----------|---------|-------|
+| `CLAUDE_STANDALONE_ENABLED` | `claude.yml`, `codex-auto-fix.yml` | Explicit per-repository opt-in for the standalone CLI/bridge. Only `true` enables it; unset is disabled even with an API key. |
+| `CLAUDE_MAX_BUDGET_USD` | `claude.yml` | Estimated CLI stopping threshold, default USD 2, allowed 0.1–10; not a hard billing cap. |
 | `CLAUDE_FALLBACK_REVIEW_ENABLED` | `codex-gate.yml`, `merge-bot.yml`, `claude-fallback-watchdog.yml`, `claude-fallback-review.yml` | Opt-in switch for Claude fallback review evidence. Unset or anything other than `true` means the repo keeps the Codex-only contract. Variables are **not** synced — set it per repo. |
 | `CODEX_BACKUP_ENABLED` | `claude-fallback-watchdog.yml` | Enables the OpenAI-quota-dependent Codex API backup fixer stage. |
 | `CODEX_CLOUD_ENABLED` | `claude-fallback-watchdog.yml` | Enables the `@codex fix` Codex Cloud fixer stage. |
@@ -150,8 +153,8 @@ See `docs/adr/0001-canonical-review-evidence.md` for the full rationale.
 
 Every workflow's first step checks for its required secret and exits green
 with a log notice if it is missing. This is deliberate: these files are
-synced to **every** repo, but only repos that opt in (by having the secrets
-set) actually run the automation. Key-less repos never produce red failures
+synced to **every** repo, but only repos that opt in actually run the automation. The standalone Claude
+fixer additionally requires `CLAUDE_STANDALONE_ENABLED=true`. Key-less repos never produce red failures
 and burn essentially no Actions minutes.
 
 ### Protected paths
@@ -163,14 +166,18 @@ escalated to manual `needs-owner`. A same-repository PR authored by `funzi7`
 may still auto-merge protected workflow changes, but only after the unchanged
 full exact-head CI, trusted Codex review/gate, active-thread, mergeability, and
 SHA-pinned merge requirements pass. Add `no-automerge` for an explicit human
-hold. Because `AUTOMATION_PAT` can make a Claude-created PR appear owner-authored,
+hold. Sync PRs also need valid review evidence for their exact current head;
+waiting 30 minutes or having no findings never substitutes for a review.
+Because `AUTOMATION_PAT` can make a Claude-created PR appear owner-authored,
 the trusted Claude workflow records durable `claude-generated` provenance using
-the Actions identity. On Issue runs, checkout uses `github.token` with
-credential persistence disabled; the model has no shell, generic interpreter,
-or generic write tool; the action uses constrained file operations and signed
-API commits; and a mandatory scrub removes its git credential before a trusted
-PAT-backed post-step creates the PR from the exact branch output. The branch therefore
-provides immediate provenance at PR creation, with the durable label following.
+the Actions identity. On Issue runs, checkout uses `github.token` with credential persistence disabled.
+The standalone model has no GitHub credential, shell, generic interpreter or
+write tool. A constrained text edit plan is validated after the model exits;
+trusted code creates a GitHub-signed API commit on the exact controlled branch.
+Only the later PR-creation step receives the PAT. The branch therefore provides
+immediate provenance at PR creation, with the durable label following.
+See [standalone fixer controls](docs/standalone-claude-fixer.md) for eligibility,
+mode boundaries, offline validation and separate opt-in rollout requirements.
 The exact same-repository automation-core sync signature remains trusted when
 no Claude provenance exists.
 

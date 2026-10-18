@@ -43,6 +43,9 @@ for name in config['synced_workflows']:
     print(f"  identical: {name}")
 EOF
 
+echo "Checking embedded standalone runtime delivery..."
+python3 scripts/embed_claude_runtime.py --check
+
 echo "Checking JavaScript helper syntax and deterministic logic tests..."
 for f in tools/*.js; do
   node --check "$f"
