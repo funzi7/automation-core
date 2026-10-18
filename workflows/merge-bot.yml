@@ -1549,12 +1549,11 @@ jobs:
               }
 
               // Defense in depth: the exact-head gate must be green AND the
-              // current head must have a trusted Codex signal unless this is
-              // the established grace-eligible trusted sync. This prevents a
-              // persisted override-green check from surviving override label
-              // removal before Codex reviews the head.
+              // current head must have accepted review evidence, including for
+              // trusted sync PRs. This also rejects an old grace/override-green
+              // check without evidence after the exception/label is removed.
               let reviewEvidence = { accepted: true, authority: 'none', blocking: false, reason: 'not_required' };
-              if (!initialLabels.has(CODEX_OVERRIDE_LABEL) && !isTrustedSync(pr)) {
+              if (!initialLabels.has(CODEX_OVERRIDE_LABEL)) {
                 reviewEvidence = await hasCurrentHeadReviewEvidence(
                   prNumber, headSha, pr.base?.repo?.default_branch,
                 );
@@ -1637,7 +1636,7 @@ jobs:
                 core.info(`#${prNumber}: no-automerge appeared after validation, hard stop`);
                 continue;
               }
-              if (!finalLabels.has(CODEX_OVERRIDE_LABEL) && !isTrustedSync(finalPr)) {
+              if (!finalLabels.has(CODEX_OVERRIDE_LABEL)) {
                 // Revalidate the identical canonical decision against the final
                 // candidate: a commit or a returning Codex finding between the
                 // two checks must still stop the merge.

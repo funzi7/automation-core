@@ -1,8 +1,8 @@
 # Standalone Claude Fixer: opt-in preparation
 
 This change is a draft implementation, not a rollout. It does not change any
-repository variable, secret, linked Console organization, credit balance, merge
-policy, or downstream PR. Merging the upstream workflow can distribute it through
+repository variable, secret, linked Console organization, credit balance, or
+downstream PR. Merging the upstream workflow can distribute it through
 the existing daily sync, so upstream merge and downstream activation require a
 separate rollout decision.
 
@@ -75,6 +75,17 @@ exact checked-out head. The Issue model never shares this credential environment
 The Issue read fence is a CLI permission boundary, not OS/container isolation.
 Both modes keep transcripts off public logs; the former full-output opt-in is
 intentionally removed. Delivery classification exposes only a sanitized category.
+
+## Sync review safety addition
+
+The same draft also removes the trusted-sync 30-minute Codex-silence exception.
+A sync PR stays pending without valid exact-current-head review, regardless of
+age or absence of findings. Merge Bot independently checks that evidence at both
+candidate evaluation and the final merge boundary, so a stale grace-green check
+cannot authorize merging. Its ordinary automatic merging remains in place once
+review, checks and the existing stop-label/protected-path conditions pass.
+Existing explicit administrator overrides and opt-in fallback review semantics
+are unchanged. No new manual merge-approval label is introduced.
 
 ## Per-target pause
 

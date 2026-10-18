@@ -166,7 +166,9 @@ escalated to manual `needs-owner`. A same-repository PR authored by `funzi7`
 may still auto-merge protected workflow changes, but only after the unchanged
 full exact-head CI, trusted Codex review/gate, active-thread, mergeability, and
 SHA-pinned merge requirements pass. Add `no-automerge` for an explicit human
-hold. Because `AUTOMATION_PAT` can make a Claude-created PR appear owner-authored,
+hold. Sync PRs also need valid review evidence for their exact current head;
+waiting 30 minutes or having no findings never substitutes for a review.
+Because `AUTOMATION_PAT` can make a Claude-created PR appear owner-authored,
 the trusted Claude workflow records durable `claude-generated` provenance using
 the Actions identity. On Issue runs, checkout uses `github.token` with credential persistence disabled.
 The standalone model has no GitHub credential, shell, generic interpreter or

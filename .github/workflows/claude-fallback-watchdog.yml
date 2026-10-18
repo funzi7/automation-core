@@ -615,9 +615,7 @@ jobs:
             const PENDING_TITLE = '🟡 Waiting for Codex review';
             const GATE_WORKFLOW = 'codex-gate.yml';
             const VERDICT_CHECK = 'check-codex-status';
-            // fix #21: trusted-sync grace window (must EQUAL codex-gate.yml's).
-            const SYNC_GRACE_MINUTES = 30;
-            // Trusted-sync predicate — must match merge-bot.yml / codex-gate.yml — keep in sync.
+            // Trusted-sync predicate used only for identifying branch-update candidates.
             const SYNC_TITLE_PREFIX = 'chore(automation): sync from automation-core';
             const SYNC_BRANCH = 'chore/sync-automation-core';   // branch the sync workflow opens
             const OWNER_LOGIN = 'funzi7';
@@ -1509,7 +1507,7 @@ jobs:
                   try {
                     headObservedAt = await observedHeadTransition(prNumber, headSha, issueComments);
                   } catch (e) {
-                    core.info(`PR #${prNumber}: head-transition lookup failed; unmarked signals and sync grace remain pending: ${e.message}`);
+                    core.info(`PR #${prNumber}: head-transition lookup failed; unmarked signals remain pending: ${e.message}`);
                   }
 
                   // Newest authoritative check-codex-status run on the head (READ → GITHUB_TOKEN).
@@ -1640,18 +1638,11 @@ jobs:
                     (!Number.isFinite(verdictAgeMs) || verdictAgeMs >= FALLBACK_REDISPATCH_MIN_AGE_MS);
                   const freshSignal = codexSignalOnHead || fallbackDispatchNeeded;
 
-                  // Dispatch a pending/missing verdict for a fresh review signal,
-                  // a silent trusted-sync after grace, or an explicit override. A
-                  // changed red thread state also dispatches without a new event:
-                  // the trusted evaluator then decides clear versus pending from the
-                  // authoritative thread state and current-head signal.
-                  const graceMs = SYNC_GRACE_MINUTES * 60 * 1000;
-                  const headAgeMs = headObservedAt
-                    ? Date.now() - headObservedAt.getTime()
-                    : 0;
-                  const silentSyncStale = isTrustedSync(pr) && headAgeMs > graceMs;
+                  // Dispatch on real review evidence, an explicit override, or a
+                  // changed finding/thread state. Elapsed sync time alone never
+                  // clears a gate and no longer causes repeated timer-only runs.
                   if (
-                    !freshSignal && !silentSyncStale &&
+                    !freshSignal &&
                     !overrideCandidate && !redThreadStateChanged &&
                     !greenHeadNewFinding
                   ) continue;
@@ -1663,9 +1654,7 @@ jobs:
                     ? `thread-state sweep: dispatching gate for PR #${prNumber} @ ${head7}`
                     : fallbackSatisfiesReview && !codexSignalOnHead
                     ? `fallback-evidence sweep: dispatching gate for PR #${prNumber} @ ${head7} (Claude Code fallback review accepted; Codex quota unavailable)`
-                    : freshSignal
-                    ? `late-signal sweep: dispatching gate for PR #${prNumber} @ ${head7}`
-                    : `silent-sync grace: dispatching gate for PR #${prNumber} @ ${head7}`;
+                    : `late-signal sweep: dispatching gate for PR #${prNumber} @ ${head7}`;
 
                   // Dispatch the trusted workflow from the PR base/default branch.
                   // The evaluator fetches pr.head.sha and creates the authoritative

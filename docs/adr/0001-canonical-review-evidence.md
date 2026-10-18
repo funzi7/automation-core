@@ -150,6 +150,13 @@ It never reports "Codex reviewed" for a Claude review.
 
 ## Consequences
 
+- Trusted automation-core sync PRs follow the same current-head evidence rule.
+  The former 30-minute silence exception is removed from Codex Gate, and Merge
+  Bot independently revalidates evidence both initially and immediately before
+  merging, even if an older gate check is green. No findings is not proof that
+  a review happened. After valid review and all green checks, automatic merging
+  remains enabled under the existing candidate/stop-label policy. Existing
+  administrator overrides and explicitly enabled fallback evidence are unchanged.
 - `codex-p1-acknowledged`, owner override and reaction acknowledgement keep
   their own distinct semantics and are never used to represent a fallback.
 - Fallback is **off** until a repository sets `CLAUDE_FALLBACK_REVIEW_ENABLED`
