@@ -72,6 +72,13 @@ jobs:
             const repo = context.repo.repo;
             const prNumber = parseInt(process.env.PR_NUMBER || '', 10);
             const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+            if (pr.state !== 'open' || pr.draft || (pr.labels || []).some((label) =>
+                ['no-autofix', 'review-only'].includes(label.name))) {
+              core.info('Codex backup paused before model execution.');
+              core.setOutput('proceed', 'false');
+              core.setOutput('fork_pr', 'false');
+              return;
+            }
             const sameRepo =
               pr.head && pr.head.repo && pr.head.repo.full_name === `${owner}/${repo}`;
             if (!sameRepo) {
@@ -422,7 +429,10 @@ jobs:
             // STALE-HEAD GUARD: if the head advanced while Codex worked, the patch
             // is against an old tree — do NOT apply it. A fresh review on the new
             // head starts a new cycle.
-            const stale = pr.head.sha !== inputSha;
+            const fixPaused = pr.state !== 'open' || pr.draft || (pr.labels || []).some((label) =>
+              ['no-autofix', 'review-only'].includes(label.name));
+            const stale = fixPaused || pr.head.sha !== inputSha;
+            if (fixPaused) core.info('Codex backup paused before applying its patch.');
             core.setOutput("head_ref", pr.head.ref);
             core.setOutput("stale", stale ? "true" : "false");
 
