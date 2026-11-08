@@ -60,8 +60,12 @@ policy, not by the system prompt alone:
    accepts an explicit path, so a secret in the worktree could reach the model),
    symlinks leaving the repository (OpenCode checks the requested path, not the
    canonical one; targets under `/usr`, `/bin`, `/lib` such as virtualenv
-   interpreters are tolerated) and credential-looking content in
-   `gradle.properties` or `.git/config`.
+   interpreters are tolerated), symlinks that alias a secret-like path or Git
+   metadata under a harmless name (`review-config.txt -> .git/config`,
+   `cfg -> .ssh`: the alias would be readable by name, so these are refused
+   unconditionally, like outward links) and credential-looking content in
+   `gradle.properties` or `.git/config` (user:secret URLs, `extraHeader`
+   authorization values).
 5. **Diagnostics before exec**: `opencode debug config`, `opencode models` and
    `opencode debug agents` are run with `--standalone` and parsed; the launch
    proceeds only if the sole config source is the oauto file, exactly the
@@ -111,7 +115,12 @@ policy, not by the system prompt alone:
    is best effort by nature: it holds when git pairs the files (identical or
    ≥50 % similar content); a safe-named file that merely still contains
    secret text is reviewable content under name-based classification, and
-   its hunks are shown.
+   its hunks are shown. The one content-based exception is the
+   `CONTENT_CHECKS` set (`gradle.properties`): a changed file of that name
+   has its worktree and branch-delta diffs checked for credential-looking
+   assignments on either side, and a hit excludes the file from the
+   preflight (listed as `credential-looking content in its diff`), so
+   removing a committed credential never sends the removed line.
 
 The config is rendered at every launch into a private directory,
 `~/.local/state/oauto/<repo>-<hash>/xdg-config/opencode/opencode.json`, selected

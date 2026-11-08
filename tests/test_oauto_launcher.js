@@ -260,11 +260,65 @@ test('scan reports secret-like files, outward symlinks and credential content in
   assert.ok(!lines.some((l) => l.includes('link-system')), 'system interpreter links are tolerated');
   assert.ok(!lines.some((l) => l.includes('link-inside')));
   assert.ok(lines.includes('CONTENT gradle.properties: credential-looking assignment'));
-  assert.ok(lines.includes('CONTENT .git/config: remote URL embeds credentials (user:secret@)'));
+  assert.ok(lines.includes('CONTENT .git/config: remote URL or http header embeds credentials'));
   assert.match(lines[lines.length - 1], /^SUMMARY files=\d+ elapsed=[\d.]+s complete=1$/);
   const exhausted = policy(['scan', repo, '--budget', '0']);
   assert.equal(exhausted.status, 3);
   assert.match(exhausted.stdout, /complete=0/);
+});
+
+test('scan reports in-repository symlinks to secret-like targets with the reason, and http credentials in .git/config', () => {
+  const sb = sandbox();
+  const repo = mkRepo(sb, 'scan-alias', { 'src/a.py': 'x = 1\n', 'packages/pkg/index.js': '1\n', '.ssh/config': 'Host x\n',
+    'Config/Prod.Secrets.YAML': 'k: v\n', 'deploy/.aws/credentials': '[default]\n' }, { commit: false });
+  const real = fs.realpathSync(repo);
+  const aliases = [['review-config.txt', '.git/config'], ['git-meta', '.git'], ['cfg', '.ssh'],
+    ['n', 'Config/Prod.Secrets.YAML'], ['docs/aws', '../deploy/.aws', 'deploy/.aws']];
+  fs.mkdirSync(path.join(repo, 'docs'));
+  for (const [link, target] of aliases) fs.symlinkSync(target, path.join(repo, link));
+  fs.symlinkSync('src/a.py', path.join(repo, 'link-inside'));
+  fs.mkdirSync(path.join(repo, 'node_modules'));
+  fs.symlinkSync('../packages/pkg', path.join(repo, 'node_modules', 'pkg'));
+  fs.appendFileSync(path.join(repo, '.git', 'config'), '[http "https://example.invalid/"]\n\textraheader = AUTHORIZATION: basic xyz\n');
+  const r = policy(['scan', repo, '--budget', '60']);
+  assert.equal(r.status, 0, r.stderr);
+  const lines = r.stdout.trim().split('\n');
+  for (const [link, target, relTarget = target] of aliases) {
+    assert.ok(lines.includes(`SYMLINK ${link} -> ${real}/${relTarget} (secret-like target: ${relTarget})`), `${link}:\n${r.stdout}`);
+  }
+  assert.ok(!lines.some((l) => /^SYMLINK (link-inside|node_modules\/pkg) /.test(l)), `ordinary in-repo links stay tolerated:\n${r.stdout}`);
+  assert.ok(lines.includes('CONTENT .git/config: remote URL or http header embeds credentials'), r.stdout);
+
+  // Any extraHeader line (any case) and any Authorization: Bearer/Basic value count; a plain config does not.
+  for (const [label, text, flagged] of [
+    ['extraHeader, other case and value', '[http]\n\tExtraHeader = X-Trace: 1\n', true],
+    ['bearer token elsewhere', '[credential]\n\thelper = store\n# Authorization: Bearer SYNTH-HEADER-TOKEN-0d1e\n', true],
+    ['plain remote', '[remote "origin"]\n\turl = https://example.invalid/x.git\n', false],
+  ]) {
+    const plain = mkRepo(sb, `scan-header-${label.replace(/\W+/g, '-')}`, { 'a.txt': 'a\n' }, { commit: false });
+    fs.appendFileSync(path.join(plain, '.git', 'config'), text);
+    const out = policy(['scan', plain, '--budget', '60']).stdout;
+    assert.equal(out.includes('CONTENT .git/config: remote URL or http header embeds credentials'), flagged, `${label}:\n${out}`);
+  }
+});
+
+test('SENSITIVE_DIR_COMPONENTS names exactly the directories the read patterns protect', () => {
+  const r = spawnSync('python3', ['-I', '-c', [
+    'import importlib.util, json, sys',
+    'spec = importlib.util.spec_from_file_location("oauto_policy", sys.argv[1])',
+    'mod = importlib.util.module_from_spec(spec)',
+    'spec.loader.exec_module(mod)',
+    'print(json.dumps({"patterns": mod.SENSITIVE_READ_PATTERNS, "dirs": sorted(mod.SENSITIVE_DIR_COMPONENTS)}))',
+  ].join('\n'), POLICY], { encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr);
+  const { patterns, dirs } = JSON.parse(r.stdout);
+  // X/* and */X/* protect directory X; so does X/<file> (.docker/config.json).
+  const derived = new Set();
+  for (const p of patterns) {
+    const m = p.match(/^(?:\*\/)?([^*?/]+)\/[^/]+$/);
+    if (m) derived.add(m[1]);
+  }
+  assert.deepEqual([...derived].sort(), dirs);
 });
 
 // ---------------------------------------------------------------------------
@@ -894,6 +948,145 @@ test('oauto-run has no branch delta when the base shares no history with HEAD (t
   assert.match(preflight, /-i\n\+j\n/);
 });
 
+test('P1-D: in-repository symlinks aliasing Git metadata or secret-like paths are refused; ordinary in-repository links are not', () => {
+  const sb = sandbox();
+  // A harmless-looking name for .git/config (and one for .git itself), plain --check.
+  const repo = mkRepo(sb, 'alias-git', { 'src/a.py': 'x = 1\n' });
+  fs.symlinkSync('.git/config', path.join(repo, 'review-config.txt'));
+  fs.symlinkSync('.git', path.join(repo, 'git-meta'));
+  let r = runOauto(sb, repo, ['--check']);
+  assert.equal(r.status, 1, `an alias of .git/config must be refused:\n${r.stderr}`);
+  assert.match(r.stderr, /symlinks leaving the repository or aliasing secret-like paths/);
+  assert.match(r.stderr, /review-config\.txt -> \S+\/\.git\/config \(secret-like target: \.git\/config\)/);
+  assert.match(r.stderr, /git-meta -> \S+\/\.git \(secret-like target: \.git\)/);
+  assert.ok(!fs.existsSync(stateDir(sb, repo)), 'nothing is rendered before the scan passes');
+
+  // Aliases of a protected directory and of secret-like files: refused even with the
+  // sensitive-files override, which only accepts such files under their own names.
+  const repo2 = mkRepo(sb, 'alias-secrets', { 'src/a.py': 'x = 1\n', '.ssh/config': 'Host example\n',
+    'config/prod.secrets.yaml': 'k: v\n', 'keys/server.pem': 'synthetic test material\n' });
+  fs.symlinkSync('.ssh', path.join(repo2, 'cfg'));
+  fs.symlinkSync('config/prod.secrets.yaml', path.join(repo2, 'n'));
+  fs.symlinkSync('keys/server.pem', path.join(repo2, 'k'));
+  r = runOauto(sb, repo2, ['--check'], { OAUTO_ALLOW_SENSITIVE_FILES: '1' });
+  assert.equal(r.status, 1, r.stderr);
+  for (const [link, target] of [['cfg', '.ssh'], ['n', 'config/prod.secrets.yaml'], ['k', 'keys/server.pem']]) {
+    assert.ok(r.stderr.includes(`${link} -> ${fs.realpathSync(repo2)}/${target} (secret-like target: ${target})`), `${link}:\n${r.stderr}`);
+  }
+
+  // Ordinary in-repository links stay tolerated.
+  const repo3 = mkRepo(sb, 'alias-ordinary', { 'src/a.py': 'x = 1\n', 'packages/pkg/index.js': 'module.exports = 1;\n' });
+  fs.symlinkSync('src/a.py', path.join(repo3, 'link-inside'));
+  fs.mkdirSync(path.join(repo3, 'node_modules'));
+  fs.symlinkSync('../packages/pkg', path.join(repo3, 'node_modules', 'pkg'));
+  r = runOauto(sb, repo3, ['--check']);
+  assert.equal(r.status, 0, r.stderr);
+});
+
+const GRADLE_SECRET = 'SYNTH-GRADLE-SECRET-91af';
+const gradleProps = ({ password = true, jvm = '1g' } = {}) => [`org.gradle.jvmargs=-Xmx${jvm}`,
+  ...(password ? [`signingPassword=${GRADLE_SECRET}`] : []), 'org.gradle.parallel=true', ''].join('\n');
+
+// Full launch: the test double records the whole prompt OpenCode would receive.
+function launchRecordingPrompt(sb, repo, env = {}) {
+  const promptFile = path.join(sb.root, `prompt-${path.basename(repo)}.txt`);
+  fakeControl(sb, { PROMPT_FILE: promptFile });
+  const r = runOauto(sb, repo, [], env);
+  return {
+    r,
+    preflight: r.status === 0 ? readPreflight(sb, repo) : '',
+    prompt: fs.existsSync(promptFile) ? fs.readFileSync(promptFile, 'utf8') : '',
+  };
+}
+
+test('P1-E: removing a credential line from gradle.properties keeps the removed value out of the preflight and the prompt', () => {
+  const sb = sandbox();
+  const repo = mkRepo(sb, 'gradle-edit', { 'gradle.properties': gradleProps(), 'src/a.py': 'x = 1\n' });
+  writeFiles(repo, { 'gradle.properties': gradleProps({ password: false }), 'src/a.py': 'x = 2\n' });
+  const { r, preflight, prompt } = launchRecordingPrompt(sb, repo);
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(!/credential-looking content in:/.test(r.stderr), 'the worktree is clean, so the scan reports nothing');
+  assert.ok(!preflight.includes(GRADLE_SECRET) && !prompt.includes(GRADLE_SECRET), 'the removed credential must not reach the preflight or the prompt');
+  assert.deepEqual(excludedLines(preflight), ['gradle.properties (credential-looking content in its diff)']);
+  assert.ok(!preflight.includes('diff --git a/gradle.properties '));
+  assert.match(preflight, /-x = 1\n\+x = 2\n/);
+});
+
+test('P1-E: a deleted, nested or branch-committed credential removal is excluded, an innocuous gradle.properties edit is shown', () => {
+  const sb = sandbox();
+  const results = {};
+  // (b) the file deleted in the worktree
+  const deleted = mkRepo(sb, 'gradle-deleted', { 'gradle.properties': gradleProps(), 'src/a.py': 'x = 1\n' });
+  fs.rmSync(path.join(deleted, 'gradle.properties'));
+  results.deleted = { ...launchRecordingPrompt(sb, deleted), file: 'gradle.properties' };
+  // (e) a nested app/gradle.properties, the line removed and staged
+  const nested = mkRepo(sb, 'gradle-nested', { 'app/gradle.properties': gradleProps(), 'src/a.py': 'x = 1\n' });
+  fs.writeFileSync(path.join(nested, 'app/gradle.properties'), gradleProps({ password: false }));
+  git(nested, ['add', '-A']);
+  results.nested = { ...launchRecordingPrompt(sb, nested), file: 'app/gradle.properties' };
+  // (c) the removal committed on a feature branch off main: only the branch delta carries it
+  const branch = mkRepo(sb, 'gradle-branch', { 'gradle.properties': gradleProps(), 'src/a.py': 'x = 1\n' });
+  git(branch, ['checkout', '-q', '-b', 'feature']);
+  fs.writeFileSync(path.join(branch, 'gradle.properties'), gradleProps({ password: false }));
+  git(branch, ['commit', '-q', '-am', 'drop the signing password']);
+  results.branch = { ...launchRecordingPrompt(sb, branch), file: 'gradle.properties' };
+  const leaked = Object.keys(results).filter((k) => results[k].preflight.includes(GRADLE_SECRET) || results[k].prompt.includes(GRADLE_SECRET));
+  assert.deepEqual(leaked, [], 'a removed credential may not reach the preflight or the prompt');
+  for (const [label, x] of Object.entries(results)) {
+    assert.equal(x.r.status, 0, `${label}: ${x.r.stderr}`);
+    assert.deepEqual(excludedLines(x.preflight), [`${x.file} (credential-looking content in its diff)`], label);
+  }
+  const delta = sectionOf(results.branch.preflight, '## Branch delta vs main');
+  assert.ok(delta && !delta.includes('gradle.properties'), `the branch delta must not show gradle.properties:\n${delta}`);
+
+  // (d) an innocuous edit of a credential-free gradle.properties is reviewed as usual.
+  const innocuous = mkRepo(sb, 'gradle-innocuous', { 'gradle.properties': gradleProps({ password: false }) });
+  fs.writeFileSync(path.join(innocuous, 'gradle.properties'), gradleProps({ password: false, jvm: '2g' }));
+  let r = runOauto(sb, innocuous, ['--check']);
+  assert.equal(r.status, 0, r.stderr);
+  let preflight = readPreflight(sb, innocuous);
+  assert.deepEqual(excludedLines(preflight), []);
+  assert.match(preflight, /diff --git a\/gradle\.properties b\/gradle\.properties\n[\s\S]*?-org\.gradle\.jvmargs=-Xmx1g\n\+org\.gradle\.jvmargs=-Xmx2g\n/);
+  // A jvmargs-only edit next to a credential that stays (override set for the scan): the
+  // credential would be a context line of the hunk, so the path is excluded.
+  const context = mkRepo(sb, 'gradle-context', { 'gradle.properties': gradleProps() });
+  fs.writeFileSync(path.join(context, 'gradle.properties'), gradleProps({ jvm: '2g' }));
+  r = runOauto(sb, context, ['--check'], { OAUTO_ALLOW_SENSITIVE_FILES: '1' });
+  assert.equal(r.status, 0, r.stderr);
+  preflight = readPreflight(sb, context);
+  assert.ok(!preflight.includes(GRADLE_SECRET), 'a credential in a context line must not reach the preflight');
+  assert.deepEqual(excludedLines(preflight), ['gradle.properties (credential-looking content in its diff)']);
+});
+
+test('check-diff-content, classify --content-candidates and quote-path: content-checked diffs fail closed', () => {
+  const sb = sandbox();
+  const diff = (...hunk) => ['diff --git a/gradle.properties b/gradle.properties', 'index 1111111..2222222 100644',
+    '--- a/gradle.properties', '+++ b/gradle.properties', '@@ -1,3 +1,2 @@', ...hunk, ''].join('\n');
+  const check = (file, text) => spawnSync('python3', ['-I', POLICY, 'check-diff-content', '--', file], { input: text }).status;
+  assert.equal(check('gradle.properties', diff(' org.gradle.jvmargs=-Xmx1g', '-signingPassword=SYNTH', ' org.gradle.parallel=true')), 3, 'removed line');
+  assert.equal(check('gradle.properties', diff('+storePassword=SYNTH')), 3, 'added line');
+  assert.equal(check('app/Gradle.Properties', diff(' signingPassword=SYNTH', '-org.gradle.jvmargs=-Xmx1g', '+org.gradle.jvmargs=-Xmx2g')), 3,
+    'context line, nested path, any case');
+  assert.equal(check('-lead/gradle.properties', diff('-api_key = SYNTH')), 3, 'a leading-dash path after --');
+  assert.equal(check('gradle.properties', diff('-org.gradle.jvmargs=-Xmx1g', '+org.gradle.jvmargs=-Xmx2g')), 0, 'innocuous edit');
+  assert.equal(check('gradle.properties', ''), 0, 'empty diff');
+  assert.equal(check('README.md', diff('-password=x')), 2, 'no content check for that name');
+
+  const pairs = path.join(sb.root, 'pairs');
+  const cands = path.join(sb.root, 'cands');
+  fs.writeFileSync(pairs, nulJoin('R100', 'gradle.properties', 'build/gradle.properties'));
+  const r = policyBytes(['classify', '-z', '--renames', pairs, '--content-candidates', cands],
+    nulJoin('gradle.properties', 'app/Gradle.Properties', 'src/a.py', '.env', 'gradle.properties.bak', 'build/gradle.properties'));
+  assert.equal(r.status, 0, r.stderr.toString());
+  assert.deepEqual(r.stdout, nulJoin('.env'));
+  assert.deepEqual(fs.readFileSync(cands), nulJoin('app/Gradle.Properties', 'build/gradle.properties', 'gradle.properties'));
+  assert.equal(policy(['classify', '--content-candidates', cands], 'x\n').status, 2, '--content-candidates needs -z');
+
+  const q = policyBytes(['quote-path'], nulJoin('app/gradle.properties', 'tab\tgradle.properties'));
+  assert.equal(q.status, 0, q.stderr.toString());
+  assert.equal(q.stdout.toString(), 'app/gradle.properties\n"tab\\tgradle.properties"\n');
+});
+
 test('F: ordinary changes and non-sensitive special names still reach the preflight', () => {
   const sb = sandbox();
   const names = { naive: 'src/naïve file.py', tab: 'docs/tab\tname.md', dash: '-lead.py', plain: 'src/plain.py' };
@@ -1076,7 +1269,13 @@ test('oauto-run source: no automatic approval, standalone helpers, bounded helpe
   assert.equal(code.match(/\bg log\b/g).length, 1);
   assert.match(code, /\bg log --no-show-signature --no-color --oneline -15\b/);
   assert.match(code, /\bg status --short --untracked-files=normal --ignore-submodules=dirty\b/);
-  assert.match(code, /python3 -I "\$POLICY" classify -z --renames "\$pairs" --display "\$display" < "\$names" > "\$excluded_z" \|\|\s*die /);
+  assert.match(code, /python3 -I "\$POLICY" classify -z --renames "\$pairs" --display "\$display" --content-candidates "\$content_z" < "\$names" > "\$excluded_z" \|\|\s*die /);
+  // Content-checked files (gradle.properties ...): every candidate's own diff is checked
+  // through gd with a literal pathspec, and anything but "clean" or "found" is fatal.
+  const contentLines = lines.filter((l) => l.includes('check-diff-content'));
+  assert.equal(contentLines.length, 1, contentLines.join('\n'));
+  assert.match(contentLines[0], /^\s*gd "\$rev" -- ":\(literal\)\$path" \| python3 -I "\$POLICY" check-diff-content -- "\$path" \|\| status=\$\?$/);
+  assert.match(code, /\(\( status == 0 \)\) \|\|\s*die "/);
   assert.match(code, /python3 -I "\$POLICY" check-excluded "\$excluded_z" "\$after" >&2 \|\|\s*die /);
   assert.ok(!/<<< "\$excluded"/.test(code), 'excluded paths never travel through a shell variable');
 });

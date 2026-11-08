@@ -128,8 +128,8 @@ sensitive="$(printf '%s\n' "$scan_out" | sed -n 's/^SENSITIVE //p')"
 content_hits="$(printf '%s\n' "$scan_out" | sed -n 's/^CONTENT //p')"
 outward="$(printf '%s\n' "$scan_out" | sed -n 's/^SYMLINK //p')"
 if [[ -n "$outward" ]]; then
-  printf 'oauto: symlinks leaving the repository:\n%s\n' "$outward" >&2
-  die "refusing to launch: OpenCode resolves reads through symlinks, so these would expose paths outside $REPO (targets under /usr, /bin, /lib are tolerated)"
+  printf 'oauto: symlinks leaving the repository or aliasing secret-like paths:\n%s\n' "$outward" >&2
+  die "refusing to launch: OpenCode resolves reads through symlinks but checks only the requested name, so these would expose paths outside $REPO, or Git metadata and secret-like files inside it under a harmless name (targets under /usr, /bin, /lib are tolerated)"
 fi
 if [[ -n "$sensitive$content_hits" ]]; then
   [[ -n "$sensitive" ]] && printf 'oauto: secret-like files present in %s:\n%s\n' "$REPO" "$sensitive" >&2
@@ -235,7 +235,8 @@ pairs="$(mktemp "$STATE_DIR/.pairs.XXXXXX")"
 excluded_z="$(mktemp "$STATE_DIR/.excluded.XXXXXX")"
 display="$(mktemp "$STATE_DIR/.display.XXXXXX")"
 after="$(mktemp "$STATE_DIR/.after.XXXXXX")"
-trap 'rm -f -- "$names" "$pairs" "$excluded_z" "$display" "$after"' EXIT
+content_z="$(mktemp "$STATE_DIR/.content.XXXXXX")"
+trap 'rm -f -- "$names" "$pairs" "$excluded_z" "$display" "$after" "$content_z"' EXIT
 # A partial pair list would silently drop the destination-side exclusion, so a
 # failing or timed-out pair pass is fatal (never `|| true`).
 pair_pass_failed() {
@@ -260,8 +261,28 @@ if [[ "$head_sha" != "(no commits)" ]]; then
   fi
 fi
 g ls-files --others --exclude-standard -z >> "$names" || name_pass_failed $?
-python3 -I "$POLICY" classify -z --renames "$pairs" --display "$display" < "$names" > "$excluded_z" ||
+python3 -I "$POLICY" classify -z --renames "$pairs" --display "$display" --content-candidates "$content_z" < "$names" > "$excluded_z" ||
   die "could not classify the changed paths for the preflight"
+# Files with a content check (gradle.properties ...) are reviewable by name, but a
+# change that removes a credential line, or deletes the file, carries the old value
+# in its diff where the worktree scan cannot see it: such a path is excluded when its
+# own diff (uncommitted or branch delta) holds a credential-looking line.
+if [[ "$head_sha" != "(no commits)" ]]; then
+  while IFS= read -r -d '' path <&3; do
+    for rev in HEAD ${base:+"$base...HEAD"}; do
+      status=0
+      gd "$rev" -- ":(literal)$path" | python3 -I "$POLICY" check-diff-content -- "$path" || status=$?
+      if (( status == 3 )); then
+        printf '%s\0' "$path" >> "$excluded_z"
+        quoted="$(printf '%s\0' "$path" | python3 -I "$POLICY" quote-path)" || die "could not quote a path for the preflight"
+        printf '%s (credential-looking content in its diff)\n' "$quoted" >> "$display"
+        break
+      fi
+      (( status == 0 )) ||
+        die "checking the diff of a content-checked file (gradle.properties ...) for credentials failed (status $status)"
+    done
+  done 3< "$content_z"
+fi
 exclude_spec=()
 while IFS= read -r -d '' path; do exclude_spec+=(":(exclude,literal)$path"); done < "$excluded_z"
 # Prove the exclusion applied: the same name diffs, with the pathspecs, may list no
@@ -328,7 +349,7 @@ set -e -o pipefail
 chmod 600 "$PREFLIGHT_FILE"
 excluded_note=""
 if [[ -s "$display" ]]; then excluded_note=", secret-like paths excluded"; fi
-rm -f -- "$names" "$pairs" "$excluded_z" "$display" "$after"
+rm -f -- "$names" "$pairs" "$excluded_z" "$display" "$after" "$content_z"
 trap - EXIT
 preflight_bytes="$(wc -c < "$PREFLIGHT_FILE")"
 (( preflight_bytes <= PREFLIGHT_MAX_BYTES )) ||

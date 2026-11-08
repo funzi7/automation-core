@@ -12,6 +12,11 @@ Subcommands
                   C-quoted listing (--display); the form the launcher uses.
   check-excluded  Fail if a path the preflight still diffs was excluded or is
                   secret-like (proves the exclusion pathspecs applied).
+  check-diff-content
+                  Read one file's unified diff on stdin; exit 3 when it carries a
+                  credential-looking line for that file's content check (removed,
+                  added or context), 0 when not.
+  quote-path      Print NUL-delimited paths from stdin C-quoted like git, one per line.
   verify-sources  Read ``opencode debug config`` JSON on stdin; fail unless the only
                   configuration sources are the oauto-owned config directory and file.
   verify-agents   Read ``opencode debug agents`` JSON on stdin; fail unless every agent
@@ -113,6 +118,11 @@ SENSITIVE_READ_PATTERNS = [
     # infrastructure state
     "*.tfstate", "*.tfstate.*", "*.tfvars",
 ]
+# Directories the patterns above protect as a whole (X/*, */X/*, .docker/config.json).
+# An in-repository symlink whose target passes through one of them is refused: OpenCode
+# checks the requested (alias) path, not the canonical one. A test keeps this in step
+# with SENSITIVE_READ_PATTERNS.
+SENSITIVE_DIR_COMPONENTS = frozenset({".git", ".ssh", ".gnupg", ".aws", ".docker"})
 # Documented examples are not secrets; re-allowed after the denies (last match wins).
 SENSITIVE_READ_EXCEPTIONS = [
     "*.env.example",
@@ -131,6 +141,9 @@ CONTENT_CHECKS = {
         r"^\s*[\w.-]*(password|passwd|secret|token|passphrase|api[_-]?key)[\w.-]*\s*=\s*\S", re.I | re.M),
 }
 GIT_CONFIG_USERINFO = re.compile(r"://[^/\s:@]+:[^/\s@]+@")
+# http.<url>.extraHeader lines (any value; CI checkouts store tokens there) and any
+# Authorization: Bearer/Basic value.
+GIT_CONFIG_HTTP_CREDENTIALS = re.compile(r"^\s*extraheader\s*=|authorization:\s*(bearer|basic)\s+\S", re.I | re.M)
 
 # Symlink targets under these read-only system prefixes are not an escape (Python
 # virtualenvs link their interpreter there); anything else outside the repo is.
@@ -422,11 +435,19 @@ def parse_name_status_z(data: bytes) -> tuple[list[bytes], list[tuple[str, bytes
     return paths, pairs
 
 
-def classify_z(names: bytes, renames: bytes | None, display: str | None) -> None:
+def _content_checker(path: bytes):
+    """The CONTENT_CHECKS pattern for a path's basename (case-insensitive), or None."""
+    return CONTENT_CHECKS.get(path.rsplit(b"/", 1)[-1].decode("utf-8", "surrogateescape").lower())
+
+
+def classify_z(names: bytes, renames: bytes | None, display: str | None,
+               content_candidates: str | None = None) -> None:
     """stdout: the unique excluded paths, NUL-terminated, sorted by bytes. A rename or
     copy with a secret-like side excludes BOTH sides: a renamed secret must not
     reappear under a safe name, and a secret's new name must not reveal what its old
-    (safe-named) source contained."""
+    (safe-named) source contained. ``content_candidates`` receives the paths that are
+    not excluded but have a content check (gradle.properties ...): the launcher checks
+    their diffs, which can carry a credential line the worktree no longer has."""
     candidates = _nul_fields(names, "classify -z", terminated=False)
     pairs: list[tuple[str, bytes, bytes]] = []
     if renames is not None:
@@ -445,7 +466,24 @@ def classify_z(names: bytes, renames: bytes | None, display: str | None) -> None
         with open(display, "w", encoding="ascii") as fh:
             for path in ordered:
                 fh.write(" ".join([git_quote(path), *sorted(excluded[path])]) + "\n")
+    if content_candidates:
+        checked = sorted({p for p in candidates if p not in excluded and _content_checker(p) is not None})
+        with open(content_candidates, "wb") as fh:
+            fh.write(b"".join(path + b"\0" for path in checked))
     sys.stdout.buffer.write(b"".join(path + b"\0" for path in ordered))
+
+
+def check_diff_content(path: str) -> int:
+    """Exit status for the launcher: 3 when the unified diff on stdin (added, removed or
+    context lines alike) holds a credential-looking assignment for this file's content
+    check, 0 when not; no content check for the name fails closed (exit 2)."""
+    raw = os.fsencode(path)
+    checker = _content_checker(raw)
+    if checker is None:
+        _die(f"check-diff-content: no content check for {git_quote(raw)}")
+    text = sys.stdin.buffer.read().decode("utf-8", "replace")
+    body = "\n".join(line[1:] if line[:1] in ("+", "-", " ") else line for line in text.split("\n"))
+    return 3 if checker.search(body) else 0
 
 
 def check_excluded(excluded_file: str, remaining_file: str) -> None:
@@ -482,14 +520,22 @@ def scan(repo: str, budget: float) -> int:
         system = target.startswith(ALLOWED_SYMLINK_PREFIXES) and os.path.exists(target)
         if not (inside or system):
             symlinks.append((rel(path), target if os.path.lexists(target) else f"{target} (dangling)"))
+        elif inside and target != repo:
+            # Inside, but an alias of Git metadata, a protected directory or a
+            # secret-like file: the alias name would pass OpenCode's read rules.
+            rel_target = rel(target)
+            parts = rel_target.lower().split("/")
+            if any(p in SENSITIVE_DIR_COMPONENTS for p in parts) or is_sensitive_path(rel_target):
+                symlinks.append((rel(path), f"{target} (secret-like target: {rel_target})"))
 
     git_dir = os.path.join(repo, ".git")
     if os.path.isdir(git_dir):
         cfg = os.path.join(git_dir, "config")
         try:
             with open(cfg, encoding="utf-8", errors="replace") as fh:
-                if GIT_CONFIG_USERINFO.search(fh.read()):
-                    content.append((".git/config", "remote URL embeds credentials (user:secret@)"))
+                text = fh.read()
+            if GIT_CONFIG_USERINFO.search(text) or GIT_CONFIG_HTTP_CREDENTIALS.search(text):
+                content.append((".git/config", "remote URL or http header embeds credentials"))
         except OSError:
             pass
 
@@ -689,9 +735,13 @@ def main(argv: list[str]) -> None:
                             help="concatenated `git diff --name-status -z -M` output (needs -z)")
     p_classify.add_argument("--display", metavar="FILE",
                             help="write the excluded paths C-quoted, one per line (needs -z)")
+    p_classify.add_argument("--content-candidates", metavar="FILE",
+                            help="write the not-excluded paths that have a content check, NUL-terminated (needs -z)")
     p_check = sub.add_parser("check-excluded")
     p_check.add_argument("excluded", help="NUL-delimited excluded paths (classify -z output)")
     p_check.add_argument("remaining", help="NUL-delimited paths the preflight still diffs")
+    sub.add_parser("check-diff-content").add_argument("path", help="repository-relative path whose diff is on stdin")
+    sub.add_parser("quote-path")
     sub.add_parser("verify-sources").add_argument("--config-dir", required=True)
     sub.add_parser("verify-agents")
     sub.add_parser("verify-models")
@@ -708,15 +758,20 @@ def main(argv: list[str]) -> None:
     elif args.cmd == "classify":
         if args.nul:
             renames = _read_bytes(args.renames) if args.renames else None
-            classify_z(sys.stdin.buffer.read(), renames, args.display)
-        elif args.renames or args.display:
-            _die("--renames and --display need -z")
+            classify_z(sys.stdin.buffer.read(), renames, args.display, args.content_candidates)
+        elif args.renames or args.display or args.content_candidates:
+            _die("--renames, --display and --content-candidates need -z")
         else:
             for line in sys.stdin.read().splitlines():
                 if line and is_sensitive_path(line):
                     print(line)
     elif args.cmd == "check-excluded":
         check_excluded(args.excluded, args.remaining)
+    elif args.cmd == "check-diff-content":
+        sys.exit(check_diff_content(args.path))
+    elif args.cmd == "quote-path":
+        for path in _nul_fields(sys.stdin.buffer.read(), "quote-path", terminated=False):
+            print(git_quote(path))
     elif args.cmd == "verify-sources":
         config_dir = args.config_dir.rstrip("/")
         verify_sources(json.load(sys.stdin), config_dir, os.path.join(config_dir, "opencode.json"))
