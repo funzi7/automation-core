@@ -103,7 +103,10 @@ policy, not by the system prompt alone:
    way is handed back to the scan, which runs again until nothing new
    appears (include targets are tracked under their referenced name and
    their canonical target, and traversal is keyed by the referenced path,
-   so a symlinked include or bridge is followed the way git resolves it),
+   so a symlinked include or bridge is followed the way git resolves it; a
+   symlink that is itself an include name is denied by its own name rather
+   than refused as an alias, and a directory alias over such a link is
+   refused like any alias of a denied path),
    so a present file reached only through history is counted,
    credential-checked and alias-protected like any other include and a
    deleted chain is excluded hop by hop (a chain that passed through a

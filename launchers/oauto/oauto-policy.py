@@ -1006,9 +1006,13 @@ def scan(repo: str, budget: float, included_out: str | None = None,
     secret_like = sensitive | included_rels
     # A directory alias renames every path below its target, so a file that is
     # secret-like only through a directory name above it would be readable by name.
+    # Every name handed over for exclusion/denial is guarded here, the exempt
+    # include-name links included: an alias over their directory would re-expose
+    # them by name (they are not counted as present secret-like files, though).
+    alias_guarded = secret_like | set(include_names.values()) | set(unloadable_includes.values())
     for link, target, rel_target in dir_links:
         prefix = rel_target + "/" if rel_target else ""
-        flagged = sorted(p for p in secret_like if p.startswith(prefix))
+        flagged = sorted(p for p in alias_guarded if p.startswith(prefix))
         if flagged:
             symlinks.add((link, target, f"aliases a directory holding secret-like files: {_q(flagged[0])}"))
     # A hard link is the same file under another name, which no symlink rule sees.

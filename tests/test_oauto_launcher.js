@@ -1848,6 +1848,23 @@ test('P1-N: an include name symlinked to a present in-repository config: both na
   for (const name of ['review.cfg', 'existing-other.cfg']) assert.equal(decide(cfg.agents['review-glm'].permissions, 'read', name), 'deny', name);
 });
 
+test('a directory alias over an exempt include-name link is still refused, even with the override', () => {
+  const sb = sandbox();
+  const repo = mkRepo(sb, 'alias-over-include-link', { 'src/a.py': 'x = 1\n',
+    'conf/real.cfg': '[http]\n\textraheader = AUTHORIZATION: bearer SYNTH-ALIASLINK-TOKEN-99aa\n' });
+  fs.mkdirSync(path.join(repo, 'linkdir'));
+  fs.symlinkSync('../conf/real.cfg', path.join(repo, 'linkdir', 'link.cfg'));
+  fs.appendFileSync(path.join(repo, '.git', 'config'), '[include]\n\tpath = ../linkdir/link.cfg\n');
+  let r = runOauto(sb, repo, ['--check']);
+  assert.equal(r.status, 1, 'the included config is counted without the override');
+  r = runOauto(sb, repo, ['--check'], { OAUTO_ALLOW_SENSITIVE_FILES: '1' });
+  assert.equal(r.status, 0, `the include-name link itself is denied by name, not refused:\n${r.stderr}`);
+  fs.symlinkSync('linkdir', path.join(repo, 'd'));
+  r = runOauto(sb, repo, ['--check'], { OAUTO_ALLOW_SENSITIVE_FILES: '1' });
+  assert.equal(r.status, 1, 'a directory alias over the exempt link would re-expose it as d/link.cfg');
+  assert.match(r.stderr, /^d -> .*aliases a directory holding secret-like files: linkdir\/link\.cfg/m);
+});
+
 test('P1-O: two symlinked bridges to one file are each followed in their own directory', () => {
   const sb = sandbox();
   const token = 'SYNTH-O-TOKEN-55ee';

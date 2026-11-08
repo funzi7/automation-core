@@ -106,7 +106,7 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
 - Device (Phase 5): `bash launchers/oauto/install.sh` refreshed `/root/work/bin/oauto-run` and
   `oauto-policy.py` after each validated state during the round (previous copies kept as
   `*.backup-before-oauto-20261108-120902`, `-132239`, `-134043`, `-140044`, `-144953`, `-152257`,
-  `-154043`, `-160518`, `-163804`, `-171353`, `-174147` and `-183754`; `ai-launch`, the
+  `-154043`, `-160518`, `-163804`, `-171353`, `-174147`, `-183754` and `-192727`; `ai-launch`, the
   Termux `oauto-launch` wrapper and both `.bashrc` blocks were already identical and untouched; the
   original `ai-launch.backup-before-oauto-20261107` still equals the pristine fixture); `install.sh
   --verify` clean; installed copies byte-identical to the tracked ones (device-parity test passes);
@@ -115,7 +115,7 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
   sources/models/agents (GLM and DeepSeek default agents) and printed the banner; fixture, state dir
   and lock removed; no OpenCode process or service left.
 - Final validation at the pushed head: `bash scripts/validate.sh` green (YAML, JSON, sync/mirror parity,
-  JS syntax, `node --test` 201/201 including `tests/test_oauto_launcher.js` 74/74, 59 github-script
+  JS syntax, `node --test` 202/202 including `tests/test_oauto_launcher.js` 75/75, 59 github-script
   bodies, actionlint, `git diff --check`); real-binary battery (scratchpad script, every scenario of
   this entry) passed on the final launcher, and the six live model probes were repeated on it: shell,
   `/etc/hostname`, `.env`, `opencode/big-pickle` and `--agent build` denied as before, probe secret
@@ -287,6 +287,15 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
   resolution context — with canonical paths used only for the inside/outside test and the
   existing-file checks; depth and loop guards unchanged. Regression tests reproduce both on the
   previous code; the battery gained both.
+- Eighth pass of the independent reviewer on that round: Codex's two cases closed (include-name links
+  pointing at `.git/config`, `.env` or a secret-like directory still refused; chains of include-name
+  links denied name by name; link loops terminate live and through history; `..`/`./`-heavy
+  spellings register once; three bridges; a metacharacter include name refuses). One P2 introduced
+  by the new exemption (CONFIRMED): a directory alias over a folder holding an exempt include-name
+  link (`d -> linkdir`, `linkdir/link.cfg -> ../conf/real.cfg`) re-exposed it as `d/link.cfg` under
+  the override → fixed by adding every handed-over include name to the set the directory-alias check
+  uses (regression test); ADR item 4 and the README now state the exemption and that a directory
+  alias over such a link is refused.
 - Review and gate state: the fixes were pushed to the PR branch after this entry's commit; the
   exact-head CI result, the Codex re-review of the pushed head (`@codex review`), the resolution of
   every Codex P1/P2 thread and the Codex Gate verdict are recorded on the PR and in agent-memory
