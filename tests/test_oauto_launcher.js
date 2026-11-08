@@ -1720,7 +1720,77 @@ test('includes-in-config: targets of a Git config read from stdin, resolved like
     + '[include]\n\tpath = ../../outside.cfg\n\tpath = ../.git/config\n\tpath = b.cfg\n';
   const r = spawnSync('python3', ['-I', POLICY, 'includes-in-config', `--repo=${repo}`, '--config-path=conf/a.cfg'], { input: text });
   assert.equal(r.status, 0, r.stderr.toString());
-  assert.deepEqual(r.stdout, nulJoin('conf/b.cfg', 'top.cfg', 'conf/sub dir/c.cfg'));
+  // I records: in-repository targets (relative); O records: anything else, a file to follow (absolute).
+  const real = fs.realpathSync(repo);
+  assert.deepEqual(r.stdout, nulJoin('I', 'conf/b.cfg', 'I', 'top.cfg', 'I', 'conf/sub dir/c.cfg',
+    'O', path.join(path.dirname(real), 'outside.cfg'), 'O', path.join(real, '.git', 'config')));
+  // An outside file's content resolves relative to its own (absolute) location.
+  const outside = spawnSync('python3', ['-I', POLICY, 'includes-in-config', `--repo=${repo}`, `--config-path=${path.join(sb.root, 'bridge.cfg')}`],
+    { input: `[include]\n\tpath = ${path.join(real, 'conf', 'b.cfg')}\n\tpath = elsewhere.cfg\n` });
+  assert.deepEqual(outside.stdout, nulJoin('I', 'conf/b.cfg', 'O', path.join(fs.realpathSync(sb.root), 'elsewhere.cfg')));
+});
+
+// ---------------------------------------------------------------------------
+// Round 10: the scan is the single decision point. Targets found through history or
+// through files outside the repository are handed back to it until nothing new appears.
+// ---------------------------------------------------------------------------
+test('P1-L: a present file reached only through a deleted include is counted, checked, excluded, denied and alias-protected', () => {
+  const sb = sandbox();
+  const token = 'SYNTH-L-TOKEN-11aa';
+  const repo = chainRepo(sb, 'chain-present', { 'conf/a.cfg': '[include]\n\tpath = b.cfg\n', 'conf/b.cfg': includedConfigText(token) }, '../conf/a.cfg');
+  fs.rmSync(path.join(repo, 'conf/a.cfg'));
+  fs.appendFileSync(path.join(repo, 'conf/b.cfg'), '[k]\n\tv = 1\n'); // changed, so its diff would carry the token
+  let r = runOauto(sb, repo, ['--check']);
+  assert.equal(r.status, 1, `the present target must refuse the launch without the override:\n${r.stderr}`);
+  assert.match(r.stderr, /\nconf\/b\.cfg \(included Git config\)\n/);
+  assert.match(r.stderr, /\nconf\/b\.cfg: remote URL or http header embeds credentials\n/);
+  assert.match(r.stderr, /worktree scan passes: 2\n/);
+  const { r: r2, preflight, prompt } = launchRecordingPrompt(sb, repo, { OAUTO_ALLOW_SENSITIVE_FILES: '1' });
+  assert.equal(r2.status, 0, r2.stderr);
+  assert.ok(!preflight.includes(token) && !prompt.includes(token), 'the history-discovered target must not reach the preflight or the prompt');
+  assert.deepEqual(excludedLines(preflight), ['conf/a.cfg (included Git config)', 'conf/b.cfg (included Git config)']);
+  const cfg = JSON.parse(fs.readFileSync(path.join(stateDir(sb, repo), 'xdg-config', 'opencode', 'opencode.json'), 'utf8'));
+  for (const agent of ['review-glm', 'review-deepseek']) assert.equal(decide(cfg.agents[agent].permissions, 'read', 'conf/b.cfg'), 'deny', agent);
+  // An alias of that target is refused, override or not.
+  fs.symlinkSync('conf/b.cfg', path.join(repo, 'link'));
+  r = runOauto(sb, repo, ['--check'], { OAUTO_ALLOW_SENSITIVE_FILES: '1' });
+  assert.equal(r.status, 1, r.stderr);
+  assert.match(r.stderr, /\nlink -> \S+\/conf\/b\.cfg \(secret-like target: conf\/b\.cfg\)\n/);
+});
+
+test('P1-M: a deleted include bridging through a file outside the repository back to a deleted target is followed', () => {
+  const sb = sandbox();
+  const token = 'SYNTH-M-TOKEN-22bb';
+  const bridge = path.join(sb.root, 'bridge.cfg'); // outside the repository, present
+  const repo = chainRepo(sb, 'chain-bridge', { 'conf/a.cfg': `[include]\n\tpath = ${bridge}\n`, 'conf/b.cfg': includedConfigText(token) }, '../conf/a.cfg');
+  fs.writeFileSync(bridge, `[include]\n\tpath = ${path.join(repo, 'conf', 'b.cfg')}\n`);
+  fs.rmSync(path.join(repo, 'conf'), { recursive: true });
+  const { r, preflight, prompt } = launchRecordingPrompt(sb, repo); // no override: nothing present is secret-like
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(!preflight.includes(token) && !prompt.includes(token), 'the target reached through the outside bridge must not reach the preflight or the prompt');
+  assert.deepEqual(excludedLines(preflight), ['conf/a.cfg (included Git config)', 'conf/b.cfg (included Git config)']);
+});
+
+test('P1-L: a chain needing two scan passes (deleted a -> present b -> deleted c), and one pass without includes', () => {
+  const sb = sandbox();
+  const token = 'SYNTH-TWO-PASS-33cc';
+  const repo = chainRepo(sb, 'chain-two-pass', { 'conf/a.cfg': '[include]\n\tpath = b.cfg\n', 'conf/b.cfg': '[include]\n\tpath = c.cfg\n',
+    'conf/c.cfg': includedConfigText(token) }, '../conf/a.cfg');
+  fs.rmSync(path.join(repo, 'conf/a.cfg'));
+  fs.rmSync(path.join(repo, 'conf/c.cfg'));
+  let r = runOauto(sb, repo, ['--check']);
+  assert.equal(r.status, 1, `b.cfg is present Git configuration and must be counted:\n${r.stderr}`);
+  assert.match(r.stderr, /\nconf\/b\.cfg \(included Git config\)\n/);
+  assert.match(r.stderr, /worktree scan passes: 2\n/);
+  const { r: r2, preflight, prompt } = launchRecordingPrompt(sb, repo, { OAUTO_ALLOW_SENSITIVE_FILES: '1' });
+  assert.equal(r2.status, 0, r2.stderr);
+  assert.ok(!preflight.includes(token) && !prompt.includes(token));
+  assert.deepEqual(excludedLines(preflight), ['conf/a.cfg (included Git config)', 'conf/c.cfg (included Git config)']);
+  // A repository without includes is scanned exactly once.
+  const plain = mkRepo(sb, 'plain-one-pass', { 'src/a.py': 'x = 1\n' });
+  r = runOauto(sb, plain, ['--check']);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stderr, /worktree scan passes: 1\n/);
 });
 
 test('F: ordinary changes and non-sensitive special names still reach the preflight', () => {
@@ -1928,9 +1998,16 @@ test('oauto-run source: no automatic approval, standalone helpers, bounded helpe
   // merge base); a missing blob is a skip, a parser failure is fatal; the deny rules are
   // built only after every hop is known.
   assert.match(code, /^\s*g cat-file blob "\$rev:\$path" > "\$blob_tmp" \|\| continue$/m);
-  assert.equal((code.match(/includes-in-config --repo="\$REPO" --config-path="\$path" < "[^"]+" >> "\$hops_z" \|\|\n\s*die "/g) || []).length, 2);
-  assert.ok(lines.findIndex((l) => l.startsWith('deny_read_args=()')) > lines.findIndex((l) => l.startsWith('hop_index=0')),
-    'the deny rules cover the hops found through history');
+  assert.match(code, /includes-in-config --repo="\$REPO" --config-path="\$1" >> "\$hops_z" \|\|\n\s*die "/);
+  assert.match(code, /^\s*parse_config_includes "\$path" < "\$path" /m, 'a file outside the repository is read as it is, without git');
+  // One decision point: the scan runs in a bounded loop, fed what history reveals, and the
+  // verdict, the deny rules and classify use the final pass.
+  assert.match(code, /\(\( scan_pass <= 8 \)\) \|\| die "/);
+  assert.match(code, /--missing-out "\$missing_z" --extra-config "\$extra_z"\)" \|\| scan_status=\$\?/);
+  assert.match(code, /\n\s*history_pass\n\s*\[\[ -s "\$new_z" \]\] \|\| break\n\s*cat "\$new_z" >> "\$extra_z"\ndone\n/);
+  const loopEnd = lines.findIndex((l) => l.startsWith('note "worktree scan passes: $scan_pass"'));
+  assert.ok(loopEnd > 0 && lines.findIndex((l) => l.startsWith('if (( n_symlinks > 0 )); then')) > loopEnd, 'the verdict follows the last pass');
+  assert.ok(lines.findIndex((l) => l.startsWith('deny_read_args=()')) > loopEnd, 'the deny rules cover everything the passes found');
   // Content-checked files (gradle.properties ...): every candidate's own diff is checked
   // through gd with a literal pathspec, and anything but "clean" or "found" is fatal.
   const contentLines = lines.filter((l) => l.includes('check-diff-content'));

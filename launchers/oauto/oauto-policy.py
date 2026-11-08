@@ -19,9 +19,9 @@ Subcommands
                   partner), 0 when not.
   quote-path      Print NUL-delimited paths from stdin C-quoted like git, one per line.
   includes-in-config
-                  Read Git config content on stdin (a committed blob of a file the
-                  worktree no longer has); print the in-repository include targets it
-                  names, resolved as git would for --config-path, NUL-terminated.
+                  Read Git config content on stdin (a committed blob, or a file
+                  outside the repository); print the include targets it names, resolved
+                  as git would for --config-path, as I (in-repo) / O (other) records.
   verify-sources  Read ``opencode debug config`` JSON on stdin; fail unless the only
                   configuration sources are the oauto-owned config directory and file.
   verify-agents   Read ``opencode debug agents`` JSON on stdin; fail unless every agent
@@ -560,21 +560,27 @@ def config_include_paths(text: str) -> list[str]:
     return paths
 
 
-def includes_in_config(repo: str, config_path: str, data: bytes) -> list[bytes]:
+def includes_in_config(repo: str, config_path: str, data: bytes) -> list[tuple[bytes, bytes]]:
     """Targets of the include directives in Git config content (``data``), resolved as
-    git would for a file at ``config_path`` (repository-relative, which need not exist):
-    repository-relative, inside the repository and outside .git, deduplicated, in order."""
+    git would for a file at ``config_path`` (repository-relative, or absolute for a file
+    outside the repository; it need not exist). Records, deduplicated, in order:
+    (b"I", repository-relative path) for a target inside the repository and outside
+    .git; (b"O", absolute path) for any other target, a file the launcher follows (an
+    include may leave the repository and come back)."""
     repo = os.path.realpath(repo)
     git_dir = os.path.join(repo, ".git")
     base_dir = os.path.dirname(os.path.join(repo, config_path))
-    found: list[bytes] = []
+    found: list[tuple[bytes, bytes]] = []
     for inc in config_include_paths(data.decode("utf-8", "surrogateescape")):
         canon = os.path.realpath(os.path.join(base_dir, os.path.expanduser(inc)))
-        if not canon.startswith(repo + os.sep) or canon == git_dir or canon.startswith(git_dir + os.sep):
+        if canon == repo:
             continue
-        rel_target = os.fsencode(os.path.relpath(canon, repo).replace(os.sep, "/"))
-        if rel_target not in found:
-            found.append(rel_target)
+        if canon.startswith(repo + os.sep) and not (canon == git_dir or canon.startswith(git_dir + os.sep)):
+            record = (b"I", os.fsencode(os.path.relpath(canon, repo).replace(os.sep, "/")))
+        else:
+            record = (b"O", os.fsencode(canon))
+        if record not in found:
+            found.append(record)
     return found
 
 
@@ -689,7 +695,8 @@ def check_excluded(excluded_file: str, remaining_file: str) -> None:
 # ---------------------------------------------------------------------------
 
 def scan(repo: str, budget: float, included_out: str | None = None,
-         config_origins: str | None = None, missing_out: str | None = None) -> int:
+         config_origins: str | None = None, missing_out: str | None = None,
+         extra_config: str | None = None) -> int:
     """Print one ASCII record per finding (every pathname C-quoted like git) and a final
     SUMMARY line whose counts are what the launcher decides on:
 
@@ -702,7 +709,10 @@ def scan(repo: str, budget: float, included_out: str | None = None,
     the include targets there that git cannot load (deleted or renamed away):
     NUL-terminated, repository-relative, sorted. ``missing_out`` receives the latter
     alone (include targets missing from the worktree), whose last committed content the
-    launcher reads for further includes."""
+    launcher reads for further includes. ``extra_config``: repository-relative paths
+    the launcher found as include targets beyond the scan's reach (in committed content,
+    through files outside the repository); each is handled exactly like an include
+    target the scan found itself."""
     repo = os.path.realpath(repo)
     git_dir = os.path.join(repo, ".git")
     started = time.monotonic()
@@ -897,6 +907,15 @@ def scan(repo: str, budget: float, included_out: str | None = None,
                     check_git_config(full, 0, full, full)
     if config_origins:
         check_config_origins(config_origins)
+    if extra_config:
+        for extra in _nul_fields(_read_bytes(extra_config), "--extra-config", terminated=True):
+            found = os.path.join(repo, os.fsdecode(extra))
+            canon = os.path.realpath(found)
+            if os.path.isfile(canon):
+                role = config_role(canon)
+                check_git_config(found, 0, role, role)
+            else:
+                note_unloadable_include(canon)
     # An included Git config is secret-like wherever it lives: by name, as a link target
     # and as a hard-link partner.
     for canon, r in included.items():
@@ -1133,6 +1152,8 @@ def main(argv: list[str]) -> None:
     p_scan.add_argument("--budget", type=float, default=180.0, help="seconds before the scan gives up (exit 3)")
     p_scan.add_argument("--config-origins", metavar="FILE",
                         help="git config --list --show-origin -z output: every config file git loaded")
+    p_scan.add_argument("--extra-config", metavar="FILE",
+                        help="NUL-terminated include targets found beyond the scan (history, outside files)")
     p_scan.add_argument("--missing-out", metavar="FILE",
                         help="write the include targets missing from the worktree, NUL-terminated")
     p_scan.add_argument("--included-out", metavar="FILE",
@@ -1178,7 +1199,8 @@ def main(argv: list[str]) -> None:
         json.dump(doc, sys.stdout, indent=2)
         sys.stdout.write("\n")
     elif args.cmd == "scan":
-        sys.exit(scan(args.repo, args.budget, args.included_out, args.config_origins, args.missing_out))
+        sys.exit(scan(args.repo, args.budget, args.included_out, args.config_origins, args.missing_out,
+                      args.extra_config))
     elif args.cmd == "classify":
         if args.nul:
             renames = _read_bytes(args.renames) if args.renames else None
@@ -1196,8 +1218,8 @@ def main(argv: list[str]) -> None:
     elif args.cmd == "check-diff-content":
         sys.exit(check_diff_content(args.path, args.checker))
     elif args.cmd == "includes-in-config":
-        targets = includes_in_config(args.repo, args.config_path, sys.stdin.buffer.read())
-        sys.stdout.buffer.write(b"".join(t + b"\0" for t in targets))
+        records = includes_in_config(args.repo, args.config_path, sys.stdin.buffer.read())
+        sys.stdout.buffer.write(b"".join(kind + b"\0" + target + b"\0" for kind, target in records))
     elif args.cmd == "quote-path":
         for path in _nul_fields(sys.stdin.buffer.read(), "quote-path", terminated=False):
             print(git_quote(path))

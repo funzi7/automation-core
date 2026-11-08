@@ -98,8 +98,12 @@ policy, not by the system prompt alone:
    removed contents either, while only an existing one counts as a
    secret-like file; a missing include's last committed content (at HEAD
    and at the branch delta's merge base) is read through the hardened git
-   helper and its own includes are followed the same way, so a deleted
-   chain is excluded hop by hop. Included files outside the repository are followed for
+   helper and its own includes are followed the same way — through files
+   outside the repository too — and every in-repository target found this
+   way is handed back to the scan, which runs again until nothing new
+   appears, so a present file reached only through history is counted,
+   credential-checked and alias-protected like any other include and a
+   deleted chain is excluded hop by hop. Included files outside the repository are followed for
    further hops but not themselves checked; they belong to the user. The scan
    reports pathnames C-quoted and ends with a count summary that the
    launcher decides on, so no filename byte can hide a hit.

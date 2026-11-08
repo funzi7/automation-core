@@ -106,7 +106,7 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
 - Device (Phase 5): `bash launchers/oauto/install.sh` refreshed `/root/work/bin/oauto-run` and
   `oauto-policy.py` after each validated state during the round (previous copies kept as
   `*.backup-before-oauto-20261108-120902`, `-132239`, `-134043`, `-140044`, `-144953`, `-152257`,
-  `-154043`, `-160518` and `-163804`; `ai-launch`, the
+  `-154043`, `-160518`, `-163804` and `-171353`; `ai-launch`, the
   Termux `oauto-launch` wrapper and both `.bashrc` blocks were already identical and untouched; the
   original `ai-launch.backup-before-oauto-20261107` still equals the pristine fixture); `install.sh
   --verify` clean; installed copies byte-identical to the tracked ones (device-parity test passes);
@@ -115,7 +115,7 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
   sources/models/agents (GLM and DeepSeek default agents) and printed the banner; fixture, state dir
   and lock removed; no OpenCode process or service left.
 - Final validation at the pushed head: `bash scripts/validate.sh` green (YAML, JSON, sync/mirror parity,
-  JS syntax, `node --test` 194/194 including `tests/test_oauto_launcher.js` 67/67, 59 github-script
+  JS syntax, `node --test` 197/197 including `tests/test_oauto_launcher.js` 70/70, 59 github-script
   bodies, actionlint, `git diff --check`); real-binary battery (scratchpad script, every scenario of
   this entry) passed on the final launcher, and the six live model probes were repeated on it: shell,
   `/etc/hostname`, `.env`, `opencode/big-pickle` and `--agent build` denied as before, probe secret
@@ -256,6 +256,17 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
   limitation (resolving through HEAD's tree is not attempted); likewise an include line removed from
   `.git/config` itself together with its target cannot be traced (`.git/config` has no history). The
   stale first-round limitation lines (`.bak` rename, hard links) were marked superseded in this entry.
+- Codex re-review of the fifth fixed head (`3733fb3`, exact-head CI green, the previous thread
+  replied to and resolved): two P1s in the new history traversal, both valid and reproduced by
+  Codex — a still-present file reached only through a deleted include's committed content was
+  excluded and read-denied but never counted by the scan's refusal or alias checks (so a bearer
+  value in it stayed grep-reachable without the override); and a deleted chain passing through a
+  file outside the repository was not followed, so the returning in-repository target was missed.
+  Fixed: the scan is the single decision point and runs to a fixed point — the history traversal
+  (now following outside bridges by reading them) hands every in-repository target back to the scan
+  (`--extra-config`), which runs again until nothing new appears; refusal, credential checks,
+  alias protection, exclusion and deny-read all apply to the final set. Regression tests reproduce
+  both on the previous code; the battery gained both cases.
 - Review and gate state: the fixes were pushed to the PR branch after this entry's commit; the
   exact-head CI result, the Codex re-review of the pushed head (`@codex review`), the resolution of
   every Codex P1/P2 thread and the Codex Gate verdict are recorded on the PR and in agent-memory
