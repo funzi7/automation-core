@@ -571,16 +571,19 @@ def includes_in_config(repo: str, config_path: str, data: bytes) -> list[tuple[b
     git_dir = os.path.join(repo, ".git")
     base_dir = os.path.dirname(os.path.join(repo, config_path))
     found: list[tuple[bytes, bytes]] = []
+    seen: set[str] = set()
     for inc in config_include_paths(data.decode("utf-8", "surrogateescape")):
-        canon = os.path.realpath(os.path.join(base_dir, os.path.expanduser(inc)))
-        if canon == repo:
+        joined = os.path.normpath(os.path.join(base_dir, os.path.expanduser(inc)))
+        canon = os.path.realpath(joined)
+        if canon == repo or canon in seen:
             continue
+        seen.add(canon)
         if canon.startswith(repo + os.sep) and not (canon == git_dir or canon.startswith(git_dir + os.sep)):
-            record = (b"I", os.fsencode(os.path.relpath(canon, repo).replace(os.sep, "/")))
+            found.append((b"I", os.fsencode(os.path.relpath(canon, repo).replace(os.sep, "/"))))
         else:
-            record = (b"O", os.fsencode(canon))
-        if record not in found:
-            found.append(record)
+            # The path as git has it, not its canonical form: git resolves a symlinked
+            # config's relative includes against the link's directory, so must we.
+            found.append((b"O", os.fsencode(joined)))
     return found
 
 

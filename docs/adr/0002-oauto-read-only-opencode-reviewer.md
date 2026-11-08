@@ -103,7 +103,10 @@ policy, not by the system prompt alone:
    way is handed back to the scan, which runs again until nothing new
    appears, so a present file reached only through history is counted,
    credential-checked and alias-protected like any other include and a
-   deleted chain is excluded hop by hop. Included files outside the repository are followed for
+   deleted chain is excluded hop by hop (a chain that passed through a
+   directory symlink deleted together with its target is not resolved; a
+   repository with such chains can take up to eight scan passes, each
+   within the scan budget, before the launch fails closed). Included files outside the repository are followed for
    further hops but not themselves checked; they belong to the user. The scan
    reports pathnames C-quoted and ends with a count summary that the
    launcher decides on, so no filename byte can hide a hit.

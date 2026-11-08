@@ -1727,7 +1727,15 @@ test('includes-in-config: targets of a Git config read from stdin, resolved like
   // An outside file's content resolves relative to its own (absolute) location.
   const outside = spawnSync('python3', ['-I', POLICY, 'includes-in-config', `--repo=${repo}`, `--config-path=${path.join(sb.root, 'bridge.cfg')}`],
     { input: `[include]\n\tpath = ${path.join(real, 'conf', 'b.cfg')}\n\tpath = elsewhere.cfg\n` });
-  assert.deepEqual(outside.stdout, nulJoin('I', 'conf/b.cfg', 'O', path.join(fs.realpathSync(sb.root), 'elsewhere.cfg')));
+  assert.deepEqual(outside.stdout, nulJoin('I', 'conf/b.cfg', 'O', path.join(sb.root, 'elsewhere.cfg')));
+  // A symlinked outside config resolves its relative includes against the link's own
+  // directory, as git does, not against the link target's directory.
+  fs.mkdirSync(path.join(sb.root, 'sub'));
+  fs.writeFileSync(path.join(sb.root, 'sub', 'real.cfg'), '[include]\n\tpath = r.cfg\n');
+  fs.symlinkSync(path.join(sb.root, 'sub', 'real.cfg'), path.join(sb.root, 'bridge-link.cfg'));
+  const linked = spawnSync('python3', ['-I', POLICY, 'includes-in-config', `--repo=${repo}`, `--config-path=${path.join(sb.root, 'bridge-link.cfg')}`],
+    { input: fs.readFileSync(path.join(sb.root, 'bridge-link.cfg')) });
+  assert.deepEqual(linked.stdout, nulJoin('O', path.join(sb.root, 'r.cfg')), 'resolved against the link directory, not sub/');
 });
 
 // ---------------------------------------------------------------------------

@@ -106,7 +106,7 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
 - Device (Phase 5): `bash launchers/oauto/install.sh` refreshed `/root/work/bin/oauto-run` and
   `oauto-policy.py` after each validated state during the round (previous copies kept as
   `*.backup-before-oauto-20261108-120902`, `-132239`, `-134043`, `-140044`, `-144953`, `-152257`,
-  `-154043`, `-160518`, `-163804` and `-171353`; `ai-launch`, the
+  `-154043`, `-160518`, `-163804`, `-171353` and `-174147`; `ai-launch`, the
   Termux `oauto-launch` wrapper and both `.bashrc` blocks were already identical and untouched; the
   original `ai-launch.backup-before-oauto-20261107` still equals the pristine fixture); `install.sh
   --verify` clean; installed copies byte-identical to the tracked ones (device-parity test passes);
@@ -267,6 +267,14 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
   (`--extra-config`), which runs again until nothing new appears; refusal, credential checks,
   alias protection, exclusion and deny-read all apply to the final set. Regression tests reproduce
   both on the previous code; the battery gained both cases.
+- Seventh pass of the independent reviewer on that loop: no P1/P2 — termination (self-include, in/out
+  alternation, ten hops → fails closed), FIFO and 24 MB outside bridges, a bridge into another
+  repository, aliases of history-found present targets, the final-pass decision source, branch-only
+  content and an absent base all held. Its P3 was taken: an outside bridge that is a symlink now
+  resolves its relative includes against the link's own directory, as git does (`O` records carry
+  the path as joined, canonical only for the inside/outside test and de-duplication; unit test
+  added). ADR item 4 now states the deleted-directory-symlink limitation and the up-to-eight-pass
+  worst case.
 - Review and gate state: the fixes were pushed to the PR branch after this entry's commit; the
   exact-head CI result, the Codex re-review of the pushed head (`@codex review`), the resolution of
   every Codex P1/P2 thread and the Codex Gate verdict are recorded on the PR and in agent-memory
