@@ -10,6 +10,61 @@
 
 ---
 
+## Current Snapshot addendum (Codex Gate fail-closed enforcement, 2026-11-08)
+
+Investigation of the paywall-bot Codex Gate "failures" seen during the
+Telegraph token fix (PR #120 run `42477092393`, PR #122 run `42485718581`)
+found three distinct things, none of which was an unreviewed merge:
+
+1. **Expected WAITING state.** Each failed `pull_request_target` run fired
+   seconds after the push, before Codex had reviewed, and published
+   `check-codex-status` = `🟡 Waiting for Codex review` (conclusion `failure`)
+   while application CI was green. Codex then posted a `codex-review-receipt`
+   comment with `**Reviewed commit:**` naming the exact head within 1–3
+   minutes (#120 `23eac35` at 11:47:14Z, #121 `68985bc` at 12:49:00Z, #122
+   `fcd6263` at 13:36:47Z), the `issue_comment` gate run republished
+   `🟢 Reviewed — clear` on that exact head, and Merge Bot merged with the
+   SHA-pinned squash (merged_by is `funzi7` because Merge Bot uses
+   `AUTOMATION_PAT`). PR #120's three Codex P2 threads were all resolved before
+   its final head; no P1/P2 was active at any merge.
+2. **Real permission defect (universal).** The warning `trusted head marker
+   publish failed ... Resource not accessible by integration` appears on every
+   `pull_request_target` gate run in paywall-bot AND automation-core (PR #58,
+   all day). The gate declared `issues: write` but `pull-requests: read`; the
+   `codex-head-epoch:v3` marker is a comment on a pull request. Zero markers
+   exist on any PR in either repository since the mechanism shipped
+   (2026-08-13), so the authenticated head-epoch model never engaged. The
+   consequence was fail-closed everywhere (reaction-only clean, sync grace and
+   fallback episodes all stayed pending), never a false green. The canonical
+   fallback producer `claude-fallback-review.yml` carried the identical defect,
+   so no fallback attestation could ever have been minted.
+3. **Fail-open on technical errors.** The gate's exception branch published a
+   GREEN `check-codex-status` ("Technical fail-soft"). It never fired in the
+   observed runs, but it converted any API error into an approval signal.
+
+Fix (this branch, source of truth `workflows/`): `pull-requests: write` on the
+gate and the producer; technical errors publish `failure` titled
+`🟠 Gate evaluation error — fail-closed` (watchdog treats it like pending; the
+pure mirror returns `pending`/`technical_error_fail_closed`); Codex's structured
+`codex-review-state:v1` completed marker (full 40-char `commit_sha`) counts as
+exact-head evidence alongside `commit_id`/`Reviewed commit`; review threads
+with more than 100 comments fail closed (`review_thread_truncated`); the
+canonical evidence block closes quota episodes on timestamp ties, bounds Route A
+by the attestation time, binds attestations to the current head epoch, keeps
+scanning past inactive candidates, tolerates an `@ref` suffix on the producer
+run path, and the producer counts Codex reactions as activity. Regression tests
+drive the SHIPPED gate script end to end (`tests/test_codex_gate_workflow.js`)
+through the 2026-11-08 incident shape: marker 403, missing marker + reaction,
+late previous-head review, active P1/P2, technical error.
+
+Downstream fact: paywall-bot's `codex-gate.yml`, `merge-bot.yml` and
+`claude-fallback-watchdog.yml` on `main` are NOT automation-core copies — a
+paywall-bot feature commit (`b07344f4`, 2026-09-05) modified them locally
+(summary-row reaction binding) and they predate PR #56. The official sync PR
+paywall-bot #107 (open since 2026-10-02) is blocked by Codex findings against
+the synced gate code (addressed here) and by paywall-bot's own
+`tests/test_codex_gate_logic.js` asserting the local patch. See the Open TODO.
+
 ## Current Snapshot (emergency gate recovery, updated 2026-08-13)
 
 Emergency bootstrap PR #40 repaired the GitHub-unparseable Codex Gate and was
@@ -134,22 +189,75 @@ is the permanent human opt-out and is never removed by automation.
    review and attestation, or a normal Codex review once quota returns. Do not
    claim it passes before that evidence exists.
 7. **Longer-term:** update minutes-guard target coverage after downstream audit; keep direct-to-main and branch-protection decisions explicit.
-8. **oauto (read-only OpenCode reviewer launcher) — installed, PR #58 pending.** The
-   launcher, its policy module, tests and docs live under `launchers/` on branch
-   `claude/oauto-opencode-reviewer` (ADR 0002). Validated on the device against
-   OpenCode 2.2.6 with disposable fixture repositories (see the 2026-11-08
-   `handoffs/loop-build.md` entries for the full record). Codex's first review
-   (commit `d17f3a1`) found three P1s in the git preflight — repository-configured
-   textconv/external-diff helpers executed, special-character filenames escaped
-   the secret exclusion, rename detection hid a renamed secret's source — all
-   fixed on the PR branch with regression tests and recorded in the 2026-11-08
-   "Codex P1 round" entry; the Codex re-review of the fixed head and the Codex
-   Gate result are recorded in `agent-memory/automation-core/cc-latest.md`.
-   Physically pending: one `oauto <repo>` run from a real Termux shell (the hop
-   cannot be exercised from inside the Debian PRoot session), the PR merge, and
-   an owner decision on listing `oauto` in `DEVELOPMENT_RULES_FULL` §7. Any
-   OpenCode upgrade re-opens validation: the launcher refuses every version
-   other than 2.2.6.
+8. **Codex Gate fail-closed enforcement (2026-11-08) — PR #59 merged to `main`
+   (`15e44e6`, 2026-11-08); post-merge observation pending.** Branch `claude/codex-gate-fail-closed`,
+   <https://github.com/funzi7/automation-core/pull/59>. Physically verified:
+   the root cause (403 on the PR-comment marker in both repositories; zero
+   markers ever written) and the legitimacy of the three paywall-bot merges;
+   the full local suite and CI on the PR head. NOT physically verifiable
+   before merge: `pull_request_target` loads the gate from the default branch,
+   so the first marker publish and the first real `🟠` error verdict can only
+   be observed after this PR merges to `main`. First post-merge checks: a
+   `pull_request_target` gate run logs `indexed trusted head epoch run` and a
+   `<!-- codex-head-epoch:v3 ... -->` comment by `github-actions[bot]` appears
+   on the PR; `tests/test_workflow_permissions.js` stays green. Then the daily
+   sync refreshes paywall-bot #107 (Codex must re-review the new sync head;
+   paywall-bot's local `tests/test_codex_gate_logic.js` summary-binding
+   assertions must be updated in paywall-bot itself — the synced gate now binds
+   through the connector's structured `codex-review-state:v1` marker instead of
+   the local summary-row heuristic). If a marker publish still fails after
+   merge, the remaining suspects are repository Actions settings (both repos
+   currently report `default_workflow_permissions: write`), not workflow YAML.
+   **Merge Bot cannot merge PR #59 by design** (dry-run of the policy mirror
+   `tools/merge_bot_logic.js` against the live PR, 2026-11-08 21:45Z): without
+   `automerge` the `claude/*` branch is `not_candidate`; with `automerge`, a
+   green gate and exact-head Codex evidence it is `protected_path_untrusted`,
+   because the PR touches `workflows/**` and `.github/workflows/**` and a
+   `claude/*` branch carries Claude provenance — such PRs require a human
+   merge (adding `automerge` would only escalate it to `needs-owner`). Owner
+   action: `gh pr merge 59 --squash --repo funzi7/automation-core` once
+   satisfied with the review state. Review state at 21:47Z: Codex reviewed the
+   exact head `5491701` on request (`@codex review` 21:44:50Z) — receipt
+   "Didn't find any major issues" with `**Reviewed commit:** 5491701be5`
+   (21:46:39Z), review-state marker `completed` for `5491701…` with
+   `has_any_findings=false`, 👍 (21:46:43Z), no review threads; the gate
+   published `🟢 Reviewed — clear` (`current_head_signal_no_active_findings`)
+   at 21:46:52Z and CI `validate-automation-core` is green on the head. Review
+   and required checks are genuinely satisfied; only the human merge remains.
+   Independently of policy, **Merge Bot is non-functional in automation-core**:
+   both runs woken by this PR's green gate (`42526903520`, `42526913653`) — and
+   every Merge Bot run since 2026-09-11 — fail with `Unhandled error: HttpError:
+   Bad credentials` (401) on the first `AUTOMATION_PAT` call; see item 9.
+9. **`AUTOMATION_PAT` rejected in automation-core since 2026-09-11 — owner
+   action.** Merge Bot, Claude Fallback Watchdog and CI Doctor in THIS
+   repository fail every run with `HttpError: Bad credentials` (401): last
+   Merge Bot success 2026-09-08 13:40Z, failures from 2026-09-11 00:27Z through
+   today; watchdog and CI Doctor scheduled runs on 2026-11-07/08 show the same
+   error. The secret exists but GitHub rejects it (expired or revoked
+   fine-grained PAT). paywall-bot's own `AUTOMATION_PAT` works (its Merge Bot
+   merged #120–#122 on 2026-11-08). Owner: regenerate the fine-grained PAT
+   (Contents/PRs/Issues write, Metadata read) and update the automation-core
+   secret, then confirm one green Merge Bot and Watchdog run. Design note: the
+   fail-soft check only tests that the secret is non-empty, so an invalid PAT
+   crashes the job instead of exiting green or alerting — a loud, deduplicated
+   `Bad credentials` preflight (with the Telegram escalation) is a future
+   hardening item and is deliberately NOT part of PR #59.
+10. **oauto (read-only OpenCode reviewer launcher) — installed, PR #58 pending.** The
+    launcher, its policy module, tests and docs live under `launchers/` on branch
+    `claude/oauto-opencode-reviewer` (ADR 0002). Validated on the device against
+    OpenCode 2.2.6 with disposable fixture repositories (see the 2026-11-08
+    `handoffs/loop-build.md` entries for the full record). Codex's first review
+    (commit `d17f3a1`) found three P1s in the git preflight — repository-configured
+    textconv/external-diff helpers executed, special-character filenames escaped
+    the secret exclusion, rename detection hid a renamed secret's source — all
+    fixed on the PR branch with regression tests and recorded in the 2026-11-08
+    "Codex P1 round" entry; the Codex re-review of the fixed head and the Codex
+    Gate result are recorded in `agent-memory/automation-core/cc-latest.md`.
+    Physically pending: one `oauto <repo>` run from a real Termux shell (the hop
+    cannot be exercised from inside the Debian PRoot session), the PR merge, and
+    an owner decision on listing `oauto` in `DEVELOPMENT_RULES_FULL` §7. Any
+    OpenCode upgrade re-opens validation: the launcher refuses every version
+    other than 2.2.6.
 
 Older items below are history. If they conflict with this section, treat them as HISTORICAL or SUPERSEDED and follow this section.
 
@@ -205,6 +313,15 @@ Synced workflows listed in `sync-config.json`: `codex-auto-fix.yml`, `codex-gate
 - Freshness is never inferred from Git author/committer dates or from a signal timestamp after the observed head transition. Review objects and inline comments bind through immutable `commit_id`/`original_commit_id`; Codex result comments must name the exact `Reviewed commit`. Task summaries and other unmarked result surfaces are not affirmative because old-head asynchronous work can finish after a new push. Reaction-only clean is the narrow exception: it counts only when authenticated Gate marker history proves the PR has never had another observed head. After any head transition, immutable commit-bearing evidence is mandatory.
 - Trusted-sync grace-green is limited to zero-Codex-signal sync PRs older than `SYNC_GRACE_MINUTES`.
 - The old in-run self-rerun poll is gone; the watchdog sweep handles late Codex signals and override-label dispatches.
+- 2026-11-08: the head-epoch marker is a comment on a pull request and needs
+  `pull-requests: write` (declared alongside `issues: write`); a missing or
+  unverifiable marker is fail-closed, never a clean review. A technical
+  evaluation error publishes `failure` titled `🟠 Gate evaluation error —
+  fail-closed` (never green); the watchdog treats that title like pending.
+  Codex's structured `codex-review-state:v1` marker with `status: completed`
+  and a full 40-char `commit_sha` equal to the head is exact-head evidence. A
+  review thread whose comments exceed one GraphQL page fails closed
+  (`review_thread_truncated`).
 
 ### `claude-fallback-watchdog.yml` — Delivery-judged fixer ladder
 
@@ -290,8 +407,8 @@ Install/refresh with `bash launchers/oauto/install.sh`; contract in
 
 | Repo | Status | Notes |
 |---|---|---|
-| automation-core | loop installed and live | Public source of truth and test bed. |
-| paywall-bot | expression-safety sync merged; final race fix pending | PR #96 normally auto-merged as `cb5cc5d87f335963e1f80db54de11fe706e3f6de`; all seven workflows matched automation-core then. PR #97 exposed the delayed-task-result race, so one final sync is required after this correction merges. |
+| automation-core | loop installed; PAT-backed workflows crashing since 2026-09-11 | Public source of truth and test bed. Codex Gate and CI run normally; Merge Bot, Watchdog and CI Doctor fail every run with `Bad credentials` because the repository's `AUTOMATION_PAT` is rejected (TODO item 9). PRs here are merged by the owner until the secret is rotated. |
+| paywall-bot | sync stale and locally diverged; sync PR #107 blocked | PR #96 normally auto-merged as `cb5cc5d87f335963e1f80db54de11fe706e3f6de`. Checked 2026-11-08: `codex-auto-fix.yml` matches the source; `codex-gate.yml`, `merge-bot.yml` and `claude-fallback-watchdog.yml` were modified locally by `b07344f4` (2026-09-05) and predate PR #56; `claude-fallback-review.yml` absent. Sync PR #107 (head `c770aa5`) is red: Codex P1/P2 findings on the synced gate code (addressed in the 2026-11-08 fail-closed work) and the local `tests/test_codex_gate_logic.js` asserting the local patch. The 2026-11-08 Telegraph PRs #120–#122 were legitimately gated (exact-head Codex receipts, no active P1/P2, CI green) despite the marker 403. |
 | OptionsProfitTracker | onboarding PR #12 merged | Verified fact only. Current sync/secrets/variables/permissions/runtime health not checked in this pass. |
 | thai-rent-finder | onboarding PR #80 merged | Verified fact only. Current sync/secrets/variables/permissions/runtime health not checked in this pass. |
 | other downstream repos | via sync where bootstrapped | Do not claim synced or healthy without checking current evidence. |

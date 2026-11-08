@@ -123,11 +123,39 @@ Runtime-unverified after fix #27:
 - Claude proxy applying a Codex Cloud ready diff to the original PR head.
 - Codex API backup delivery while OpenAI quota is unavailable.
 
+Verified 2026-11-08 (Codex Gate fail-closed pass, read-only against GitHub):
+
+- Every `pull_request_target` Codex Gate run in paywall-bot and automation-core
+  logged `trusted head marker publish failed ... Resource not accessible by
+  integration`; no `codex-head-epoch:v3` comment exists on any PR of either
+  repository (automation-core #41–#58, paywall-bot #94–#122). Cause: the gate
+  declared `pull-requests: read`; the marker is a PR comment. Both repositories
+  report `default_workflow_permissions: write`, so the fix is workflow YAML,
+  not a repository setting.
+- paywall-bot PRs #120/#121/#122 (Telegraph token fix) were gated correctly:
+  pre-review `🟡` verdicts, then exact-head `Reviewed commit` receipts, then
+  `🟢` on the exact head, then SHA-pinned Merge Bot squashes; PR #120's three
+  Codex P2 threads were resolved before its final head.
+- paywall-bot `main` carries locally modified `codex-gate.yml`,
+  `merge-bot.yml`, `claude-fallback-watchdog.yml` (`b07344f4`, 2026-09-05)
+  that predate PR #56; `codex-auto-fix.yml` matches the source.
+
+- automation-core's `AUTOMATION_PAT` is rejected by GitHub: Merge Bot, the
+  watchdog and CI Doctor fail every run in this repository with `Unhandled
+  error: HttpError: Bad credentials` (401) — last Merge Bot success
+  2026-09-08, failures continuous from 2026-09-11, including both runs woken by
+  PR #59's green gate on 2026-11-08. paywall-bot's own PAT works. Owner must
+  rotate the secret (LOOP_STATE item 9); nothing in PR #59 depends on it.
+
+Not physically verifiable before the 2026-11-08 fix merges to `main`
+(`pull_request_target` loads the gate from the default branch): the first
+successful marker publish and the first `🟠 Gate evaluation error —
+fail-closed` verdict.
+
 Unknown / not checked in this pass:
 
-- Downstream repo secrets, Actions variables, workflow permissions, and broader
-  runtime health, including paywall-bot beyond the exact evidence recorded
-  below.
+- Downstream repo secrets, Actions variables, and broader runtime health,
+  including paywall-bot beyond the exact evidence recorded below.
 - Whether downstream repositories other than paywall-bot have the latest
   synced workflow contents.
 - Any current Codex Cloud product behavior beyond the documented limitation: a ready diff is not delivery unless the PR head branch receives a commit.
@@ -166,17 +194,33 @@ Trust, all fail-closed:
   run+attempt through the Actions API: the run must be that workflow, event
   `workflow_dispatch`, `head_branch` the default branch, and the comment must
   fall inside the run window. Any lookup failure ignores the attestation, and
-  the whole evidence call is wrapped so it can never reach the Gate's technical
-  fail-soft green.
+  the whole evidence call is wrapped so a failure inside it looks like absent
+  evidence, never like success and never like an evaluator error (the Gate's
+  technical-error branch itself fails closed since 2026-11-08).
 - Exact-head binding: `reviewed_head` must equal the live head. Any new commit
   invalidates it; a previous-head attestation fails.
 - Trusted quota episode: the Codex connector identity must have posted its own
   code-review usage-limit notice. Route A = the decline landed on this head
-  epoch. Route B = the decline predates this head epoch, Codex has posted
-  nothing since, and the attestation happened within 24 h of it. Any genuine
-  Codex activity newer than the newest notice closes the episode. No
+  epoch. Route B = the decline predates this head epoch and Codex has posted
+  nothing since. Both routes admit a fallback only when it was attested within
+  24 h after the newest notice (Route A also admits one attested before that
+  notice, because the head epoch bounds it from below); anything later is
+  `stale_quota_evidence`. Any genuine Codex activity at least as new as the
+  newest notice closes the episode — a same-second tie fails closed. No
   authenticated head epoch means no episode at all.
-- Precedence: override/fail-soft, then active Codex findings, then a fallback
+- Epoch binding and candidate scanning (2026-11-08 hardening, triggered by the
+  Codex findings on paywall-bot PR #107): an attestation whose comment predates
+  the current head epoch (A -> B -> A; 5 s skew like the run window) is
+  rejected as `attestation_predates_head_epoch`; a candidate outside its
+  episode no longer ends the scan, so a newer stale attestation cannot hide an
+  older still-valid exact-head one, while a blocking (unresolved P1/P2)
+  attestation still wins immediately. The producer run's `path` is accepted
+  bare or suffixed with that run's own branch (`@<head_branch>` or
+  `@refs/heads/<head_branch>`) and nothing else, and the producer counts
+  trusted Codex reactions as Codex activity exactly as every consumer does and
+  refuses to mint more than 24 h after the newest notice.
+- Precedence: override (clear) or technical evaluation error (pending,
+  fail-closed), then active Codex findings, then a fallback
   declaring unresolved P1/P2, then genuine current-head Codex evidence, then an
   accepted fallback, else pending. A fallback can never bypass a real Codex
   finding, and a returning Codex review on the current head is the authority.
@@ -186,7 +230,7 @@ Trust, all fail-closed:
 - `codex-p1-acknowledged`, owner override and reaction acknowledgement keep
   their own semantics and are never used to represent a fallback.
 
-Acceptance coverage lives in `tests/test_review_evidence.js` (43 tests,
+Acceptance coverage lives in `tests/test_review_evidence.js` (50 tests,
 numbered `1`..`15` to match the mandated matrix one-for-one): the
 full mandatory matrix, the paywall-bot PR #103 regression built on that PR's
 real timestamps, the shipped inline block from all three consumers executed
@@ -291,6 +335,20 @@ Verified current facts only:
   the delayed-result race correction in the current automation-core PR.
 - OptionsProfitTracker PR #12 is merged.
 - thai-rent-finder PR #80 is merged.
+- paywall-bot, checked 2026-11-08: `main` runs a STALE and LOCALLY MODIFIED
+  `codex-gate.yml`, `merge-bot.yml` and `claude-fallback-watchdog.yml`
+  (feature commit `b07344f4`, 2026-09-05, added a Codex summary-row reaction
+  binding) that predate PR #56; `codex-auto-fix.yml` matches the source and
+  `claude-fallback-review.yml` is absent. The official sync PR #107 (head
+  `c770aa5`, open since 2026-10-02) is red for two reasons: Codex left 4 P1 +
+  5 P2 findings on the synced gate/evidence code (addressed centrally by the
+  2026-11-08 fail-closed work), and paywall-bot's own
+  `tests/test_codex_gate_logic.js` asserts the local summary-row patch
+  (`not ok 19 - authoritative workflow keeps gate policy inline`), which must
+  be updated in paywall-bot when the sync lands. The Telegraph PRs
+  #120/#121/#122 (2026-11-08) were gated correctly by that stale gate through
+  exact-head `Reviewed commit` receipts; their marker publishes failed with the
+  same 403 as everywhere else.
 
 Not verified in this pass for every downstream, including paywall-bot:
 
@@ -320,7 +378,63 @@ These are preserved as incident records. They are not current operating instruct
 
 ## 7. Current Open TODO
 
-A0. Canonical Claude fallback review evidence:
+A00. Codex Gate fail-closed enforcement (2026-11-08, branch
+`claude/codex-gate-fail-closed`, PR #59
+<https://github.com/funzi7/automation-core/pull/59>, owner merge pending):
+
+- DONE in this repository: `pull-requests: write` on the gate and the fallback
+  producer (the PR-comment markers were failing with 403 everywhere, never
+  written once since 2026-08-13); technical gate errors publish a failure
+  verdict titled `🟠 Gate evaluation error — fail-closed` instead of a green
+  one (watchdog treats it like pending); Codex's structured
+  `codex-review-state:v1` completed marker counts as exact-head evidence;
+  review threads longer than one GraphQL page fail closed; the canonical
+  evidence block closes quota episodes on ties, bounds Route A by the
+  attestation time, binds attestations to the current head epoch, skips
+  inactive candidates, tolerates an `@ref` run path, and the producer counts
+  Codex reactions — the Codex P1/P2 findings left on paywall-bot sync PR #107.
+  Regression tests execute the shipped gate script end to end through the
+  incident shape (marker 403, missing marker + reaction, late previous-head
+  review, active P1/P2, technical error) and pin the permission shape.
+- PENDING (physical): owner merge — Merge Bot cannot do it by design (policy
+  mirror dry-run 2026-11-08: `not_candidate` without `automerge`, and
+  `protected_path_untrusted` with it, because a `claude/*` branch carries
+  Claude provenance and the PR touches `workflows/**` /
+  `.github/workflows/**`; `main` is unprotected, so the owner merges with
+  `gh pr merge 59 --squash`). Review state at 21:47Z: Codex reviewed the exact
+  head `5491701` on request — receipt with `**Reviewed commit:** 5491701be5`,
+  completed review-state marker with no findings, 👍, no threads; the gate
+  published `🟢 Reviewed — clear` on that head and CI is green, so review and
+  required checks are genuinely satisfied. Second, independent blocker: Merge
+  Bot cannot run at all in this repository — its `AUTOMATION_PAT` is rejected
+  (`Bad credentials`, since 2026-09-11; both runs woken by this green gate
+  crashed), so the owner must also rotate that secret (LOOP_STATE item 9) before
+  any automated merge here. After the merge, the first
+  `pull_request_target` gate run on `main` (any push to an open PR, e.g. #58,
+  or a new PR) must log `indexed trusted head epoch run` and leave a
+  `github-actions[bot]` `codex-head-epoch:v3` comment on that PR — this cannot
+  be observed before merge because `pull_request_target` loads the gate from
+  the default branch; the `🟠` verdict cannot be induced safely in production
+  and stays covered by the end-to-end tests only. Then paywall-bot's daily
+  sync (03:00 UTC cron, template-identical `sync-automation-core.yml`; or an
+  owner `gh workflow run sync-automation-core.yml --repo funzi7/paywall-bot`)
+  pushes the new contents to `chore/sync-automation-core`, refreshing PR #107
+  (unchanged since 2026-10-02 only because automation-core `main` has not
+  changed since PR #56); Codex must re-review the new sync head; and
+  paywall-bot's own `tests/test_codex_gate_logic.js` must drop its pins on
+  `completedCodexSummaryTargetsHead` / `codex-pull-request-review-summary` in
+  `.github/workflows/codex-gate.yml`, `merge-bot.yml` and
+  `claude-fallback-watchdog.yml` (test "authoritative workflow keeps gate
+  policy inline", plus the three `completedCodexSummaryTargetsHead` unit tests
+  and the export in its local `tools/codex_gate_logic.js`) — the synced gate
+  binds through `codex-review-state:v1` instead. That test change is a
+  paywall-bot commit, not made from this repository.
+- SUPERSEDED by this pass: "intentional technical fail-soft" in the gate (now
+  fail-closed) and "Route A deliberately carries no TTL" in ADR 0001 (now
+  bounded by the attestation time); paywall-bot's local summary-row reaction
+  binding (replaced by the structured `codex-review-state:v1` binding).
+
+A0. Canonical Claude fallback review evidence (this pass):
 
 - implemented centrally in automation-core and covered deterministically;
   PR #56 merged 2026-09-15 as `15652f663ccf31fac3c03651a5a7b56758257de4`;

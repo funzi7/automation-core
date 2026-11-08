@@ -6,6 +6,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const {
   decideCodexGate,
+  classifyThreads,
   severity,
   signalTargetsHead,
   currentHeadEpochStart,
@@ -14,6 +15,7 @@ const {
   isCodexCapacityNotice,
   isCodexTaskResult,
   reactionTargetsOnlyObservedHead,
+  REVIEW_STATE_MARKER_PATTERN,
 } = require('../tools/codex_gate_logic');
 
 const CODEX = 'chatgpt-codex-connector';
@@ -344,10 +346,19 @@ test('explicit administrator override clears', () => {
   assert.equal(result.reason, 'administrator_override');
 });
 
-test('technical API error retains intentional fail-soft policy', () => {
+test('technical API error fails closed instead of clearing the head', () => {
+  // An API failure proves nothing about the head. The former
+  // `technical_fail_soft` branch published a GREEN check-codex-status on any
+  // exception, which Merge Bot and branch protection read as approval.
   const result = decideCodexGate({ technicalError: true });
-  assert.equal(result.status, 'clear');
-  assert.equal(result.reason, 'technical_fail_soft');
+  assert.notEqual(result.status, 'clear');
+  assert.equal(result.status, 'pending');
+  assert.equal(result.reason, 'technical_error_fail_closed');
+  assert.deepEqual(result.activeFindings, []);
+  // Even an override-less, finding-less head with a clean signal does not
+  // turn green while the evaluation itself failed.
+  const withSignal = decideCodexGate({ technicalError: true, currentHeadSignal: true });
+  assert.equal(withSignal.status, 'pending');
 });
 
 test('one active thread blocks among resolved/outdated threads', () => {
@@ -408,7 +419,24 @@ test('authoritative workflow keeps gate policy inline', () => {
   assert.match(workflow, /return markers\.sort\(\(a, b\) =>\s*b\.observedAt - a\.observedAt \|\| b\.id - a\.id\)/);
   assert.doesNotMatch(workflow, /refs\.sort\(/);
   assert.doesNotMatch(workflow, /if \(head !== exactHead\) break/);
+  // The head-epoch marker is a comment on a PULL REQUEST. `pull-requests: read`
+  // made every publish fail with "Resource not accessible by integration"
+  // (2026-11-08, paywall-bot #120/#122 and automation-core #58).
+  assert.match(workflow, /\n  pull-requests: write\n/);
+  assert.doesNotMatch(workflow, /\n  pull-requests: read\n/);
   assert.match(workflow, /issues: write/);
+  // Technical errors must publish a non-success verdict, never a green one.
+  assert.match(workflow, /const GATE_ERROR_TITLE = '🟠 Gate evaluation error — fail-closed';/);
+  assert.doesNotMatch(workflow, /Technical fail-soft/);
+  assert.doesNotMatch(workflow, /technical_fail_soft/);
+  const technicalCatch = workflow.slice(
+    workflow.indexOf('} catch (err) {'),
+    workflow.indexOf("core.summary.addHeading('Codex Gate Results')"),
+  );
+  assert.ok(technicalCatch.length > 200, 'the technical-error catch block must be located');
+  assert.match(technicalCatch, /anyBlocked = true;/);
+  assert.match(technicalCatch, /'failure',\s*GATE_ERROR_TITLE,/);
+  assert.doesNotMatch(technicalCatch, /'success'/);
   assert.ok(
     workflow.indexOf('comments = await ensureHeadEpochMarker') <
       workflow.indexOf('// Manual override — admin force-merge.'),
@@ -442,7 +470,14 @@ test('queued PR head events are revalidated before gate evaluation', () => {
   assert.match(workflow, /event\.event === 'head_ref_force_pushed'/);
   assert.match(workflow, /newestForcePushAt < runCreatedAt/);
   assert.doesNotMatch(workflow, /context\.payload\.action !== 'synchronize'\) return true/);
-  assert.match(workflow, /if \(!\(await triggeringHeadEventIsCurrent\(prNumber, headSha\)\)\)/);
+  // Tri-state: a freshness-lookup API error is skipped fail-closed AND loudly
+  // (anyBlocked), never silently relabelled as a stale event.
+  assert.match(workflow, /const headEventState = await triggeringHeadEventIsCurrent\(prNumber, headSha\);/);
+  assert.match(workflow, /if \(headEventState === 'lookup_failed'\) \{[\s\S]{0,1500}?anyBlocked = true;/);
+  assert.match(workflow, /if \(headEventState === 'lookup_failed'\) \{[\s\S]{0,1500}?core\.error\(/);
+  assert.match(workflow, /if \(headEventState !== 'current'\) \{/);
+  assert.match(workflow, /return 'lookup_failed';/);
+  assert.doesNotMatch(workflow, /freshness lookup failed[^\n]*\n[^\n]*return false;/);
   assert.match(workflow, /stale queued head event skipped/);
   assert.ok(
     workflow.indexOf('await triggeringHeadEventIsCurrent(prNumber, headSha)') <
@@ -611,4 +646,428 @@ test('backup fixer includes trusted current-head top-level findings', () => {
   assert.match(backup, /TARGET_HEAD: \$\{\{ inputs\.head_sha \}\}/);
   assert.match(backup, /parseInt\(process\.env\.PR_NUMBER \|\| '', 10\)/);
   assert.match(backup, /String\(process\.env\.TARGET_HEAD \|\| ''\)/);
+});
+
+// ---------------------------------------------------------------------------
+// paywall-bot #107 P1: Codex's structured review-state marker is exact-head
+// evidence. Codex keeps ONE summary comment per PR, edited in place, whose
+// body starts with this machine-written marker. When a PR has had several
+// heads and Codex returns clean through that summary plus a 👍 only (no
+// `Reviewed commit` receipt), nothing else can bind the head and the gate
+// stayed yellow forever.
+// ---------------------------------------------------------------------------
+const WORKFLOWS = ['codex-gate.yml', 'merge-bot.yml', 'claude-fallback-watchdog.yml'];
+const workflowSource = (name) => fs.readFileSync(
+  path.join(__dirname, '..', 'workflows', name), 'utf8',
+);
+
+const PR120_HEAD = '23eac3576e5b7213311f26bd34fa6537f5017a4c';
+// Verbatim opening of the summary comment on paywall-bot PR #120
+// (automation-core #58 has the same shape with has_any_findings:false).
+const PR120_BODY = [
+  '<!-- codex-pull-request-review-summary -->',
+  '<!-- codex-review-state:v1 {"code_review":{"commit_sha":"23eac3576e5b7213311f26bd34fa6537f5017a4c","has_any_findings":true,"has_unresolved_findings":false,"status":"completed"},"security_review":{"commit_sha":null,"has_any_findings":null,"has_unresolved_findings":null,"status":null}} -->',
+  '',
+  '<details>',
+  '<summary><strong>Codex Review Summary</strong>: ✅ Completed</summary>',
+  '',
+  'This comment shows the latest Codex review activity on this pull request.',
+  '',
+  '| Review | Status | Commit | Review trigger |',
+  '| --- | --- | --- | --- |',
+  '| 📝 **Code Review** | ✅ **Completed** | `23eac35` | Manual request |',
+  '</details>',
+].join('\n');
+
+function reviewStateBody(codeReview, securityReview = {
+  commit_sha: null, has_any_findings: null, has_unresolved_findings: null, status: null,
+}) {
+  const state = typeof codeReview === 'string'
+    ? codeReview
+    : JSON.stringify({ code_review: codeReview, security_review: securityReview });
+  return `<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 ${state} -->\n\nCodex Review Summary`;
+}
+const completedReview = (overrides = {}) => ({
+  commit_sha: PR120_HEAD, has_any_findings: false, has_unresolved_findings: false,
+  status: 'completed', ...overrides,
+});
+
+// [label, item, head, expected] — shared by the module test and the inline
+// copies so all four implementations are held to the same table.
+const MARKER_CASES = [
+  ['real PR #120 summary binds its exact head', { body: PR120_BODY }, PR120_HEAD, true],
+  ['real PR #120 summary does not bind another head', { body: PR120_BODY }, 'a'.repeat(40), false],
+  ['an upper-case commit_sha still binds the lower-case head',
+    { body: reviewStateBody(completedReview({ commit_sha: PR120_HEAD.toUpperCase() })) }, PR120_HEAD, true],
+  ['the head is compared case-insensitively too', { body: PR120_BODY }, PR120_HEAD.toUpperCase(), true],
+  ['status in_progress is not a review',
+    { body: reviewStateBody(completedReview({ status: 'in_progress' })) }, PR120_HEAD, false],
+  ['status pending is not a review',
+    { body: reviewStateBody(completedReview({ status: 'pending' })) }, PR120_HEAD, false],
+  ['status null is not a review',
+    { body: reviewStateBody(completedReview({ status: null })) }, PR120_HEAD, false],
+  ['status must equal completed exactly',
+    { body: reviewStateBody(completedReview({ status: 'Completed' })) }, PR120_HEAD, false],
+  ['a 7-char commit_sha prefix never binds',
+    { body: reviewStateBody(completedReview({ commit_sha: PR120_HEAD.slice(0, 7) })) }, PR120_HEAD, false],
+  ['a 39-char commit_sha never binds',
+    { body: reviewStateBody(completedReview({ commit_sha: PR120_HEAD.slice(0, 39) })) }, PR120_HEAD, false],
+  ['a null commit_sha never binds',
+    { body: reviewStateBody(completedReview({ commit_sha: null })) }, PR120_HEAD, false],
+  ['malformed JSON never binds',
+    { body: reviewStateBody('{"code_review":{"commit_sha":"' + PR120_HEAD + '","status":"completed"}') }, PR120_HEAD, false],
+  ['a marker without a code_review block never binds',
+    { body: reviewStateBody('{"security_review":{"commit_sha":"' + PR120_HEAD + '","status":"completed"}}') }, PR120_HEAD, false],
+  ['a matching security_review never speaks for the code review',
+    { body: reviewStateBody(
+      { commit_sha: null, has_any_findings: null, has_unresolved_findings: null, status: null },
+      { commit_sha: PR120_HEAD, has_any_findings: false, has_unresolved_findings: false, status: 'completed' },
+    ) }, PR120_HEAD, false],
+  ['a completed review of a different head never binds this one',
+    { body: reviewStateBody(completedReview({ commit_sha: 'b'.repeat(40) })) }, PR120_HEAD, false],
+  ['isCodexTaskResult still wins when a task summary carries the marker',
+    { body: ['### Summary', '* Fixed the earlier head.', PR120_BODY, '[View task →](https://chatgpt.com/s/example)'].join('\n') },
+    PR120_HEAD, false],
+  ['an explicit mismatched commit_id wins over the marker',
+    { commit_id: 'b'.repeat(40), body: PR120_BODY }, PR120_HEAD, false],
+  ['an explicit mismatched original_commit_id wins over the marker',
+    { original_commit_id: 'b'.repeat(40), commit_id: PR120_HEAD, body: PR120_BODY }, PR120_HEAD, false],
+  ['a Reviewed commit receipt wins over the marker',
+    { body: '**Reviewed commit:** `bbbbbbbbbb`\n\n' + PR120_BODY }, PR120_HEAD, false],
+  ['a body with no binding of any kind never binds', { body: 'Codex Review Summary: ✅ Completed' }, PR120_HEAD, false],
+];
+
+test('the structured review-state marker binds a completed review to its exact head', () => {
+  const captured = PR120_BODY.match(REVIEW_STATE_MARKER_PATTERN);
+  assert.ok(captured, 'the exported pattern must match the real summary body');
+  assert.equal(JSON.parse(captured[1]).code_review.commit_sha, PR120_HEAD);
+  for (const [label, item, head, expected] of MARKER_CASES) {
+    assert.equal(signalTargetsHead(item, head), expected, label);
+  }
+  // Codex's own state saying findings are still unresolved is not a clean
+  // current-head signal, even before the matching review threads are visible
+  // (independent review, 2026-11-08). Liveness still comes from the threads;
+  // the marker merely declines to vouch for the head meanwhile.
+  assert.equal(
+    signalTargetsHead({ body: reviewStateBody(completedReview({ has_unresolved_findings: true })) }, PR120_HEAD),
+    false,
+    'a completed review that still reports unresolved findings is not a clean signal',
+  );
+  assert.equal(
+    signalTargetsHead({ body: reviewStateBody(completedReview({ has_unresolved_findings: false })) }, PR120_HEAD),
+    true,
+    'a completed review with no unresolved findings binds',
+  );
+  assert.equal(
+    signalTargetsHead({ body: reviewStateBody(completedReview({ has_any_findings: true, has_unresolved_findings: false })) }, PR120_HEAD),
+    true,
+    'resolved findings (paywall-bot #120 shape) still bind',
+  );
+});
+
+// Execute the SHIPPED signalTargetsHead of each workflow, not a mirror. The
+// region from REVIEWED_COMMIT_PATTERN through signalTargetsHead is
+// self-contained in all three workflows (gate and Merge Bot define it as a
+// function, the watchdog as an arrow function).
+function inlineSignalTargetsHead(name) {
+  const body = workflowSource(name);
+  const start = body.indexOf('            const REVIEWED_COMMIT_PATTERN = ');
+  assert.ok(start >= 0, `${name} must define REVIEWED_COMMIT_PATTERN inline`);
+  const definition = body.indexOf('function signalTargetsHead(', start) >= 0
+    ? body.indexOf('            function signalTargetsHead(', start)
+    : body.indexOf('            const signalTargetsHead = (', start);
+  assert.ok(definition > start, `${name} must define signalTargetsHead inline`);
+  let end = body.indexOf('\n            }', definition);
+  assert.ok(end > definition, `${name}: could not bound signalTargetsHead`);
+  end += '\n            }'.length;
+  if (body[end] === ';') end += 1;
+  const source = body.slice(start, end).split('\n').map((line) => line.slice(12)).join('\n');
+  return {
+    source: body.slice(definition, end),
+    fn: new Function(`${source}\nreturn signalTargetsHead;`)(),
+  };
+}
+
+test('all three inline signalTargetsHead copies bind the review-state marker like the module', () => {
+  for (const name of WORKFLOWS) {
+    const { fn } = inlineSignalTargetsHead(name);
+    for (const [label, item, head, expected] of MARKER_CASES) {
+      assert.equal(fn(item, head), expected, `${name}: ${label}`);
+      assert.equal(fn(item, head), signalTargetsHead(item, head), `${name}: must agree with the module: ${label}`);
+    }
+    // The legacy bindings are untouched.
+    assert.equal(fn({ commit_id: PR120_HEAD }, PR120_HEAD), true, `${name}: commit_id still binds`);
+    assert.equal(fn({ body: '**Reviewed commit:** `23eac3576e`' }, PR120_HEAD), true, `${name}: receipt still binds`);
+    assert.equal(fn({ created_at: '2026-11-08T00:00:00Z', body: 'clean' }, PR120_HEAD), false, `${name}: timing alone never binds`);
+  }
+});
+
+test('the review-state marker binding is pinned in every workflow with the mandated precedence', () => {
+  const markerSource = `const REVIEW_STATE_MARKER_PATTERN = /${REVIEW_STATE_MARKER_PATTERN.source}/;`;
+  assert.match(markerSource, /codex-review-state:v1/);
+  for (const name of WORKFLOWS) {
+    const body = workflowSource(name);
+    assert.ok(body.includes(markerSource), `${name} must define the module's REVIEW_STATE_MARKER_PATTERN verbatim`);
+    assert.match(body, /machine-written state marker from the trusted\s+(?:\/\/ )?connector/,
+      `${name} must document that the marker is machine-written by the trusted connector`);
+    assert.match(body, /is NOT a review/, `${name} must document that a non-completed state is not a review`);
+    const { source } = inlineSignalTargetsHead(name);
+    assert.match(source, /codex-review-state|REVIEW_STATE_MARKER_PATTERN/,
+      `${name}: signalTargetsHead must consult the review-state marker`);
+    assert.match(source, /review = JSON\.parse\(state\)\?\.code_review;/);
+    assert.match(source, /if \(!review \|\| review\.status !== 'completed'\) return false;/);
+    assert.match(source, /return \/\^\[a-f0-9\]\{40\}\$\/\.test\(reviewedSha\) && reviewedSha === exactHead;/);
+    assert.doesNotMatch(source, /login/, `${name}: trust stays the caller's job inside signalTargetsHead`);
+    const order = [
+      'isCodexTaskResult(item?.body)) return false',
+      'original_commit_id',
+      'commit_id || \'\')',
+      'REVIEWED_COMMIT_PATTERN',
+      'REVIEW_STATE_MARKER_PATTERN',
+    ];
+    const indices = order.map((needle) => source.indexOf(needle));
+    indices.forEach((index, position) => assert.ok(index >= 0, `${name}: missing ${order[position]}`));
+    for (let i = 1; i < indices.length; i += 1) {
+      assert.ok(indices[i] > indices[i - 1], `${name}: ${order[i]} must come after ${order[i - 1]}`);
+    }
+    assert.ok(source.lastIndexOf('return false;') > indices[indices.length - 1],
+      `${name}: the marker must be the last binding before the fail-closed return`);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// paywall-bot #107 P2: every thread reader requests comments(first: 100). A
+// trusted P1/P2 beyond the first page was invisible, so a clean signal or a
+// fallback could turn the gate green past a live finding. Fail closed.
+// ---------------------------------------------------------------------------
+function truncatedThread(overrides = {}) {
+  return {
+    id: 'T-overflow',
+    isResolved: false,
+    isOutdated: false,
+    path: 'core/scheduler.py',
+    line: 7,
+    startLine: null,
+    commentsTruncated: true,
+    comments: [{ author: { login: 'funzi7' }, body: 'long discussion continues on the next page' }],
+    ...overrides,
+  };
+}
+
+test('classifyThreads reports a truncated unresolved thread without a visible finding', () => {
+  const classified = classifyThreads([truncatedThread()]);
+  assert.deepEqual(classified, {
+    active: [],
+    outdated: [],
+    resolved: [],
+    truncated: [{ path: 'core/scheduler.py', line: 7, startLine: null, threadId: 'T-overflow' }],
+  });
+  // A finding visible on the first page classifies exactly as before.
+  const visible = classifyThreads([truncatedThread({
+    comments: [{ author: { login: CODEX }, body: '**P1** visible on page one' }],
+  })]);
+  assert.equal(visible.active.length, 1);
+  assert.deepEqual(visible.truncated, []);
+  const visibleOutdated = classifyThreads([truncatedThread({
+    isOutdated: true,
+    comments: [{ author: { login: CODEX }, body: '**P2** visible on page one' }],
+  })]);
+  assert.equal(visibleOutdated.outdated.length, 1);
+  assert.deepEqual(visibleOutdated.truncated, []);
+  // A resolved thread is settled no matter how long it is.
+  assert.deepEqual(classifyThreads([truncatedThread({ isResolved: true })]).truncated, []);
+  // Legacy shapes without the flag, or with a complete page, are not truncated.
+  assert.deepEqual(classifyThreads([{ ...thread(), comments: [] }]).truncated, []);
+  assert.deepEqual(classifyThreads([truncatedThread({ commentsTruncated: false })]).truncated, []);
+  assert.deepEqual(classifyThreads([truncatedThread({ commentsTruncated: undefined })]).truncated, []);
+});
+
+test('a truncated unresolved thread keeps the gate pending even with a clean current-head signal', () => {
+  const result = decideCodexGate({ threads: [truncatedThread()] });
+  assert.equal(result.status, 'pending');
+  assert.equal(result.reason, 'review_thread_truncated');
+  assert.deepEqual(result.activeFindings, []);
+  assert.deepEqual(result.outdatedFindings, []);
+  // A signal never clears an unreadable thread.
+  const withSignal = decideCodexGate({ threads: [truncatedThread()], currentHeadSignal: true });
+  assert.equal(withSignal.status, 'pending');
+  assert.equal(withSignal.reason, 'review_thread_truncated');
+  // An OUTDATED truncated thread is just as unreadable.
+  const outdatedTruncated = decideCodexGate({
+    threads: [truncatedThread({ isOutdated: true })],
+    currentHeadSignal: true,
+  });
+  assert.equal(outdatedTruncated.status, 'pending');
+  assert.equal(outdatedTruncated.reason, 'review_thread_truncated');
+  // Visible outdated findings travel with the verdict.
+  const mixed = decideCodexGate({
+    threads: [thread({ outdated: true }), truncatedThread()],
+    currentHeadSignal: true,
+  });
+  assert.equal(mixed.reason, 'review_thread_truncated');
+  assert.equal(mixed.outdatedFindings.length, 1);
+});
+
+test('a truncated thread with a visible P1 blocks, a resolved truncated thread is ignored', () => {
+  const blocked = decideCodexGate({
+    threads: [truncatedThread({
+      comments: [{ author: { login: CODEX }, body: '**P1** visible on page one' }],
+    })],
+    currentHeadSignal: true,
+  });
+  assert.equal(blocked.status, 'blocked');
+  assert.equal(blocked.reason, 'active_unresolved_review_thread');
+  // An active finding elsewhere still wins over the truncation verdict.
+  const activeFirst = decideCodexGate({ threads: [truncatedThread(), thread()] });
+  assert.equal(activeFirst.status, 'blocked');
+  // Resolved means settled: the gate behaves exactly as without the thread.
+  const resolved = truncatedThread({ isResolved: true });
+  assert.equal(decideCodexGate({ threads: [resolved], currentHeadSignal: true }).status, 'clear');
+  const unsignalled = decideCodexGate({ threads: [resolved], currentHeadSignal: false });
+  assert.equal(unsignalled.status, 'pending');
+  assert.equal(unsignalled.reason, 'current_head_review_pending');
+  // A complete page without findings is clean as before.
+  assert.equal(
+    decideCodexGate({ threads: [truncatedThread({ commentsTruncated: false })], currentHeadSignal: true }).status,
+    'clear',
+  );
+});
+
+test('every review-thread comments page carries hasNextPage so truncation can fail closed', () => {
+  const expectedBlocks = { 'codex-gate.yml': 1, 'merge-bot.yml': 2, 'claude-fallback-watchdog.yml': 2 };
+  for (const [name, count] of Object.entries(expectedBlocks)) {
+    const body = workflowSource(name);
+    const blocks = body.match(/comments\(first: 100\)/g) || [];
+    assert.equal(blocks.length, count, `${name}: expected ${count} comments(first: 100) block(s)`);
+    const flagged = body.match(/comments\(first: 100\) \{\s*pageInfo \{ hasNextPage \}\s*nodes/g) || [];
+    assert.equal(flagged.length, count,
+      `${name}: every comments(first: 100) block must request pageInfo { hasNextPage }`);
+  }
+  const gate = workflowSource('codex-gate.yml');
+  assert.match(gate, /commentsTruncated: !!t\.comments\?\.pageInfo\?\.hasNextPage,/,
+    'the gate must carry the truncation flag onto each mapped thread');
+  assert.match(gate, /if \(thread\?\.isResolved !== true && thread\?\.commentsTruncated === true\) \{\s*truncated\.push\(threadLocation\(thread\)\);/);
+  assert.match(gate, /return \{ active, outdated, resolved, truncated \};/);
+  assert.match(gate, /if \(classified\.truncated\.length\) \{/);
+  assert.match(gate, /reason: 'review_thread_truncated',/);
+  assert.ok(
+    gate.indexOf('if (classified.active.length) {') <
+      gate.indexOf('if (classified.truncated.length) {') &&
+    gate.indexOf('if (classified.truncated.length) {') <
+      gate.indexOf('if (classified.outdated.length && !currentHeadSignal) {'),
+    'the truncation verdict must sit after the active check and before the outdated check',
+  );
+  assert.match(gate,
+    /gateDecision\.reason === 'review_thread_truncated'\s*\? 'a review thread has more comments than can be read in one page; cannot prove no Codex finding is unresolved'/,
+    'the pending verdict must explain the truncation');
+  assert.match(gate, /'🟡 Waiting for Codex review',/, 'the watchdog matches this title verbatim');
+  assert.match(gate, /const truncatedReviewThread =\s*classifyThreads\(reviewThreads\)\.truncated\.length > 0;/);
+  assert.match(gate, /outdatedUnresolvedFinding: outdatedUnresolvedFinding \|\| truncatedReviewThread,/,
+    'a fallback must never clear a thread the gate could not read');
+  for (const name of ['merge-bot.yml', 'claude-fallback-watchdog.yml']) {
+    const body = workflowSource(name);
+    const hits = body.match(/if \(thread\.comments\?\.pageInfo\?\.hasNextPage\) return true;/g) || [];
+    assert.equal(hits.length, 2, `${name}: both thread predicates must fail closed on a truncated page`);
+  }
+});
+
+// Execute the SHIPPED Merge Bot / watchdog thread predicates against paged
+// GraphQL fixtures, modelled on loadOutdatedHelper in test_review_evidence.js.
+function inlineAsyncFunctionSource(name, fnName) {
+  const body = workflowSource(name);
+  const head = `            async function ${fnName}(`;
+  const start = body.indexOf(head);
+  assert.ok(start >= 0, `${name} must define ${fnName} inline`);
+  const end = body.indexOf('\n            }\n', start);
+  assert.ok(end > start, `${name}: could not bound ${fnName}`);
+  return body.slice(start, end + '\n            }'.length)
+    .split('\n')
+    .map((line) => line.slice(12))
+    .join('\n');
+}
+
+function loadThreadPredicate(name, fnName, pages) {
+  const source = inlineAsyncFunctionSource(name, fnName);
+  let call = 0;
+  const github = {
+    graphql: async () => {
+      const page = pages[call] || { nodes: [], hasNextPage: false };
+      call += 1;
+      return {
+        repository: {
+          pullRequest: {
+            reviewThreads: {
+              pageInfo: { hasNextPage: !!page.hasNextPage, endCursor: 'c' },
+              nodes: page.nodes,
+            },
+          },
+        },
+      };
+    },
+  };
+  const fn = new Function(
+    'github', 'owner', 'repo', 'TRUSTED_CODEX_LOGINS', 'isCodex', 'hasSeverity',
+    `${source}\nreturn ${fnName};`,
+  )(
+    github, 'funzi7', 'example',
+    new Set([CODEX, CODEX_REST]),
+    (user) => [CODEX, CODEX_REST].includes(String(user?.login || '')),
+    (body) => severity(body) !== null,
+  );
+  return { fn, calls: () => call };
+}
+
+// GraphQL shape. `truncated` undefined omits pageInfo entirely, which is how
+// every pre-existing fixture looks and must keep meaning "complete page".
+function graphqlThread({
+  resolved = false, outdated = false, author = CODEX, body = 'nit: tidy this up', truncated,
+} = {}) {
+  const comments = { nodes: [{ body, author: { login: author } }] };
+  if (truncated !== undefined) comments.pageInfo = { hasNextPage: truncated };
+  return { isResolved: resolved, isOutdated: outdated, comments };
+}
+
+test('Merge Bot and watchdog hasActiveTrustedFinding fail closed on a truncated unresolved thread', async () => {
+  for (const name of ['merge-bot.yml', 'claude-fallback-watchdog.yml']) {
+    const run = (threads) => loadThreadPredicate(name, 'hasActiveTrustedFinding', [{ nodes: threads }]).fn(7);
+    assert.equal(await run([graphqlThread({ truncated: true })]), true,
+      `${name}: a truncated unresolved thread without a visible finding must block`);
+    assert.equal(await run([graphqlThread({ truncated: true, author: 'funzi7', body: '**P1** untrusted' })]), true,
+      `${name}: an untrusted finding on a truncated page proves nothing; still fail closed`);
+    assert.equal(await run([graphqlThread({ truncated: true, body: '**P1** visible on page one' })]), true,
+      `${name}: a visible trusted finding still blocks`);
+    assert.equal(await run([graphqlThread({ truncated: true, outdated: true })]), false,
+      `${name}: an outdated truncated thread belongs to the outdated predicate`);
+    assert.equal(await run([graphqlThread({ truncated: true, resolved: true })]), false,
+      `${name}: a resolved truncated thread is settled`);
+    assert.equal(await run([graphqlThread({ truncated: false })]), false,
+      `${name}: a complete page without a finding is clean`);
+    assert.equal(await run([graphqlThread()]), false,
+      `${name}: a page without pageInfo is a complete page`);
+    // Truncation on a later reviewThreads page is reached through the cursor loop.
+    const paged = loadThreadPredicate(name, 'hasActiveTrustedFinding', [
+      { nodes: [graphqlThread({ truncated: false })], hasNextPage: true },
+      { nodes: [graphqlThread({ truncated: true })] },
+    ]);
+    assert.equal(await paged.fn(7), true, `${name}: must paginate to a truncated thread`);
+    assert.equal(paged.calls(), 2, `${name}: must actually request the second page`);
+  }
+});
+
+test('Merge Bot and watchdog hasOutdatedUnresolvedTrustedFinding fail closed on a truncated outdated thread', async () => {
+  for (const name of ['merge-bot.yml', 'claude-fallback-watchdog.yml']) {
+    const run = (threads) => loadThreadPredicate(name, 'hasOutdatedUnresolvedTrustedFinding', [{ nodes: threads }]).fn(7);
+    assert.equal(await run([graphqlThread({ truncated: true, outdated: true })]), true,
+      `${name}: a truncated unresolved outdated thread without a visible finding must block a fallback`);
+    assert.equal(await run([graphqlThread({ truncated: true, outdated: true, body: '**P2** visible' })]), true,
+      `${name}: a visible outdated finding still counts`);
+    assert.equal(await run([graphqlThread({ truncated: true, outdated: false })]), false,
+      `${name}: a current truncated thread belongs to the active predicate`);
+    assert.equal(await run([graphqlThread({ truncated: true, outdated: true, resolved: true })]), false,
+      `${name}: a resolved truncated thread is settled`);
+    assert.equal(await run([graphqlThread({ truncated: false, outdated: true })]), false,
+      `${name}: a complete outdated page without a finding is clean`);
+    assert.equal(await run([graphqlThread({ outdated: true })]), false,
+      `${name}: a page without pageInfo is a complete page`);
+  }
 });
