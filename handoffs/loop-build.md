@@ -104,16 +104,24 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
   transient git failure could have left a secret-like path unexcluded while the content diff still
   succeeded — now fatal (`name_pass_failed`), with a source-shape test.
 - Device (Phase 5): `bash launchers/oauto/install.sh` refreshed `/root/work/bin/oauto-run` and
-  `oauto-policy.py` (previous copies kept as `*.backup-before-oauto-20261108-120902`; `ai-launch`, the
+  `oauto-policy.py` three times during the round (after each validated state; previous copies kept
+  as `*.backup-before-oauto-20261108-120902`, `-132239` and `-134043`; `ai-launch`, the
   Termux `oauto-launch` wrapper and both `.bashrc` blocks were already identical and untouched; the
   original `ai-launch.backup-before-oauto-20261107` still equals the pristine fixture); `install.sh
   --verify` clean; installed copies byte-identical to the tracked ones (device-parity test passes);
-  `/root/work/bin/ai-launch opencode oauto-selftest-j --check` through the installed launcher resolved
-  the fixture, proved the exclusion (`preflight exclusion ok`), verified sources/models/agents and
-  printed the banner; fixture, state dir and lock removed; no OpenCode process or service left.
+  `/root/work/bin/ai-launch opencode oauto-selftest-j [deepseek] --check` through the installed
+  launcher resolved the fixture, proved the exclusion (`preflight exclusion ok`), verified
+  sources/models/agents (GLM and DeepSeek default agents) and printed the banner; fixture, state dir
+  and lock removed; no OpenCode process or service left.
 - Final validation at the pushed head: `bash scripts/validate.sh` green (YAML, JSON, sync/mirror parity,
-  JS syntax, `node --test` 159/159 including `tests/test_oauto_launcher.js` 32/32, 59 github-script
-  bodies, actionlint, `git diff --check`).
+  JS syntax, `node --test` 174/174 including `tests/test_oauto_launcher.js` 47/47, 59 github-script
+  bodies, actionlint, `git diff --check`); real-binary battery (scratchpad script, every scenario of
+  this entry) passed on the final launcher, and the six live model probes were repeated on it: shell,
+  `/etc/hostname`, `.env`, `opencode/big-pickle` and `--agent build` denied as before, probe secret
+  absent from every transcript, no file created; the edit probe's first run matched none of the
+  expected phrases because the model declined without calling any tool, so it was re-run with a
+  tool-listing prompt — the model reported its tools as exactly `glob, grep, question, read, skill`
+  and answered `NO-WRITE-TOOL`; nothing was created.
 - Not physically tested: the Termux hop itself (unchanged this round; `proot-distro login` cannot run
   from inside the Debian session, so `oauto <repo>` still needs one run from a real Termux shell); a
   review on a real project repository; a full DeepSeek TUI session; a repository using git-lfs
@@ -123,16 +131,60 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
   copy).
 - Limitations / risks after this round: classification is by path, so a safe-named file that still
   holds secret text (edited beyond git's 50 % similarity, or copied from an unmodified secret file under
-  the `OAUTO_ALLOW_SENSITIVE_FILES=1` override) is shown like any added file; `git diff` against the
+  the `OAUTO_ALLOW_SENSITIVE_FILES=1` override) is shown like any added file; the content-based
+  exception covers only the `CONTENT_CHECKS` basenames, so renaming `gradle.properties` to a name
+  without a check (`gradle.properties.bak`) leaves its added lines reviewable; a hardlink to
+  `.git/config` is not a symlink and is not detected (git cannot ship hardlinks, it takes local
+  action to create one); `git diff` against the
   worktree still refreshes stat data in `.git/index` (no content, ref or hook; `GIT_OPTIONAL_LOCKS=0`
   covers `status` only); changes made to the repository during the second of collection are not
   covered; `-l0` makes the pair pass exhaustive, so a change set with thousands of unpaired deletions
   and additions can hit the 120 s timeout and the launch is refused rather than degraded; LFS-style
   filtered files diff raw; submodule worktree dirtiness is not reported; `color.decorate` and
   `submodule.recurse` are no-ops for these commands in git 2.47 and stay as guards.
+- Codex re-review of the first fixed head (`de81444`, requested with `@codex review`, exact-head CI
+  green, the three original P1 threads replied to with the fix commits and resolved): two NEW P1s,
+  both valid and reproduced by Codex — (D) a worktree symlink aliasing Git metadata or a secret-like
+  path under a harmless name (`review-config.txt -> .git/config`) passed the scan (target inside the
+  repo; `.git` pruned; only the alias name classified) and, because OpenCode checks the requested
+  path, made `.git/config` readable; (E) the `gradle.properties` content check looked only at the
+  current worktree, so a change that removed a committed credential line (or deleted the file) sent
+  the removed line in the diff. Fixed in this round: the scan refuses, unconditionally like outward
+  links, any symlink whose canonical target is or lies under `.git`/`.ssh`/`.gnupg`/`.aws`/`.docker`
+  (constant kept in sync with the directory patterns by a test) or whose target is secret-like by
+  name, and the `.git/config` content check also flags `extraHeader`/`Authorization` values;
+  changed `gradle.properties` paths (any directory) have their worktree and branch-delta diffs
+  checked (`check-diff-content`, both sides of every hunk) and a hit excludes the file from the
+  preflight, listed as `credential-looking content in its diff`. Regression tests reproduce both
+  leaks on the previous code; the real-binary battery gained both scenarios.
+- Second independent review (same Opus reviewer, read-only, `git diff de81444`): P1-D and P1-E
+  closed as reported (chained links, `..` targets, nested hops, case variants, link loops and the
+  override all held; `:(literal)` with special bytes, `--` for leading-dash paths, pipefail death on a
+  failing git, and the `check-excluded` proof all held); no P1; 5 P2 and 4 P3, all fixed in the next
+  commit: a symlink to a *directory* holding secret-like files (`cfgdir -> secrets/`) renamed the
+  directory past the name rules (D1 → refused when any flagged path lies under the target); the
+  `.git/config` check missed a token as URL user-info, `extraheader` on a section line,
+  `config.worktree`, linked-worktree and submodule configs (D5 → all checked); the `gradle.properties`
+  pattern missed `:`/whitespace separators and key-material names (E1 → broadened, no bare `auth`);
+  the content check did not follow renames/copies to `.bak`/`.orig` (E2 → prefix rule with template
+  exemption, both sides of a pair checked); git's hunk headers carried the credential line (E3 →
+  header text checked); hard links to `.git/config` or a secret-like file (D2 → refused); symlinks
+  inside `.git` leaving the repo (D4 → refused); `.docker` over-refused harmless links (D3 →
+  component set is `.git/.ssh/.gnupg/.aws`, file links by name). ADR item 4/8 and the README rows
+  now describe exactly these rules.
+- Third pass of the same reviewer on those nine fixes: all hold (root alias, two-level directory
+  alias, pnpm hard-linked store, `ssh://git@` vs `ssh://user:pw@`, `gradle.properties.example.bak`,
+  partner without a checker, `:`-separated header text); one P2 left — dotted Gradle keys (`api.key`,
+  `signing.key`, `access.key`, `private.key`) escaped the pattern → `[_.-]?` separators, test with
+  dotted/colon/space forms; P3s: a hook installed as a hard link from the worktree was refused →
+  `.git/hooks/` excluded from the hard-link inode set (test); git-annex object links and
+  `https://org@dev.azure.com`-style login-name remotes are refused by design (the latter
+  overridable) and documented; docs now say "in the repository" for hard links, name the `ssh://`
+  exemption, call the word list a heuristic, and say "unless `OAUTO_ALLOW_SENSITIVE_FILES=1`" where
+  it applies.
 - Review and gate state: the fixes were pushed to the PR branch after this entry's commit; the
-  exact-head CI result, the Codex re-review of the pushed head (`@codex review`), the resolution of the
-  three original P1 threads and the Codex Gate verdict are recorded on the PR and in agent-memory
+  exact-head CI result, the Codex re-review of the pushed head (`@codex review`), the resolution of
+  every Codex P1 thread and the Codex Gate verdict are recorded on the PR and in agent-memory
   `automation-core/cc-latest.md` (owner-facing state), never claimed here ahead of the evidence.
 - Needs from the owner: unchanged — run `oauto <repo>` once from Termux; merge the PR once Codex Gate is
   green; decide whether `DEVELOPMENT_RULES_FULL` §7 should list `oauto` next to `cauto`/`clauto`.

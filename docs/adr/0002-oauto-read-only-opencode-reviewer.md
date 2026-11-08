@@ -66,15 +66,19 @@ policy, not by the system prompt alone:
    `.git`, `.ssh`, `.gnupg` or `.aws`, symlinks to a secret-like file
    (`notes.txt -> config/prod.secrets.yaml`, `c -> .docker/config.json`),
    symlinks to a directory that holds secret-like files (`cfgdir -> secrets/`),
-   hard links to a secret-like file or to a file under `.git`, and symlinks
-   inside `.git` that leave the repository; and credential-looking content in
-   `gradle.properties`-style files (`CONTENT_CHECKS`: basename equal to the
-   key or key plus a suffix, template suffixes exempt; `=`, `:` or whitespace
-   separators; password/secret/token/passphrase/api-, access-, secret-,
-   signing-, private-key/credential names) or in Git config files
-   (`.git/config`, `config.worktree`, linked-worktree and submodule configs:
-   any user-info in a remote URL, `extraHeader` anywhere on a line,
-   `Authorization: Bearer|Basic` values).
+   hard links to a secret-like file in the repository or to a file under
+   `.git` other than its hooks, and symlinks inside `.git` that leave the
+   repository (git-annex object links are refused by the `.git` rule); and,
+   refused unless `OAUTO_ALLOW_SENSITIVE_FILES=1` is set, credential-looking
+   content in `gradle.properties`-style files (`CONTENT_CHECKS`: basename
+   equal to the key or key plus a suffix, template suffixes exempt; `=`, `:`
+   or whitespace separators; a heuristic word list — password, passwd,
+   secret, token, passphrase, credential, and api/access/secret/signing/
+   private key with `_`, `.`, `-` or no separator, plus `inMemoryKey`) or in
+   Git config files (`.git/config`, `config.worktree`, linked-worktree and
+   submodule configs: any user-info in a remote URL except a bare login name
+   in an `ssh://` URL, so `https://org@dev.azure.com/...` is flagged too;
+   `extraHeader` anywhere on a line; `Authorization: Bearer|Basic` values).
 5. **Diagnostics before exec**: `opencode debug config`, `opencode models` and
    `opencode debug agents` are run with `--standalone` and parsed; the launch
    proceeds only if the sole config source is the oauto file, exactly the

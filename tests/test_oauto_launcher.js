@@ -1191,10 +1191,23 @@ test('D5: credentials in any Git config of the repository are found and refuse t
   assert.equal(r.status, 0, r.stderr);
 });
 
+test('D2 follow-up: a hook installed as a hard link from the worktree is not an alias, a hard-linked .git/config is', () => {
+  const sb = sandbox();
+  const repo = mkRepo(sb, 'hook-link', { 'scripts/pre-commit': '#!/bin/sh\nexit 0\n', 'src/a.py': 'x = 1\n' });
+  fs.linkSync(path.join(repo, 'scripts', 'pre-commit'), path.join(repo, '.git', 'hooks', 'pre-commit'));
+  let out = policy(['scan', repo, '--budget', '60']);
+  assert.equal(out.status, 0, out.stderr);
+  assert.ok(!out.stdout.includes('SYMLINK'), `a hard-linked hook must not be reported: ${out.stdout}`);
+  fs.linkSync(path.join(repo, '.git', 'config'), path.join(repo, 'review.txt'));
+  out = policy(['scan', repo, '--budget', '60']);
+  assert.match(out.stdout, /SYMLINK review\.txt -> .*\(hard link to \.git\/config\)/);
+});
+
 test('E1: gradle.properties credentials are found with =, : or whitespace separators and key-material names', () => {
   const sb = sandbox();
-  const hits = ['signingPassword: V', 'signingPassword V', 'signingInMemoryKey=V', 'mavenCentralSecretKey=V'];
-  const misses = ['org.gradle.jvmargs=-Xmx1g', 'kotlin.code.style=official'];
+  const hits = ['signingPassword: V', 'signingPassword V', 'signingInMemoryKey=V', 'mavenCentralSecretKey=V',
+    'api.key=V', 'signing.key=V', 'access.key: V', 'private.key V', 'aws.secret.key=V'];
+  const misses = ['org.gradle.jvmargs=-Xmx1g', 'kotlin.code.style=official', 'android.useAndroidX=true'];
   const lines = [...hits, ...misses];
   const files = {};
   lines.forEach((line, i) => { files[`m${i}/gradle.properties`] = `${line}\n`; });

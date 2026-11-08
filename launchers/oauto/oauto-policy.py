@@ -142,9 +142,13 @@ ESCAPING_GLOB_PATTERNS = ["/*", "~*", "$HOME*", "..*", "*/../*", "*{/*", "*[*", 
 # key and value by '=', ':' or whitespace.
 CONTENT_CHECKS = {
     "gradle.properties": re.compile(
-        r"^\s*[\w.-]*(password|passwd|secret|token|passphrase|api[_-]?key|access[_-]?key|secret[_-]?key"
-        r"|signing[_-]?key|inmemorykey|private[_-]?key|credential)[\w.-]*(\s*[=:]\s*|\s+)\S", re.I | re.M),
+        r"^\s*[\w.-]*(password|passwd|secret|token|passphrase|api[_.-]?key|access[_.-]?key|secret[_.-]?key"
+        r"|signing[_.-]?key|inmemorykey|private[_.-]?key|credential)[\w.-]*(\s*[=:]\s*|\s+)\S", re.I | re.M),
 }
+# The word list above is a heuristic: it names the credential keys seen in Gradle,
+# Maven-publishing and signing setups (dotted, underscored, dashed or camel-cased).
+# A key outside it (sonar.login, bintrayKey) is not recognised; the path-based rules
+# and the worktree refusal remain the primary controls.
 # A content-checked name also covers its copies under a further suffix
 # (gradle.properties.bak, .orig ...), but not documented templates.
 CONTENT_CHECK_TEMPLATE_SUFFIXES = (".example", ".sample", ".template", ".dist")
@@ -636,7 +640,10 @@ def scan(repo: str, budget: float) -> int:
                 if st is None or not stat.S_ISREG(st.st_mode):
                     continue
                 r = rel(full)
-                alias_inodes.setdefault((st.st_dev, st.st_ino), r)
+                # Hooks are scripts, not secrets; a hook installed as a hard link from
+                # the worktree (ln scripts/pre-commit .git/hooks/pre-commit) is not an alias.
+                if not r.startswith(".git/hooks/"):
+                    alias_inodes.setdefault((st.st_dev, st.st_ino), r)
                 if _is_git_config(r):
                     try:
                         with open(full, encoding="utf-8", errors="replace") as fh:
