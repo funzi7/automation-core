@@ -107,6 +107,9 @@ jobs:
             const FALLBACK_VERDICT = 'clean';
             const FALLBACK_ATTESTATION_WORKFLOW_PATH =
               '.github/workflows/claude-fallback-review.yml';
+            // Must EQUAL the consumers' QUOTA_EPISODE_TTL_MS: a fallback may be
+            // minted only within this long after the newest trusted notice.
+            const QUOTA_EPISODE_TTL_MS = 24 * 60 * 60 * 1000;
             // `<status>/<reference>`; only a PASSED status may carry evidence.
             const VALIDATION_TOKEN_PATTERN = /^passed\/[A-Za-z0-9._:#=,;+()-]{1,180}$/;
             const TRUSTED_CODEX_LOGINS = new Set([
@@ -164,6 +167,10 @@ jobs:
                   return false;
                 }
                 if (!review || review.status !== 'completed') return false;
+                // Codex's own state saying findings are still unresolved is
+                // not a clean current-head signal, even before the matching
+                // review threads are visible.
+                if (review.has_unresolved_findings === true) return false;
                 const reviewedSha = String(review.commit_sha || '').toLowerCase();
                 return /^[a-f0-9]{40}$/.test(reviewedSha) && reviewedSha === exactHead;
               }
@@ -325,6 +332,19 @@ jobs:
                 `${new Date(signalAt(newestSignal.item)).toISOString()} is not older than the ` +
                 `newest quota notice at ${new Date(newestNoticeAt).toISOString()}; ` +
                 'the quota episode is not current.',
+              );
+            }
+            // Mirror the consumers' bound: a fallback may be MINTED only within
+            // QUOTA_EPISODE_TTL_MS of the newest trusted notice. Later than
+            // that the decline no longer proves present unavailability (quota
+            // may have been restored and nobody re-requested a review), and
+            // every consumer would reject the attestation as
+            // stale_quota_evidence anyway — refuse instead of minting it.
+            if (Date.now() - newestNoticeAt > QUOTA_EPISODE_TTL_MS) {
+              return refuse(
+                `the newest trusted Codex quota notice (${new Date(newestNoticeAt).toISOString()}) is older ` +
+                `than ${QUOTA_EPISODE_TTL_MS / 3600000} h; request a fresh Codex review (@codex review) to ` +
+                'prove the quota is still exhausted before attesting a fallback.',
               );
             }
 

@@ -225,6 +225,17 @@ test('4c: an attestation run must be the canonical producing workflow', () => {
       { ...base, path: `${FALLBACK_ATTESTATION_WORKFLOW_PATH}@main`, head_branch: 'feature/pr-branch' }, opts,
     ), false,
     'the ref is pinned by head_branch, not by the suffix');
+  // The suffix may only be THIS run's own branch: a blanket strip would admit
+  // a differently named workflow file (independent review, 2026-11-08).
+  assert.equal(
+    attestationRunIsTrusted({ ...base, path: `${FALLBACK_ATTESTATION_WORKFLOW_PATH}@evil.yml` }, opts), false,
+    '`…/claude-fallback-review.yml@evil.yml` is a different workflow file, not a ref spelling');
+  assert.equal(
+    attestationRunIsTrusted({ ...base, path: `${FALLBACK_ATTESTATION_WORKFLOW_PATH}@refs/heads/main` }, opts), true,
+    'the fully qualified ref spelling of the run\'s own branch is accepted');
+  assert.equal(
+    attestationRunIsTrusted({ ...base, path: `${FALLBACK_ATTESTATION_WORKFLOW_PATH}@develop` }, opts), false,
+    'a suffix naming another branch than the run\'s own is rejected');
   assert.equal(attestationRunIsTrusted(null, opts), false);
 });
 
@@ -239,6 +250,12 @@ test('4d: the SHIPPED block pins the producer path with or without an @ref suffi
     assert.equal(
       api.attestationRunIsTrusted({ ...TRUSTED_RUN, path: '.github/workflows/claude.yml@main' }, 1, commentAt, 'main'),
       false, `${name}: another workflow never mints evidence, suffix or not`);
+    assert.equal(
+      api.attestationRunIsTrusted({ ...TRUSTED_RUN, path: `${TRUSTED_RUN.path}@evil.yml` }, 1, commentAt, 'main'),
+      false, `${name}: a suffix that is not the run's own branch is a different workflow file`);
+    assert.equal(
+      api.attestationRunIsTrusted({ ...TRUSTED_RUN, path: `${TRUSTED_RUN.path}@refs/heads/main` }, 1, commentAt, 'main'),
+      true, `${name}: the fully qualified spelling of the run's own branch is accepted`);
     assert.equal(
       api.attestationRunIsTrusted(
         { ...TRUSTED_RUN, path: `${TRUSTED_RUN.path}@main`, head_branch: 'claude/some-pr' }, 1, commentAt, 'main',
@@ -1792,6 +1809,9 @@ async function attemptAttestation(overrides = {}) {
     p2 = '0',
     found = '6',
     fixed = '6',
+    // The producer mirrors the consumers' 24 h bound against the wall clock;
+    // pin "now" so the historical fixtures stay inside it.
+    producerNow = '2026-09-09T10:02:00Z',
   } = overrides;
 
   const posted = [];
@@ -1822,6 +1842,9 @@ async function attemptAttestation(overrides = {}) {
     'github', 'context', 'core', 'process',
     `return (async () => {\n${producerScript()}\n})();`,
   );
+  const realNow = Date.now;
+  Date.now = () => new Date(producerNow).getTime();
+  try {
   await fn(
     github,
     { repo: { owner: 'funzi7', repo: 'automation-core' }, ref },
@@ -1842,6 +1865,9 @@ async function attemptAttestation(overrides = {}) {
       },
     },
   );
+  } finally {
+    Date.now = realNow;
+  }
   return { posted, failure };
 }
 
@@ -1881,6 +1907,16 @@ test('producer: refuses every unsafe attestation', async () => {
     'non-passed validation': { validation: 'failed/suite-red' },
     'unstructured validation': { validation: 'suite-661-green' },
     'non-numeric counts': { found: 'many' },
+    // Mirrors the consumers' QUOTA_EPISODE_TTL_MS at mint time: a decline
+    // older than 24 h no longer proves present unavailability.
+    'quota notice older than the 24 h bound': {
+      comments: [quotaNotice({ at: '2026-09-07T10:00:00Z' })],
+      producerNow: '2026-09-09T10:02:00Z',
+    },
+    'quota notice one second past the bound': {
+      comments: [quotaNotice({ at: '2026-09-08T10:01:59Z' })],
+      producerNow: '2026-09-09T10:02:00Z',
+    },
   };
   for (const [label, override] of Object.entries(cases)) {
     const result = await attemptAttestation(override);

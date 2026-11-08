@@ -473,7 +473,8 @@ test('queued PR head events are revalidated before gate evaluation', () => {
   // Tri-state: a freshness-lookup API error is skipped fail-closed AND loudly
   // (anyBlocked), never silently relabelled as a stale event.
   assert.match(workflow, /const headEventState = await triggeringHeadEventIsCurrent\(prNumber, headSha\);/);
-  assert.match(workflow, /if \(headEventState === 'lookup_failed'\) \{[\s\S]{0,600}?anyBlocked = true;/);
+  assert.match(workflow, /if \(headEventState === 'lookup_failed'\) \{[\s\S]{0,1500}?anyBlocked = true;/);
+  assert.match(workflow, /if \(headEventState === 'lookup_failed'\) \{[\s\S]{0,1500}?core\.error\(/);
   assert.match(workflow, /if \(headEventState !== 'current'\) \{/);
   assert.match(workflow, /return 'lookup_failed';/);
   assert.doesNotMatch(workflow, /freshness lookup failed[^\n]*\n[^\n]*return false;/);
@@ -743,12 +744,24 @@ test('the structured review-state marker binds a completed review to its exact h
   for (const [label, item, head, expected] of MARKER_CASES) {
     assert.equal(signalTargetsHead(item, head), expected, label);
   }
-  // The marker is informational about findings; liveness still comes from
-  // the review threads, so unresolved findings do not stop the binding.
+  // Codex's own state saying findings are still unresolved is not a clean
+  // current-head signal, even before the matching review threads are visible
+  // (independent review, 2026-11-08). Liveness still comes from the threads;
+  // the marker merely declines to vouch for the head meanwhile.
   assert.equal(
     signalTargetsHead({ body: reviewStateBody(completedReview({ has_unresolved_findings: true })) }, PR120_HEAD),
+    false,
+    'a completed review that still reports unresolved findings is not a clean signal',
+  );
+  assert.equal(
+    signalTargetsHead({ body: reviewStateBody(completedReview({ has_unresolved_findings: false })) }, PR120_HEAD),
     true,
-    'a completed review with unresolved findings is still a review of this head',
+    'a completed review with no unresolved findings binds',
+  );
+  assert.equal(
+    signalTargetsHead({ body: reviewStateBody(completedReview({ has_any_findings: true, has_unresolved_findings: false })) }, PR120_HEAD),
+    true,
+    'resolved findings (paywall-bot #120 shape) still bind',
   );
 });
 

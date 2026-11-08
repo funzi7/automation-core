@@ -127,10 +127,20 @@ function attestationRunIsTrusted(run, {
   // PR-controlled YAML.
   //
   // GitHub documents a run attempt's `path` with an `@ref` suffix
-  // ("…/build.yml@main"); live responses return the bare path. Accept both
-  // spellings of the ONE canonical path — the ref itself is pinned separately
-  // by the head_branch check below.
-  if (String(run.path || '').replace(/@.*$/, '') !== workflowPath) return false;
+  // ("…/build.yml@main"); live responses return the bare path. Accept the
+  // bare canonical path or the canonical path suffixed with THIS run's own
+  // branch (`@<head_branch>` or `@refs/heads/<head_branch>`) and nothing
+  // else: stripping any `@…` tail would also admit a differently named
+  // workflow file such as `…/claude-fallback-review.yml@evil.yml`.
+  const runPath = String(run.path || '');
+  const runBranch = String(run.head_branch || '');
+  const pathIsCanonical = runPath === workflowPath || (
+    runBranch !== '' && (
+      runPath === `${workflowPath}@${runBranch}` ||
+      runPath === `${workflowPath}@refs/heads/${runBranch}`
+    )
+  );
+  if (!pathIsCanonical) return false;
   if (String(run.event || '') !== 'workflow_dispatch') return false;
   // An unknown default branch fails closed rather than skipping the check that
   // keeps a PR-ref run — which would execute PR-controlled YAML — out.

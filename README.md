@@ -175,8 +175,10 @@ and burn essentially no Actions minutes.
 Fail-soft covers only *missing opt-in secrets*. It never covers a failed
 evaluation: when Codex Gate hits an API or GraphQL error while judging a head,
 it publishes `check-codex-status` as **failure** with the title
-`🟠 Gate evaluation error — fail-closed`, fails its evaluator job, and lets the
-next event or the 15-minute scheduled sweep re-evaluate the head. Until
+`🟠 Gate evaluation error — fail-closed`, annotates the error, fails the
+evaluator job on event-driven runs (a scheduled sweep keeps its job green on
+purpose so Merge Bot still wakes for other PRs), and lets the next event or
+the 15-minute scheduled sweep re-evaluate the head. Until
 2026-11-08 that branch published a green "Technical fail-soft" check, which
 Merge Bot and branch protection read as review approval. The expected
 pre-review state is different and normal: a `pull_request_target` run fires

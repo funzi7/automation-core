@@ -290,6 +290,10 @@ jobs:
                   return false;
                 }
                 if (!review || review.status !== 'completed') return false;
+                // Codex's own state saying findings are still unresolved is
+                // not a clean current-head signal, even before the matching
+                // review threads are visible.
+                if (review.has_unresolved_findings === true) return false;
                 const reviewedSha = String(review.commit_sha || '').toLowerCase();
                 return /^[a-f0-9]{40}$/.test(reviewedSha) && reviewedSha === exactHead;
               }
@@ -777,9 +781,20 @@ jobs:
               // default branch fails closed rather than skipping the check.
               // GitHub documents a run attempt's `path` with an `@ref` suffix
               // ("…/build.yml@main"); live responses return the bare path.
-              // Accept both spellings of the ONE canonical path — the ref
-              // itself is pinned separately by the head_branch check.
-              if (String(run.path || '').replace(/@.*$/, '') !== FALLBACK_ATTESTATION_WORKFLOW_PATH) return false;
+              // Accept the bare canonical path or the canonical path suffixed
+              // with THIS run's own branch (`@<head_branch>` or
+              // `@refs/heads/<head_branch>`) and nothing else: stripping any
+              // `@…` tail would also admit a differently named workflow file
+              // such as `…/claude-fallback-review.yml@evil.yml`.
+              const runPath = String(run.path || '');
+              const runBranch = String(run.head_branch || '');
+              const pathIsCanonical = runPath === FALLBACK_ATTESTATION_WORKFLOW_PATH || (
+                runBranch !== '' && (
+                  runPath === `${FALLBACK_ATTESTATION_WORKFLOW_PATH}@${runBranch}` ||
+                  runPath === `${FALLBACK_ATTESTATION_WORKFLOW_PATH}@refs/heads/${runBranch}`
+                )
+              );
+              if (!pathIsCanonical) return false;
               if (String(run.event || '') !== 'workflow_dispatch') return false;
               if (!defaultBranch) return false;
               if (String(run.head_branch || '') !== String(defaultBranch)) return false;
@@ -803,8 +818,9 @@ jobs:
             // The single canonical question every consumer asks. Returns
             // { accepted, blocking, severity, reason, episodeReason }. It must
             // never throw: an exception escaping here would reach the Gate's
-            // technical fail-soft branch, which publishes GREEN. Absence of
-            // evidence must look like absence of evidence, not like success.
+            // technical-error branch (fail-closed since 2026-11-08, but still
+            // a non-verdict). Absence of evidence must look like absence of
+            // evidence, not like success and not like an evaluator error.
             async function acceptedFallbackEvidence(options) {
               try {
                 return await acceptedFallbackEvidenceUnsafe(options);

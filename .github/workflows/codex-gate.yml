@@ -260,6 +260,10 @@ jobs:
                   return false;
                 }
                 if (!review || review.status !== 'completed') return false;
+                // Codex's own state saying findings are still unresolved is
+                // not a clean current-head signal, even before the matching
+                // review threads are visible to this evaluator.
+                if (review.has_unresolved_findings === true) return false;
                 const reviewedSha = String(review.commit_sha || '').toLowerCase();
                 return /^[a-f0-9]{40}$/.test(reviewedSha) && reviewedSha === exactHead;
               }
@@ -948,9 +952,20 @@ jobs:
               // default branch fails closed rather than skipping the check.
               // GitHub documents a run attempt's `path` with an `@ref` suffix
               // ("…/build.yml@main"); live responses return the bare path.
-              // Accept both spellings of the ONE canonical path — the ref
-              // itself is pinned separately by the head_branch check.
-              if (String(run.path || '').replace(/@.*$/, '') !== FALLBACK_ATTESTATION_WORKFLOW_PATH) return false;
+              // Accept the bare canonical path or the canonical path suffixed
+              // with THIS run's own branch (`@<head_branch>` or
+              // `@refs/heads/<head_branch>`) and nothing else: stripping any
+              // `@…` tail would also admit a differently named workflow file
+              // such as `…/claude-fallback-review.yml@evil.yml`.
+              const runPath = String(run.path || '');
+              const runBranch = String(run.head_branch || '');
+              const pathIsCanonical = runPath === FALLBACK_ATTESTATION_WORKFLOW_PATH || (
+                runBranch !== '' && (
+                  runPath === `${FALLBACK_ATTESTATION_WORKFLOW_PATH}@${runBranch}` ||
+                  runPath === `${FALLBACK_ATTESTATION_WORKFLOW_PATH}@refs/heads/${runBranch}`
+                )
+              );
+              if (!pathIsCanonical) return false;
               if (String(run.event || '') !== 'workflow_dispatch') return false;
               if (!defaultBranch) return false;
               if (String(run.head_branch || '') !== String(defaultBranch)) return false;
@@ -974,8 +989,9 @@ jobs:
             // The single canonical question every consumer asks. Returns
             // { accepted, blocking, severity, reason, episodeReason }. It must
             // never throw: an exception escaping here would reach the Gate's
-            // technical fail-soft branch, which publishes GREEN. Absence of
-            // evidence must look like absence of evidence, not like success.
+            // technical-error branch (fail-closed since 2026-11-08, but still
+            // a non-verdict). Absence of evidence must look like absence of
+            // evidence, not like success and not like an evaluator error.
             async function acceptedFallbackEvidence(options) {
               try {
                 return await acceptedFallbackEvidenceUnsafe(options);
@@ -1192,9 +1208,12 @@ jobs:
                 const headEventState = await triggeringHeadEventIsCurrent(prNumber, headSha);
                 if (headEventState === 'lookup_failed') {
                   // FAIL CLOSED AND LOUD: no verdict is published for this
-                  // head (the previous one, if any, stays), and the evaluator
-                  // fails so the skipped evaluation is visible. The next
-                  // trigger or the scheduled sweep re-evaluates the head.
+                  // head (the previous one, if any, stays), the error is
+                  // annotated, and an event-driven evaluator run fails so the
+                  // skipped evaluation is visible (this branch only runs on
+                  // pull_request_target events). The next trigger or the
+                  // scheduled sweep re-evaluates the head.
+                  core.error(`PR #${prNumber}: head-event freshness lookup failed; evaluation skipped fail-closed`);
                   results.push(`PR #${prNumber}: ⚠️ head-event freshness lookup failed — evaluation skipped fail-closed, no verdict published`);
                   anyBlocked = true;
                   continue;
@@ -1543,10 +1562,16 @@ jobs:
                 // explicit non-success verdict instead. Every event trigger
                 // and the 15-minute scheduled sweep re-evaluate the head, so a
                 // transient error costs one cycle, never an unreviewed merge.
+                // Event-driven runs also fail the evaluator job; a scheduled
+                // sweep keeps its job green on purpose (see the setFailed
+                // rule below) so Merge Bot still wakes for other PRs — the
+                // red verdict and the error annotation carry the signal there.
                 results.push(
                   `PR #${prNumber}: ⚠️ gate errored technically — fail-closed, re-evaluated on the next trigger: ${err.message}`
                 );
-                core.warning(`Codex Gate technical error on PR #${prNumber}: ${err.stack || err.message}`);
+                // Annotated as an error so a sweep-wide API failure (which
+                // keeps the scheduled job green by design) is still loud.
+                core.error(`Codex Gate technical error on PR #${prNumber}: ${err.stack || err.message}`);
                 anyBlocked = true;
                 if (headSha) {
                   await publishGateCheck(

@@ -187,8 +187,9 @@ Trust, all fail-closed:
   run+attempt through the Actions API: the run must be that workflow, event
   `workflow_dispatch`, `head_branch` the default branch, and the comment must
   fall inside the run window. Any lookup failure ignores the attestation, and
-  the whole evidence call is wrapped so it can never reach the Gate's technical
-  fail-soft green.
+  the whole evidence call is wrapped so a failure inside it looks like absent
+  evidence, never like success and never like an evaluator error (the Gate's
+  technical-error branch itself fails closed since 2026-11-08).
 - Exact-head binding: `reviewed_head` must equal the live head. Any new commit
   invalidates it; a previous-head attestation fails.
 - Trusted quota episode: the Codex connector identity must have posted its own
@@ -206,11 +207,13 @@ Trust, all fail-closed:
   rejected as `attestation_predates_head_epoch`; a candidate outside its
   episode no longer ends the scan, so a newer stale attestation cannot hide an
   older still-valid exact-head one, while a blocking (unresolved P1/P2)
-  attestation still wins immediately. The producer run's `path` is matched
-  with any `@ref` suffix stripped (the ref stays pinned by `head_branch`), and
-  the producer counts trusted Codex reactions as Codex activity exactly as
-  every consumer does.
-- Precedence: override/fail-soft, then active Codex findings, then a fallback
+  attestation still wins immediately. The producer run's `path` is accepted
+  bare or suffixed with that run's own branch (`@<head_branch>` or
+  `@refs/heads/<head_branch>`) and nothing else, and the producer counts
+  trusted Codex reactions as Codex activity exactly as every consumer does and
+  refuses to mint more than 24 h after the newest notice.
+- Precedence: override (clear) or technical evaluation error (pending,
+  fail-closed), then active Codex findings, then a fallback
   declaring unresolved P1/P2, then genuine current-head Codex evidence, then an
   accepted fallback, else pending. A fallback can never bypass a real Codex
   finding, and a returning Codex review on the current head is the authority.

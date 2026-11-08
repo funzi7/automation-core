@@ -716,7 +716,9 @@ test('11: a GraphQL outage publishes the fail-closed error verdict and never a g
   neverGreen(result);
   assert.ok(result.failed, 'setFailed must be called');
   assert.match(result.failed, /fail-closed/);
-  assert.ok(result.warnings.some((w) =>
+  // Annotated as an error (not a warning) so a sweep-wide failure, whose job
+  // stays green by design, is still loud in the run summary.
+  assert.ok(result.errors.some((w) =>
     /Codex Gate technical error on PR #120: .*GraphQL outage/s.test(w)));
   assert.match(result.summary.join('\n'), /⚠️ gate errored technically — fail-closed/);
 });
@@ -864,4 +866,124 @@ test('15: a failed check publish fails the evaluator job even on a clean head', 
   assert.ok(result.errors.some((line) =>
     /check-codex-status publish failed for 23eac35: Resource not accessible by integration/.test(line)));
   assert.ok(result.failed, 'gatePublishFailed must fail the job');
+});
+
+// ---------------------------------------------------------------------------
+// 16. Review threads longer than one page fail closed (independent review,
+// 2026-11-08: these paths were pinned only by source-text assertions).
+// ---------------------------------------------------------------------------
+function truncatedThread(overrides = {}) {
+  const base = thread({ body: 'nit: consider renaming this helper', ...overrides });
+  base.comments.pageInfo = { hasNextPage: true };
+  return base;
+}
+
+test('16: an unresolved thread with more comments than one page stays yellow despite a clean receipt', async () => {
+  const result = await runGate(fixture({
+    comments: [receipt(HEAD)],
+    threads: [truncatedThread()],
+  }));
+  assertVerdict(result, 'failure', TITLE.waiting);
+  assert.match(onlyCheck(result).summary, /more comments than can be read in one page/);
+  neverGreen(result);
+  assert.ok(result.failed, 'an unreadable thread fails the evaluator like any pending head');
+
+  // A truncated thread that still shows a finding on its first page blocks.
+  const visibleFinding = await runGate(fixture({
+    comments: [receipt(HEAD)],
+    threads: [truncatedThread({ body: badge('P1', 'Unsafe direction control') })],
+  }));
+  assertVerdict(visibleFinding, 'failure', TITLE.blocked);
+
+  // A resolved thread is not a live finding however long it is.
+  const resolved = await runGate(fixture({
+    comments: [receipt(HEAD)],
+    threads: [truncatedThread({ resolved: true })],
+  }));
+  assertVerdict(resolved, 'success', TITLE.clear);
+
+  // An outdated-but-unresolved overflowing thread also stays yellow: the
+  // gate cannot prove the hidden comments hold no live finding.
+  const outdated = await runGate(fixture({
+    comments: [receipt(HEAD)],
+    threads: [truncatedThread({ outdated: true })],
+  }));
+  assertVerdict(outdated, 'failure', TITLE.waiting);
+});
+
+// ---------------------------------------------------------------------------
+// 17. Codex's structured review-state marker as exact-head evidence
+// ---------------------------------------------------------------------------
+function reviewStateComment({
+  sha = HEAD,
+  status = 'completed',
+  unresolved = false,
+  anyFindings = false,
+  at = '2026-11-08T11:05:16Z', // created at PR open, edited in place later
+} = {}) {
+  const state = JSON.stringify({
+    code_review: {
+      commit_sha: sha, has_any_findings: anyFindings,
+      has_unresolved_findings: unresolved, status,
+    },
+    security_review: { commit_sha: null, has_any_findings: null, has_unresolved_findings: null, status: null },
+  });
+  return {
+    id: id(), user: { login: CODEX_REST }, created_at: at, updated_at: T.receipt,
+    body: `<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 ${state} -->\n\n` +
+      '<details>\n<summary><strong>Codex Review Summary</strong>: ✅ Completed</summary>\n\n' +
+      '| Review | Status | Commit | Review trigger |\n| --- | --- | --- | --- |\n' +
+      `| 📝 **Code Review** | ✅ **Completed** | \`${sha.slice(0, 7)}\` | Manual request |\n</details>`,
+  };
+}
+
+test('17: a completed review-state marker for the exact head is Codex evidence; anything less is not', async () => {
+  // The multi-head deadlock shape: the PR has had two heads, Codex returned
+  // clean through the summary plus a 👍 only, no `Reviewed commit` receipt.
+  const twoHeads = {
+    workflowRuns: [prRun({ head: PREVIOUS_HEAD, at: '2026-11-08T11:16:48Z' }), prRun({ head: HEAD, at: T.headRun })],
+    reactions: [codexReaction()],
+  };
+  const clean = await runGate(fixture({ ...twoHeads, comments: [reviewStateComment()] }));
+  assertVerdict(clean, 'success', TITLE.clear);
+  assert.match(onlyCheck(clean).summary, /current_head_signal_no_active_findings/);
+
+  // Without the marker the same PR would deadlock on the reaction alone.
+  const reactionOnly = await runGate(fixture({ ...twoHeads }));
+  assertVerdict(reactionOnly, 'failure', TITLE.waiting);
+
+  for (const [label, comment] of [
+    ['review still in progress', reviewStateComment({ status: 'in_progress' })],
+    ['completed for the previous head', reviewStateComment({ sha: PREVIOUS_HEAD })],
+    ['completed with unresolved findings', reviewStateComment({ unresolved: true, anyFindings: true })],
+    ['a short SHA', reviewStateComment({ sha: HEAD.slice(0, 7) })],
+  ]) {
+    const result = await runGate(fixture({ ...twoHeads, comments: [comment] }));
+    assertVerdict(result, 'failure', TITLE.waiting);
+    assert.equal(result.checks[0].title, TITLE.waiting, `${label} must not bind`);
+    neverGreen(result);
+  }
+
+  // Resolved findings (the real paywall-bot #120 shape) still bind.
+  const resolvedFindings = await runGate(fixture({
+    ...twoHeads,
+    comments: [reviewStateComment({ anyFindings: true, unresolved: false })],
+    threads: [thread({ body: badge('P2', 'Require an explicit invalid-token response'), resolved: true })],
+  }));
+  assertVerdict(resolvedFindings, 'success', TITLE.clear);
+
+  // The marker never speaks for an untrusted author.
+  const forged = await runGate(fixture({
+    ...twoHeads,
+    comments: [{ ...reviewStateComment(), user: { login: 'funzi7' } }],
+  }));
+  assertVerdict(forged, 'failure', TITLE.waiting);
+
+  // An active P1 thread still blocks whatever the summary says.
+  const activeThread = await runGate(fixture({
+    ...twoHeads,
+    comments: [reviewStateComment()],
+    threads: [thread()],
+  }));
+  assertVerdict(activeThread, 'failure', TITLE.blocked);
 });

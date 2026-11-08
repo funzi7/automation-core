@@ -67,6 +67,10 @@ function signalTargetsHead(item, headSha, headObservedAt = null, dateField = 'cr
       return false;
     }
     if (!review || review.status !== 'completed') return false;
+    // Codex's own state saying findings are still unresolved is not a clean
+    // current-head signal, even before the matching review threads are
+    // visible to the evaluator.
+    if (review.has_unresolved_findings === true) return false;
     const reviewedSha = String(review.commit_sha || '').toLowerCase();
     return /^[a-f0-9]{40}$/.test(reviewedSha) && reviewedSha === exactHead;
   }

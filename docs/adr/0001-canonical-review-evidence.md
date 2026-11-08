@@ -70,9 +70,10 @@ existing `codex-head-epoch` markers:
 - the comment was authored by `github-actions[bot]`;
 - the referenced run and attempt resolve through the **authenticated** Actions
   API to a real run of `.github/workflows/claude-fallback-review.yml` (matched
-  with any `@ref` suffix stripped — GitHub documents run-attempt paths as
-  `build.yml@main` even though live responses return the bare path; the ref
-  itself is pinned by the next rule);
+  bare, or suffixed with that run's own branch as `@<head_branch>` /
+  `@refs/heads/<head_branch>` — GitHub documents run-attempt paths as
+  `build.yml@main` even though live responses return the bare path; any other
+  suffix is a different workflow file and fails);
 - that run's event is `workflow_dispatch` and its `head_branch` is the default
   branch (a run from a PR ref would execute PR-controlled YAML);
 - the comment was written inside the **current head epoch**: a branch that
@@ -143,7 +144,8 @@ Gate and Merge Bot therefore cannot drift into different verdicts.
 
 ### Precedence
 
-1. administrator override / technical fail-soft — provenance claims no review;
+1. administrator override (clear) / technical evaluation error (pending,
+   fail-closed since 2026-11-08) — provenance claims no review either way;
 2. active trusted Codex P1/P2 (thread or current-head non-inline) — blocked;
 3. a fallback attestation declaring unresolved P1/P2 — blocked;
 4. genuine current-head Codex evidence — clear, authority `codex`;
@@ -197,8 +199,10 @@ accepted; none widens it.
 5. **Run `path` with an `@ref` suffix (P1, defensive).** GitHub's documented
    example for "Get a workflow run attempt" shows `build.yml@main`; live
    responses on 2026-11-08 returned the bare path on both repositories.
-   `attestationRunIsTrusted` compares the path with any `@…` suffix stripped,
-   the ref being pinned by the `head_branch` rule. `trustedHeadMarkers`
+   `attestationRunIsTrusted` accepts the bare canonical path or the canonical
+   path suffixed with the run's own `head_branch` (plain or `refs/heads/`),
+   nothing else — a blanket strip would also admit a differently named file
+   such as `claude-fallback-review.yml@evil.yml`. `trustedHeadMarkers`
    (outside the block) keeps its exact comparison.
 6. **The producer counts reactions (P2).** `claude-fallback-review.yml` lists
    the PR's issue reactions and includes trusted Codex reactions in the
