@@ -115,30 +115,50 @@ done
 # 2. One scan: secret-like files (the grep tool returns matching lines from any
 #    file it is pointed at, so a secret in the worktree could reach the model
 #    even though reads are denied), symlinks leaving the repository (OpenCode
-#    2.2.6 checks the requested path, not the canonical one), and credential
-#    content in known config files.
+#    2.2.6 checks the requested path, not the canonical one), credential content
+#    in known config files and Git configs, and worktree files a Git config
+#    includes (they are Git configuration the reviewer could read by name).
 # ---------------------------------------------------------------------------
+# The private state directory is created now (the lock is held): the scan hands over
+# the worktree files that a Git config includes, for classify and render.
+mkdir -p "$STATE_ROOT/$REPO_KEY"
+chmod 700 "$STATE_ROOT" "$STATE_ROOT/$REPO_KEY"
+STATE_DIR="$STATE_ROOT/$REPO_KEY"
+tmp_files=()
+trap 'rm -f -- "${tmp_files[@]}"' EXIT
+included_z="$(mktemp "$STATE_DIR/.included.XXXXXX")"
+tmp_files+=("$included_z")
+
 scan_status=0
-scan_out="$(python3 -I "$POLICY" scan "$REPO" --budget "$SCAN_BUDGET")" || scan_status=$?
+scan_out="$(python3 -I "$POLICY" scan "$REPO" --budget "$SCAN_BUDGET" --included-out "$included_z")" || scan_status=$?
 if (( scan_status != 0 )); then
   printf '%s\n' "$scan_out" | tail -3 >&2
   die "worktree scan did not complete within ${SCAN_BUDGET}s (status $scan_status); set OAUTO_SCAN_BUDGET higher for large trees"
 fi
-sensitive="$(printf '%s\n' "$scan_out" | sed -n 's/^SENSITIVE //p')"
-content_hits="$(printf '%s\n' "$scan_out" | sed -n 's/^CONTENT //p')"
-outward="$(printf '%s\n' "$scan_out" | sed -n 's/^SYMLINK //p')"
-if [[ -n "$outward" ]]; then
-  printf 'oauto: symlinks leaving the repository or aliasing secret-like paths (hard links included):\n%s\n' "$outward" >&2
+# Decisions rest on the SUMMARY counts only. The records above it (one ASCII line each,
+# names C-quoted) are displayed, never parsed for a decision.
+summary="${scan_out##*$'\n'}"
+summary_re='^SUMMARY files=[0-9]+ sensitive=([0-9]+) symlinks=([0-9]+) content=([0-9]+) elapsed=[0-9.]+s complete=1$'
+[[ "$summary" =~ $summary_re ]] ||
+  die "the worktree scan did not end with a well-formed SUMMARY line"
+n_sensitive="${BASH_REMATCH[1]}"; n_symlinks="${BASH_REMATCH[2]}"; n_content="${BASH_REMATCH[3]}"
+scan_records() { printf '%s\n' "$scan_out" | sed -n "s/^$1 //p"; }
+if (( n_symlinks > 0 )); then
+  printf 'oauto: symlinks leaving the repository or aliasing secret-like paths (hard links included):\n%s\n' "$(scan_records SYMLINK)" >&2
   die "refusing to launch: OpenCode resolves reads through symlinks but checks only the requested name (and a hard link is the same file under another name), so these would expose paths outside $REPO, or Git metadata and secret-like files inside it, under a harmless name (targets under /usr, /bin, /lib are tolerated)"
 fi
-if [[ -n "$sensitive$content_hits" ]]; then
-  [[ -n "$sensitive" ]] && printf 'oauto: secret-like files present in %s:\n%s\n' "$REPO" "$sensitive" >&2
-  [[ -n "$content_hits" ]] && printf 'oauto: credential-looking content in:\n%s\n' "$content_hits" >&2
+if (( n_sensitive + n_content > 0 )); then
+  if (( n_sensitive > 0 )); then printf 'oauto: secret-like files present in %s:\n%s\n' "$REPO" "$(scan_records SENSITIVE)" >&2; fi
+  if (( n_content > 0 )); then printf 'oauto: credential-looking content in:\n%s\n' "$(scan_records CONTENT)" >&2; fi
   if [[ "${OAUTO_ALLOW_SENSITIVE_FILES:-}" != "1" ]]; then
     die "refusing to launch: the model's grep tool can surface lines from these files. Move them out of the worktree, or set OAUTO_ALLOW_SENSITIVE_FILES=1 to accept that exposure risk explicitly (their diffs stay excluded from the preflight either way)"
   fi
   note "WARNING: OAUTO_ALLOW_SENSITIVE_FILES=1 set; continuing with the files above exposed to grep"
 fi
+# Worktree files a Git config includes are Git configuration: the rendered config
+# denies reading them by their exact name too.
+deny_read_args=()
+while IFS= read -r -d '' path; do deny_read_args+=("--deny-read=$path"); done < "$included_z"
 
 # ---------------------------------------------------------------------------
 # 3. Read-only git preflight. It runs before OpenCode's restrictions apply, so no
@@ -189,9 +209,6 @@ g()  { timeout 120 env -i "${git_env[@]}" git -C "$REPO" --work-tree="$REPO" "${
 #                              run with the submodule's own config and filters
 gd() { g diff --no-ext-diff --no-textconv --no-renames --no-relative --no-color --submodule=short --ignore-submodules=dirty "$@"; }
 
-mkdir -p "$STATE_ROOT/$REPO_KEY"
-chmod 700 "$STATE_ROOT" "$STATE_ROOT/$REPO_KEY"
-STATE_DIR="$STATE_ROOT/$REPO_KEY"
 PREFLIGHT_FILE="$STATE_DIR/preflight.md"
 capped() { # $1 max bytes; stdin -> stdout, byte-exact, with a truncation marker
   local max="$1" tmp size
@@ -236,7 +253,7 @@ excluded_z="$(mktemp "$STATE_DIR/.excluded.XXXXXX")"
 display="$(mktemp "$STATE_DIR/.display.XXXXXX")"
 after="$(mktemp "$STATE_DIR/.after.XXXXXX")"
 content_z="$(mktemp "$STATE_DIR/.content.XXXXXX")"
-trap 'rm -f -- "$names" "$pairs" "$excluded_z" "$display" "$after" "$content_z"' EXIT
+tmp_files+=("$names" "$pairs" "$excluded_z" "$display" "$after" "$content_z")
 # A partial pair list would silently drop the destination-side exclusion, so a
 # failing or timed-out pair pass is fatal (never `|| true`).
 pair_pass_failed() {
@@ -261,7 +278,7 @@ if [[ "$head_sha" != "(no commits)" ]]; then
   fi
 fi
 g ls-files --others --exclude-standard -z >> "$names" || name_pass_failed $?
-python3 -I "$POLICY" classify -z --renames "$pairs" --display "$display" --content-candidates "$content_z" < "$names" > "$excluded_z" ||
+python3 -I "$POLICY" classify -z --renames "$pairs" --display "$display" --content-candidates "$content_z" --extra-sensitive "$included_z" < "$names" > "$excluded_z" ||
   die "could not classify the changed paths for the preflight"
 # Files with a content check (gradle.properties ...) are reviewable by name, but a
 # change that removes a credential line, or deletes the file, carries the old value
@@ -352,7 +369,8 @@ set -e -o pipefail
 chmod 600 "$PREFLIGHT_FILE"
 excluded_note=""
 if [[ -s "$display" ]]; then excluded_note=", secret-like paths excluded"; fi
-rm -f -- "$names" "$pairs" "$excluded_z" "$display" "$after" "$content_z"
+rm -f -- "${tmp_files[@]}"
+tmp_files=()
 trap - EXIT
 preflight_bytes="$(wc -c < "$PREFLIGHT_FILE")"
 (( preflight_bytes <= PREFLIGHT_MAX_BYTES )) ||
@@ -384,8 +402,8 @@ oc() {
   local seconds="$1"; shift
   timeout "$seconds" env -i "${clean_env[@]}" "$OPENCODE_BIN" "$@"
 }
-render_config() { # $@ = extra render args
-  python3 -I "$POLICY" render --model "$MODEL_ALIAS" "$@" > "$CONFIG_FILE.tmp"
+render_config() { # $@ = extra render args; every render denies the included Git configs
+  python3 -I "$POLICY" render --model "$MODEL_ALIAS" "${deny_read_args[@]}" "$@" > "$CONFIG_FILE.tmp"
   mv -f "$CONFIG_FILE.tmp" "$CONFIG_FILE"
   chmod 600 "$CONFIG_FILE"
 }

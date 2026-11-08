@@ -80,9 +80,16 @@ policy, not by the system prompt alone:
    private key with `_`, `.`, `-` or no separator, plus `inMemoryKey`; files
    are read in full and one above 16 MiB is refused rather than skipped) or in
    Git config files (`.git/config`, `config.worktree`, linked-worktree and
-   submodule configs: any user-info in a remote URL except a bare login name
-   in an `ssh://` URL, so `https://org@dev.azure.com/...` is flagged too;
+   submodule configs, and every file they include through `include.path` /
+   `includeIf`: any user-info in a remote URL except a bare login name in an
+   `ssh://` URL, so `https://org@dev.azure.com/...` is flagged too;
    `extraHeader` anywhere on a line; `Authorization: Bearer|Basic` values).
+   An included file that lives inside the repository is Git configuration
+   under an ordinary name: it is reported as secret-like (refused unless
+   overridden), excluded from the preflight diffs and denied to the `read`
+   tool by an extra per-launch rule. The scan reports pathnames C-quoted and
+   ends with a count summary that the launcher decides on, so no filename
+   byte can hide a hit.
 5. **Diagnostics before exec**: `opencode debug config`, `opencode models` and
    `opencode debug agents` are run with `--standalone` and parsed; the launch
    proceeds only if the sole config source is the oauto file, exactly the

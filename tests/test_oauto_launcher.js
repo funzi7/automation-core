@@ -123,6 +123,13 @@ function stateDir(sb, repo) {
   return path.join(sb.state, 'oauto', repoKey(repo));
 }
 
+// The state directory is created before the scan (it receives the scan's list of
+// included Git config files); a refused launch must leave nothing in it.
+function nothingRendered(sb, repo) {
+  const sd = stateDir(sb, repo);
+  return !fs.existsSync(sd) || fs.readdirSync(sd).length === 0;
+}
+
 // ---------------------------------------------------------------------------
 // Rendered configuration contract
 // ---------------------------------------------------------------------------
@@ -261,7 +268,7 @@ test('scan reports secret-like files, outward symlinks and credential content in
   assert.ok(!lines.some((l) => l.includes('link-inside')));
   assert.ok(lines.includes('CONTENT gradle.properties: credential-looking assignment'));
   assert.ok(lines.includes('CONTENT .git/config: remote URL or http header embeds credentials'));
-  assert.match(lines[lines.length - 1], /^SUMMARY files=\d+ elapsed=[\d.]+s complete=1$/);
+  assert.match(lines[lines.length - 1], /^SUMMARY files=\d+ sensitive=3 symlinks=2 content=2 elapsed=[\d.]+s complete=1$/);
   const exhausted = policy(['scan', repo, '--budget', '0']);
   assert.equal(exhausted.status, 3);
   assert.match(exhausted.stdout, /complete=0/);
@@ -431,7 +438,7 @@ test('oauto-run refuses secret-like files unless overridden, and symlinks that l
   assert.equal(r.status, 1);
   assert.match(r.stderr, /secret-like files present/);
   assert.match(r.stderr, /refusing to launch: the model's grep tool/);
-  assert.ok(!fs.existsSync(stateDir(sb, repo)), 'nothing is rendered before the scan passes');
+  assert.ok(nothingRendered(sb, repo), 'nothing is rendered before the scan passes');
 
   r = runOauto(sb, repo, ['--check'], { OAUTO_ALLOW_SENSITIVE_FILES: '1' });
   assert.equal(r.status, 0, r.stderr);
@@ -959,7 +966,7 @@ test('P1-D: in-repository symlinks aliasing Git metadata or secret-like paths ar
   assert.match(r.stderr, /symlinks leaving the repository or aliasing secret-like paths/);
   assert.match(r.stderr, /review-config\.txt -> \S+\/\.git\/config \(secret-like target: \.git\/config\)/);
   assert.match(r.stderr, /git-meta -> \S+\/\.git \(secret-like target: \.git\)/);
-  assert.ok(!fs.existsSync(stateDir(sb, repo)), 'nothing is rendered before the scan passes');
+  assert.ok(nothingRendered(sb, repo), 'nothing is rendered before the scan passes');
 
   // Aliases of a protected directory and of secret-like files: refused even with the
   // sensitive-files override, which only accepts such files under their own names.
@@ -1320,6 +1327,132 @@ test('E3: a credential that git copies into a hunk header stays out of the prefl
   assert.deepEqual(excludedLines(preflight), ['gradle.properties (credential-looking content in its diff)']);
 });
 
+// ---------------------------------------------------------------------------
+// Round 6: a structured scan contract (P1-H) and included Git config files (P1-I).
+// ---------------------------------------------------------------------------
+test('P1-H: a secret-like file whose name starts with a newline is counted, shown C-quoted and excluded', () => {
+  const sb = sandbox();
+  const name = '\n.env';
+  const secret = 'SYNTH-NEWLINE-LEAD-5e5e';
+  const repo = mkRepo(sb, 'newline-name', { 'src/a.py': 'x = 1\n' });
+  fs.writeFileSync(path.join(repo, name), `TOKEN=${secret}\n`);
+  git(repo, ['add', '--', name]);
+  let r = runOauto(sb, repo, ['--check']);
+  assert.equal(r.status, 1, `a secret-like file must refuse the launch whatever its name:\n${r.stderr}`);
+  assert.ok(r.stderr.includes('"\\n.env"'), r.stderr);
+  // The scan prints names C-quoted, one record per line, and counts every kind in SUMMARY.
+  const scan = policy(['scan', repo, '--budget', '60']).stdout.trim().split('\n');
+  assert.ok(scan.includes('SENSITIVE "\\n.env"'), scan.join('\n'));
+  assert.match(scan[scan.length - 1], /^SUMMARY files=\d+ sensitive=1 symlinks=0 content=0 elapsed=[\d.]+s complete=1$/);
+  r = runOauto(sb, repo, ['--check'], { OAUTO_ALLOW_SENSITIVE_FILES: '1' });
+  assert.equal(r.status, 0, r.stderr);
+  const preflight = readPreflight(sb, repo);
+  assert.ok(!preflight.includes(secret));
+  assert.deepEqual(excludedLines(preflight), ['"\\n.env"']);
+});
+
+test('P1-H: every scan record is one ASCII line with C-quoted names (links, targets and reasons included)', () => {
+  const sb = sandbox();
+  const repo = mkRepo(sb, 'quoted-scan', { 'src/a.py': 'x = 1\n', 'sec\tdir/db.secrets.json': '{}\n', 'gradle.properties': 'signingPassword=V\n' }, { commit: false });
+  fs.symlinkSync('sec\tdir/db.secrets.json', path.join(repo, 'nïce'));
+  fs.symlinkSync(path.join(sb.root, 'gone\nfile'), path.join(repo, 'out\nlink'));
+  const r = policy(['scan', repo, '--budget', '60']);
+  assert.equal(r.status, 0, r.stderr);
+  const lines = r.stdout.trim().split('\n');
+  assert.ok(lines.every((l) => /^(SENSITIVE|SYMLINK|CONTENT|SUMMARY) [\x20-\x7e]*$/.test(l)), r.stdout);
+  const real = fs.realpathSync(repo);
+  assert.ok(lines.includes('SENSITIVE "sec\\tdir/db.secrets.json"'), r.stdout);
+  assert.ok(lines.includes(`SYMLINK "n\\303\\257ce" -> "${real}/sec\\tdir/db.secrets.json" (secret-like target: "sec\\tdir/db.secrets.json")`), r.stdout);
+  assert.ok(lines.includes(`SYMLINK "out\\nlink" -> "${fs.realpathSync(sb.root)}/gone\\nfile" (dangling)`), r.stdout);
+  assert.ok(lines.includes('CONTENT gradle.properties: credential-looking assignment'), r.stdout);
+  assert.match(lines[lines.length - 1], /^SUMMARY files=\d+ sensitive=1 symlinks=2 content=1 elapsed=[\d.]+s complete=1$/);
+});
+
+test('P1-I: a worktree file included from .git/config is Git configuration: counted, checked, excluded and denied by name', () => {
+  const sb = sandbox();
+  const token = 'SYNTH-INCLUDE-TOKEN-99cc';
+  const repo = mkRepo(sb, 'include-main', { 'src/a.py': 'x = 1\n' });
+  fs.writeFileSync(path.join(repo, 'review-config.txt'), `[http]\n\textraheader = AUTHORIZATION: bearer ${token}\n`);
+  git(repo, ['add', 'review-config.txt']);
+  fs.appendFileSync(path.join(repo, '.git', 'config'), '[include]\n\tpath = ../review-config.txt\n');
+  let r = runOauto(sb, repo, ['--check']);
+  assert.equal(r.status, 1, `an included Git config in the worktree must refuse the launch without the override:\n${r.stderr}`);
+  assert.match(r.stderr, /\nreview-config\.txt \(included Git config\)\n/);
+  assert.match(r.stderr, /\nreview-config\.txt: remote URL or http header embeds credentials\n/);
+  assert.ok(nothingRendered(sb, repo));
+
+  const { r: r2, preflight, prompt } = launchRecordingPrompt(sb, repo, { OAUTO_ALLOW_SENSITIVE_FILES: '1' });
+  assert.equal(r2.status, 0, r2.stderr);
+  assert.ok(!preflight.includes(token) && !prompt.includes(token), 'the included config must not reach the preflight or the prompt');
+  assert.deepEqual(excludedLines(preflight), ['review-config.txt (included Git config)']);
+  const cfg = JSON.parse(fs.readFileSync(path.join(stateDir(sb, repo), 'xdg-config', 'opencode', 'opencode.json'), 'utf8'));
+  for (const agent of ['review-glm', 'review-deepseek']) {
+    assert.equal(decide(cfg.agents[agent].permissions, 'read', 'review-config.txt'), 'deny', `${agent} must not read the included config`);
+    assert.equal(decide(cfg.agents[agent].permissions, 'read', 'src/a.py'), 'allow', `${agent} still reads ordinary files`);
+  }
+  assert.equal(decide(cfg.permissions, 'read', 'review-config.txt'), 'deny');
+  assert.equal(decide(cfg.policies, 'tool.use', 'read:review-config.txt'), 'deny');
+});
+
+test('P1-I: chained and includeIf includes are followed; an include outside the repository is ignored', () => {
+  const sb = sandbox();
+  const scanLines = (repo, env = {}) => spawnSync('python3', ['-I', POLICY, 'scan', repo, '--budget', '60'],
+    { encoding: 'utf8', env: { ...process.env, ...env } }).stdout.trim().split('\n');
+  const flagged = (lines, file, credential) => lines.includes(`SENSITIVE ${file} (included Git config)`)
+    && lines.includes(`CONTENT ${file}: remote URL or http header embeds credentials`) === credential;
+  // Chained: .git/config -> conf/review.cfg -> ../more.cfg (git resolves an include
+  // relative to the file that contains it, so this is <repo>/more.cfg).
+  const chain = mkRepo(sb, 'include-chain', { 'src/a.py': 'x = 1\n', 'conf/review.cfg': '[include]\n\tpath = ../more.cfg\n',
+    'more.cfg': '[remote "x"]\n\turl = https://ghp_x@github.com/o/r.git\n' });
+  fs.appendFileSync(path.join(chain, '.git', 'config'), '[include]\n\tpath = ../conf/review.cfg\n');
+  let lines = scanLines(chain);
+  assert.ok(flagged(lines, 'conf/review.cfg', false) && flagged(lines, 'more.cfg', true), lines.join('\n'));
+  let r = runOauto(sb, chain, ['--check']);
+  assert.equal(r.status, 1, r.stderr);
+  // --included-out hands the launcher the in-repository included configs (NUL-terminated, sorted).
+  const out = path.join(sb.root, 'included.z');
+  assert.equal(spawnSync('python3', ['-I', POLICY, 'scan', chain, '--budget', '60', '--included-out', out]).status, 0);
+  assert.deepEqual(fs.readFileSync(out), nulJoin('conf/review.cfg', 'more.cfg'));
+  // includeIf: the condition is not evaluated; quoted value, trailing comment, any case.
+  const cond = mkRepo(sb, 'include-if', { 'src/a.py': 'x = 1\n', 'team.cfg': '[http]\n\tExtraHeader = X-Token: SYNTH-TEAM\n' });
+  fs.appendFileSync(path.join(cond, '.git', 'config'), '[IncludeIf "onbranch:feature/*"]\n\tPath = "../team.cfg" ; team settings\n');
+  lines = scanLines(cond);
+  assert.ok(flagged(lines, 'team.cfg', true), lines.join('\n'));
+  assert.equal(runOauto(sb, cond, ['--check']).status, 1);
+  // An include loop does not hang the scan.
+  const loop = mkRepo(sb, 'include-loop', { 'src/a.py': 'x = 1\n', 'a.cfg': '[include]\n\tpath = b.cfg\n', 'b.cfg': '[include]\n\tpath = a.cfg\n' });
+  fs.appendFileSync(path.join(loop, '.git', 'config'), '[include]\n\tpath = ../a.cfg\n');
+  lines = scanLines(loop);
+  assert.ok(flagged(lines, 'a.cfg', false) && flagged(lines, 'b.cfg', false), lines.join('\n'));
+  // Outside the repository (the user's own ~/.gitconfig-work): ignored.
+  const outside = mkRepo(sb, 'include-outside', { 'src/a.py': 'x = 1\n' });
+  fs.writeFileSync(path.join(sb.home, '.gitconfig-work'), '[http]\n\textraHeader = X-Token: SYNTH-HOME\n');
+  fs.appendFileSync(path.join(outside, '.git', 'config'), '[include]\n\tpath = ~/.gitconfig-work\n');
+  lines = scanLines(outside, { HOME: sb.home });
+  assert.ok(!lines.some((l) => l.includes('gitconfig-work')), lines.join('\n'));
+  r = runOauto(sb, outside, ['--check']);
+  assert.equal(r.status, 0, r.stderr);
+});
+
+test('P1-I: classify --extra-sensitive and render --deny-read', () => {
+  const sb = sandbox();
+  const extra = path.join(sb.root, 'extra.z');
+  const display = path.join(sb.root, 'display');
+  fs.writeFileSync(extra, nulJoin('review-config.txt', 'conf/unchanged.cfg'));
+  const r = policyBytes(['classify', '-z', '--extra-sensitive', extra, '--display', display], nulJoin('review-config.txt', 'src/a.py'));
+  assert.equal(r.status, 0, r.stderr.toString());
+  assert.deepEqual(r.stdout, nulJoin('review-config.txt'));
+  assert.equal(fs.readFileSync(display, 'utf8'), 'review-config.txt (included Git config)\n');
+  const cfg = render('glm', ['--deny-read', 'review-config.txt', '--deny-read=-dash.cfg']);
+  for (const rules of [cfg.permissions, cfg.agents['review-glm'].permissions, cfg.agents['review-deepseek'].permissions]) {
+    assert.equal(decide(rules, 'read', 'review-config.txt'), 'deny');
+    assert.equal(decide(rules, 'read', '-dash.cfg'), 'deny');
+    assert.equal(decide(rules, 'read', 'review-config.txt.bak'), 'allow', 'an exact path, not a pattern');
+  }
+  assert.equal(decide(cfg.policies, 'tool.use', 'read:review-config.txt'), 'deny');
+  assert.deepEqual(render('glm'), JSON.parse(JSON.stringify(render('glm', []))), 'no --deny-read: unchanged contract');
+});
+
 test('F: ordinary changes and non-sensitive special names still reach the preflight', () => {
   const sb = sandbox();
   const names = { naive: 'src/naïve file.py', tab: 'docs/tab\tname.md', dash: '-lead.py', plain: 'src/plain.py' };
@@ -1502,7 +1635,17 @@ test('oauto-run source: no automatic approval, standalone helpers, bounded helpe
   assert.equal(code.match(/\bg log\b/g).length, 1);
   assert.match(code, /\bg log --no-show-signature --no-color --oneline -15\b/);
   assert.match(code, /\bg status --short --untracked-files=normal --ignore-submodules=dirty\b/);
-  assert.match(code, /python3 -I "\$POLICY" classify -z --renames "\$pairs" --display "\$display" --content-candidates "\$content_z" < "\$names" > "\$excluded_z" \|\|\s*die /);
+  assert.match(code, /python3 -I "\$POLICY" classify -z --renames "\$pairs" --display "\$display" --content-candidates "\$content_z" --extra-sensitive "\$included_z" < "\$names" > "\$excluded_z" \|\|\s*die /);
+  // The scan decision rests on SUMMARY counts, never on text extracted from records.
+  assert.match(code, /python3 -I "\$POLICY" scan "\$REPO" --budget "\$SCAN_BUDGET" --included-out "\$included_z"/);
+  assert.match(code, /summary_re='\^SUMMARY files=\[0-9\]\+ sensitive=\(\[0-9\]\+\) symlinks=\(\[0-9\]\+\) content=\(\[0-9\]\+\) elapsed=\[0-9\.\]\+s complete=1\$'/);
+  assert.match(code, /\[\[ "\$summary" =~ \$summary_re \]\] \|\|\s*die /);
+  assert.match(code, /if \(\( n_symlinks > 0 \)\); then/);
+  assert.match(code, /if \(\( n_sensitive \+ n_content > 0 \)\); then/);
+  assert.ok(!/\[\[ -n "\$(outward|sensitive)/.test(code), 'no decision on extracted record text');
+  // Included Git config files reach classify and both renders.
+  assert.match(code, /while IFS= read -r -d '' path; do deny_read_args\+=\("--deny-read=\$path"\); done < "\$included_z"/);
+  assert.match(code, /python3 -I "\$POLICY" render --model "\$MODEL_ALIAS" "\$\{deny_read_args\[@\]\}" "\$@"/);
   // Content-checked files (gradle.properties ...): every candidate's own diff is checked
   // through gd with a literal pathspec, and anything but "clean" or "found" is fatal.
   const contentLines = lines.filter((l) => l.includes('check-diff-content'));

@@ -220,11 +220,14 @@ def _rule(action: str, resource: str, effect: str) -> dict:
     return {"action": action, "resource": resource, "effect": effect}
 
 
-def read_only_ruleset() -> list[dict]:
+def read_only_ruleset(deny_read: list[str] = ()) -> list[dict]:
+    """``deny_read``: exact repository-relative paths (worktree files that .git/config
+    includes as Git configuration), denied after the exceptions so nothing re-allows them."""
     rules = [_rule("*", "*", "deny")]
     rules += [_rule(a, "*", "allow") for a in ("read", "glob", "grep", "question")]
     rules += [_rule("read", p, "deny") for p in SENSITIVE_READ_PATTERNS]
     rules += [_rule("read", p, "allow") for p in SENSITIVE_READ_EXCEPTIONS]
+    rules += [_rule("read", p, "deny") for p in deny_read]
     rules += [_rule("glob", p, "deny") for p in ESCAPING_GLOB_PATTERNS]
     rules += [_rule(a, "*", "deny") for a in DENIED_ACTIONS]
     return rules
@@ -234,7 +237,7 @@ def deny_all_ruleset() -> list[dict]:
     return [_rule("*", "*", "deny")]
 
 
-def policies() -> list[dict]:
+def policies(deny_read: list[str] = ()) -> list[dict]:
     pol = [
         _rule("provider.use", "*", "deny"),
         _rule("provider.use", APPROVED_PROVIDER, "allow"),
@@ -249,10 +252,11 @@ def policies() -> list[dict]:
     pol += [_rule("tool.use", f"{a}:*", "deny") for a in DENIED_ACTIONS]
     pol += [_rule("tool.use", f"read:{p}", "deny") for p in SENSITIVE_READ_PATTERNS]
     pol += [_rule("tool.use", f"read:{p}", "allow") for p in SENSITIVE_READ_EXCEPTIONS]
+    pol += [_rule("tool.use", f"read:{p}", "deny") for p in deny_read]
     return pol
 
 
-def render(alias: str, extra_disabled: list[str]) -> dict:
+def render(alias: str, extra_disabled: list[str], deny_read: list[str] = ()) -> dict:
     if alias not in APPROVED_MODELS:
         _die(f"unknown model alias {alias!r}; approved: {', '.join(APPROVED_MODELS)}")
     model = APPROVED_MODELS[alias]
@@ -277,7 +281,7 @@ def render(alias: str, extra_disabled: list[str]) -> dict:
             "mode": "primary",
             "model": APPROVED_MODELS[agent_alias],
             "system": SYSTEM_PROMPT,
-            "permissions": read_only_ruleset(),
+            "permissions": read_only_ruleset(deny_read),
         }
 
     provider_models = {
@@ -304,8 +308,8 @@ def render(alias: str, extra_disabled: list[str]) -> dict:
         "watcher": {"ignore": WATCHER_IGNORE},
         "experimental": {"todo": False},
         "providers": {APPROVED_PROVIDER: {"models": provider_models}},
-        "permissions": read_only_ruleset(),
-        "policies": policies(),
+        "permissions": read_only_ruleset(deny_read),
+        "policies": policies(deny_read),
         "agents": agents,
     }
 
@@ -479,6 +483,74 @@ def git_config_has_credentials(text: str) -> bool:
     return False
 
 
+# Include directives are followed this deep (git itself stops at 10); a deeper chain
+# is reported instead of being treated as clean.
+MAX_INCLUDE_DEPTH = 8
+_CONFIG_SECTION_HEADER = re.compile(r'\s*\[\s*([^\]\s"]+)(?:\s+"(?:[^"\\]|\\.)*")?\s*\](.*)$', re.S)
+
+
+def _strip_config_comment(line: str) -> str:
+    """A Git config line without its ; or # comment (outside double quotes)."""
+    out, quoted, escaped = [], False, False
+    for ch in line:
+        if escaped:
+            escaped = False
+        elif ch == "\\":
+            escaped = True
+        elif ch == '"':
+            quoted = not quoted
+        elif ch in "#;" and not quoted:
+            break
+        out.append(ch)
+    return "".join(out)
+
+
+def _config_value(raw: str) -> str:
+    """A Git config value: surrounding blanks removed, double quotes dropped, escapes undone."""
+    out, escaped = [], False
+    for ch in raw.strip():
+        if escaped:
+            out.append({"n": "\n", "t": "\t", "b": "\b"}.get(ch, ch))
+            escaped = False
+        elif ch == "\\":
+            escaped = True
+        elif ch != '"':
+            out.append(ch)
+    return "".join(out)
+
+
+def config_include_paths(text: str) -> list[str]:
+    """Every `path` value of an [include] or [includeIf "<condition>"] section, in any
+    case, conservatively: conditions are not evaluated (any of them may apply)."""
+    paths: list[str] = []
+    section = ""
+    pending = ""
+    for physical in text.split("\n"):
+        line = pending + physical.rstrip("\r")
+        if line.endswith("\\") and not line.endswith("\\\\"):
+            pending = line[:-1]  # continued on the next line
+            continue
+        pending = ""
+        line = _strip_config_comment(line)
+        header = _CONFIG_SECTION_HEADER.match(line)
+        if header:
+            section = header.group(1).split(".", 1)[0].lower()
+            line = header.group(2)  # a variable may follow the header on the same line
+        if section not in ("include", "includeif"):
+            continue
+        key, sep, value = line.partition("=")
+        if sep and key.strip().lower() == "path":
+            value = _config_value(value)
+            if value:
+                paths.append(value)
+    return paths
+
+
+def _q(path: str) -> str:
+    """A scan pathname, C-quoted like git: ASCII and always one line."""
+    return git_quote(os.fsencode(path))
+
+
 def _is_git_config(rel: str) -> bool:
     """config / config.worktree directly in .git, in .git/worktrees/<name>/, and anywhere
     under .git/modules/ (submodule git dirs, nested ones included)."""
@@ -489,7 +561,7 @@ def _is_git_config(rel: str) -> bool:
 
 
 def classify_z(names: bytes, renames: bytes | None, display: str | None,
-               content_candidates: str | None = None) -> None:
+               content_candidates: str | None = None, extra_sensitive: frozenset = frozenset()) -> None:
     """stdout: the unique excluded paths, NUL-terminated, sorted by bytes. A rename or
     copy with a secret-like side excludes BOTH sides: a renamed secret must not
     reappear under a safe name, and a secret's new name must not reveal what its old
@@ -504,11 +576,18 @@ def classify_z(names: bytes, renames: bytes | None, display: str | None,
         named, pairs = parse_name_status_z(renames)
         candidates += named
     excluded: dict[bytes, set[str]] = {}
+
+    def secret_like(path: bytes) -> bool:
+        # extra_sensitive: worktree files that .git/config includes as Git configuration.
+        return _sensitive_bytes(path) or path in extra_sensitive
+
     for path in candidates:
-        if _sensitive_bytes(path):
+        if secret_like(path):
             excluded.setdefault(path, set())
+            if path in extra_sensitive:
+                excluded[path].add("(included Git config)")
     for kind, src, dst in pairs:
-        if _sensitive_bytes(src) or _sensitive_bytes(dst):
+        if secret_like(src) or secret_like(dst):
             excluded.setdefault(src, set()).add(f"({kind} to {git_quote(dst, always=True)})")
             excluded.setdefault(dst, set()).add(f"({kind} from {git_quote(src, always=True)})")
     ordered = sorted(excluded)
@@ -577,16 +656,29 @@ def check_excluded(excluded_file: str, remaining_file: str) -> None:
 # Scanner: one walk, no pruning (an explicit grep path bypasses ignore rules)
 # ---------------------------------------------------------------------------
 
-def scan(repo: str, budget: float) -> int:
+def scan(repo: str, budget: float, included_out: str | None = None) -> int:
+    """Print one ASCII record per finding (every pathname C-quoted like git) and a final
+    SUMMARY line whose counts are what the launcher decides on:
+
+      SENSITIVE <path>[ (included Git config)]
+      SYMLINK <link> -> <target>[ (<reason>)]
+      CONTENT <path>: <reason>
+      SUMMARY files=N sensitive=N symlinks=N content=N elapsed=Xs complete=0|1
+
+    ``included_out`` receives the in-repository files that a Git config includes
+    (NUL-terminated, repository-relative, sorted)."""
     repo = os.path.realpath(repo)
+    git_dir = os.path.join(repo, ".git")
     started = time.monotonic()
     files = 0
-    sensitive: list[str] = []
-    symlinks: list[tuple[str, str]] = []
-    content: list[tuple[str, str]] = []
+    sensitive: set[str] = set()
+    symlinks: set[tuple[str, str, str]] = set()     # (link, target, reason quoting its own paths)
+    content: set[tuple[str, str]] = set()
     dir_links: list[tuple[str, str, str]] = []      # in-repo directory aliases (link, target, rel target)
     alias_inodes: dict[tuple[int, int], str] = {}   # (st_dev, st_ino) of secret-like files and .git files
     linked: list[tuple[str, tuple[int, int]]] = []  # other regular files with st_nlink > 1
+    included: dict[str, str] = {}                   # in-repo, non-.git included Git configs: canonical -> rel
+    seen_configs: set[str] = set()
     complete = True
 
     def rel(path: str) -> str:
@@ -598,13 +690,16 @@ def scan(repo: str, budget: float) -> int:
         except OSError:
             return None
 
+    def inside_repo(path: str) -> bool:
+        return path == repo or path.startswith(repo + os.sep)
+
     def link_target(path: str) -> tuple[str, bool]:
         """(canonical target, inside the repository); reports a link that leaves it,
         unless the target is under a tolerated system prefix."""
         target = os.path.realpath(path)
-        inside = target == repo or target.startswith(repo + os.sep)
+        inside = inside_repo(target)
         if not inside and not (target.startswith(ALLOWED_SYMLINK_PREFIXES) and os.path.exists(target)):
-            symlinks.append((rel(path), target if os.path.lexists(target) else f"{target} (dangling)"))
+            symlinks.add((rel(path), target, "" if os.path.lexists(target) else "dangling"))
         return target, inside
 
     def check_symlink(path: str) -> None:
@@ -613,20 +708,48 @@ def scan(repo: str, budget: float) -> int:
             return
         rel_target = "" if target == repo else rel(target)
         parts = rel_target.lower().split("/") if rel_target else []
-        if any(p in SENSITIVE_DIR_COMPONENTS for p in parts) or (rel_target and is_sensitive_path(rel_target)):
-            # An alias of Git metadata, a protected directory or a secret-like file:
-            # the alias name would pass OpenCode's read rules.
-            symlinks.append((rel(path), f"{target} (secret-like target: {rel_target})"))
+        if (any(p in SENSITIVE_DIR_COMPONENTS for p in parts) or (rel_target and is_sensitive_path(rel_target))
+                or target in included):
+            # An alias of Git metadata, a protected directory, a secret-like file or an
+            # included Git config: the alias name would pass OpenCode's read rules.
+            symlinks.add((rel(path), target, f"secret-like target: {_q(rel_target)}"))
         elif os.path.isdir(target):
             dir_links.append((rel(path), target, rel_target))  # judged after the walk
 
+    def check_git_config(found: str, depth: int) -> None:
+        """Credentials in one Git config file, then the files its include directives
+        name, resolved like git: relative to the directory of the file as found. An
+        included file inside the repository but outside .git is Git configuration the
+        reviewer could read by name; one outside the repository is the user's own."""
+        canon = os.path.realpath(found)
+        if canon in seen_configs:
+            return
+        seen_configs.add(canon)
+        try:
+            with open(canon, encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+        except OSError:
+            return
+        if git_config_has_credentials(text):
+            content.add((rel(canon), "remote URL or http header embeds credentials"))
+        for inc in config_include_paths(text):
+            target = os.path.join(os.path.dirname(found), os.path.expanduser(inc))
+            canon_inc = os.path.realpath(target)
+            if not inside_repo(canon_inc) or not os.path.isfile(canon_inc):
+                continue
+            if depth >= MAX_INCLUDE_DEPTH:
+                content.add((rel(canon), f"Git config includes nested deeper than {MAX_INCLUDE_DEPTH} levels"))
+                continue
+            if not (canon_inc == git_dir or canon_inc.startswith(git_dir + os.sep)):
+                included.setdefault(canon_inc, rel(canon_inc))
+            check_git_config(target, depth + 1)
+
     # .git: links that leave the repository, the inodes of its files (a hard link to
-    # one is an alias) and every Git config file (credentials). Its object store holds
-    # none of these and can be large.
-    git_dir = os.path.join(repo, ".git")
+    # one is an alias) and every Git config file (credentials, include directives). Its
+    # object store holds none of these and can be large.
     if os.path.islink(git_dir):
         # Git would write its config (and credentials) wherever this points; refuse.
-        symlinks.append((".git", f"{os.path.realpath(git_dir)} (.git itself is a symlink)"))
+        symlinks.add((".git", os.path.realpath(git_dir), ".git itself is a symlink"))
     if os.path.isdir(git_dir):
         for dirpath, dirnames, filenames in os.walk(git_dir, topdown=True, followlinks=False):
             if time.monotonic() - started > budget:
@@ -643,7 +766,7 @@ def scan(repo: str, budget: float) -> int:
                     if _is_git_config(rel(full)):
                         # Git writes credentials into its config files; through a link
                         # they would land in a file the reviewer may read by name.
-                        symlinks.append((rel(full), f"{target} (Git config file is a symlink)"))
+                        symlinks.add((rel(full), target, "Git config file is a symlink"))
                     continue
                 st = lstat(full)
                 if st is None or not stat.S_ISREG(st.st_mode):
@@ -654,13 +777,13 @@ def scan(repo: str, budget: float) -> int:
                 if not r.startswith(".git/hooks/"):
                     alias_inodes.setdefault((st.st_dev, st.st_ino), r)
                 if _is_git_config(r):
-                    try:
-                        with open(full, encoding="utf-8", errors="replace") as fh:
-                            text = fh.read()
-                    except OSError:
-                        continue
-                    if git_config_has_credentials(text):
-                        content.append((r, "remote URL or http header embeds credentials"))
+                    check_git_config(full, 0)
+    # An included Git config is secret-like wherever it lives: by name, as a link target
+    # and as a hard-link partner.
+    for canon, r in included.items():
+        st = lstat(canon)
+        if st is not None and stat.S_ISREG(st.st_mode):
+            alias_inodes.setdefault((st.st_dev, st.st_ino), r)
 
     for dirpath, dirnames, filenames in os.walk(repo, topdown=True, followlinks=False):
         if not complete or time.monotonic() - started > budget:
@@ -682,7 +805,7 @@ def scan(repo: str, budget: float) -> int:
             st = None if is_link else lstat(full)
             regular = st is not None and stat.S_ISREG(st.st_mode)
             if is_sensitive_path(r):
-                sensitive.append(r)
+                sensitive.add(r)
                 if regular:
                     alias_inodes.setdefault((st.st_dev, st.st_ino), r)
                 continue
@@ -694,35 +817,41 @@ def scan(repo: str, budget: float) -> int:
                 # rather than treated as clean past a cut-off.
                 try:
                     if os.stat(full).st_size > CONTENT_CHECK_MAX_BYTES:
-                        content.append((r, f"too large to content-check (> {CONTENT_CHECK_MAX_BYTES} bytes)"))
+                        content.add((r, f"too large to content-check (> {CONTENT_CHECK_MAX_BYTES} bytes)"))
                         continue
                     with open(full, encoding="utf-8", errors="replace") as fh:
                         if CONTENT_CHECKS[key].search(fh.read()):
-                            content.append((r, "credential-looking assignment"))
+                            content.add((r, "credential-looking assignment"))
                 except OSError:
                     pass
 
+    included_rels = set(included.values())
+    secret_like = sensitive | included_rels
     # A directory alias renames every path below its target, so a file that is
     # secret-like only through a directory name above it would be readable by name.
     for link, target, rel_target in dir_links:
         prefix = rel_target + "/" if rel_target else ""
-        flagged = sorted(p for p in sensitive if p.startswith(prefix))
+        flagged = sorted(p for p in secret_like if p.startswith(prefix))
         if flagged:
-            symlinks.append((link, f"{target} (aliases a directory holding secret-like files: {flagged[0]})"))
+            symlinks.add((link, target, f"aliases a directory holding secret-like files: {_q(flagged[0])}"))
     # A hard link is the same file under another name, which no symlink rule sees.
     for r, inode in linked:
         other = alias_inodes.get(inode)
         if other is not None and other != r:
-            symlinks.append((r, f"{os.path.join(repo, other)} (hard link to {other})"))
+            symlinks.add((r, os.path.join(repo, other), f"hard link to {_q(other)}"))
 
-    for path in sorted(sensitive):
-        print(f"SENSITIVE {path}")
-    for path, target in sorted(symlinks):
-        print(f"SYMLINK {path} -> {target}")
+    for path in sorted(secret_like, key=os.fsencode):
+        print(f"SENSITIVE {_q(path)}" + (" (included Git config)" if path in included_rels else ""))
+    for link, target, reason in sorted(symlinks):
+        print(f"SYMLINK {_q(link)} -> {_q(target)}" + (f" ({reason})" if reason else ""))
     for path, reason in sorted(content):
-        print(f"CONTENT {path}: {reason}")
+        print(f"CONTENT {_q(path)}: {reason}")
     elapsed = time.monotonic() - started
-    print(f"SUMMARY files={files} elapsed={elapsed:.1f}s complete={'1' if complete else '0'}")
+    print(f"SUMMARY files={files} sensitive={len(secret_like)} symlinks={len(symlinks)} content={len(content)}"
+          f" elapsed={elapsed:.1f}s complete={'1' if complete else '0'}")
+    if included_out:
+        with open(included_out, "wb") as fh:
+            fh.write(b"".join(os.fsencode(r) + b"\0" for r in sorted(included_rels, key=os.fsencode)))
     return 0 if complete else 3
 
 
@@ -871,10 +1000,14 @@ def main(argv: list[str]) -> None:
     p_render.add_argument("--model", default=DEFAULT_ALIAS, choices=sorted(APPROVED_MODELS))
     p_render.add_argument("--disable-model", action="append", default=[],
                           help="additional provider/model id to disable (repeatable)")
+    p_render.add_argument("--deny-read", action="append", default=[], metavar="PATH",
+                          help="exact repository-relative path the reviewer may not read (repeatable)")
 
     p_scan = sub.add_parser("scan")
     p_scan.add_argument("repo")
     p_scan.add_argument("--budget", type=float, default=180.0, help="seconds before the scan gives up (exit 3)")
+    p_scan.add_argument("--included-out", metavar="FILE",
+                        help="write the in-repository files .git/config includes, NUL-terminated")
 
     p_classify = sub.add_parser("classify")
     p_classify.add_argument("-z", dest="nul", action="store_true",
@@ -885,6 +1018,8 @@ def main(argv: list[str]) -> None:
                             help="write the excluded paths C-quoted, one per line (needs -z)")
     p_classify.add_argument("--content-candidates", metavar="FILE",
                             help="write the not-excluded paths that have a content check, NUL-terminated (needs -z)")
+    p_classify.add_argument("--extra-sensitive", metavar="FILE",
+                            help="NUL-terminated paths to treat as secret-like: included Git config files (needs -z)")
     p_check = sub.add_parser("check-excluded")
     p_check.add_argument("excluded", help="NUL-delimited excluded paths (classify -z output)")
     p_check.add_argument("remaining", help="NUL-delimited paths the preflight still diffs")
@@ -901,17 +1036,19 @@ def main(argv: list[str]) -> None:
     args = parser.parse_args(argv)
 
     if args.cmd == "render":
-        doc = render(args.model, args.disable_model)
+        doc = render(args.model, args.disable_model, list(dict.fromkeys(p for p in args.deny_read if p)))
         json.dump(doc, sys.stdout, indent=2)
         sys.stdout.write("\n")
     elif args.cmd == "scan":
-        sys.exit(scan(args.repo, args.budget))
+        sys.exit(scan(args.repo, args.budget, args.included_out))
     elif args.cmd == "classify":
         if args.nul:
             renames = _read_bytes(args.renames) if args.renames else None
-            classify_z(sys.stdin.buffer.read(), renames, args.display, args.content_candidates)
-        elif args.renames or args.display or args.content_candidates:
-            _die("--renames, --display and --content-candidates need -z")
+            extra = frozenset(_nul_fields(_read_bytes(args.extra_sensitive), "--extra-sensitive", terminated=True)) \
+                if args.extra_sensitive else frozenset()
+            classify_z(sys.stdin.buffer.read(), renames, args.display, args.content_candidates, extra)
+        elif args.renames or args.display or args.content_candidates or args.extra_sensitive:
+            _die("--renames, --display, --content-candidates and --extra-sensitive need -z")
         else:
             for line in sys.stdin.read().splitlines():
                 if line and is_sensitive_path(line):

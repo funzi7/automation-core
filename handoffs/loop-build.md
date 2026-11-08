@@ -105,7 +105,7 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
   succeeded — now fatal (`name_pass_failed`), with a source-shape test.
 - Device (Phase 5): `bash launchers/oauto/install.sh` refreshed `/root/work/bin/oauto-run` and
   `oauto-policy.py` after each validated state during the round (previous copies kept as
-  `*.backup-before-oauto-20261108-120902`, `-132239`, `-134043` and `-140044`; `ai-launch`, the
+  `*.backup-before-oauto-20261108-120902`, `-132239`, `-134043`, `-140044` and `-144953`; `ai-launch`, the
   Termux `oauto-launch` wrapper and both `.bashrc` blocks were already identical and untouched; the
   original `ai-launch.backup-before-oauto-20261107` still equals the pristine fixture); `install.sh
   --verify` clean; installed copies byte-identical to the tracked ones (device-parity test passes);
@@ -114,7 +114,7 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
   sources/models/agents (GLM and DeepSeek default agents) and printed the banner; fixture, state dir
   and lock removed; no OpenCode process or service left.
 - Final validation at the pushed head: `bash scripts/validate.sh` green (YAML, JSON, sync/mirror parity,
-  JS syntax, `node --test` 176/176 including `tests/test_oauto_launcher.js` 49/49, 59 github-script
+  JS syntax, `node --test` 181/181 including `tests/test_oauto_launcher.js` 54/54, 59 github-script
   bodies, actionlint, `git diff --check`); real-binary battery (scratchpad script, every scenario of
   this entry) passed on the final launcher, and the six live model probes were repeated on it: shell,
   `/etc/hostname`, `.env`, `opencode/big-pickle` and `--agent build` denied as before, probe secret
@@ -191,6 +191,20 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
   unconditionally (`SYMLINK ... (Git config file is a symlink)`), and content-checked files are read
   in full with a 16 MiB ceiling above which the launch is refused (`too large to content-check`).
   Regression tests reproduce both on the previous code; the real-binary battery gained both.
+- Codex re-review of the third fixed head (`a23cfec`, exact-head CI green, the previous two threads
+  replied to and resolved): two more P1s, both valid and reproduced by Codex — a secret-like file whose
+  name begins with a newline printed as `SENSITIVE ` + newline + name, the launcher's line extraction
+  yielded an empty line that command substitution dropped, and the launch proceeded without the
+  override; and a `.git/config` `include.path` (or `includeIf`) pointing at an ordinary-named worktree
+  file made that file Git configuration without any credential check, diff exclusion or read deny.
+  Fixed: the scan now prints every pathname C-quoted and ends with a `SUMMARY` line carrying
+  `sensitive=`/`symlinks=`/`content=` counts, and the launcher decides on those counts (a missing
+  summary fails closed); include directives are parsed conservatively (every `path` under `[include]`
+  or `[includeIf ...]`, recursively, loops guarded) and every included file inside the repository is
+  credential-checked, reported as `SENSITIVE ... (included Git config)` (refuse unless overridden),
+  excluded from the preflight diffs and read-denied by name in the rendered permissions and policies
+  (`render --deny-read`). Regression tests reproduce both on the previous code; the real-binary
+  battery gained both.
 - Review and gate state: the fixes were pushed to the PR branch after this entry's commit; the
   exact-head CI result, the Codex re-review of the pushed head (`@codex review`), the resolution of
   every Codex P1/P2 thread and the Codex Gate verdict are recorded on the PR and in agent-memory
