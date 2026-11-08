@@ -7,7 +7,10 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
 ## [2026-11-08 UTC] Codex Gate reliability and fail-closed enforcement (paywall-bot Telegraph PRs)
 - PR: <https://github.com/funzi7/automation-core/pull/59>
 - Branch: `claude/codex-gate-fail-closed` (based on `main` `15652f6`)
-- Status: opened — owner merge pending; `pull_request_target` loads the gate from `main`, so the fix is only observable after merge
+- Status: review complete — Codex clean on the exact head `5491701`, gate `🟢`, CI green; owner merge
+  pending (Merge Bot cannot merge a `claude/*` protected-path PR by design, and is crashing in this
+  repository on a rejected `AUTOMATION_PAT` since 2026-09-11); `pull_request_target` loads the gate
+  from `main`, so the fix itself is only observable after merge
 - What was investigated (paywall-bot, read-only, 2026-11-08):
   - PR #120 run `42477092393` and PR #122 run `42485718581` are `pull_request_target` gate runs fired
     seconds after each push. Both logged `trusted head marker publish failed; markerless signals stay
@@ -64,11 +67,21 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
   `workflow_dispatch` probe of the permission was attempted and removed — GitHub only registers
   dispatchable workflows from the default branch, so the first real marker publish is observable
   only after merge.
-- Needs from the owner: merge this PR (protected paths; `claude/*` branch is not a Merge Bot
-  candidate by design); then watch the first `pull_request_target` gate run on any PR for
-  `indexed trusted head epoch run` and a `github-actions[bot]` marker comment; then let the daily
-  sync refresh paywall-bot #107 and update paywall-bot's local gate test (summary-row assertions)
-  in that repository.
+- Needs from the owner: merge this PR manually (`gh pr merge 59 --squash`). Merge Bot cannot
+  merge it by design — policy-mirror dry-run against the live PR: `not_candidate` without
+  `automerge`, `protected_path_untrusted` with it, because the `claude/*` branch carries Claude
+  provenance and the PR touches `workflows/**` and `.github/workflows/**`; adding `automerge` would
+  only escalate it to `needs-owner`. Review state at 21:47Z: Codex reviewed the exact head
+  `5491701` on request (`@codex review`) — receipt with `**Reviewed commit:** 5491701be5`, completed
+  review-state marker with no findings, 👍, no threads; the gate published `🟢 Reviewed — clear` on
+  that head and CI is green — review and required checks are genuinely satisfied. Second blocker,
+  independent of this PR: automation-core's `AUTOMATION_PAT` is rejected by GitHub (`HttpError: Bad
+  credentials`, every Merge Bot/Watchdog/CI Doctor run since 2026-09-11, including both runs woken by
+  this green gate) — rotate the secret (LOOP_STATE item 9). Then watch the first
+  `pull_request_target` gate run on any PR for `indexed trusted head epoch run` and a
+  `github-actions[bot]` marker comment; then let paywall-bot's daily sync (or an owner dispatch of
+  its `sync-automation-core.yml`) refresh PR #107 and update paywall-bot's local gate test
+  (`completedCodexSummaryTargetsHead` / `codex-pull-request-review-summary` pins) in that repository.
 - Next: after merge, record the first observed marker and `🟠` verdict (if any) in LOOP_STATE item 8;
   confirm paywall-bot #107 goes green with Codex's re-review of the new sync head.
 

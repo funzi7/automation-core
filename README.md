@@ -88,7 +88,7 @@ still happen within minutes — the crons are just the backstop.
 |--------|-------------|-------|
 | `ANTHROPIC_API_KEY` | `claude.yml` | **Required for the fixer.** If absent, Claude Fixer exits green (fail-soft) — no fix, no red runs, ~0 minutes. Set only on the repos you want auto-fixed (cost control). |
 | `CROSS_REPO_PAT` | `bootstrap.yml` (onboarding / auto-enrollment), `minutes-guard.yml` | automation-core only. Cross-repo fine-grained PAT (Contents/PRs/Workflows write, Metadata read; all repos). If absent, auto-enrollment exits green with a notice (fail-soft). |
-| `AUTOMATION_PAT` | `ci-doctor.yml`, `merge-bot.yml`, and trusted post-Claude PR creation | **Required for the loop to chain.** It is never passed to Issue-mode Claude or its model-facing checkout. If absent, trusted writes exit green (fail-soft). Needs Contents/PRs/Issues write, Metadata read. |
+| `AUTOMATION_PAT` | `ci-doctor.yml`, `merge-bot.yml`, and trusted post-Claude PR creation | **Required for the loop to chain.** It is never passed to Issue-mode Claude or its model-facing checkout. If absent, trusted writes exit green (fail-soft). Needs Contents/PRs/Issues write, Metadata read. An **expired or revoked** PAT is not fail-soft: the first API call fails with `Bad credentials` and Merge Bot, Watchdog and CI Doctor stay red until the secret is rotated (automation-core itself has been in that state since 2026-09-11; see `LOOP_STATE.md` item 9). |
 | `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` | optional | Escalation pings on `needs-owner` / protected-path blocks. Messages use `parse_mode: HTML` (Markdown underscores broke us before). Skipped silently if unset. |
 
 ### GITHUB_TOKEN permissions for review evidence

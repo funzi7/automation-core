@@ -207,6 +207,40 @@ is the permanent human opt-out and is never removed by automation.
    the local summary-row heuristic). If a marker publish still fails after
    merge, the remaining suspects are repository Actions settings (both repos
    currently report `default_workflow_permissions: write`), not workflow YAML.
+   **Merge Bot cannot merge PR #59 by design** (dry-run of the policy mirror
+   `tools/merge_bot_logic.js` against the live PR, 2026-11-08 21:45Z): without
+   `automerge` the `claude/*` branch is `not_candidate`; with `automerge`, a
+   green gate and exact-head Codex evidence it is `protected_path_untrusted`,
+   because the PR touches `workflows/**` and `.github/workflows/**` and a
+   `claude/*` branch carries Claude provenance — such PRs require a human
+   merge (adding `automerge` would only escalate it to `needs-owner`). Owner
+   action: `gh pr merge 59 --squash --repo funzi7/automation-core` once
+   satisfied with the review state. Review state at 21:47Z: Codex reviewed the
+   exact head `5491701` on request (`@codex review` 21:44:50Z) — receipt
+   "Didn't find any major issues" with `**Reviewed commit:** 5491701be5`
+   (21:46:39Z), review-state marker `completed` for `5491701…` with
+   `has_any_findings=false`, 👍 (21:46:43Z), no review threads; the gate
+   published `🟢 Reviewed — clear` (`current_head_signal_no_active_findings`)
+   at 21:46:52Z and CI `validate-automation-core` is green on the head. Review
+   and required checks are genuinely satisfied; only the human merge remains.
+   Independently of policy, **Merge Bot is non-functional in automation-core**:
+   both runs woken by this PR's green gate (`42526903520`, `42526913653`) — and
+   every Merge Bot run since 2026-09-11 — fail with `Unhandled error: HttpError:
+   Bad credentials` (401) on the first `AUTOMATION_PAT` call; see item 9.
+9. **`AUTOMATION_PAT` rejected in automation-core since 2026-09-11 — owner
+   action.** Merge Bot, Claude Fallback Watchdog and CI Doctor in THIS
+   repository fail every run with `HttpError: Bad credentials` (401): last
+   Merge Bot success 2026-09-08 13:40Z, failures from 2026-09-11 00:27Z through
+   today; watchdog and CI Doctor scheduled runs on 2026-11-07/08 show the same
+   error. The secret exists but GitHub rejects it (expired or revoked
+   fine-grained PAT). paywall-bot's own `AUTOMATION_PAT` works (its Merge Bot
+   merged #120–#122 on 2026-11-08). Owner: regenerate the fine-grained PAT
+   (Contents/PRs/Issues write, Metadata read) and update the automation-core
+   secret, then confirm one green Merge Bot and Watchdog run. Design note: the
+   fail-soft check only tests that the secret is non-empty, so an invalid PAT
+   crashes the job instead of exiting green or alerting — a loud, deduplicated
+   `Bad credentials` preflight (with the Telegram escalation) is a future
+   hardening item and is deliberately NOT part of PR #59.
 
 Older items below are history. If they conflict with this section, treat them as HISTORICAL or SUPERSEDED and follow this section.
 
@@ -341,7 +375,7 @@ Synced workflows listed in `sync-config.json`: `codex-auto-fix.yml`, `codex-gate
 
 | Repo | Status | Notes |
 |---|---|---|
-| automation-core | loop installed and live | Public source of truth and test bed. |
+| automation-core | loop installed; PAT-backed workflows crashing since 2026-09-11 | Public source of truth and test bed. Codex Gate and CI run normally; Merge Bot, Watchdog and CI Doctor fail every run with `Bad credentials` because the repository's `AUTOMATION_PAT` is rejected (TODO item 9). PRs here are merged by the owner until the secret is rotated. |
 | paywall-bot | sync stale and locally diverged; sync PR #107 blocked | PR #96 normally auto-merged as `cb5cc5d87f335963e1f80db54de11fe706e3f6de`. Checked 2026-11-08: `codex-auto-fix.yml` matches the source; `codex-gate.yml`, `merge-bot.yml` and `claude-fallback-watchdog.yml` were modified locally by `b07344f4` (2026-09-05) and predate PR #56; `claude-fallback-review.yml` absent. Sync PR #107 (head `c770aa5`) is red: Codex P1/P2 findings on the synced gate code (addressed in the 2026-11-08 fail-closed work) and the local `tests/test_codex_gate_logic.js` asserting the local patch. The 2026-11-08 Telegraph PRs #120–#122 were legitimately gated (exact-head Codex receipts, no active P1/P2, CI green) despite the marker 403. |
 | OptionsProfitTracker | onboarding PR #12 merged | Verified fact only. Current sync/secrets/variables/permissions/runtime health not checked in this pass. |
 | thai-rent-finder | onboarding PR #80 merged | Verified fact only. Current sync/secrets/variables/permissions/runtime health not checked in this pass. |

@@ -140,6 +140,13 @@ Verified 2026-11-08 (Codex Gate fail-closed pass, read-only against GitHub):
   `merge-bot.yml`, `claude-fallback-watchdog.yml` (`b07344f4`, 2026-09-05)
   that predate PR #56; `codex-auto-fix.yml` matches the source.
 
+- automation-core's `AUTOMATION_PAT` is rejected by GitHub: Merge Bot, the
+  watchdog and CI Doctor fail every run in this repository with `Unhandled
+  error: HttpError: Bad credentials` (401) — last Merge Bot success
+  2026-09-08, failures continuous from 2026-09-11, including both runs woken by
+  PR #59's green gate on 2026-11-08. paywall-bot's own PAT works. Owner must
+  rotate the secret (LOOP_STATE item 9); nothing in PR #59 depends on it.
+
 Not physically verifiable before the 2026-11-08 fix merges to `main`
 (`pull_request_target` loads the gate from the default branch): the first
 successful marker publish and the first `🟠 Gate evaluation error —
@@ -389,14 +396,39 @@ A00. Codex Gate fail-closed enforcement (2026-11-08, branch
   Regression tests execute the shipped gate script end to end through the
   incident shape (marker 403, missing marker + reaction, late previous-head
   review, active P1/P2, technical error) and pin the permission shape.
-- PENDING (physical): owner merge; the first `pull_request_target` gate run on
-  `main` must log `indexed trusted head epoch run` and leave a
-  `github-actions[bot]` `codex-head-epoch:v3` comment on the PR — this cannot
+- PENDING (physical): owner merge — Merge Bot cannot do it by design (policy
+  mirror dry-run 2026-11-08: `not_candidate` without `automerge`, and
+  `protected_path_untrusted` with it, because a `claude/*` branch carries
+  Claude provenance and the PR touches `workflows/**` /
+  `.github/workflows/**`; `main` is unprotected, so the owner merges with
+  `gh pr merge 59 --squash`). Review state at 21:47Z: Codex reviewed the exact
+  head `5491701` on request — receipt with `**Reviewed commit:** 5491701be5`,
+  completed review-state marker with no findings, 👍, no threads; the gate
+  published `🟢 Reviewed — clear` on that head and CI is green, so review and
+  required checks are genuinely satisfied. Second, independent blocker: Merge
+  Bot cannot run at all in this repository — its `AUTOMATION_PAT` is rejected
+  (`Bad credentials`, since 2026-09-11; both runs woken by this green gate
+  crashed), so the owner must also rotate that secret (LOOP_STATE item 9) before
+  any automated merge here. After the merge, the first
+  `pull_request_target` gate run on `main` (any push to an open PR, e.g. #58,
+  or a new PR) must log `indexed trusted head epoch run` and leave a
+  `github-actions[bot]` `codex-head-epoch:v3` comment on that PR — this cannot
   be observed before merge because `pull_request_target` loads the gate from
-  the default branch. Then the daily sync refreshes paywall-bot #107, Codex
-  re-reviews the new sync head, and paywall-bot's local
-  `tests/test_codex_gate_logic.js` summary-row assertions must be updated in
-  that repository (the synced gate binds through the structured marker now).
+  the default branch; the `🟠` verdict cannot be induced safely in production
+  and stays covered by the end-to-end tests only. Then paywall-bot's daily
+  sync (03:00 UTC cron, template-identical `sync-automation-core.yml`; or an
+  owner `gh workflow run sync-automation-core.yml --repo funzi7/paywall-bot`)
+  pushes the new contents to `chore/sync-automation-core`, refreshing PR #107
+  (unchanged since 2026-10-02 only because automation-core `main` has not
+  changed since PR #56); Codex must re-review the new sync head; and
+  paywall-bot's own `tests/test_codex_gate_logic.js` must drop its pins on
+  `completedCodexSummaryTargetsHead` / `codex-pull-request-review-summary` in
+  `.github/workflows/codex-gate.yml`, `merge-bot.yml` and
+  `claude-fallback-watchdog.yml` (test "authoritative workflow keeps gate
+  policy inline", plus the three `completedCodexSummaryTargetsHead` unit tests
+  and the export in its local `tools/codex_gate_logic.js`) — the synced gate
+  binds through `codex-review-state:v1` instead. That test change is a
+  paywall-bot commit, not made from this repository.
 - SUPERSEDED by this pass: "intentional technical fail-soft" in the gate (now
   fail-closed) and "Route A deliberately carries no TTL" in ADR 0001 (now
   bounded by the attestation time); paywall-bot's local summary-row reaction
