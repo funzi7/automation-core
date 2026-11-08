@@ -676,8 +676,9 @@ def scan(repo: str, budget: float, included_out: str | None = None,
       CONTENT <path>: <reason>
       SUMMARY files=N sensitive=N symlinks=N content=N elapsed=Xs complete=0|1
 
-    ``included_out`` receives the in-repository files that a Git config includes
-    (NUL-terminated, repository-relative, sorted)."""
+    ``included_out`` receives the in-repository files that a Git config includes, and
+    the include targets there that git cannot load (deleted or renamed away):
+    NUL-terminated, repository-relative, sorted."""
     repo = os.path.realpath(repo)
     git_dir = os.path.join(repo, ".git")
     started = time.monotonic()
@@ -689,6 +690,7 @@ def scan(repo: str, budget: float, included_out: str | None = None,
     alias_inodes: dict[tuple[int, int], str] = {}   # (st_dev, st_ino) of secret-like files and .git files
     linked: list[tuple[str, tuple[int, int]]] = []  # other regular files with st_nlink > 1
     included: dict[str, str] = {}                   # in-repo, non-.git included Git configs: canonical -> rel
+    unloadable_includes: dict[str, str] = {}        # in-repo include targets git cannot load (deleted ...)
     seen_configs: set[str] = set()
     complete = True
 
@@ -768,6 +770,20 @@ def scan(repo: str, budget: float, included_out: str | None = None,
             return printed or canon  # this repository's own config, kept outside the worktree
         return None
 
+    def note_unloadable_include(canon: str) -> None:
+        """An include target inside the repository (outside .git) that git cannot load,
+        typically deleted or renamed away: not present, so not secret-like and no refusal,
+        but its last content can be in the diff, so it is still excluded from the preflight
+        and denied by name (handed over through included_out, never counted)."""
+        if not inside_repo(canon) or canon == git_dir or canon.startswith(git_dir + os.sep):
+            return
+        if canon in included or canon in unloadable_includes:
+            return
+        r = rel(canon)
+        unloadable_includes[canon] = r
+        if any(c in r for c in GLOB_METACHARACTERS):
+            content.add((r, "cannot be denied by exact path (glob metacharacter)"))
+
     def check_git_config(found: str, depth: int, report: str | None, anchor: str | None) -> None:
         """Credentials in one Git config file (when it is reportable), then every file its
         include directives name, resolved like git: relative to the directory of the file
@@ -790,6 +806,7 @@ def scan(repo: str, budget: float, included_out: str | None = None,
             target = os.path.join(os.path.dirname(found), os.path.expanduser(inc))
             canon_inc = os.path.realpath(target)
             if not os.path.isfile(canon_inc):
+                note_unloadable_include(canon_inc)
                 continue
             if depth >= MAX_INCLUDE_DEPTH:
                 if anchor is not None:
@@ -929,7 +946,8 @@ def scan(repo: str, budget: float, included_out: str | None = None,
           f" elapsed={elapsed:.1f}s complete={'1' if complete else '0'}")
     if included_out:
         with open(included_out, "wb") as fh:
-            fh.write(b"".join(os.fsencode(r) + b"\0" for r in sorted(included_rels, key=os.fsencode)))
+            handed_over = included_rels | set(unloadable_includes.values())
+            fh.write(b"".join(os.fsencode(r) + b"\0" for r in sorted(handed_over, key=os.fsencode)))
     return 0 if complete else 3
 
 

@@ -92,8 +92,12 @@ policy, not by the system prompt alone:
    tool by extra per-launch rules (the exact relative path and its `*/`
    form, in permissions and `tool.use` policies) that `opencode debug
    agents` must resolve to deny; a path containing `*`, `?`, `[`, `{`, `}`
-   or `\` cannot be named exactly and refuses the launch instead. Included files outside the repository are followed for further
-   hops but not themselves checked; they belong to the user. The scan
+   or `\` cannot be named exactly and refuses the launch instead. An include
+   path is registered for exclusion as soon as it is referenced, so a
+   referenced file that was deleted (or renamed away) never sends its
+   removed contents either, while only an existing one counts as a
+   secret-like file. Included files outside the repository are followed for
+   further hops but not themselves checked; they belong to the user. The scan
    reports pathnames C-quoted and ends with a count summary that the
    launcher decides on, so no filename byte can hide a hit.
 5. **Diagnostics before exec**: `opencode debug config`, `opencode models` and

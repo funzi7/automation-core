@@ -1576,6 +1576,66 @@ test('verify-agents --deny-read proves the per-launch read denial; render refuse
   }
 });
 
+// ---------------------------------------------------------------------------
+// Round 8 (P1-J): an include target that no longer exists in the worktree. Git skips a
+// missing include, but the deleted file's last content is in the diff.
+// ---------------------------------------------------------------------------
+const includedConfigText = (token) => `[http]\n\textraheader = AUTHORIZATION: bearer ${token}\n`;
+
+function repoIncluding(sb, name, token) {
+  const repo = mkRepo(sb, name, { 'src/a.py': 'x = 1\n', 'review-config.txt': includedConfigText(token) });
+  fs.appendFileSync(path.join(repo, '.git', 'config'), '[include]\n\tpath = ../review-config.txt\n');
+  return repo;
+}
+
+test('P1-J: an included Git config deleted in the worktree stays out of the preflight and the prompt, without refusing', () => {
+  const sb = sandbox();
+  const token = 'SYNTH-DELETED-INCLUDE-5e8e';
+  const repo = repoIncluding(sb, 'include-deleted', token);
+  fs.rmSync(path.join(repo, 'review-config.txt'));
+  const { r, preflight, prompt } = launchRecordingPrompt(sb, repo); // no override: a missing file is not a refusal
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(!preflight.includes(token) && !prompt.includes(token), 'the deleted include target must not reach the preflight or the prompt');
+  assert.deepEqual(excludedLines(preflight), ['review-config.txt (included Git config)']);
+  // The scan hands it over for exclusion and denial without counting it as present.
+  const out = path.join(sb.root, 'included.z');
+  const scan = spawnSync('python3', ['-I', POLICY, 'scan', repo, '--budget', '60', '--included-out', out], { encoding: 'utf8' });
+  assert.equal(scan.status, 0, scan.stderr);
+  assert.match(scan.stdout, /^SUMMARY files=\d+ sensitive=0 symlinks=0 content=0 /m);
+  assert.deepEqual(fs.readFileSync(out), nulJoin('review-config.txt'));
+  const cfg = JSON.parse(fs.readFileSync(path.join(stateDir(sb, repo), 'xdg-config', 'opencode', 'opencode.json'), 'utf8'));
+  assert.equal(decide(cfg.agents['review-glm'].permissions, 'read', 'review-config.txt'), 'deny');
+});
+
+test('P1-J: an include target deleted in a branch commit stays out of the branch delta', () => {
+  const sb = sandbox();
+  const token = 'SYNTH-DELETED-BRANCH-6f8f';
+  const repo = repoIncluding(sb, 'include-deleted-branch', token);
+  git(repo, ['checkout', '-q', '-b', 'feature']);
+  git(repo, ['rm', '-q', 'review-config.txt']);
+  git(repo, ['commit', '-q', '-m', 'drop the review config']);
+  const { r, preflight, prompt } = launchRecordingPrompt(sb, repo);
+  assert.equal(r.status, 0, r.stderr);
+  const delta = sectionOf(preflight, '## Branch delta vs main');
+  assert.ok(delta, preflight);
+  assert.ok(!preflight.includes(token) && !prompt.includes(token), `the branch delta must not carry the token:\n${delta}`);
+  assert.deepEqual(excludedLines(preflight), ['review-config.txt (included Git config)']);
+});
+
+test('P1-J: a renamed include target: the old name is excluded, and the rename pair excludes the new name too', () => {
+  const sb = sandbox();
+  const token = 'SYNTH-RENAMED-INCLUDE-7a8a';
+  const repo = repoIncluding(sb, 'include-renamed', token);
+  git(repo, ['mv', 'review-config.txt', 'notes.txt']); // credential kept; include.path still names the old file
+  const { r, preflight, prompt } = launchRecordingPrompt(sb, repo);
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(!preflight.includes(token) && !prompt.includes(token), 'neither name may carry the token into the preflight');
+  // What the code does: the exhaustive rename pass pairs the two names (R100), so the new
+  // name is excluded as the rename partner of an included config, not on its own.
+  assert.deepEqual(excludedLines(preflight), ['notes.txt (renamed from "review-config.txt")',
+    'review-config.txt (included Git config) (renamed to "notes.txt")']);
+});
+
 test('F: ordinary changes and non-sensitive special names still reach the preflight', () => {
   const sb = sandbox();
   const names = { naive: 'src/naïve file.py', tab: 'docs/tab\tname.md', dash: '-lead.py', plain: 'src/plain.py' };

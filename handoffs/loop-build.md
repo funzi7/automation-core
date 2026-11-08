@@ -105,8 +105,8 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
   succeeded — now fatal (`name_pass_failed`), with a source-shape test.
 - Device (Phase 5): `bash launchers/oauto/install.sh` refreshed `/root/work/bin/oauto-run` and
   `oauto-policy.py` after each validated state during the round (previous copies kept as
-  `*.backup-before-oauto-20261108-120902`, `-132239`, `-134043`, `-140044`, `-144953`, `-152257` and
-  `-154043`; `ai-launch`, the
+  `*.backup-before-oauto-20261108-120902`, `-132239`, `-134043`, `-140044`, `-144953`, `-152257`,
+  `-154043` and `-160518`; `ai-launch`, the
   Termux `oauto-launch` wrapper and both `.bashrc` blocks were already identical and untouched; the
   original `ai-launch.backup-before-oauto-20261107` still equals the pristine fixture); `install.sh
   --verify` clean; installed copies byte-identical to the tracked ones (device-parity test passes);
@@ -115,7 +115,7 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
   sources/models/agents (GLM and DeepSeek default agents) and printed the banner; fixture, state dir
   and lock removed; no OpenCode process or service left.
 - Final validation at the pushed head: `bash scripts/validate.sh` green (YAML, JSON, sync/mirror parity,
-  JS syntax, `node --test` 188/188 including `tests/test_oauto_launcher.js` 61/61, 59 github-script
+  JS syntax, `node --test` 191/191 including `tests/test_oauto_launcher.js` 64/64, 59 github-script
   bodies, actionlint, `git diff --check`); real-binary battery (scratchpad script, every scenario of
   this entry) passed on the final launcher, and the six live model probes were repeated on it: shell,
   `/etc/hostname`, `.env`, `opencode/big-pickle` and `--agent build` denied as before, probe secret
@@ -231,6 +231,17 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
   `\` join `*`, `?`, `[` as characters that refuse an included path instead of relying on matcher
   semantics. Behaviour change worth knowing: a repository whose `.git/config` includes a tracked
   file (`include.path = ../.gitconfig`) is now refused unless `OAUTO_ALLOW_SENSITIVE_FILES=1`.
+- Codex re-review of the fourth fixed head (`ac10beb`, exact-head CI green, the previous two threads
+  replied to and resolved): one P1, valid and reproduced by Codex — a tracked file referenced by
+  `include.path` and then DELETED was skipped by the parser's existence check (and git's origin
+  listing omits a missing include), so it never reached the exclusion list and its deletion hunk,
+  credential included, was in the preflight. Fixed: an in-repository include path is registered for
+  exclusion (and per-launch read deny) as soon as it is referenced, before the existence check;
+  only an existing file counts as secret-like, so reviewing the deletion of a leaked config does not
+  refuse the launch and does not transmit the removed contents. Regression tests cover the worktree
+  deletion, a deletion committed on the branch and a rename of the target (the exhaustive pair pass
+  excludes both names; the new name is an ordinary file until `include.path` is updated, so the
+  owner should update the include after renaming such a file); the battery gained the deletion case.
 - Review and gate state: the fixes were pushed to the PR branch after this entry's commit; the
   exact-head CI result, the Codex re-review of the pushed head (`@codex review`), the resolution of
   every Codex P1/P2 thread and the Codex Gate verdict are recorded on the PR and in agent-memory
