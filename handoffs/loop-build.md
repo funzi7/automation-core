@@ -4,6 +4,139 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
 
 ---
 
+## [2026-11-08 UTC] oauto — Codex P1 round: helper-free git preflight, exact pathnames, no rename hiding
+- PR: <https://github.com/funzi7/automation-core/pull/58> (same PR as the entry below; fixes pushed to its branch)
+- Branch: `claude/oauto-opencode-reviewer`
+- Status: Codex P1 findings fixed with regression tests; see "Review and gate state" at the end of this
+  entry for the re-review outcome.
+- What Codex found (review of commit `d17f3a1`, 2026-11-08T00:23Z, three P1 inline threads on
+  `launchers/oauto/oauto-run`):
+  - P1-A `--no-ext-diff`/`--no-textconv` missing: a repository's `.gitattributes` + `diff.<driver>.textconv`
+    (or an external diff driver) executed during the preflight's `git diff` calls, before OpenCode's
+    restrictions apply; Codex reproduced a helper creating a file outside the repository while `--check`
+    succeeded.
+  - P1-B C-quoted pathnames: `git diff --name-only` munged a deleted tracked `prod<TAB>.env` into
+    `"prod\t.env"`, so classification never saw the real path and the deleted secret reached `preflight.md`.
+  - P1-C rename detection: `git mv .env safe.txt` plus a sanitised destination made `--name-only` report
+    only the destination, the sensitive source was absent from the exclusion pathspecs, and the removed
+    secret appeared in the diff.
+- What changed (`launchers/oauto/oauto-run`, `launchers/oauto/oauto-policy.py`, tests, docs):
+  - Every preflight git call now runs `timeout 120 env -i` (HOME, PATH, LANG, TMPDIR, `GIT_OPTIONAL_LOCKS=0`,
+    `GIT_TERMINAL_PROMPT=0`, LC_ALL/TZ when set — no `GIT_DIR`/`GIT_WORK_TREE`/`GIT_EXTERNAL_DIFF`/
+    `GIT_CONFIG_*` from the caller), `git -C "$REPO" --work-tree="$REPO"` (a `core.worktree` in
+    `.git/config` cannot redirect the diff to another directory), with `core.fsmonitor=false`,
+    `core.hooksPath=/dev/null`, `log.showSignature=false`, `submodule.recurse=false`, `color.ui/diff/
+    status/decorate=never`, `diff.external=` and, for every `filter.<name>` driver found by
+    `git config --get-regexp` (the empty driver name included), `clean=`/`smudge=`/`process=`/
+    `required=false`; a driver name containing `=` cannot be addressed by `git -c` and refuses the launch.
+    Every diff goes through one helper carrying `--no-ext-diff --no-textconv --no-renames --no-relative
+    --no-color --submodule=short --ignore-submodules=dirty`; `git log` carries `--no-show-signature --no-color`.
+  - Changed paths are collected NUL-delimited (`--name-only -z`, `ls-files -z`) into 0600 temp files inside
+    the state directory, never through command substitution; `oauto-policy.py classify -z --renames
+    --display` classifies the exact bytes (decoded only for matching, surrogateescape), excludes both
+    sides of every rename/copy pair when either side is secret-like, writes a C-quoted display list
+    (git's `core.quotePath` rules, ASCII only) and fails closed on any empty, truncated or unknown record;
+    the launcher builds `:(exclude,literal)` pathspecs with `read -r -d ''` and then PROVES the exclusion
+    (`check-excluded`: the name diffs re-run with the pathspecs may list no excluded and no secret-like
+    path) before `preflight.md` is written. Temp files are removed (EXIT trap covers failures).
+  - Diffs never use rename detection; the single `-M --name-status -z` pass exists only to find pairs
+    for the both-sides exclusion. The excluded list shows e.g. `safe.txt (renamed from ".env")`.
+  - `tests/fixtures/fake-opencode` gained a `PROMPT_FILE` control so tests can assert on the whole
+    `--prompt` argument. ADR 0002 gained decision item 8 and two consequences; `launchers/oauto/README.md`
+    "What is blocked" gained the helper row; LOOP_STATE item 8 / "Device launchers" and CONTEXT A1 updated.
+- Regression tests (`tests/test_oauto_launcher.js`, now 29 tests; the launcher is driven end to end against
+  the test double, so the exact bash code paths run): `P1-A` (textconv, external diff, driver command,
+  clean/process filter incl. the empty driver name and a submodule-local filter, fsmonitor hook,
+  `post-index-change` hook via `core.hooksPath`, `gpg.program` reached through a crafted `gpgsig` commit,
+  caller-environment `GIT_EXTERNAL_DIFF`/`GIT_CONFIG_COUNT`; a `filter.x=y` driver must be refused);
+  `P1-B` TAB name without the sensitive override; `P1-B` newline, non-ASCII, space, quote, backslash,
+  leading-dash names, deleted and modified, asserting on `preflight.md`, the recorded `--prompt` and
+  `last-helper.err`; `P1-C` staged, pure and reverse renames; `P1-C` branch delta plus a non-sensitive
+  rename shown as delete+add; `F` ordinary and special-named non-sensitive changes still appear;
+  `core.worktree` redirection and a linked worktree (`.git` file); forced ANSI colour; the NUL interface
+  (`classify -z`, `check-excluded`, pairs, quoting, fail-closed cases); source-shape guard for the helpers.
+  - Reproduction first: run against the previous launcher, 7 new/changed tests failed (helpers executed;
+    TAB, newline, non-ASCII, quote and backslash names leaked; sanitised and reverse renames leaked;
+    branch-delta rename leaked; `classify -z` unknown). Not reproducible on the old code and kept as
+    guards: case F (by design), pure 100 % renames (the old code printed no hunk for them), and some
+    P1-A helpers (external diff, driver command, clean/smudge, post-index-change) because git died on the
+    required process filter first — masked, not safe. Removing each new defence one at a time in scratch
+    copies made the suite fail every time except for `-c log.showSignature=false` alone, which
+    `--no-show-signature` already covers. `color.decorate` and `submodule.recurse` are no-ops for these
+    commands in git 2.47 and stay as guards.
+- Validation performed (device, git 2.47.3, OpenCode 2.2.6, disposable fixture repositories only):
+  - `node --test tests/test_oauto_launcher.js`: 28/29 before the re-install (the device-parity test fails
+    until `install.sh` runs; see below), `bash -n`, `git diff --check` clean.
+  - Real binary, `oauto-run --check` on fixtures (scratchpad battery, 20 checks): hostile config
+    (`diff.probe.textconv/command`, `diff.external`, `filter.probe.clean/process/required`,
+    `core.fsmonitor`, `log.showSignature` + `gpg.program`) → exit 0, no helper marker, textual diffs
+    present, `config sources ok` / `models ok: exactly [glm, deepseek]` / `agents ok`; six deleted
+    special-name secrets (TAB, newline, `naïve`, `"`, `\`, `-dash`) → exit 0 without the override, no
+    synthetic value in `preflight.md`, `"prod\t.env"` listed quoted, ordinary change shown; renamed
+    secrets on a `feature` branch and staged in the worktree → no original value in the branch-delta or
+    worktree sections, no `rename from` anywhere, `safe.txt (renamed from ".env")` listed, non-sensitive
+    rename shown as add.
+  - Real binary, tool level under the rendered config (`opencode run --standalone`, six remote requests
+    with synthetic fixture content): edit/write → denied and no file created; shell → denied;
+    `/etc/hostname` → `external_directory` denied; `.env` → `Permission denied`; the probe secret never
+    appeared in any transcript; `--model opencode/big-pickle` → unavailable; `--agent build` → not found.
+    No fixture, lock or process left behind.
+- Independent review (Opus reviewer subagent, not the implementing agent, full PR diff vs `main`,
+  attack fixtures under mktemp only): P1-A and P1-B confirmed closed (no helper fired for textconv,
+  driver command, external diff, env `GIT_EXTERNAL_DIFF`, clean/smudge/process filters incl. the empty
+  name, an `include.path` driver, an env-injected `GIT_CONFIG_*` driver and a submodule's driver,
+  fsmonitor, gpg, hooks; `--work-tree` defeats `core.worktree`; `--stat` honours the pathspecs; NUL
+  interface fail-closed on every malformed input tried). One P1 in this round's own design
+  (CONFIRMED): the destination-side exclusion of a renamed secret rested on a single `-M` pass whose
+  rename detection a repository can throttle (`diff.renameLimit=1` + two ≈80 %-similar renames →
+  D/A instead of R → the destinations' add-hunks, still holding the secrets, reached `preflight.md`);
+  plus the matching test gap (only ≥50 %-similar or pure renames were tested) and the over-claim
+  "both sides" in ADR/README. Fixed: the pair pass runs `-M -C -l0` (exhaustive, limits pinned,
+  copies included) and the launch is refused if that pass fails or times out; a regression test with
+  `diff.renameLimit=1` reproduces the leak on the previous code; ADR item 8, its consequences and the
+  README row now state the real contract — the source side is always excluded, the other side of a
+  pair git detects is excluded, and a safe-named file that merely still contains secret text (edited
+  beyond git's similarity threshold) is reviewable content and is shown. No P2; nothing else found in
+  ai-launch, install.sh, lock, config rendering, verifiers or the scrubbed exec.
+  Provenance: `review_provider = claude_code_fallback` style independent review in addition to the
+  Codex review that opened this round; the Codex re-review of the fixed head is recorded below.
+  Follow-up from the same review's caveats: the name-collection and proof passes were `|| true` and a
+  transient git failure could have left a secret-like path unexcluded while the content diff still
+  succeeded — now fatal (`name_pass_failed`), with a source-shape test.
+- Device (Phase 5): `bash launchers/oauto/install.sh` refreshed `/root/work/bin/oauto-run` and
+  `oauto-policy.py` (previous copies kept as `*.backup-before-oauto-20261108-120902`; `ai-launch`, the
+  Termux `oauto-launch` wrapper and both `.bashrc` blocks were already identical and untouched; the
+  original `ai-launch.backup-before-oauto-20261107` still equals the pristine fixture); `install.sh
+  --verify` clean; installed copies byte-identical to the tracked ones (device-parity test passes);
+  `/root/work/bin/ai-launch opencode oauto-selftest-j --check` through the installed launcher resolved
+  the fixture, proved the exclusion (`preflight exclusion ok`), verified sources/models/agents and
+  printed the banner; fixture, state dir and lock removed; no OpenCode process or service left.
+- Final validation at the pushed head: `bash scripts/validate.sh` green (YAML, JSON, sync/mirror parity,
+  JS syntax, `node --test` 159/159 including `tests/test_oauto_launcher.js` 32/32, 59 github-script
+  bodies, actionlint, `git diff --check`).
+- Not physically tested: the Termux hop itself (unchanged this round; `proot-distro login` cannot run
+  from inside the Debian session, so `oauto <repo>` still needs one run from a real Termux shell); a
+  review on a real project repository; a full DeepSeek TUI session; a repository using git-lfs
+  filters, submodules or linked worktrees against the real binary (covered by the node tests against
+  the test double and by real git in the fixtures, not by a real OpenCode session); a pair-pass
+  timeout on a huge change set (the refusal path is exercised only by forcing a failure in a scratch
+  copy).
+- Limitations / risks after this round: classification is by path, so a safe-named file that still
+  holds secret text (edited beyond git's 50 % similarity, or copied from an unmodified secret file under
+  the `OAUTO_ALLOW_SENSITIVE_FILES=1` override) is shown like any added file; `git diff` against the
+  worktree still refreshes stat data in `.git/index` (no content, ref or hook; `GIT_OPTIONAL_LOCKS=0`
+  covers `status` only); changes made to the repository during the second of collection are not
+  covered; `-l0` makes the pair pass exhaustive, so a change set with thousands of unpaired deletions
+  and additions can hit the 120 s timeout and the launch is refused rather than degraded; LFS-style
+  filtered files diff raw; submodule worktree dirtiness is not reported; `color.decorate` and
+  `submodule.recurse` are no-ops for these commands in git 2.47 and stay as guards.
+- Review and gate state: the fixes were pushed to the PR branch after this entry's commit; the
+  exact-head CI result, the Codex re-review of the pushed head (`@codex review`), the resolution of the
+  three original P1 threads and the Codex Gate verdict are recorded on the PR and in agent-memory
+  `automation-core/cc-latest.md` (owner-facing state), never claimed here ahead of the evidence.
+- Needs from the owner: unchanged — run `oauto <repo>` once from Termux; merge the PR once Codex Gate is
+  green; decide whether `DEVELOPMENT_RULES_FULL` §7 should list `oauto` next to `cauto`/`clauto`.
+
 ## [2026-11-08 UTC] oauto — read-only, privacy-restricted OpenCode reviewer launcher
 - PR: <https://github.com/funzi7/automation-core/pull/58>
 - Branch: `claude/oauto-opencode-reviewer` (from `main` = `15652f663ccf31fac3c03651a5a7b56758257de4`)
