@@ -82,6 +82,29 @@ policy, not by the system prompt alone:
    diffs (listing only their names), stores the result under
    `~/.local/state/oauto/<repo>-<hash>/` and passes it as the first prompt. The
    model never runs git.
+8. **The preflight itself runs no repository-controlled code and preserves
+   exact pathnames** (amended 2026-11-08 after Codex review of PR #58): every
+   git call runs in a scrubbed environment (`env -i`, so no `GIT_DIR`,
+   `GIT_EXTERNAL_DIFF` or `GIT_CONFIG_*` redirection) pinned to the resolved
+   repository with `--work-tree` (a `core.worktree` in `.git/config` cannot point
+   the diff at another directory), with `core.fsmonitor=false`,
+   `core.hooksPath=/dev/null`, `log.showSignature=false` (`git log
+   --no-show-signature`), `submodule.recurse=false`, every `color.*` forced off
+   (`--no-color`), `diff.external` emptied and every configured
+   `filter.<name>.{clean,smudge,process}` driver — the empty driver name
+   included — emptied with `required=false` (a driver name containing `=`
+   cannot be addressed by `git -c`, so the launch is refused); every diff —
+   name collection, `--stat`, worktree and branch delta — carries
+   `--no-ext-diff --no-textconv --no-renames --no-relative --submodule=short
+   --ignore-submodules=dirty` (no child `git` runs inside a submodule with the
+   submodule's own config). Changed paths are collected
+   NUL-delimited (`-z`) into private files, never through command
+   substitution, classified bytes-exact, excluded with `:(exclude,literal)`
+   pathspecs, listed C-quoted, and the exclusion is proven by re-listing the
+   diff with the pathspecs before anything is written. Renames are detected
+   once, separately, only to exclude *both* sides when either side is
+   secret-like; the diffs themselves show renames as delete + add so a
+   renamed secret's source is always classified under its own name.
 
 The config is rendered at every launch into a private directory,
 `~/.local/state/oauto/<repo>-<hash>/xdg-config/opencode/opencode.json`, selected
@@ -117,4 +140,15 @@ DeepSeek pass follows a GLM pass without any other model becoming selectable.
   must treat them as untrusted repository content.
 - The preflight travels as a command-line argument, so it is visible in
   `/proc/<pid>/cmdline` to processes of the same user for the session's lifetime.
+- Because clean/smudge filters are neutralised for the preflight, files tracked
+  through such a driver (git-lfs style) diff raw — pointer blob against worktree
+  content — and may show as modified in the preflight; they are not reviewable
+  content anyway. Rename detection in the diffs is off, so a moved file appears
+  as a deletion plus an addition. Submodules whose only change is a dirty
+  worktree are not reported (`--ignore-submodules=dirty`); changed submodule
+  commits still are.
+- `git diff` against the worktree refreshes stat information in `.git/index`
+  when entries are stat-dirty (`GIT_OPTIONAL_LOCKS=0` stops `git status` from
+  doing so, not `git diff`); no content, ref or hook runs from it, but the
+  preflight is not byte-for-byte free of writes under `.git/`.
 - No code-editing OpenCode mode exists; adding one is a separate decision.

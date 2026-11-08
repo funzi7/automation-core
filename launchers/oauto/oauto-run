@@ -9,8 +9,9 @@
 #   1. fail-closed preflight (binary version, system config, project config);
 #   2. one scan of the worktree for secret-like files, outward symlinks and
 #      credential-looking config content;
-#   3. read-only git metadata collection outside the model's tool execution, with
-#      every secret-like path excluded from the diffs;
+#   3. read-only git metadata collection outside the model's tool execution, in which
+#      no repository-configured helper program runs, with every secret-like path
+#      (matched by its exact bytes, renames included) excluded from the diffs;
 #   4. rendering of a private OpenCode config directory (XDG_CONFIG_HOME under the
 #      oauto state dir) from oauto-policy.py, with every model the binary offers
 #      except the approved one(s) disabled;
@@ -140,12 +141,53 @@ if [[ -n "$sensitive$content_hits" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 3. Read-only git preflight (GIT_OPTIONAL_LOCKS=0: no index refresh writes;
-#    every call time-bounded). Secret-like paths are excluded from every diff,
-#    including deleted or modified tracked secrets, so cleaning up a leak never
-#    sends the leaked content to the model.
+# 3. Read-only git preflight. It runs before OpenCode's restrictions apply, so no
+#    helper program that the repository (.gitattributes, .git/config, a submodule's
+#    config) or the user's global config selects may run here. Secret-like paths
+#    are excluded from every diff by their exact bytes, including deleted, modified
+#    and renamed tracked secrets, so cleaning up a leak never sends the leaked
+#    content to the model.
 # ---------------------------------------------------------------------------
-g() { GIT_OPTIONAL_LOCKS=0 timeout 120 git -C "$REPO" -c core.pager=cat -c color.ui=never --no-pager "$@" 2>/dev/null; }
+# Scrubbed, time-bounded git. env -i: no GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE /
+# GIT_EXTERNAL_DIFF / GIT_CONFIG_* redirection from the caller's environment. HOME
+# stays so the user's global config and safe.directory still apply. --work-tree:
+# a core.worktree in .git/config cannot point the diffs at a directory outside $REPO.
+git_env=(HOME="$HOME" PATH="$PATH" LANG="${LANG:-C.UTF-8}" TMPDIR="${TMPDIR:-/tmp}"
+         GIT_OPTIONAL_LOCKS=0 GIT_TERMINAL_PROMPT=0)
+if [[ -n "${LC_ALL:-}" ]]; then git_env+=("LC_ALL=$LC_ALL"); fi
+if [[ -n "${TZ:-}" ]]; then git_env+=("TZ=$TZ"); fi
+git_cfg=(-c core.pager=cat -c color.ui=never
+         -c color.diff=never -c color.status=never -c color.decorate=never  # color.<command> outranks color.ui
+         -c core.fsmonitor=false        # no fsmonitor hook on the index refresh of status/diff
+         -c core.hooksPath=/dev/null    # no repository hook, e.g. post-index-change when diff refreshes the index
+         -c log.showSignature=false     # no gpg.program / gpg.ssh.program run by git log
+         -c submodule.recurse=false     # no command recursing into submodules, which have their own config
+         -c diff.external=)             # belt and braces next to --no-ext-diff
+# Every configured clean/smudge/process filter driver (a .gitattributes `filter=`
+# acts only through these keys; git-lfs is one) is neutralised: an empty command
+# runs nothing, required=false keeps git from dying on the neutralised driver, so
+# LFS-tracked files diff raw (pointer vs content). The empty driver name (selected
+# by `filter=`) is included; a name containing '=' cannot be addressed by -c (git
+# splits at the first '='), so it is refused.
+filter_cfg=()
+while IFS= read -r -d '' entry; do
+  key="${entry%%$'\n'*}"; name="${key#filter.}"; name="${name%.*}"
+  [[ "$name" != *=* ]] || die "a configured git filter driver name contains '=', which git -c cannot neutralise; refusing to run the preflight with it"
+  filter_cfg+=(-c "filter.$name.clean=" -c "filter.$name.smudge=" -c "filter.$name.process=" -c "filter.$name.required=false")
+done < <(timeout 120 env -i "${git_env[@]}" git -C "$REPO" --work-tree="$REPO" config -z --get-regexp '^filter\..*\.(clean|smudge|process|required)$' 2>/dev/null || true)
+
+g()  { timeout 120 env -i "${git_env[@]}" git -C "$REPO" --work-tree="$REPO" "${git_cfg[@]}" "${filter_cfg[@]}" --no-pager "$@" 2>/dev/null; }
+# gd: EVERY diff the preflight runs (name collection, rename pairs, --stat, content;
+# worktree and branch delta).
+#   --no-ext-diff   no diff.external / diff.<driver>.command / GIT_EXTERNAL_DIFF program
+#   --no-textconv   no diff.<driver>.textconv program
+#   --no-renames    a renamed secret diffs as a deletion under its own (excluded) name
+#   --no-relative   names stay repository-rooted whatever diff.relative says
+#   --no-color      no ANSI escapes in the preflight whatever color.* says
+#   --submodule=short          no nested diff process inside a submodule
+#   --ignore-submodules=dirty  no child `git status` inside a submodule, which would
+#                              run with the submodule's own config and filters
+gd() { g diff --no-ext-diff --no-textconv --no-renames --no-relative --no-color --submodule=short --ignore-submodules=dirty "$@"; }
 
 mkdir -p "$STATE_ROOT/$REPO_KEY"
 chmod 700 "$STATE_ROOT" "$STATE_ROOT/$REPO_KEY"
@@ -180,20 +222,41 @@ if [[ -n "$base" ]]; then
   ahead_behind="$(g rev-list --left-right --count "$base...HEAD" | awk '{print "behind " $1 ", ahead " $2}' || true)"
 fi
 
-# Paths whose content may never enter the preflight: every changed, deleted or
-# untracked path that the policy classifies as sensitive.
-excluded="$({
-  if [[ "$head_sha" != "(no commits)" ]]; then
-    g diff HEAD --name-only || true
-    [[ -n "$base" ]] && { g diff --name-only "$base...HEAD" || true; }
+# Paths whose content may never enter the preflight: every changed, deleted, renamed
+# or untracked path that the policy classifies as secret-like. Names travel
+# NUL-delimited (-z: no C-quoting) through private temp files, never through a shell
+# variable, so the policy classifies exactly the bytes git will match.
+names="$(mktemp "$STATE_DIR/.names.XXXXXX")"
+pairs="$(mktemp "$STATE_DIR/.pairs.XXXXXX")"
+excluded_z="$(mktemp "$STATE_DIR/.excluded.XXXXXX")"
+display="$(mktemp "$STATE_DIR/.display.XXXXXX")"
+after="$(mktemp "$STATE_DIR/.after.XXXXXX")"
+trap 'rm -f -- "$names" "$pairs" "$excluded_z" "$display" "$after"' EXIT
+if [[ "$head_sha" != "(no commits)" ]]; then
+  gd --name-only -z HEAD >> "$names" || true
+  # The only rename-detecting diff (-M after gd's --no-renames): pairs whose source
+  # or destination is secret-like get both sides excluded.
+  gd -M --name-status -z HEAD >> "$pairs" || true
+  if [[ -n "$base" ]]; then
+    gd --name-only -z "$base...HEAD" >> "$names" || true
+    gd -M --name-status -z "$base...HEAD" >> "$pairs" || true
   fi
-  g ls-files --others --exclude-standard || true
-} | sort -u | python3 -I "$POLICY" classify)"
+fi
+g ls-files --others --exclude-standard -z >> "$names" || true
+python3 -I "$POLICY" classify -z --renames "$pairs" --display "$display" < "$names" > "$excluded_z" ||
+  die "could not classify the changed paths for the preflight"
 exclude_spec=()
-while IFS= read -r path; do
-  [[ -n "$path" ]] || continue
-  exclude_spec+=(":(exclude,literal)$path")
-done <<< "$excluded"
+while IFS= read -r -d '' path; do exclude_spec+=(":(exclude,literal)$path"); done < "$excluded_z"
+# Prove the exclusion applied: the same name diffs, with the pathspecs, may list no
+# excluded or otherwise secret-like path.
+if [[ "$head_sha" != "(no commits)" ]]; then
+  gd --name-only -z HEAD -- "${exclude_spec[@]}" >> "$after" || true
+  if [[ -n "$base" ]]; then
+    gd --name-only -z "$base...HEAD" -- "${exclude_spec[@]}" >> "$after" || true
+  fi
+fi
+python3 -I "$POLICY" check-excluded "$excluded_z" "$after" >&2 ||
+  die "an excluded path still reaches the preflight diff"
 
 set +e +o pipefail   # a repository without commits or without a base must still produce a preflight
 {
@@ -206,46 +269,50 @@ set +e +o pipefail   # a repository without commits or without a base must still
   echo "- HEAD: $head_sha"
   echo "- Upstream: ${upstream:-(none)}"
   echo "- Base for branch delta: ${base:-(none found)} ${ahead_behind:+($ahead_behind)}"
-  if [[ -n "$excluded" ]]; then
+  if [[ -s "$display" ]]; then
     echo
     echo "## Excluded from this preflight (secret-like paths; names only)"
     echo '```'
-    printf '%s\n' "$excluded"
+    cat "$display"
     echo '```'
   fi
   echo
   echo "## git status --short"
   echo '```'
-  g status --short --untracked-files=normal | capped "$STATUS_MAX_BYTES"
+  g status --short --untracked-files=normal --ignore-submodules=dirty | capped "$STATUS_MAX_BYTES"
   echo '```'
   if [[ "$head_sha" != "(no commits)" ]]; then
     echo
     echo "## Uncommitted changes (git diff HEAD --stat / git diff HEAD)"
     echo '```'
-    g diff HEAD --stat -- "${exclude_spec[@]}" | capped "$STAT_MAX_BYTES"
+    gd HEAD --stat -- "${exclude_spec[@]}" | capped "$STAT_MAX_BYTES"
     echo '```'
     echo '```diff'
-    g diff HEAD -- "${exclude_spec[@]}" | capped "$DIFF_MAX_BYTES"
+    gd HEAD -- "${exclude_spec[@]}" | capped "$DIFF_MAX_BYTES"
     echo '```'
     echo
     echo "## Recent commits (git log --oneline -15)"
     echo '```'
-    g log --oneline -15 | capped "$LOG_MAX_BYTES"
+    g log --no-show-signature --no-color --oneline -15 | capped "$LOG_MAX_BYTES"
     echo '```'
   fi
   if [[ -n "$base" ]]; then
     echo
     echo "## Branch delta vs $base (merge-base...HEAD)"
     echo '```'
-    g diff --stat "$base...HEAD" -- "${exclude_spec[@]}" | capped "$STAT_MAX_BYTES"
+    gd --stat "$base...HEAD" -- "${exclude_spec[@]}" | capped "$STAT_MAX_BYTES"
     echo '```'
     echo '```diff'
-    g diff "$base...HEAD" -- "${exclude_spec[@]}" | capped "$DIFF_MAX_BYTES"
+    gd "$base...HEAD" -- "${exclude_spec[@]}" | capped "$DIFF_MAX_BYTES"
     echo '```'
   fi
 } > "$PREFLIGHT_FILE"
 set -e -o pipefail
 chmod 600 "$PREFLIGHT_FILE"
+excluded_note=""
+if [[ -s "$display" ]]; then excluded_note=", secret-like paths excluded"; fi
+rm -f -- "$names" "$pairs" "$excluded_z" "$display" "$after"
+trap - EXIT
 preflight_bytes="$(wc -c < "$PREFLIGHT_FILE")"
 (( preflight_bytes <= PREFLIGHT_MAX_BYTES )) ||
   die "preflight is $preflight_bytes bytes (> $PREFLIGHT_MAX_BYTES); the uncommitted or branch diff is too large for one prompt"
@@ -322,7 +389,7 @@ Note  : every model request sends the selected code context (and the preflight
         below) to OpenCode's remote inference service. The published terms for
         this model state zero retention and no training; it is still a remote
         transmission of your code.
-Preflight: $PREFLIGHT_FILE ($preflight_bytes bytes${excluded:+, secret-like paths excluded})
+Preflight: $PREFLIGHT_FILE ($preflight_bytes bytes$excluded_note)
 ============================================================
 
 EOF

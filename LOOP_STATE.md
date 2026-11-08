@@ -137,12 +137,19 @@ is the permanent human opt-out and is never removed by automation.
 8. **oauto (read-only OpenCode reviewer launcher) — installed, PR #58 pending.** The
    launcher, its policy module, tests and docs live under `launchers/` on branch
    `claude/oauto-opencode-reviewer` (ADR 0002). Validated on the device against
-   OpenCode 2.2.6 with disposable fixture repositories (see the 2026-11-07
-   `handoffs/loop-build.md` entry for the full record). Physically pending: one
-   `oauto <repo>` run from a real Termux shell (the hop cannot be exercised from
-   inside the Debian PRoot session), the PR merge, and an owner decision on
-   listing `oauto` in `DEVELOPMENT_RULES_FULL` §7. Any OpenCode upgrade re-opens
-   validation: the launcher refuses every version other than 2.2.6.
+   OpenCode 2.2.6 with disposable fixture repositories (see the 2026-11-08
+   `handoffs/loop-build.md` entries for the full record). Codex's first review
+   (commit `d17f3a1`) found three P1s in the git preflight — repository-configured
+   textconv/external-diff helpers executed, special-character filenames escaped
+   the secret exclusion, rename detection hid a renamed secret's source — all
+   fixed on the PR branch with regression tests and recorded in the 2026-11-08
+   "Codex P1 round" entry; the Codex re-review of the fixed head and the Codex
+   Gate result are recorded in `agent-memory/automation-core/cc-latest.md`.
+   Physically pending: one `oauto <repo>` run from a real Termux shell (the hop
+   cannot be exercised from inside the Debian PRoot session), the PR merge, and
+   an owner decision on listing `oauto` in `DEVELOPMENT_RULES_FULL` §7. Any
+   OpenCode upgrade re-opens validation: the launcher refuses every version
+   other than 2.2.6.
 
 Older items below are history. If they conflict with this section, treat them as HISTORICAL or SUPERSEDED and follow this section.
 
@@ -273,6 +280,9 @@ read-only OpenCode reviewer: OpenCode 2.2.6 pinned to `opencode/glm-5.3-flash-fr
 tool, provider, model, plugin, MCP server and external directory denied by
 `permissions` + `policies` in a private per-launch config directory, verified
 before every launch with OpenCode's own diagnostics, one session per repository.
+Its git preflight runs no repository-configured helper (no textconv, external
+diff, clean/smudge filter, fsmonitor, gpg or hook; `--work-tree` pinned) and
+excludes secret-like paths by exact bytes, renames included.
 Install/refresh with `bash launchers/oauto/install.sh`; contract in
 `docs/adr/0002-oauto-read-only-opencode-reviewer.md`.
 

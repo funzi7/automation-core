@@ -6,7 +6,8 @@
 #   models --standalone            -> approved ids + EXTRA_MODELS minus disabled
 #   debug config --standalone      -> [{document}, {directory}]
 #   debug agents --standalone      -> resolved agents with model {id, providerID}
-#   --standalone --prompt <text>   -> records argv/env/prompt to LAUNCH_LOG
+#   --standalone --prompt <text>   -> records argv/env/prompt to LAUNCH_LOG, and the
+#                                     whole --prompt argument to PROMPT_FILE when set
 # oauto-run scrubs the environment before calling the binary, so the test controls
 # live in $HOME/.fake-opencode-control (KEY=VALUE lines); HOME always passes through.
 set -euo pipefail
@@ -19,6 +20,7 @@ control() { # KEY -> value or empty
 VERSION="$(control VERSION)"
 EXTRA_MODELS="$(control EXTRA_MODELS)"
 LAUNCH_LOG="$(control LAUNCH_LOG)"
+PROMPT_FILE="$(control PROMPT_FILE)"
 
 case "${1:-}" in
   --version)
@@ -82,6 +84,7 @@ EOF
       echo "PROMPT_BYTES ${#3}"
       echo "PROMPT_HEAD ${3:0:400}"
     } > "$log"
+    if [[ -n "$PROMPT_FILE" ]]; then printf '%s' "$3" > "$PROMPT_FILE"; fi
     ;;
   *)
     echo "fake-opencode: unsupported invocation: $*" >&2

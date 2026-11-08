@@ -8,6 +8,10 @@ Subcommands
   scan            Walk a repository once: report secret-like files, symlinks that
                   leave it, and credential-looking content in known config files.
   classify        Read paths on stdin; print the ones the reviewer may never read.
+                  With -z: NUL-delimited, bytes-exact, rename pairs (--renames) and a
+                  C-quoted listing (--display); the form the launcher uses.
+  check-excluded  Fail if a path the preflight still diffs was excluded or is
+                  secret-like (proves the exclusion pathspecs applied).
   verify-sources  Read ``opencode debug config`` JSON on stdin; fail unless the only
                   configuration sources are the oauto-owned config directory and file.
   verify-agents   Read ``opencode debug agents`` JSON on stdin; fail unless every agent
@@ -330,6 +334,133 @@ def is_sensitive_path(relpath: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Bytes-exact classification for the launcher's git preflight. Paths arrive
+# NUL-delimited exactly as git stores them (no C-quoting, any byte but NUL), are
+# decoded only to be matched, and leave as the same bytes, so the launcher's
+# :(exclude,literal) pathspecs name exactly what git diffs.
+# ---------------------------------------------------------------------------
+
+# git's C-style quoting (quote.c with core.quotePath=true).
+_CQ_ESCAPES = {0x07: "\\a", 0x08: "\\b", 0x09: "\\t", 0x0A: "\\n", 0x0B: "\\v", 0x0C: "\\f",
+               0x0D: "\\r", 0x22: '\\"', 0x5C: "\\\\"}
+# `git diff --name-status` status letters; R and C carry a score and two paths.
+_NAME_STATUS_SINGLE = re.compile(rb"[ADMTUX][0-9]*")
+_NAME_STATUS_PAIR = re.compile(rb"([RC])[0-9]*")
+
+
+def git_quote(path: bytes, always: bool = False) -> str:
+    """Quote a pathname like git with core.quotePath=true: \\a \\b \\t \\n \\v \\f \\r,
+    \\" and \\\\, other control bytes, DEL and bytes >= 0x80 as \\ooo; wrapped in double
+    quotes only when something was escaped (or when ``always``)."""
+    out = []
+    escaped = False
+    for byte in path:
+        if byte in _CQ_ESCAPES:
+            out.append(_CQ_ESCAPES[byte])
+        elif byte < 0x20 or byte >= 0x7F:
+            out.append(f"\\{byte:03o}")
+        else:
+            out.append(chr(byte))
+            continue
+        escaped = True
+    text = "".join(out)
+    return f'"{text}"' if escaped or always else text
+
+
+def _sensitive_bytes(path: bytes) -> bool:
+    return is_sensitive_path(path.decode("utf-8", "surrogateescape"))
+
+
+def _read_bytes(path: str) -> bytes:
+    try:
+        with open(path, "rb") as fh:
+            return fh.read()
+    except OSError as exc:
+        _die(f"cannot read {path}: {exc.strerror}")
+    return b""
+
+
+def _nul_fields(data: bytes, what: str, terminated: bool) -> list[bytes]:
+    """Split NUL-delimited records. An empty record, or a missing final NUL where git
+    always writes one (``terminated``), means truncated or forged input."""
+    if not data:
+        return []
+    if terminated and not data.endswith(b"\0"):
+        _die(f"{what}: last record is not NUL-terminated (truncated input; fail closed)")
+    fields = data.split(b"\0")
+    if fields[-1] == b"":
+        fields.pop()
+    if b"" in fields:
+        _die(f"{what}: empty path or field in NUL-delimited input (fail closed)")
+    return fields
+
+
+def parse_name_status_z(data: bytes) -> tuple[list[bytes], list[tuple[str, bytes, bytes]]]:
+    """Parse concatenated ``git diff --name-status -z -M`` output. Returns every path
+    named and the (kind, source, destination) pairs of R and C records; anything else
+    (unknown status, missing or empty path) fails closed."""
+    fields = _nul_fields(data, "--renames", terminated=True)
+    paths: list[bytes] = []
+    pairs: list[tuple[str, bytes, bytes]] = []
+    i = 0
+    while i < len(fields):
+        status = fields[i]
+        pair = _NAME_STATUS_PAIR.fullmatch(status)
+        if pair:
+            count = 2
+        elif _NAME_STATUS_SINGLE.fullmatch(status):
+            count = 1
+        else:
+            _die(f"--renames: unknown status {git_quote(status)} (fail closed)")
+        record = fields[i + 1:i + 1 + count]
+        if len(record) != count:
+            _die(f"--renames: record {git_quote(status)} is missing a path (fail closed)")
+        paths.extend(record)
+        if pair:
+            pairs.append(("renamed" if pair.group(1) == b"R" else "copied", record[0], record[1]))
+        i += 1 + count
+    return paths, pairs
+
+
+def classify_z(names: bytes, renames: bytes | None, display: str | None) -> None:
+    """stdout: the unique excluded paths, NUL-terminated, sorted by bytes. A rename or
+    copy with a secret-like side excludes BOTH sides: a renamed secret must not
+    reappear under a safe name, and a secret's new name must not reveal what its old
+    (safe-named) source contained."""
+    candidates = _nul_fields(names, "classify -z", terminated=False)
+    pairs: list[tuple[str, bytes, bytes]] = []
+    if renames is not None:
+        named, pairs = parse_name_status_z(renames)
+        candidates += named
+    excluded: dict[bytes, set[str]] = {}
+    for path in candidates:
+        if _sensitive_bytes(path):
+            excluded.setdefault(path, set())
+    for kind, src, dst in pairs:
+        if _sensitive_bytes(src) or _sensitive_bytes(dst):
+            excluded.setdefault(src, set()).add(f"({kind} to {git_quote(dst, always=True)})")
+            excluded.setdefault(dst, set()).add(f"({kind} from {git_quote(src, always=True)})")
+    ordered = sorted(excluded)
+    if display:
+        with open(display, "w", encoding="ascii") as fh:
+            for path in ordered:
+                fh.write(" ".join([git_quote(path), *sorted(excluded[path])]) + "\n")
+    sys.stdout.buffer.write(b"".join(path + b"\0" for path in ordered))
+
+
+def check_excluded(excluded_file: str, remaining_file: str) -> None:
+    """Exit 2 if any path still in the diff (REMAINING, NUL-delimited) was excluded,
+    or is secret-like at all (an incomplete name collection must not pass)."""
+    excluded = set(_nul_fields(_read_bytes(excluded_file), "excluded list", terminated=True))
+    remaining = set(_nul_fields(_read_bytes(remaining_file), "remaining list", terminated=True))
+    leaked = sorted(p for p in remaining if p in excluded or _sensitive_bytes(p))
+    if leaked:
+        _die("excluded or secret-like paths still reach the preflight diff: "
+             + ", ".join(git_quote(p) for p in leaked))
+    print(f"preflight exclusion ok: {len(excluded)} path(s) excluded, {len(remaining)} diffed path(s) checked")
+
+
+# ---------------------------------------------------------------------------
 # Scanner: one walk, no pruning (an explicit grep path bypasses ignore rules)
 # ---------------------------------------------------------------------------
 
@@ -551,7 +682,16 @@ def main(argv: list[str]) -> None:
     p_scan.add_argument("repo")
     p_scan.add_argument("--budget", type=float, default=180.0, help="seconds before the scan gives up (exit 3)")
 
-    sub.add_parser("classify")
+    p_classify = sub.add_parser("classify")
+    p_classify.add_argument("-z", dest="nul", action="store_true",
+                            help="NUL-delimited paths on stdin, bytes-exact; NUL-terminated output")
+    p_classify.add_argument("--renames", metavar="FILE",
+                            help="concatenated `git diff --name-status -z -M` output (needs -z)")
+    p_classify.add_argument("--display", metavar="FILE",
+                            help="write the excluded paths C-quoted, one per line (needs -z)")
+    p_check = sub.add_parser("check-excluded")
+    p_check.add_argument("excluded", help="NUL-delimited excluded paths (classify -z output)")
+    p_check.add_argument("remaining", help="NUL-delimited paths the preflight still diffs")
     sub.add_parser("verify-sources").add_argument("--config-dir", required=True)
     sub.add_parser("verify-agents")
     sub.add_parser("verify-models")
@@ -566,9 +706,17 @@ def main(argv: list[str]) -> None:
     elif args.cmd == "scan":
         sys.exit(scan(args.repo, args.budget))
     elif args.cmd == "classify":
-        for line in sys.stdin.read().splitlines():
-            if line and is_sensitive_path(line):
-                print(line)
+        if args.nul:
+            renames = _read_bytes(args.renames) if args.renames else None
+            classify_z(sys.stdin.buffer.read(), renames, args.display)
+        elif args.renames or args.display:
+            _die("--renames and --display need -z")
+        else:
+            for line in sys.stdin.read().splitlines():
+                if line and is_sensitive_path(line):
+                    print(line)
+    elif args.cmd == "check-excluded":
+        check_excluded(args.excluded, args.remaining)
     elif args.cmd == "verify-sources":
         config_dir = args.config_dir.rstrip("/")
         verify_sources(json.load(sys.stdin), config_dir, os.path.join(config_dir, "opencode.json"))

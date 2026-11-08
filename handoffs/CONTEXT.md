@@ -341,7 +341,16 @@ A1. oauto — read-only OpenCode reviewer launcher (2026-11-07):
   Termux wrapper, tests) are on branch `claude/oauto-opencode-reviewer` (PR #58);
   contract in `docs/adr/0002-oauto-read-only-opencode-reviewer.md`;
 - installed on the device and validated against OpenCode 2.2.6 with disposable
-  fixture repositories; full record in the dated `handoffs/loop-build.md` entry;
+  fixture repositories; full record in the dated `handoffs/loop-build.md` entries;
+- 2026-11-08: Codex's review of the first PR head reported three P1s in the git
+  preflight (external diff/textconv helpers could execute; TAB/newline/non-ASCII
+  filenames escaped the secret exclusion; rename detection hid a renamed
+  secret's source). Fixed on the PR branch — scrubbed, helper-free, `--work-tree`
+  pinned git calls; NUL-delimited bytes-exact classification with a proof step;
+  `--no-renames` plus both-sides exclusion of renamed secrets — with regression
+  tests that reproduced each leak first; ADR 0002 amended (decision item 8). The
+  Codex re-review and Gate state for the fixed head live in
+  `agent-memory/automation-core/cc-latest.md`;
 - physically pending: one `oauto <repo>` run from a real Termux shell, the PR
   merge, and the owner's decision on listing `oauto` in
   `DEVELOPMENT_RULES_FULL` §7. The launcher refuses any OpenCode version other

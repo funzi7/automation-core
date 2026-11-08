@@ -531,6 +531,431 @@ test('oauto-run launches OpenCode standalone with the preflight prompt in a scru
   assert.equal(spawnSync('flock', ['-n', lock, 'true']).status, 0);
 });
 
+// ---------------------------------------------------------------------------
+// The git preflight runs before OpenCode's restrictions apply: no helper program
+// the repository configures may run, pathnames are classified by their exact
+// bytes, and rename detection may not hide a secret-like path.
+// ---------------------------------------------------------------------------
+function readPreflight(sb, repo) {
+  return fs.readFileSync(path.join(stateDir(sb, repo), 'preflight.md'), 'utf8');
+}
+
+// Text from `from` up to (not including) `to`; '' when `from` is absent.
+function sectionOf(text, from, to) {
+  const start = text.indexOf(from);
+  if (start < 0) return '';
+  const end = to ? text.indexOf(to, start + from.length) : -1;
+  return end < 0 ? text.slice(start) : text.slice(start, end);
+}
+
+// Lines of the preflight's "Excluded" block ([] when there is none).
+function excludedLines(preflight) {
+  const m = preflight.match(/## Excluded from this preflight \(secret-like paths; names only\)\n```\n([\s\S]*?)```\n/);
+  return m ? m[1].split('\n').filter(Boolean) : [];
+}
+
+const byteOrder = (a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b));
+const nulJoin = (...items) => Buffer.concat(items.flatMap((x) => [Buffer.from(x), Buffer.from([0])]));
+
+function policyBytes(args, input) {
+  return spawnSync('python3', ['-I', POLICY, ...args], { input });
+}
+
+// Helper programs that only leave a marker behind: any marker means git ran one.
+function probes(sb, names) {
+  const dir = path.join(sb.root, 'markers');
+  fs.mkdirSync(dir, { recursive: true });
+  const scripts = {};
+  for (const name of names) {
+    scripts[name] = path.join(sb.root, `probe-${name}`);
+    fs.writeFileSync(scripts[name], `#!/bin/sh\ntouch '${path.join(dir, name)}'\nexit 0\n`);
+    fs.chmodSync(scripts[name], 0o755);
+  }
+  return {
+    scripts,
+    fired: () => fs.readdirSync(dir).sort(),
+    clear: () => { for (const f of fs.readdirSync(dir)) fs.rmSync(path.join(dir, f)); },
+  };
+}
+
+// An empty commit whose object carries a (synthetic) gpgsig header, so that git log
+// has a signature it could verify.
+function commitWithSignatureHeader(repo, message) {
+  const tree = git(repo, ['rev-parse', 'HEAD^{tree}']).trim();
+  const parent = git(repo, ['rev-parse', 'HEAD']).trim();
+  const who = 'oauto-test <oauto-test@example.invalid> 1700000000 +0000';
+  const object = [`tree ${tree}`, `parent ${parent}`, `author ${who}`, `committer ${who}`,
+    'gpgsig -----BEGIN PGP SIGNATURE-----', ' ', ' iQEzBAABCAAdFiEESYNTHETICSIGNATUREFOROAUTOTESTS', ' =oaut',
+    ' -----END PGP SIGNATURE-----', '', message, ''].join('\n');
+  const sha = git(repo, ['hash-object', '-t', 'commit', '-w', '--stdin'], object).trim();
+  git(repo, ['update-ref', 'refs/heads/main', sha]);
+}
+
+// A settings file long enough for git's rename detection to pair it after one line changed.
+function settings(token) {
+  return ['# service settings', 'HOST=db.internal', 'PORT=5432', 'POOL=8', 'TIMEOUT=30',
+    'RETRIES=3', 'REGION=eu-1', 'LOG=info', `TOKEN=${token}`, ''].join('\n');
+}
+
+test('P1-A: the preflight runs no repository-configured git helper (textconv, external diff, filters, fsmonitor, hooks, gpg)', () => {
+  const sb = sandbox();
+  const p = probes(sb, ['textconv', 'diff-command', 'diff-external', 'env-external-diff', 'filter-clean', 'filter-smudge',
+    'filter-process', 'filter-empty-name', 'filter-from-env', 'filter-in-submodule', 'filter-equals-name', 'fsmonitor', 'gpg',
+    'post-index-change']);
+  const s = p.scripts;
+  const sub = mkRepo(sb, 'helpers-sub', { '.gitattributes': '* filter=subprobe\n', 'lib.txt': 'lib\n' });
+  const repo = mkRepo(sb, 'helpers', {
+    '.gitattributes': '*.txt diff=probe\n*.txt filter=probe\n*.md filter=envprobe\n*.cfg filter=\n*.ini filter=x=y\n',
+    'notes.txt': 'alpha\n', 'other.md': 'one\n', 'app.cfg': 'k=1\n', 'conf.ini': 'a=1\n', 'touched.md': 'same\n',
+  });
+  git(repo, ['-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', sub, 'vendor/lib']);
+  git(repo, ['commit', '-q', '-m', 'add submodule']);
+  commitWithSignatureHeader(repo, 'signed (synthetic) commit');
+  const hooks = path.join(sb.root, 'hooks');
+  fs.mkdirSync(hooks);
+  fs.copyFileSync(s['post-index-change'], path.join(hooks, 'post-index-change'));
+  fs.chmodSync(path.join(hooks, 'post-index-change'), 0o755);
+  const fired = {};
+
+  // Phase 1, the reported finding: a textconv driver selected by the tracked .gitattributes.
+  git(repo, ['config', 'diff.probe.textconv', s.textconv]);
+  fs.writeFileSync(path.join(repo, 'notes.txt'), 'beta\n');
+  p.clear();
+  const r1 = runOauto(sb, repo, ['--check']);
+  fired.textconv = p.fired();
+  const preflight1 = r1.status === 0 ? readPreflight(sb, repo) : '';
+
+  // Phase 2: every other helper the repository config, a submodule's own config or the
+  // caller's environment can select, all at once.
+  for (const [key, value] of [
+    ['diff.probe.command', s['diff-command']], ['diff.external', s['diff-external']],
+    ['filter.probe.clean', s['filter-clean']], ['filter.probe.smudge', s['filter-smudge']],
+    ['filter.probe.process', s['filter-process']], ['filter.probe.required', 'true'],
+    ['core.fsmonitor', s.fsmonitor], ['log.showSignature', 'true'], ['gpg.program', s.gpg],
+    ['core.hooksPath', hooks],
+  ]) git(repo, ['config', key, value]);
+  fs.appendFileSync(path.join(repo, '.git', 'config'), `[filter ""]\n\tclean = ${s['filter-empty-name']}\n`);
+  git(path.join(repo, 'vendor', 'lib'), ['config', 'filter.subprobe.clean', s['filter-in-submodule']]);
+  fs.writeFileSync(path.join(repo, 'other.md'), 'two\n');
+  fs.writeFileSync(path.join(repo, 'app.cfg'), 'k=2\n');
+  const past = new Date('2001-01-01T00:00:00Z');
+  fs.utimesSync(path.join(repo, 'touched.md'), past, past); // stat-only change: git diff rewrites the index
+  fs.utimesSync(path.join(repo, 'vendor', 'lib', 'lib.txt'), past, past); // dirty submodule worktree
+  const callerEnv = {
+    GIT_EXTERNAL_DIFF: s['env-external-diff'],
+    GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'filter.envprobe.clean', GIT_CONFIG_VALUE_0: s['filter-from-env'],
+  };
+  p.clear();
+  const r2 = runOauto(sb, repo, ['--check'], callerEnv);
+  fired.everything = p.fired();
+  const preflight2 = r2.status === 0 ? readPreflight(sb, repo) : '';
+
+  // Phase 3: a driver named "x=y" cannot be addressed by git -c, so it cannot be
+  // neutralised; the launcher must refuse before any diff runs.
+  git(repo, ['config', 'filter.x=y.clean', s['filter-equals-name']]);
+  fs.writeFileSync(path.join(repo, 'conf.ini'), 'a=2\n');
+  p.clear();
+  const r3 = runOauto(sb, repo, ['--check'], callerEnv);
+  fired.equalsName = p.fired();
+
+  assert.deepEqual(fired, { textconv: [], everything: [], equalsName: [] }, 'no helper program may run during the preflight');
+  assert.equal(r1.status, 0, r1.stderr);
+  assert.match(preflight1, /diff --git a\/notes\.txt b\/notes\.txt\n[\s\S]*?-alpha\n\+beta\n/, 'the raw .txt diff must be shown');
+  assert.equal(r2.status, 0, r2.stderr);
+  assert.ok(sectionOf(preflight2, '## git status --short', '## Uncommitted').includes('\n M notes.txt\n'), preflight2);
+  assert.match(preflight2, /diff --git a\/notes\.txt b\/notes\.txt\n[\s\S]*?-alpha\n\+beta\n/);
+  assert.match(preflight2, /diff --git a\/other\.md b\/other\.md\n[\s\S]*?-one\n\+two\n/);
+  assert.match(preflight2, /diff --git a\/app\.cfg b\/app\.cfg\n[\s\S]*?-k=1\n\+k=2\n/);
+  assert.equal(r3.status, 1, `an un-neutralisable filter driver must refuse the launch:\n${r3.stderr}`);
+  assert.match(r3.stderr, /filter driver name contains '='/);
+});
+
+test('P1-B: a deleted tracked secret with a TAB in its name is excluded, without the sensitive-files override', () => {
+  const sb = sandbox();
+  const secret = 'SYNTH-TAB-SECRET-7f3a';
+  const repo = mkRepo(sb, 'tab-name', { 'prod\t.env': `API_TOKEN=${secret}\n`, 'src/a.py': 'x = 1\n' });
+  git(repo, ['rm', '-q', '--', 'prod\t.env']);
+  fs.writeFileSync(path.join(repo, 'src/a.py'), 'x = 2\n');
+  const r = runOauto(sb, repo, ['--check']);
+  assert.equal(r.status, 0, r.stderr);
+  const preflight = readPreflight(sb, repo);
+  assert.ok(!preflight.includes(secret), 'the deleted secret must not reach the preflight');
+  assert.deepEqual(excludedLines(preflight), ['"prod\\t.env"']);
+  assert.match(preflight, /-x = 1\n\+x = 2\n/);
+  assert.match(r.stderr, /secret-like paths excluded/);
+});
+
+test('P1-B: newline, non-ASCII, space, quote, backslash and leading-dash names never leak a deleted or modified secret', () => {
+  const sb = sandbox();
+  const cases = [
+    // [name, synthetic secret, deleted with, as the Excluded block must show it]
+    ['new\nline.env', 'SYNTH-NEWLINE-SECRET-1b2c', 'git rm', '"new\\nline.env"'],
+    ['naïve.env', 'SYNTH-UTF8-SECRET-3d4e', 'rm', '"na\\303\\257ve.env"'],
+    ['with space.env', 'SYNTH-SPACE-SECRET-5f60', 'git rm', 'with space.env'],
+    ['dq"del.env', 'SYNTH-DQUOTE-SECRET-7a8b', 'rm', '"dq\\"del.env"'],
+    ['back\\slash.env', 'SYNTH-BACKSLASH-SECRET-9c0d', 'git rm', '"back\\\\slash.env"'],
+    ['-dash.env', 'SYNTH-DASH-SECRET-e1f2', 'rm', '-dash.env'],
+  ];
+  const files = { 'src/naïve file.py': 'x = 1\n' };
+  for (const [name, secret] of cases) files[name] = `TOKEN=${secret}\n`;
+  const repo = mkRepo(sb, 'special-names', files);
+  for (const [name, , how] of cases) {
+    if (how === 'git rm') git(repo, ['rm', '-q', '--', name]);
+    else fs.rmSync(path.join(repo, name));
+  }
+  fs.writeFileSync(path.join(repo, 'src/naïve file.py'), 'x = 2\n');
+  const promptFile = path.join(sb.root, 'prompt-deleted.txt');
+  fakeControl(sb, { PROMPT_FILE: promptFile });
+  // A full launch (no --check, nothing secret-like left in the worktree), so the test
+  // double records the whole prompt OpenCode would receive.
+  const r = runOauto(sb, repo, []);
+  assert.equal(r.status, 0, r.stderr);
+  const sd = stateDir(sb, repo);
+  const preflight = readPreflight(sb, repo);
+  const prompt = fs.readFileSync(promptFile, 'utf8');
+  const helperErr = fs.readFileSync(path.join(sd, 'last-helper.err'), 'utf8');
+  const leaked = cases.filter(([, secret]) => preflight.includes(secret) || prompt.includes(secret) || helperErr.includes(secret))
+    .map(([name]) => JSON.stringify(name));
+  assert.deepEqual(leaked, [], 'no deleted secret may reach the preflight, the prompt or the helper log');
+  assert.deepEqual(excludedLines(preflight), [...cases].sort((a, b) => byteOrder(a[0], b[0])).map((c) => c[3]));
+  assert.ok(prompt.includes(preflight.trimEnd()), 'the prompt carries the preflight verbatim');
+  // F: a non-sensitive file with a special name keeps its diff.
+  assert.match(preflight, /diff --git "a\/src\/na\\303\\257ve file\.py" "b\/src\/na\\303\\257ve file\.py"\n[\s\S]*?-x = 1\n\+x = 2\n/);
+
+  // A MODIFIED tracked secret stays in the worktree: refused unless overridden, and its
+  // old and new values stay out of the preflight either way.
+  const repo2 = mkRepo(sb, 'quoted-modified', { 'quo"te.env': 'TOKEN=SYNTH-QUOTE-OLD-1a2b\n', 'src/b.py': 'y = 1\n' });
+  fs.writeFileSync(path.join(repo2, 'quo"te.env'), 'TOKEN=SYNTH-QUOTE-NEW-3c4d\n');
+  fs.writeFileSync(path.join(repo2, 'src/b.py'), 'y = 2\n');
+  assert.equal(runOauto(sb, repo2, ['--check']).status, 1, 'a secret-like file in the worktree needs the override');
+  const promptFile2 = path.join(sb.root, 'prompt-modified.txt');
+  fakeControl(sb, { PROMPT_FILE: promptFile2 });
+  const r2 = runOauto(sb, repo2, [], { OAUTO_ALLOW_SENSITIVE_FILES: '1' });
+  assert.equal(r2.status, 0, r2.stderr);
+  const preflight2 = readPreflight(sb, repo2);
+  const prompt2 = fs.readFileSync(promptFile2, 'utf8');
+  for (const secret of ['SYNTH-QUOTE-OLD-1a2b', 'SYNTH-QUOTE-NEW-3c4d']) {
+    assert.ok(!preflight2.includes(secret) && !prompt2.includes(secret), `${secret} must not reach the preflight or prompt`);
+  }
+  assert.deepEqual(excludedLines(preflight2), ['"quo\\"te.env"']);
+  assert.match(preflight2, /-y = 1\n\+y = 2\n/);
+});
+
+test('P1-C: a staged rename never hides a secret-like source or destination (uncommitted changes)', () => {
+  const sb = sandbox();
+  const variants = {
+    // git mv .env safe.txt, then the secret in the destination replaced by a placeholder
+    sanitised: { from: '.env', to: 'safe.txt', secret: 'SYNTH-RENAME-SECRET-a1b2', rewrite: settings('PLACEHOLDER-0000'), env: {} },
+    // git mv .env safe.txt, content unchanged
+    pure: { from: '.env', to: 'safe.txt', secret: 'SYNTH-PURE-SECRET-c3d4', rewrite: null, env: {} },
+    // git mv notes.txt .env: the destination is the secret-like side
+    reverse: { from: 'notes.txt', to: '.env', secret: 'SYNTH-REVERSE-SECRET-e5f6', rewrite: null, env: { OAUTO_ALLOW_SENSITIVE_FILES: '1' } },
+  };
+  const results = {};
+  for (const [label, v] of Object.entries(variants)) {
+    const repo = mkRepo(sb, `mv-${label}`, { [v.from]: settings(v.secret), 'src/a.py': 'x = 1\n' });
+    git(repo, ['mv', v.from, v.to]);
+    if (v.rewrite !== null) fs.writeFileSync(path.join(repo, v.to), v.rewrite);
+    const r = runOauto(sb, repo, ['--check'], v.env);
+    results[label] = { r, preflight: r.status === 0 ? readPreflight(sb, repo) : '' };
+  }
+  const leaked = Object.keys(variants).filter((label) => results[label].preflight.includes(variants[label].secret));
+  assert.deepEqual(leaked, [], 'a rename may not carry a secret into the preflight');
+  for (const [label, { r }] of Object.entries(results)) assert.equal(r.status, 0, `${label}: ${r.stderr}`);
+  for (const label of ['sanitised', 'pure']) {
+    const { preflight } = results[label];
+    assert.ok(!preflight.includes('diff --git a/safe.txt '), `${label}: the renamed destination's hunk must be excluded`);
+    assert.ok(!preflight.includes('PLACEHOLDER-0000'));
+    assert.deepEqual(excludedLines(preflight), ['.env (renamed to "safe.txt")', 'safe.txt (renamed from ".env")'], label);
+  }
+  const { preflight } = results.reverse;
+  assert.ok(!preflight.includes('diff --git a/notes.txt ') && !preflight.includes('diff --git a/.env '));
+  assert.deepEqual(excludedLines(preflight), ['.env (renamed from "notes.txt")', 'notes.txt (renamed to ".env")']);
+  for (const { preflight: text } of Object.values(results)) assert.match(text, /^## Uncommitted changes/m);
+});
+
+test('P1-C: branch-delta renames exclude both sides, and a non-sensitive rename diffs as delete + add', () => {
+  const sb = sandbox();
+  const py = (version) => ['def area(w, h):', '    return w * h', '', 'def perimeter(w, h):', '    return 2 * (w + h)',
+    '', 'def square(s):', '    return area(s, s)', '', `VERSION = "${version}"`, ''].join('\n');
+  const repo = mkRepo(sb, 'branch-rename', {
+    '.env': settings('SYNTH-BRANCH-SECRET-0a1b'),
+    'keys/deploy.pem': 'synthetic test material, not a key\nSYNTH-BRANCH-PEM-2c3d\n',
+    'config/app.env': settings('SYNTH-WORKTREE-SECRET-4e5f'),
+    'a.py': py('1'),
+  });
+  git(repo, ['checkout', '-q', '-b', 'feature']);
+  git(repo, ['mv', '.env', 'settings.txt']);
+  fs.writeFileSync(path.join(repo, 'settings.txt'), settings('PLACEHOLDER-1111')); // sanitised destination
+  git(repo, ['mv', 'keys/deploy.pem', 'keys/deploy.txt']); // pure rename
+  git(repo, ['mv', 'a.py', 'b.py']);
+  fs.writeFileSync(path.join(repo, 'b.py'), py('2'));
+  git(repo, ['add', '-A']);
+  git(repo, ['commit', '-q', '-m', 'move settings']);
+  // The worktree variant on top: an uncommitted, sanitised rename of another secret.
+  git(repo, ['mv', 'config/app.env', 'config/app.txt']);
+  fs.writeFileSync(path.join(repo, 'config/app.txt'), settings('PLACEHOLDER-2222'));
+  const r = runOauto(sb, repo, ['--check']);
+  assert.equal(r.status, 0, r.stderr);
+  const preflight = readPreflight(sb, repo);
+  const secrets = ['SYNTH-BRANCH-SECRET-0a1b', 'SYNTH-BRANCH-PEM-2c3d', 'SYNTH-WORKTREE-SECRET-4e5f'];
+  assert.deepEqual(secrets.filter((x) => preflight.includes(x)), [], 'no secret may reach the preflight');
+  assert.match(preflight, /- Base for branch delta: main \(behind 0, ahead 1\)/);
+  const delta = sectionOf(preflight, '## Branch delta vs main');
+  const uncommitted = sectionOf(preflight, '## Uncommitted changes', '## Recent commits');
+  assert.ok(delta && uncommitted, preflight);
+  for (const p of ['.env', 'settings.txt', 'keys/deploy.pem', 'keys/deploy.txt']) {
+    assert.ok(!delta.includes(`diff --git a/${p} `), `${p} must be excluded from the branch delta`);
+  }
+  for (const p of ['config/app.env', 'config/app.txt']) {
+    assert.ok(!uncommitted.includes(`diff --git a/${p} `), `${p} must be excluded from the uncommitted diff`);
+  }
+  assert.match(delta, /diff --git a\/a\.py b\/a\.py\ndeleted file mode 100644\n/);
+  assert.match(delta, /diff --git a\/b\.py b\/b\.py\nnew file mode 100644\n[\s\S]*?\+VERSION = "2"\n/);
+  assert.ok(!/^(rename|copy) (from|to) |^similarity index /m.test(preflight), 'renames must diff as delete + add');
+  assert.deepEqual(excludedLines(preflight), [
+    '.env (renamed to "settings.txt")',
+    'config/app.env (renamed to "config/app.txt")',
+    'config/app.txt (renamed from "config/app.env")',
+    'keys/deploy.pem (renamed to "keys/deploy.txt")',
+    'keys/deploy.txt (renamed from "keys/deploy.pem")',
+    'settings.txt (renamed from ".env")',
+  ]);
+});
+
+test('F: ordinary changes and non-sensitive special names still reach the preflight', () => {
+  const sb = sandbox();
+  const names = { naive: 'src/naïve file.py', tab: 'docs/tab\tname.md', dash: '-lead.py', plain: 'src/plain.py' };
+  const repo = mkRepo(sb, 'ordinary', { [names.naive]: 'x = 1\n', [names.tab]: 'old\n', [names.dash]: 'p = 1\n', [names.plain]: 'q = 1\n' });
+  writeFiles(repo, { [names.naive]: 'x = 2\n', [names.tab]: 'new\n', [names.dash]: 'p = 2\n', [names.plain]: 'q = 2\n' });
+  const r = runOauto(sb, repo, ['--check']);
+  assert.equal(r.status, 0, r.stderr);
+  const preflight = readPreflight(sb, repo);
+  assert.ok(!preflight.includes('Excluded from this preflight'), preflight);
+  assert.ok(!/secret-like paths excluded/.test(r.stderr));
+  assert.match(preflight, /diff --git "a\/src\/na\\303\\257ve file\.py" "b\/src\/na\\303\\257ve file\.py"\n[\s\S]*?-x = 1\n\+x = 2\n/);
+  assert.match(preflight, /diff --git "a\/docs\/tab\\tname\.md" "b\/docs\/tab\\tname\.md"\n[\s\S]*?-old\n\+new\n/);
+  assert.match(preflight, /diff --git a\/-lead\.py b\/-lead\.py\n[\s\S]*?-p = 1\n\+p = 2\n/);
+  assert.match(preflight, /diff --git a\/src\/plain\.py b\/src\/plain\.py\n[\s\S]*?-q = 1\n\+q = 2\n/);
+});
+
+test('oauto-run diffs the real worktree when .git/config redirects core.worktree, and accepts a linked worktree (.git file)', () => {
+  const sb = sandbox();
+  const repo = mkRepo(sb, 'worktree-redirect', { 'src/a.py': 'x = 1\n', 'README.md': '# readme\n' });
+  fs.writeFileSync(path.join(repo, 'src/a.py'), 'x = 2\n');
+  fs.writeFileSync(path.join(repo, 'real-untracked.md'), 'here\n');
+  // Outside the repository: a same-named tracked file with a marker, and an extra file.
+  const elsewhere = path.join(sb.root, 'elsewhere');
+  writeFiles(elsewhere, { 'src/a.py': 'SYNTH-OUTSIDE-WORKTREE-MARKER-5a6b = 1\n', 'outside-only.txt': 'SYNTH-OUTSIDE-UNTRACKED-7c8d\n' });
+  git(repo, ['config', 'core.worktree', elsewhere]); // last: from here on git itself would look elsewhere
+  const r = runOauto(sb, repo, ['--check']);
+  assert.equal(r.status, 0, r.stderr);
+  const preflight = readPreflight(sb, repo);
+  assert.ok(!preflight.includes('SYNTH-OUTSIDE'), 'content from outside the repository must not reach the preflight');
+  assert.match(preflight, /diff --git a\/src\/a\.py b\/src\/a\.py\n[\s\S]*?-x = 1\n\+x = 2\n/);
+  const status = sectionOf(preflight, '## git status --short', '## Uncommitted');
+  assert.ok(status.includes('\n M src/a.py\n') && status.includes('\n?? real-untracked.md\n'), status);
+  assert.ok(!status.includes('README.md') && !status.includes('outside-only.txt'), `status must describe the real worktree:\n${status}`);
+
+  // A linked worktree: its .git is a file (gitdir: ...), which the launcher accepts.
+  const main = mkRepo(sb, 'linked-main', { 'src/c.py': 'c = 1\n' });
+  const linked = path.join(sb.repos, 'linked-review');
+  git(main, ['worktree', 'add', '-q', '-b', 'review', linked]);
+  assert.ok(fs.statSync(path.join(linked, '.git')).isFile());
+  fs.writeFileSync(path.join(linked, 'src/c.py'), 'c = 2\n');
+  const r2 = runOauto(sb, linked, ['--check']);
+  assert.equal(r2.status, 0, r2.stderr);
+  const preflight2 = readPreflight(sb, linked);
+  assert.match(preflight2, /- Branch: review\n/);
+  assert.match(preflight2, /-c = 1\n\+c = 2\n/);
+});
+
+test('the preflight carries no ANSI colour even when the repository config forces it', () => {
+  const sb = sandbox();
+  const repo = mkRepo(sb, 'forced-colour', { 'src/a.py': 'x = 1\n' });
+  git(repo, ['checkout', '-q', '-b', 'feature']);
+  writeFiles(repo, { 'src/b.py': 'y = 1\n' });
+  git(repo, ['add', '-A']);
+  git(repo, ['commit', '-q', '-m', 'add b']);
+  fs.writeFileSync(path.join(repo, 'src/a.py'), 'x = 2\n');
+  fs.writeFileSync(path.join(repo, 'untracked.md'), 'u\n');
+  for (const [key, value] of [['color.ui', 'always'], ['color.diff', 'always'], ['color.status', 'always'],
+    ['color.decorate', 'always'], ['log.decorate', 'short']]) git(repo, ['config', key, value]);
+  const r = runOauto(sb, repo, ['--check']);
+  assert.equal(r.status, 0, r.stderr);
+  const raw = fs.readFileSync(path.join(stateDir(sb, repo), 'preflight.md'));
+  assert.equal(raw.indexOf(0x1b), -1, 'no ESC byte may reach the preflight');
+  const preflight = raw.toString('utf8');
+  assert.match(sectionOf(preflight, '## Uncommitted changes', '## Recent commits'), /diff --git a\/src\/a\.py b\/src\/a\.py\n[\s\S]*?-x = 1\n\+x = 2\n/);
+  assert.match(sectionOf(preflight, '## Branch delta vs main'), /diff --git a\/src\/b\.py b\/src\/b\.py\nnew file mode 100644\n[\s\S]*?\+y = 1\n/);
+  assert.ok(sectionOf(preflight, '## git status --short', '## Uncommitted').includes('\n M src/a.py\n'));
+  assert.match(sectionOf(preflight, '## Recent commits', '## Branch delta'), /\n[0-9a-f]{7,} \(HEAD -> feature\) add b\n/);
+});
+
+test('classify -z and check-excluded: byte-exact NUL interface, rename/copy pairs, git-style quoting, fail closed', () => {
+  const sb = sandbox();
+  const pairs = path.join(sb.root, 'pairs');
+  const display = path.join(sb.root, 'display');
+  const latin1 = Buffer.from('b\xe9.env', 'latin1'); // not valid UTF-8: matched via surrogateescape, emitted as is
+  fs.writeFileSync(pairs, nulJoin('M', 'src/a.py', 'R087', '.env', 'safe.txt', 'R100', 'old.py', 'new.py',
+    'C075', 'tpl.txt', 'x.pem', 'D', 'gone.env'));
+  const names = nulJoin('src/a.py', 'prod\t.env', latin1, 'safe.txt', '.env', '.env', 'notes/README.md', 'new\nline.env', '-dash.env');
+  const r = policyBytes(['classify', '-z', '--renames', pairs, '--display', display], names);
+  assert.equal(r.status, 0, r.stderr.toString());
+  assert.deepEqual(r.stdout, nulJoin('-dash.env', '.env', latin1, 'gone.env', 'new\nline.env', 'prod\t.env', 'safe.txt', 'tpl.txt', 'x.pem'));
+  assert.equal(fs.readFileSync(display, 'utf8'), [
+    '-dash.env',
+    '.env (renamed to "safe.txt")',
+    '"b\\351.env"',
+    'gone.env',
+    '"new\\nline.env"',
+    '"prod\\t.env"',
+    'safe.txt (renamed from ".env")',
+    'tpl.txt (copied to "x.pem")',
+    'x.pem (copied from "tpl.txt")',
+    '',
+  ].join('\n'));
+  // git's quoting table: \a \b \t \n \v \f \r, \" and \\, octal for other control bytes, DEL and >= 0x80.
+  const quoted = policyBytes(['classify', '-z', '--display', display], nulJoin(Buffer.from('q\x07\x08\x0b\x0c\x0d\x01\x7f"\\.env', 'latin1')));
+  assert.equal(quoted.status, 0, quoted.stderr.toString());
+  assert.equal(fs.readFileSync(display, 'utf8'), '"q\\a\\b\\v\\f\\r\\001\\177\\"\\\\.env"\n');
+
+  // Anything unparsable fails closed (exit 2, a reason, no output).
+  const refuse = (label, renames, input, reason) => {
+    fs.writeFileSync(pairs, renames);
+    const res = policyBytes(['classify', '-z', '--renames', pairs, '--display', display], input);
+    assert.equal(res.status, 2, `${label} must fail closed`);
+    assert.match(res.stderr.toString(), reason, label);
+    assert.equal(res.stdout.length, 0, `${label}: nothing may be printed`);
+  };
+  refuse('unknown status letter', nulJoin('Z', 'a.py'), nulJoin('a.py'), /unknown status/);
+  refuse('rename without destination', nulJoin('R100', 'only-source'), nulJoin('a.py'), /missing a path/);
+  refuse('empty path in --renames', nulJoin('M', ''), nulJoin('a.py'), /empty/);
+  refuse('unterminated --renames', Buffer.from('M\0a.py'), nulJoin('a.py'), /not NUL-terminated/);
+  refuse('empty path on stdin', Buffer.alloc(0), Buffer.from('a.py\0\0b.env\0'), /empty/);
+  assert.equal(policy(['classify', '--display', display], 'x.env\n').status, 2, '--display needs -z');
+
+  // check-excluded proves that no excluded (or otherwise secret-like) path is still diffed.
+  const ex = path.join(sb.root, 'excluded');
+  const rem = path.join(sb.root, 'remaining');
+  fs.writeFileSync(ex, nulJoin('.env', 'safe.txt', 'prod\t.env'));
+  const check = (remaining) => {
+    fs.writeFileSync(rem, remaining);
+    return policyBytes(['check-excluded', ex, rem]);
+  };
+  assert.equal(check(nulJoin('src/a.py', 'README.md')).status, 0);
+  assert.equal(check(Buffer.alloc(0)).status, 0);
+  let c = check(nulJoin('src/a.py', 'safe.txt'));
+  assert.equal(c.status, 2);
+  assert.match(c.stderr.toString(), /safe\.txt/);
+  c = check(nulJoin('prod\t.env'));
+  assert.equal(c.status, 2);
+  assert.match(c.stderr.toString(), /"prod\\t\.env"/, 'names are reported C-quoted, never raw');
+  c = check(nulJoin('stray.pem'));
+  assert.equal(c.status, 2, 'a secret-like path that was never excluded is refused too');
+  assert.match(c.stderr.toString(), /stray\.pem/);
+});
+
 test('oauto-run source: no automatic approval, standalone helpers, bounded helper calls', () => {
   const src = fs.readFileSync(RUN, 'utf8');
   const code = src.split('\n').filter((line) => !/^\s*#/.test(line)).join('\n');
@@ -541,8 +966,35 @@ test('oauto-run source: no automatic approval, standalone helpers, bounded helpe
     assert.match(code, helper);
   }
   assert.ok(!/timeout \d+ oc /.test(code), 'timeout must wrap the binary inside oc(), not the function');
-  assert.match(code, /GIT_OPTIONAL_LOCKS=0 timeout 120 git/);
   assert.match(code, /exec env -i "\$\{clean_env\[@\]\}" "\$OPENCODE_BIN" --standalone --prompt/);
+
+  // Preflight git: scrubbed, time-bounded, helper-free. g() is the only git entry point
+  // besides the filter-driver enumeration; every diff goes through gd().
+  const lines = code.split('\n');
+  const gDef = lines.find((l) => /^g\(\) +\{/.test(l));
+  assert.match(gDef || '', /^g\(\) +\{ timeout 120 env -i "\$\{git_env\[@\]\}" git -C "\$REPO" --work-tree="\$REPO" "\$\{git_cfg\[@\]\}" "\$\{filter_cfg\[@\]\}" --no-pager "\$@" 2>\/dev\/null; \}$/);
+  assert.match(code, /^git_env=\([^)]*\bGIT_OPTIONAL_LOCKS=0\b[^)]*\)/m);
+  for (const opt of ['core.fsmonitor=false', 'core.hooksPath=/dev/null', 'log.showSignature=false', 'core.pager=cat', 'color.ui=never',
+    'color.diff=never', 'color.status=never', 'color.decorate=never', 'submodule.recurse=false']) {
+    assert.match(code, new RegExp(`^git_cfg=\\([^)]*-c ${opt.replace(/[.]/g, '\\.')}(\\s|\\))`, 'm'), `git_cfg must carry -c ${opt}`);
+  }
+  assert.ok(code.includes('timeout 120 env -i "${git_env[@]}" git -C "$REPO" --work-tree="$REPO" config -z --get-regexp \'^filter\\..*\\.(clean|smudge|process|required)$\''),
+    'filter drivers are enumerated with the same scrubbed environment');
+  assert.equal(code.match(/\bgit -C\b/g).length, 2, 'no git call may bypass g()');
+  const gdDef = lines.find((l) => /^gd\(\) \{/.test(l)) || '';
+  for (const flag of [' g diff ', '--no-ext-diff', '--no-textconv', '--no-renames', '--no-relative', '--no-color', '--submodule=short', '--ignore-submodules=dirty']) {
+    assert.ok(gdDef.includes(flag), `gd() must carry ${flag}`);
+  }
+  assert.equal(code.match(/\bg diff\b/g).length, 1, 'every diff goes through gd()');
+  const renameLines = lines.filter((l) => /(^|\s)-M(\s|$)/.test(l));
+  assert.equal(renameLines.length, 2, 'only the rename-pair passes re-enable renames');
+  for (const l of renameLines) assert.match(l, /\bgd -M --name-status -z /);
+  assert.equal(code.match(/\bg log\b/g).length, 1);
+  assert.match(code, /\bg log --no-show-signature --no-color --oneline -15\b/);
+  assert.match(code, /\bg status --short --untracked-files=normal --ignore-submodules=dirty\b/);
+  assert.match(code, /python3 -I "\$POLICY" classify -z --renames "\$pairs" --display "\$display" < "\$names" > "\$excluded_z" \|\|\s*die /);
+  assert.match(code, /python3 -I "\$POLICY" check-excluded "\$excluded_z" "\$after" >&2 \|\|\s*die /);
+  assert.ok(!/<<< "\$excluded"/.test(code), 'excluded paths never travel through a shell variable');
 });
 
 // ---------------------------------------------------------------------------
