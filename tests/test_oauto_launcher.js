@@ -1636,6 +1636,93 @@ test('P1-J: a renamed include target: the old name is excluded, and the rename p
     'review-config.txt (included Git config) (renamed to "notes.txt")']);
 });
 
+// ---------------------------------------------------------------------------
+// Round 9: a chain of included Git configs deleted from the worktree. A missing file
+// cannot be read, so its includes are taken from its last committed content.
+// ---------------------------------------------------------------------------
+function chainRepo(sb, name, files, rootInclude) {
+  const repo = mkRepo(sb, name, { 'src/a.py': 'x = 1\n', ...files });
+  fs.appendFileSync(path.join(repo, '.git', 'config'), `[include]\n\tpath = ${rootInclude}\n`);
+  return repo;
+}
+
+test('P1-K: a chain of included Git configs deleted from the worktree is followed through their last committed content', () => {
+  const sb = sandbox();
+  const token = 'S-CHAIN-SYNTH-8c9c';
+  const repo = chainRepo(sb, 'chain-deleted', {
+    'conf/a.cfg': '[include]\n\tpath = b.cfg\n',
+    'conf/b.cfg': includedConfigText(token),
+  }, '../conf/a.cfg');
+  fs.rmSync(path.join(repo, 'conf'), { recursive: true });
+  const { r, preflight, prompt } = launchRecordingPrompt(sb, repo); // no override: nothing secret-like is present
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(!preflight.includes(token) && !prompt.includes(token), 'the second hop of the deleted chain must not reach the preflight or the prompt');
+  assert.deepEqual(excludedLines(preflight), ['conf/a.cfg (included Git config)', 'conf/b.cfg (included Git config)']);
+});
+
+test('P1-K: a deleted chain committed on a branch, a three-hop chain, an outside hop and odd names', () => {
+  const sb = sandbox();
+  const outcome = {};
+  const record = (label, repo, tokens, env = {}) => {
+    const { r, preflight, prompt } = launchRecordingPrompt(sb, repo, env);
+    const leaked = tokens.some((token) => preflight.includes(token) || prompt.includes(token));
+    outcome[label] = { status: r.status, leaked, excluded: excludedLines(preflight), stderr: r.stderr };
+  };
+  // The chain deleted in a commit on feature (base main): only the merge base still has it.
+  const branch = chainRepo(sb, 'chain-branch', { 'conf/a.cfg': '[include]\n\tpath = b.cfg\n', 'conf/b.cfg': includedConfigText('S-CHAIN-BRANCH-1b9b') }, '../conf/a.cfg');
+  git(branch, ['checkout', '-q', '-b', 'feature']);
+  git(branch, ['rm', '-q', '-r', 'conf']);
+  git(branch, ['commit', '-q', '-m', 'drop the review configs']);
+  record('branch', branch, ['S-CHAIN-BRANCH-1b9b']);
+  // Three hops, all deleted.
+  const three = chainRepo(sb, 'chain-three', { 'conf/a.cfg': '[include]\n\tpath = b.cfg\n', 'conf/b.cfg': '[include]\n\tpath = ../deep/c.cfg\n',
+    'deep/c.cfg': includedConfigText('S-CHAIN-THREE-2c9c') }, '../conf/a.cfg');
+  fs.rmSync(path.join(three, 'conf'), { recursive: true });
+  fs.rmSync(path.join(three, 'deep'), { recursive: true });
+  record('three', three, ['S-CHAIN-THREE-2c9c']);
+  // The second hop points outside the repository: ignored.
+  const outsideCfg = path.join(sb.root, 'outside.cfg');
+  fs.writeFileSync(outsideCfg, includedConfigText('S-CHAIN-OUTSIDE-3d9d'));
+  const outside = chainRepo(sb, 'chain-outside', { 'conf/a.cfg': `[include]\n\tpath = ${outsideCfg}\n` }, '../conf/a.cfg');
+  fs.rmSync(path.join(outside, 'conf'), { recursive: true });
+  record('outside', outside, ['S-CHAIN-OUTSIDE-3d9d']);
+  // Hops named with a colon and with a leading dash, both deleted.
+  const odd = chainRepo(sb, 'chain-odd', { 'conf/a.cfg': '[include]\n\tpath = ../x:y.cfg\n\tpath = ../-lead.cfg\n',
+    'x:y.cfg': includedConfigText('S-CHAIN-COLON-4e9e'), '-lead.cfg': includedConfigText('S-CHAIN-DASH-5f9f') }, '../conf/a.cfg');
+  for (const f of ['conf/a.cfg', 'x:y.cfg', '-lead.cfg']) fs.rmSync(path.join(odd, f));
+  record('odd', odd, ['S-CHAIN-COLON-4e9e', 'S-CHAIN-DASH-5f9f']);
+  // The include line removed from a present a.cfg while its target b.cfg is deleted:
+  // a.cfg's committed content still names b.cfg (a.cfg itself needs the override).
+  const unlinked = chainRepo(sb, 'chain-unlinked', { 'conf/a.cfg': '[include]\n\tpath = b.cfg\n[k]\n\tv = 1\n',
+    'conf/b.cfg': includedConfigText('S-CHAIN-UNLINKED-6a9a') }, '../conf/a.cfg');
+  fs.writeFileSync(path.join(unlinked, 'conf/a.cfg'), '[k]\n\tv = 2\n');
+  fs.rmSync(path.join(unlinked, 'conf/b.cfg'));
+  record('unlinked', unlinked, ['S-CHAIN-UNLINKED-6a9a'], { OAUTO_ALLOW_SENSITIVE_FILES: '1' });
+  // An include of a path that never existed: no history to read, no failure.
+  const never = chainRepo(sb, 'chain-never', {}, '../never-existed.cfg');
+  record('never', never, ['S-NEVER']);
+
+  const brief = Object.fromEntries(Object.entries(outcome).map(([k, v]) => [k, { status: v.status, leaked: v.leaked, excluded: v.excluded }]));
+  assert.deepEqual(brief, {
+    branch: { status: 0, leaked: false, excluded: ['conf/a.cfg (included Git config)', 'conf/b.cfg (included Git config)'] },
+    three: { status: 0, leaked: false, excluded: ['conf/a.cfg (included Git config)', 'conf/b.cfg (included Git config)', 'deep/c.cfg (included Git config)'] },
+    outside: { status: 0, leaked: false, excluded: ['conf/a.cfg (included Git config)'] },
+    odd: { status: 0, leaked: false, excluded: ['-lead.cfg (included Git config)', 'conf/a.cfg (included Git config)', 'x:y.cfg (included Git config)'] },
+    unlinked: { status: 0, leaked: false, excluded: ['conf/a.cfg (included Git config)', 'conf/b.cfg (included Git config)'] },
+    never: { status: 0, leaked: false, excluded: [] },
+  }, Object.entries(outcome).map(([k, v]) => `${k}: ${v.stderr}`).join('\n'));
+});
+
+test('includes-in-config: targets of a Git config read from stdin, resolved like git, inside the repository only', () => {
+  const sb = sandbox();
+  const repo = mkRepo(sb, 'includes-in-config', { 'src/a.py': 'x = 1\n' }, { commit: false });
+  const text = '﻿[include]\n\tpath = b.cfg ; a comment \\\n\tpath = ../top.cfg\n[includeIf "onbranch:x"]\n\tpath = "sub dir/c.cfg"\n'
+    + '[include]\n\tpath = ../../outside.cfg\n\tpath = ../.git/config\n\tpath = b.cfg\n';
+  const r = spawnSync('python3', ['-I', POLICY, 'includes-in-config', `--repo=${repo}`, '--config-path=conf/a.cfg'], { input: text });
+  assert.equal(r.status, 0, r.stderr.toString());
+  assert.deepEqual(r.stdout, nulJoin('conf/b.cfg', 'top.cfg', 'conf/sub dir/c.cfg'));
+});
+
 test('F: ordinary changes and non-sensitive special names still reach the preflight', () => {
   const sb = sandbox();
   const names = { naive: 'src/naïve file.py', tab: 'docs/tab\tname.md', dash: '-lead.py', plain: 'src/plain.py' };
@@ -1836,7 +1923,14 @@ test('oauto-run source: no automatic approval, standalone helpers, bounded helpe
   const scanLine = lines.findIndex((l) => l.includes('python3 -I "$POLICY" scan "$REPO"'));
   assert.ok(gLine >= 0 && scanLine > gLine, 'the git helpers are defined before the scan');
   assert.match(code, /g config --list --show-origin -z > "\$origins_z" \|\| die "git configuration cannot be listed \(fail closed\)"/);
-  assert.match(code, /scan "\$REPO" --budget "\$SCAN_BUDGET" --included-out "\$included_z" --config-origins "\$origins_z"/);
+  assert.match(code, /scan "\$REPO" --budget "\$SCAN_BUDGET" --included-out "\$included_z" --config-origins "\$origins_z" --missing-out "\$missing_z"/);
+  // Missing include targets are followed through their committed content (HEAD and the
+  // merge base); a missing blob is a skip, a parser failure is fatal; the deny rules are
+  // built only after every hop is known.
+  assert.match(code, /^\s*g cat-file blob "\$rev:\$path" > "\$blob_tmp" \|\| continue$/m);
+  assert.equal((code.match(/includes-in-config --repo="\$REPO" --config-path="\$path" < "[^"]+" >> "\$hops_z" \|\|\n\s*die "/g) || []).length, 2);
+  assert.ok(lines.findIndex((l) => l.startsWith('deny_read_args=()')) > lines.findIndex((l) => l.startsWith('hop_index=0')),
+    'the deny rules cover the hops found through history');
   // Content-checked files (gradle.properties ...): every candidate's own diff is checked
   // through gd with a literal pathspec, and anything but "clean" or "found" is fatal.
   const contentLines = lines.filter((l) => l.includes('check-diff-content'));

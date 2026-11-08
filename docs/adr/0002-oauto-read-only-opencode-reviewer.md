@@ -96,7 +96,10 @@ policy, not by the system prompt alone:
    path is registered for exclusion as soon as it is referenced, so a
    referenced file that was deleted (or renamed away) never sends its
    removed contents either, while only an existing one counts as a
-   secret-like file. Included files outside the repository are followed for
+   secret-like file; a missing include's last committed content (at HEAD
+   and at the branch delta's merge base) is read through the hardened git
+   helper and its own includes are followed the same way, so a deleted
+   chain is excluded hop by hop. Included files outside the repository are followed for
    further hops but not themselves checked; they belong to the user. The scan
    reports pathnames C-quoted and ends with a count summary that the
    launcher decides on, so no filename byte can hide a hit.

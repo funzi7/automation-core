@@ -18,6 +18,10 @@ Subcommands
                   added, context or hunk-header text; --checker for a rename/copy
                   partner), 0 when not.
   quote-path      Print NUL-delimited paths from stdin C-quoted like git, one per line.
+  includes-in-config
+                  Read Git config content on stdin (a committed blob of a file the
+                  worktree no longer has); print the in-repository include targets it
+                  names, resolved as git would for --config-path, NUL-terminated.
   verify-sources  Read ``opencode debug config`` JSON on stdin; fail unless the only
                   configuration sources are the oauto-owned config directory and file.
   verify-agents   Read ``opencode debug agents`` JSON on stdin; fail unless every agent
@@ -556,6 +560,24 @@ def config_include_paths(text: str) -> list[str]:
     return paths
 
 
+def includes_in_config(repo: str, config_path: str, data: bytes) -> list[bytes]:
+    """Targets of the include directives in Git config content (``data``), resolved as
+    git would for a file at ``config_path`` (repository-relative, which need not exist):
+    repository-relative, inside the repository and outside .git, deduplicated, in order."""
+    repo = os.path.realpath(repo)
+    git_dir = os.path.join(repo, ".git")
+    base_dir = os.path.dirname(os.path.join(repo, config_path))
+    found: list[bytes] = []
+    for inc in config_include_paths(data.decode("utf-8", "surrogateescape")):
+        canon = os.path.realpath(os.path.join(base_dir, os.path.expanduser(inc)))
+        if not canon.startswith(repo + os.sep) or canon == git_dir or canon.startswith(git_dir + os.sep):
+            continue
+        rel_target = os.fsencode(os.path.relpath(canon, repo).replace(os.sep, "/"))
+        if rel_target not in found:
+            found.append(rel_target)
+    return found
+
+
 def _q(path: str) -> str:
     """A scan pathname, C-quoted like git: ASCII and always one line."""
     return git_quote(os.fsencode(path))
@@ -667,7 +689,7 @@ def check_excluded(excluded_file: str, remaining_file: str) -> None:
 # ---------------------------------------------------------------------------
 
 def scan(repo: str, budget: float, included_out: str | None = None,
-         config_origins: str | None = None) -> int:
+         config_origins: str | None = None, missing_out: str | None = None) -> int:
     """Print one ASCII record per finding (every pathname C-quoted like git) and a final
     SUMMARY line whose counts are what the launcher decides on:
 
@@ -678,7 +700,9 @@ def scan(repo: str, budget: float, included_out: str | None = None,
 
     ``included_out`` receives the in-repository files that a Git config includes, and
     the include targets there that git cannot load (deleted or renamed away):
-    NUL-terminated, repository-relative, sorted."""
+    NUL-terminated, repository-relative, sorted. ``missing_out`` receives the latter
+    alone (include targets missing from the worktree), whose last committed content the
+    launcher reads for further includes."""
     repo = os.path.realpath(repo)
     git_dir = os.path.join(repo, ".git")
     started = time.monotonic()
@@ -795,7 +819,7 @@ def scan(repo: str, budget: float, included_out: str | None = None,
             return
         seen_configs.add(canon)
         try:
-            with open(canon, encoding="utf-8", errors="replace") as fh:
+            with open(canon, encoding="utf-8", errors="surrogateescape") as fh:
                 text = fh.read()
         except OSError:
             return
@@ -948,6 +972,9 @@ def scan(repo: str, budget: float, included_out: str | None = None,
         with open(included_out, "wb") as fh:
             handed_over = included_rels | set(unloadable_includes.values())
             fh.write(b"".join(os.fsencode(r) + b"\0" for r in sorted(handed_over, key=os.fsencode)))
+    if missing_out:
+        with open(missing_out, "wb") as fh:
+            fh.write(b"".join(os.fsencode(r) + b"\0" for r in sorted(unloadable_includes.values(), key=os.fsencode)))
     return 0 if complete else 3
 
 
@@ -1106,6 +1133,8 @@ def main(argv: list[str]) -> None:
     p_scan.add_argument("--budget", type=float, default=180.0, help="seconds before the scan gives up (exit 3)")
     p_scan.add_argument("--config-origins", metavar="FILE",
                         help="git config --list --show-origin -z output: every config file git loaded")
+    p_scan.add_argument("--missing-out", metavar="FILE",
+                        help="write the include targets missing from the worktree, NUL-terminated")
     p_scan.add_argument("--included-out", metavar="FILE",
                         help="write the in-repository files .git/config includes, NUL-terminated")
 
@@ -1128,6 +1157,10 @@ def main(argv: list[str]) -> None:
                        help="CONTENT_CHECKS key to apply (a rename/copy partner's) instead of the one the name selects")
     p_cdc.add_argument("path", help="repository-relative path whose diff is on stdin")
     sub.add_parser("quote-path")
+    p_inc = sub.add_parser("includes-in-config")
+    p_inc.add_argument("--repo", required=True, help="repository root")
+    p_inc.add_argument("--config-path", required=True, metavar="REL",
+                       help="repository-relative path the config content on stdin belongs to")
     sub.add_parser("verify-sources").add_argument("--config-dir", required=True)
     sub.add_parser("verify-agents").add_argument("--deny-read", action="append", default=[], metavar="PATH",
                                                  help="also probe that the reviewers cannot read PATH (repeatable)")
@@ -1145,7 +1178,7 @@ def main(argv: list[str]) -> None:
         json.dump(doc, sys.stdout, indent=2)
         sys.stdout.write("\n")
     elif args.cmd == "scan":
-        sys.exit(scan(args.repo, args.budget, args.included_out, args.config_origins))
+        sys.exit(scan(args.repo, args.budget, args.included_out, args.config_origins, args.missing_out))
     elif args.cmd == "classify":
         if args.nul:
             renames = _read_bytes(args.renames) if args.renames else None
@@ -1162,6 +1195,9 @@ def main(argv: list[str]) -> None:
         check_excluded(args.excluded, args.remaining)
     elif args.cmd == "check-diff-content":
         sys.exit(check_diff_content(args.path, args.checker))
+    elif args.cmd == "includes-in-config":
+        targets = includes_in_config(args.repo, args.config_path, sys.stdin.buffer.read())
+        sys.stdout.buffer.write(b"".join(t + b"\0" for t in targets))
     elif args.cmd == "quote-path":
         for path in _nul_fields(sys.stdin.buffer.read(), "quote-path", terminated=False):
             print(git_quote(path))

@@ -106,7 +106,7 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
 - Device (Phase 5): `bash launchers/oauto/install.sh` refreshed `/root/work/bin/oauto-run` and
   `oauto-policy.py` after each validated state during the round (previous copies kept as
   `*.backup-before-oauto-20261108-120902`, `-132239`, `-134043`, `-140044`, `-144953`, `-152257`,
-  `-154043` and `-160518`; `ai-launch`, the
+  `-154043`, `-160518` and `-163804`; `ai-launch`, the
   Termux `oauto-launch` wrapper and both `.bashrc` blocks were already identical and untouched; the
   original `ai-launch.backup-before-oauto-20261107` still equals the pristine fixture); `install.sh
   --verify` clean; installed copies byte-identical to the tracked ones (device-parity test passes);
@@ -115,7 +115,7 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
   sources/models/agents (GLM and DeepSeek default agents) and printed the banner; fixture, state dir
   and lock removed; no OpenCode process or service left.
 - Final validation at the pushed head: `bash scripts/validate.sh` green (YAML, JSON, sync/mirror parity,
-  JS syntax, `node --test` 191/191 including `tests/test_oauto_launcher.js` 64/64, 59 github-script
+  JS syntax, `node --test` 194/194 including `tests/test_oauto_launcher.js` 67/67, 59 github-script
   bodies, actionlint, `git diff --check`); real-binary battery (scratchpad script, every scenario of
   this entry) passed on the final launcher, and the six live model probes were repeated on it: shell,
   `/etc/hostname`, `.env`, `opencode/big-pickle` and `--agent build` denied as before, probe secret
@@ -133,10 +133,10 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
 - Limitations / risks after this round: classification is by path, so a safe-named file that still
   holds secret text (edited beyond git's 50 % similarity, or copied from an unmodified secret file under
   the `OAUTO_ALLOW_SENSITIVE_FILES=1` override) is shown like any added file; the content-based
-  exception covers only the `CONTENT_CHECKS` basenames, so renaming `gradle.properties` to a name
-  without a check (`gradle.properties.bak`) leaves its added lines reviewable; a hardlink to
-  `.git/config` is not a symlink and is not detected (git cannot ship hardlinks, it takes local
-  action to create one); `git diff` against the
+  exception covers only the `CONTENT_CHECKS` basenames (SUPERSEDED within this entry: the
+  `gradle.properties.bak` rename and hard links to `.git/config` listed here as open at the time
+  were closed by the later rounds recorded below — suffixed copies and rename pairs are checked,
+  hard links to secret-like files or `.git` files are refused); `git diff` against the
   worktree still refreshes stat data in `.git/index` (no content, ref or hook; `GIT_OPTIONAL_LOCKS=0`
   covers `status` only); changes made to the repository during the second of collection are not
   covered; `-l0` makes the pair pass exhaustive, so a change set with thousands of unpaired deletions
@@ -242,6 +242,20 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
   deletion, a deletion committed on the branch and a rename of the target (the exhaustive pair pass
   excludes both names; the new name is an ordinary file until `include.path` is updated, so the
   owner should update the include after renaming such a file); the battery gained the deletion case.
+- Sixth (final) pass of the independent reviewer on that fix: worktree deletion, branch-committed
+  deletion, `git mv`, a deleted directory, `..` and `~` spellings of a missing target all held; the
+  `*/<path>` deny and the shared metacharacter set were confirmed in code; one P2 (CONFIRMED) — a
+  chained include with BOTH files deleted leaked one hop deeper (the missing first file cannot be
+  read, so its include of the second was never found, and git's origin list omits both). Fixed: the
+  launcher fetches a missing include's last committed content (`HEAD:<path>`, and the merge base's
+  copy for the branch delta) through the hardened git helper and feeds it to the parser
+  (`includes-in-config`; `git cat-file blob` plumbing, present includes seeded too so an include line
+  dropped from an existing config while its target is deleted is still traced), repeating over newly
+  found targets (depth 8, deeper fails closed), so a deleted chain is excluded hop by hop. Its P3 — an
+  include through a directory symlink with link and target both deleted — stays a documented
+  limitation (resolving through HEAD's tree is not attempted); likewise an include line removed from
+  `.git/config` itself together with its target cannot be traced (`.git/config` has no history). The
+  stale first-round limitation lines (`.bak` rename, hard links) were marked superseded in this entry.
 - Review and gate state: the fixes were pushed to the PR branch after this entry's commit; the
   exact-head CI result, the Codex re-review of the pushed head (`@codex review`), the resolution of
   every Codex P1/P2 thread and the Codex Gate verdict are recorded on the PR and in agent-memory

@@ -173,13 +173,14 @@ tmp_files=()
 trap 'rm -f -- "${tmp_files[@]}"' EXIT
 included_z="$(mktemp "$STATE_DIR/.included.XXXXXX")"
 origins_z="$(mktemp "$STATE_DIR/.origins.XXXXXX")"
-tmp_files+=("$included_z" "$origins_z")
+missing_z="$(mktemp "$STATE_DIR/.missing.XXXXXX")"
+tmp_files+=("$included_z" "$origins_z" "$missing_z")
 # Git names every configuration file it actually loads (includes followed however they
 # are written); the scan treats each one inside the worktree as Git configuration.
 g config --list --show-origin -z > "$origins_z" || die "git configuration cannot be listed (fail closed)"
 
 scan_status=0
-scan_out="$(python3 -I "$POLICY" scan "$REPO" --budget "$SCAN_BUDGET" --included-out "$included_z" --config-origins "$origins_z")" || scan_status=$?
+scan_out="$(python3 -I "$POLICY" scan "$REPO" --budget "$SCAN_BUDGET" --included-out "$included_z" --config-origins "$origins_z" --missing-out "$missing_z")" || scan_status=$?
 if (( scan_status != 0 )); then
   printf '%s\n' "$scan_out" | tail -3 >&2
   die "worktree scan did not complete within ${SCAN_BUDGET}s (status $scan_status); set OAUTO_SCAN_BUDGET higher for large trees"
@@ -204,15 +205,6 @@ if (( n_sensitive + n_content > 0 )); then
   fi
   note "WARNING: OAUTO_ALLOW_SENSITIVE_FILES=1 set; continuing with the files above exposed to grep"
 fi
-# Worktree files a Git config includes are Git configuration: the rendered config
-# denies reading them by their exact name too.
-# A name holding a glob metacharacter cannot be denied exactly (OpenCode would read it
-# as a pattern), so it is refused outright, override or not.
-deny_read_args=()
-while IFS= read -r -d '' path; do
-  [[ "$path" != *[\*\?\[\{\}\\]* ]] || die "an included Git config path holds a glob metacharacter (* ? [ { } \\) and cannot be denied by its exact name; rename it"
-  deny_read_args+=("--deny-read=$path")
-done < "$included_z"
 
 # ---------------------------------------------------------------------------
 # 3. Read-only git preflight. It runs before OpenCode's restrictions apply, so no
@@ -255,6 +247,67 @@ ahead_behind=""
 if [[ -n "$base" ]]; then
   ahead_behind="$(g rev-list --left-right --count "$base...HEAD" | awk '{print "behind " $1 ", ahead " $2}' || true)"
 fi
+
+# Include targets missing from the worktree (deleted, or renamed away) cannot be read, so
+# the includes inside them are unknown to the scan. Their last committed content (HEAD,
+# and the merge base for the branch delta) names the next hops; every hop found is
+# excluded and denied by name like an include the scan found (not counted: the scan has
+# decided the refusal), and is followed in turn, each path once, at most 8 hops deep.
+history_revs=()
+if [[ "$head_sha" != "(no commits)" ]]; then
+  history_revs+=(HEAD)
+  if [[ -n "$base" ]]; then
+    merge_base="$(g merge-base "$base" HEAD)" || die "the merge base of $base and HEAD cannot be computed"
+    history_revs+=("$merge_base")
+  fi
+fi
+blob_tmp="$(mktemp "$STATE_DIR/.blob.XXXXXX")"
+hops_z="$(mktemp "$STATE_DIR/.hops.XXXXXX")"
+tmp_files+=("$blob_tmp" "$hops_z")
+known_includes=()
+while IFS= read -r -d '' path; do known_includes+=("$path"); done < "$included_z"
+is_known_include() { local known; for known in "${known_includes[@]}"; do [[ "$known" == "$1" ]] && return 0; done; return 1; }
+hop_queue=()
+hop_depth=()
+while IFS= read -r -d '' path; do hop_queue+=("$path"); hop_depth+=(1); done < "$missing_z"
+# Includes present in the worktree are followed through history as well: their committed
+# content may still include a file deleted since, together with the include line.
+while IFS= read -r -d '' path; do
+  if [[ -f "$REPO/$path" ]]; then hop_queue+=("$path"); hop_depth+=(1); fi
+done < "$included_z"
+hop_index=0
+while (( hop_index < ${#hop_queue[@]} )); do
+  path="${hop_queue[hop_index]}"; depth="${hop_depth[hop_index]}"; hop_index=$((hop_index + 1))
+  : > "$hops_z"
+  # A hop found through history that exists in the worktree is read as it is now, too.
+  if [[ -f "$REPO/$path" ]]; then
+    python3 -I "$POLICY" includes-in-config --repo="$REPO" --config-path="$path" < "$REPO/$path" >> "$hops_z" ||
+      die "the includes of a Git config file could not be read for the preflight"
+  fi
+  for rev in "${history_revs[@]}"; do
+    # No blob at that revision (never committed there): nothing to follow.
+    g cat-file blob "$rev:$path" > "$blob_tmp" || continue
+    python3 -I "$POLICY" includes-in-config --repo="$REPO" --config-path="$path" < "$blob_tmp" >> "$hops_z" ||
+      die "the includes of a Git config file could not be read for the preflight"
+  done
+  while IFS= read -r -d '' hop; do
+    is_known_include "$hop" && continue
+    (( depth < 8 )) || die "Git config includes reached through history nest deeper than 8 levels (fail closed)"
+    known_includes+=("$hop")
+    printf '%s\0' "$hop" >> "$included_z"
+    hop_queue+=("$hop"); hop_depth+=("$((depth + 1))")
+  done < "$hops_z"
+done
+
+# Worktree files a Git config includes are Git configuration: the rendered config
+# denies reading them by their exact name too.
+# A name holding a glob metacharacter cannot be denied exactly (OpenCode would read it
+# as a pattern), so it is refused outright, override or not.
+deny_read_args=()
+while IFS= read -r -d '' path; do
+  [[ "$path" != *[\*\?\[\{\}\\]* ]] || die "an included Git config path holds a glob metacharacter (* ? [ { } \\) and cannot be denied by its exact name; rename it"
+  deny_read_args+=("--deny-read=$path")
+done < "$included_z"
 
 # Paths whose content may never enter the preflight: every changed, deleted, renamed
 # or untracked path that the policy classifies as secret-like. Names travel
