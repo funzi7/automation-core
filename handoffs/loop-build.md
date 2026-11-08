@@ -4,6 +4,87 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
 
 ---
 
+## [2026-11-08 UTC] Codex Gate reliability and fail-closed enforcement (paywall-bot Telegraph PRs)
+- PR: <https://github.com/funzi7/automation-core/pull/59>
+- Branch: `claude/codex-gate-fail-closed` (based on `main` `15652f6`)
+- Status: review complete — Codex clean on the exact head `5491701`, gate `🟢`, CI green; owner merge
+  pending (Merge Bot cannot merge a `claude/*` protected-path PR by design, and is crashing in this
+  repository on a rejected `AUTOMATION_PAT` since 2026-09-11); `pull_request_target` loads the gate
+  from `main`, so the fix itself is only observable after merge
+- What was investigated (paywall-bot, read-only, 2026-11-08):
+  - PR #120 run `42477092393` and PR #122 run `42485718581` are `pull_request_target` gate runs fired
+    seconds after each push. Both logged `trusted head marker publish failed; markerless signals stay
+    fail-closed: Resource not accessible by integration`, then `⏳ pending — Codex has not reviewed head
+    …`, published `check-codex-status` = `🟡 Waiting for Codex review` (`failure`) and failed the
+    diagnostic evaluator job while application CI was green. That is the designed pre-review state.
+  - Codex then posted a `codex-review-receipt:v1` comment with `**Reviewed commit:**` naming the exact
+    head on all three PRs (#120 `23eac35` 11:47:14Z, #121 `68985bc` 12:49:00Z, #122 `fcd6263`
+    13:36:47Z); the `issue_comment` gate run republished `🟢 Reviewed — clear` on the exact head
+    (`current_head_signal_no_active_findings`), Merge Bot woke on the gate's `workflow_run` success,
+    revalidated and merged the evaluated SHA (merged_by `funzi7` = `AUTOMATION_PAT`). PR #120's three
+    Codex P2 threads were resolved before `23eac35`; #121/#122 had no findings. No unreviewed merge.
+  - The 403 is universal: every `pull_request_target` gate run on automation-core PR #58 (public repo)
+    logs the same warning, and no `codex-head-epoch:v3` comment exists on any PR of either repository
+    since the mechanism shipped on 2026-08-13 (PRs #41–#58 here, #94–#122 there). Cause: the gate
+    declared `issues: write` + `pull-requests: read`; the marker is a comment on a pull request. The
+    missing marker was fail-closed (reaction-only clean, sync grace and fallback episodes need an
+    authenticated head epoch), never a false green. `claude-fallback-review.yml` had the same defect.
+  - Both repositories report `default_workflow_permissions: write` and
+    `can_approve_pull_request_reviews: false`; no repository-setting change is needed or made.
+  - paywall-bot `main` runs a stale, locally modified gate/merge-bot/watchdog (`b07344f4`, 2026-09-05,
+    added a summary-row reaction binding) that predates PR #56; `codex-auto-fix.yml` matches the
+    source. Official sync PR #107 (since 2026-10-02) is red: 4 P1 + 5 P2 Codex findings against the
+    synced gate code (addressed below) plus paywall-bot's own `tests/test_codex_gate_logic.js`
+    asserting the local patch (`not ok 19 - authoritative workflow keeps gate policy inline`).
+- What changed (source of truth `workflows/`, mirrors byte-identical):
+  - `codex-gate.yml` and `claude-fallback-review.yml`: `pull-requests: write` (kept `issues: write`).
+  - `codex-gate.yml`: the exception branch now publishes `failure` titled `🟠 Gate evaluation error —
+    fail-closed`, sets `anyBlocked` and fails the evaluator; `decideCodexGate({technicalError})` returns
+    `pending`/`technical_error_fail_closed` (inline and `tools/codex_gate_logic.js`); the watchdog
+    treats the new title like pending (`ERROR_TITLE`, pinned identical by test).
+  - `signalTargetsHead` (gate, merge-bot, watchdog, module): Codex's structured
+    `<!-- codex-review-state:v1 {…} -->` marker binds when `code_review.status === 'completed'` and
+    the full 40-char `commit_sha` equals the head (replaces paywall-bot's local summary-row heuristic).
+  - Review-thread readers request `comments.pageInfo.hasNextPage`; an unresolved thread with more
+    comments than one page and no visible finding fails closed (`review_thread_truncated`) in the gate,
+    Merge Bot and the watchdog.
+  - Canonical evidence block (3 verbatim copies + `tools/review_evidence.js`): timestamp ties close the
+    quota episode; Route A is bounded by the attestation time (24 h); an attestation must be minted
+    inside the current head epoch (`attestation_predates_head_epoch`, A→B→A); candidates with inactive
+    episodes are skipped rather than ending the scan; the producer run path tolerates an `@ref` suffix;
+    the producer counts Codex reactions as activity.
+  - Docs: README (permissions, fail-closed vs fail-soft), LOOP_STATE, CONTEXT, ADR 0001.
+- Validation: `bash scripts/validate.sh` green at every pushed head — 172/172 node tests
+  (`tests/test_codex_gate_workflow.js` 25 end-to-end scenarios and `tests/test_workflow_permissions.js`
+  4 guards are new; `tests/test_codex_gate_logic.js` 38→48 and `tests/test_review_evidence.js` 43→50),
+  59 github-script bodies syntax-checked, actionlint, `git diff --check`; source/mirror parity and the
+  byte-identical canonical block asserted by tests. Independent adversarial review by a reviewer
+  subagent (own fixtures, 21/22 mutants killed): no P1; its P2/P3 follow-ups are the third commit
+  (own-branch `@ref` suffix only, producer 24 h mint bound, `has_unresolved_findings` guard,
+  `core.error` annotations, docs wording). Evidence gathered read-only from GitHub: run logs of
+  `42477092393`/`42485718581` and every PR #58 gate run, PR timelines/reviews/threads/check-runs of
+  paywall-bot #120–#122 and #107, repository Actions settings of both repos. A branch-only
+  `workflow_dispatch` probe of the permission was attempted and removed — GitHub only registers
+  dispatchable workflows from the default branch, so the first real marker publish is observable
+  only after merge.
+- Needs from the owner: merge this PR manually (`gh pr merge 59 --squash`). Merge Bot cannot
+  merge it by design — policy-mirror dry-run against the live PR: `not_candidate` without
+  `automerge`, `protected_path_untrusted` with it, because the `claude/*` branch carries Claude
+  provenance and the PR touches `workflows/**` and `.github/workflows/**`; adding `automerge` would
+  only escalate it to `needs-owner`. Review state at 21:47Z: Codex reviewed the exact head
+  `5491701` on request (`@codex review`) — receipt with `**Reviewed commit:** 5491701be5`, completed
+  review-state marker with no findings, 👍, no threads; the gate published `🟢 Reviewed — clear` on
+  that head and CI is green — review and required checks are genuinely satisfied. Second blocker,
+  independent of this PR: automation-core's `AUTOMATION_PAT` is rejected by GitHub (`HttpError: Bad
+  credentials`, every Merge Bot/Watchdog/CI Doctor run since 2026-09-11, including both runs woken by
+  this green gate) — rotate the secret (LOOP_STATE item 9). Then watch the first
+  `pull_request_target` gate run on any PR for `indexed trusted head epoch run` and a
+  `github-actions[bot]` marker comment; then let paywall-bot's daily sync (or an owner dispatch of
+  its `sync-automation-core.yml`) refresh PR #107 and update paywall-bot's local gate test
+  (`completedCodexSummaryTargetsHead` / `codex-pull-request-review-summary` pins) in that repository.
+- Next: after merge, record the first observed marker and `🟠` verdict (if any) in LOOP_STATE item 8;
+  confirm paywall-bot #107 goes green with Codex's re-review of the new sync head.
+
 ## [2026-09-15 UTC] Canonical Claude fallback review evidence
 - PR: <https://github.com/funzi7/automation-core/pull/56>
 - Branch: `claude/canonical-fallback-review-evidence`

@@ -24,12 +24,15 @@ const {
   attestationRunIsTrusted,
   reviewEvidenceProvenance,
   QUOTA_EPISODE_TTL_MS,
+  HEAD_EPOCH_SKEW_MS,
   FALLBACK_ATTESTATION_WORKFLOW_PATH,
 } = require('../tools/review_evidence');
 
 const CODEX = 'chatgpt-codex-connector';
 const CODEX_REST = 'chatgpt-codex-connector[bot]';
 const BOT = 'github-actions[bot]';
+// Every carrier of the canonical inline block.
+const WORKFLOWS = ['codex-gate.yml', 'merge-bot.yml', 'claude-fallback-watchdog.yml'];
 
 const HEAD = 'd068d977a700093affc47a46aa2b1610fe72248f';
 const PREVIOUS_HEAD = 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678';
@@ -204,7 +207,78 @@ test('4c: an attestation run must be the canonical producing workflow', () => {
   assert.equal(
     attestationRunIsTrusted(base, { ...opts, defaultBranch: null }), false,
     'an unknown default branch must fail closed, not skip the check');
+  // GitHub's documented example for "Get a workflow run attempt" shows
+  // `"path": ".github/workflows/build.yml@main"`; live responses (verified on
+  // two repositories on 2026-11-08) return the bare path. Both spellings of
+  // the ONE canonical path pass; the ref itself stays pinned by head_branch.
+  assert.equal(
+    attestationRunIsTrusted({ ...base, path: `${FALLBACK_ATTESTATION_WORKFLOW_PATH}@main` }, opts), true,
+    'the documented @ref spelling of the canonical path is the same workflow');
+  assert.equal(
+    attestationRunIsTrusted({ ...base, path: '.github/workflows/claude.yml@main' }, opts), false,
+    'the suffix never lets a different workflow through');
+  assert.equal(
+    attestationRunIsTrusted({ ...base, path: '.github/workflows/evil@claude-fallback-review.yml' }, opts), false,
+    'only the text before the first @ is the path');
+  assert.equal(
+    attestationRunIsTrusted(
+      { ...base, path: `${FALLBACK_ATTESTATION_WORKFLOW_PATH}@main`, head_branch: 'feature/pr-branch' }, opts,
+    ), false,
+    'the ref is pinned by head_branch, not by the suffix');
+  // The suffix may only be THIS run's own branch: a blanket strip would admit
+  // a differently named workflow file (independent review, 2026-11-08).
+  assert.equal(
+    attestationRunIsTrusted({ ...base, path: `${FALLBACK_ATTESTATION_WORKFLOW_PATH}@evil.yml` }, opts), false,
+    '`…/claude-fallback-review.yml@evil.yml` is a different workflow file, not a ref spelling');
+  assert.equal(
+    attestationRunIsTrusted({ ...base, path: `${FALLBACK_ATTESTATION_WORKFLOW_PATH}@refs/heads/main` }, opts), true,
+    'the fully qualified ref spelling of the run\'s own branch is accepted');
+  assert.equal(
+    attestationRunIsTrusted({ ...base, path: `${FALLBACK_ATTESTATION_WORKFLOW_PATH}@develop` }, opts), false,
+    'a suffix naming another branch than the run\'s own is rejected');
   assert.equal(attestationRunIsTrusted(null, opts), false);
+});
+
+test('4d: the SHIPPED block pins the producer path with or without an @ref suffix', async () => {
+  const commentAt = new Date('2026-09-09T10:02:00Z').getTime();
+  for (const name of WORKFLOWS) {
+    const api = loadInlineEvidence(name).make();
+    assert.equal(api.attestationRunIsTrusted(TRUSTED_RUN, 1, commentAt, 'main'), true, name);
+    assert.equal(
+      api.attestationRunIsTrusted({ ...TRUSTED_RUN, path: `${TRUSTED_RUN.path}@main` }, 1, commentAt, 'main'),
+      true, `${name}: the documented @ref spelling is the canonical producer`);
+    assert.equal(
+      api.attestationRunIsTrusted({ ...TRUSTED_RUN, path: '.github/workflows/claude.yml@main' }, 1, commentAt, 'main'),
+      false, `${name}: another workflow never mints evidence, suffix or not`);
+    assert.equal(
+      api.attestationRunIsTrusted({ ...TRUSTED_RUN, path: `${TRUSTED_RUN.path}@evil.yml` }, 1, commentAt, 'main'),
+      false, `${name}: a suffix that is not the run's own branch is a different workflow file`);
+    assert.equal(
+      api.attestationRunIsTrusted({ ...TRUSTED_RUN, path: `${TRUSTED_RUN.path}@refs/heads/main` }, 1, commentAt, 'main'),
+      true, `${name}: the fully qualified spelling of the run's own branch is accepted`);
+    assert.equal(
+      api.attestationRunIsTrusted(
+        { ...TRUSTED_RUN, path: `${TRUSTED_RUN.path}@main`, head_branch: 'claude/some-pr' }, 1, commentAt, 'main',
+      ),
+      false, `${name}: the ref stays pinned by head_branch`);
+
+    const base = {
+      prNumber: 103,
+      headSha: HEAD,
+      headObservedAt: EPOCH_AT,
+      comments: [attestationComment()],
+      quotaNotices: [quotaNotice({ at: NOTICE_AT })],
+      realActivity: [],
+      defaultBranch: 'main',
+      codexSignalOnHead: false,
+    };
+    assert.equal((await api.acceptedFallbackEvidence({
+      ...base, fetchRunAttempt: async () => ({ ...TRUSTED_RUN, path: `${TRUSTED_RUN.path}@main` }),
+    })).accepted, true, `${name}: a suffixed canonical path authenticates the run`);
+    assert.equal((await api.acceptedFallbackEvidence({
+      ...base, fetchRunAttempt: async () => ({ ...TRUSTED_RUN, path: '.github/workflows/claude.yml@main' }),
+    })).accepted, false, `${name}: a suffixed foreign path still fails`);
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -218,6 +292,51 @@ test('5: a previous-head attestation never satisfies the current head', () => {
   assert.notEqual(decision.status, 'clear');
   assert.equal(decision.authority, 'none');
   assert.equal(decision.fallbackReason, 'reviewed_head_mismatch');
+});
+
+test('5b: an attestation from an earlier epoch of the same head (A -> B -> A) is rejected', () => {
+  // The branch moved A -> B -> A. The current epoch of A began when the
+  // automation observed the RETURN to A; an attestation written during the
+  // first epoch of A predates it and must not be revived, even though its
+  // reviewed_head matches byte for byte (paywall-bot PR #107, Codex P1).
+  const returnedAt = new Date('2026-09-09T09:50:19Z');
+  const notices = trustedQuotaNotices([quotaNotice({ at: '2026-09-09T09:50:28Z' })]);
+  const onReturn = (attestedAt, overrides = {}) => decide({
+    headObservedAt: returnedAt,
+    attestedAt,
+    verifiedAttestations: [attestation()],
+    quotaNotices: notices,
+    ...overrides,
+  });
+
+  const revived = onReturn(new Date('2026-09-09T09:40:00Z').getTime());
+  assert.notEqual(revived.status, 'clear');
+  assert.equal(revived.authority, 'none');
+  assert.equal(revived.fallbackReason, 'attestation_predates_head_epoch');
+  // The episode itself WOULD be active for that time (Route A, attested
+  // before the newest notice), so the rejection must come from the binding.
+  assert.equal(revived.quotaEpisode.active, true);
+
+  // The same 5 s skew the run-window checks allow, and not a millisecond more.
+  const insideSkew = onReturn(returnedAt.getTime() - HEAD_EPOCH_SKEW_MS + 1000);
+  assert.equal(insideSkew.status, 'clear');
+  assert.equal(insideSkew.authority, 'claude_code_fallback');
+  const beyondSkew = onReturn(returnedAt.getTime() - HEAD_EPOCH_SKEW_MS - 1000);
+  assert.equal(beyondSkew.fallbackReason, 'attestation_predates_head_epoch');
+
+  // A later attestation on the returned head is accepted.
+  const fresh = onReturn(new Date('2026-09-09T10:02:00Z').getTime());
+  assert.equal(fresh.status, 'clear');
+  assert.equal(fresh.authority, 'claude_code_fallback');
+
+  // The binding only ever REMOVES acceptance. A blocking attestation from the
+  // earlier epoch still blocks: the SHA is identical, so the unresolved
+  // finding it reports is still in the code.
+  const blocking = onReturn(new Date('2026-09-09T09:40:00Z').getTime(), {
+    verifiedAttestations: [attestation({ p1: 1 })],
+  });
+  assert.equal(blocking.status, 'blocked');
+  assert.equal(blocking.reason, 'unresolved_fallback_finding');
 });
 
 // ---------------------------------------------------------------------------
@@ -378,7 +497,7 @@ test('10: quota evidence from an earlier head epoch cannot authorize fallback', 
   assert.equal(decision.authority, 'none');
 });
 
-test('10b: Route B admits a pre-epoch decline only inside the TTL', () => {
+test('10b: both routes admit a decline only inside the TTL measured from the newest notice', () => {
   // Codex stops answering entirely while its quota is out, so a decline can
   // predate the current head epoch. That still counts, but only briefly.
   const observedAt = new Date('2026-09-09T09:50:19Z');
@@ -399,12 +518,144 @@ test('10b: Route B admits a pre-epoch decline only inside the TTL', () => {
   assert.equal(expired.active, false, 'stale evidence cannot authorize forever');
   assert.equal(expired.reason, 'stale_quota_evidence');
 
-  // Route A: a decline on this head epoch needs no TTL at all.
-  const onEpoch = evaluateQuotaEpisode(
-    trustedQuotaNotices([quotaNotice({ at: '2026-09-09T09:50:28Z' })]),
-    { headObservedAt: observedAt, attestedAt: new Date('2026-09-12T00:00:00Z').getTime() },
-  );
-  assert.equal(onEpoch.active, true);
+  // Route B still demands that the attestation FOLLOW the pre-epoch decline.
+  const beforePreEpochNotice = evaluateQuotaEpisode(notices, {
+    headObservedAt: observedAt,
+    attestedAt: noticeAt - (60 * 1000),
+  });
+  assert.equal(beforePreEpochNotice.active, false);
+
+  // Route A. This block used to assert "a decline on this head epoch needs no
+  // TTL at all" and accepted an attestation three days after the notice.
+  // Codex's review of paywall-bot PR #107 (2026-11-08) showed why that was
+  // wrong: on an unchanged head a months-old decline would authorize a NEWLY
+  // dispatched fallback although quota may have been restored long ago and
+  // nobody re-requested a review. Route A is now bounded by the same TTL,
+  // measured from the newest notice to the attestation, so the former
+  // expectation is deliberately inverted below.
+  const onEpoch = trustedQuotaNotices([quotaNotice({ at: '2026-09-09T09:50:28Z' })]);
+  const onEpochNoticeAt = new Date('2026-09-09T09:50:28Z').getTime();
+  const onEpochInside = evaluateQuotaEpisode(onEpoch, {
+    headObservedAt: observedAt,
+    attestedAt: onEpochNoticeAt + (6 * 60 * 60 * 1000),
+  });
+  assert.equal(onEpochInside.active, true, 'an on-epoch decline authorizes inside the TTL');
+  assert.equal(onEpochInside.reason, 'trusted_quota_episode');
+  const onEpochExpired = evaluateQuotaEpisode(onEpoch, {
+    headObservedAt: observedAt,
+    attestedAt: onEpochNoticeAt + QUOTA_EPISODE_TTL_MS + 1000,
+  });
+  assert.equal(onEpochExpired.active, false, 'an on-epoch decline is stale evidence after the TTL');
+  assert.equal(onEpochExpired.reason, 'stale_quota_evidence');
+  const threeDaysLater = evaluateQuotaEpisode(onEpoch, {
+    headObservedAt: observedAt,
+    attestedAt: new Date('2026-09-12T00:00:00Z').getTime(),
+  });
+  assert.equal(threeDaysLater.active, false, 'the former no-TTL expectation no longer holds');
+  assert.equal(threeDaysLater.reason, 'stale_quota_evidence');
+
+  // An attestation written BEFORE the newest on-epoch notice is fine: the
+  // head-epoch binding, not the TTL, bounds it from below.
+  const beforeOnEpochNotice = evaluateQuotaEpisode(onEpoch, {
+    headObservedAt: observedAt,
+    attestedAt: onEpochNoticeAt - (60 * 1000),
+  });
+  assert.equal(beforeOnEpochNotice.active, true);
+
+  // Without an attestation time neither route can be bounded, so both fail
+  // closed instead of defaulting to "active".
+  for (const set of [notices, onEpoch]) {
+    for (const attestedAt of [null, undefined, Number.NaN, 0]) {
+      const unbounded = evaluateQuotaEpisode(set, { headObservedAt: observedAt, attestedAt });
+      assert.equal(unbounded.active, false, `attestedAt=${attestedAt} must not authorize`);
+      assert.equal(unbounded.reason, 'stale_quota_evidence');
+    }
+  }
+});
+
+test('10e: Route A is bounded by the TTL in the SHIPPED block of all three workflows', async () => {
+  const notice = new Date(NOTICE_AT).getTime();
+  const fresh = attestationComment({ at: '2026-09-09T10:02:00Z' });
+  const stale = attestationComment({ at: STALE_AT });
+  for (const name of WORKFLOWS) {
+    const api = loadInlineEvidence(name).make();
+    // The notice lands ON this head epoch (Route A).
+    const episode = (attestedAt) => api.evaluateQuotaEpisode(
+      [quotaNotice({ at: NOTICE_AT })], { headObservedAt: EPOCH_AT, realActivity: [], attestedAt },
+    );
+    assert.equal(episode(notice + (6 * 60 * 60 * 1000)).active, true, `${name}: inside the TTL`);
+    assert.equal(episode(notice - (60 * 1000)).active, true, `${name}: attested before the notice`);
+    const expired = episode(notice + QUOTA_EPISODE_TTL_MS + 1000);
+    assert.equal(expired.active, false, `${name}: an on-epoch decline expires too`);
+    assert.equal(expired.reason, 'stale_quota_evidence');
+    assert.equal(episode(null).active, false, `${name}: no attestation time fails closed`);
+
+    // End to end, the attestation time is the comment's own created_at.
+    const base = {
+      prNumber: 103,
+      headSha: HEAD,
+      headObservedAt: EPOCH_AT,
+      quotaNotices: [quotaNotice({ at: NOTICE_AT })],
+      realActivity: [],
+      defaultBranch: 'main',
+      codexSignalOnHead: false,
+    };
+    const accepted = await api.acceptedFallbackEvidence({
+      ...base, comments: [fresh], fetchRunAttempt: runReaderFor([fresh]),
+    });
+    assert.equal(accepted.accepted, true, `${name}: inside the TTL`);
+    const late = await api.acceptedFallbackEvidence({
+      ...base, comments: [stale], fetchRunAttempt: runReaderFor([stale]),
+    });
+    assert.equal(late.accepted, false, `${name}: a day-old on-epoch decline is stale`);
+    assert.equal(late.reason, 'stale_quota_evidence');
+  }
+});
+
+test('10f: a same-second tie between Codex activity and the newest notice closes the episode', async () => {
+  // REST timestamps carry one-second precision: when a genuine Codex item and
+  // the newest notice share a second, nothing proves the notice came last.
+  const options = { headObservedAt: HEAD_OBSERVED_AT, attestedAt: NOW };
+  const notices = trustedQuotaNotices([quotaNotice({ at: NOTICE_AT })]);
+  const tie = evaluateQuotaEpisode(notices, { ...options, realActivity: [{ created_at: NOTICE_AT }] });
+  assert.equal(tie.active, false);
+  assert.equal(tie.reason, 'quota_episode_closed');
+  // One second earlier the order IS provable, so the episode stays open.
+  const earlier = evaluateQuotaEpisode(notices, {
+    ...options, realActivity: [{ created_at: '2026-09-09T09:50:27Z' }],
+  });
+  assert.equal(earlier.active, true);
+
+  const decision = decide({
+    verifiedAttestations: [attestation()],
+    quotaNotices: notices,
+    realActivity: [{ created_at: NOTICE_AT }],
+  });
+  assert.notEqual(decision.status, 'clear');
+  assert.equal(decision.authority, 'none');
+  assert.equal(decision.fallbackReason, 'quota_episode_closed');
+
+  for (const name of WORKFLOWS) {
+    const api = loadInlineEvidence(name).make();
+    const inlineTie = api.evaluateQuotaEpisode(
+      [quotaNotice({ at: NOTICE_AT })], { ...options, realActivity: [{ created_at: NOTICE_AT }] },
+    );
+    assert.equal(inlineTie.active, false, `${name}: a tie closes the episode`);
+    assert.equal(inlineTie.reason, 'quota_episode_closed');
+    const out = await api.acceptedFallbackEvidence({
+      prNumber: 103,
+      headSha: HEAD,
+      headObservedAt: EPOCH_AT,
+      comments: [attestationComment()],
+      quotaNotices: [quotaNotice({ at: NOTICE_AT })],
+      realActivity: [{ created_at: NOTICE_AT }],
+      defaultBranch: 'main',
+      codexSignalOnHead: false,
+      fetchRunAttempt: async () => TRUSTED_RUN,
+    });
+    assert.equal(out.accepted, false, `${name}: a tie must not authorize a fallback`);
+    assert.equal(out.reason, 'quota_episode_closed');
+  }
 });
 
 test('10d: real Codex activity after the newest notice closes the episode', () => {
@@ -552,8 +803,15 @@ test('14: the three SHIPPED blocks decide identically on identical evidence', as
     codexSignalOnHead: false,
     fetchRunAttempt: async () => TRUSTED_RUN,
   };
+  const earlierEpoch = attestationComment({ at: '2026-09-09T09:40:00Z', options: { run: 314100 } });
+  const staleComment = attestationComment({ at: STALE_AT, options: { run: 314160 } });
   const matrix = [
     ['accepted', { comments: [attestationComment()], quotaNotices: [quotaNotice({ at: '2026-09-09T09:50:28Z' })] }],
+    ['attestation predates the head epoch', { comments: [earlierEpoch], quotaNotices: [quotaNotice({ at: '2026-09-09T09:50:28Z' })], fetchRunAttempt: runReaderFor([earlierEpoch]) }],
+    ['stale on-epoch decline', { comments: [staleComment], quotaNotices: [quotaNotice({ at: '2026-09-09T09:50:28Z' })], fetchRunAttempt: runReaderFor([staleComment]) }],
+    ['newer stale candidate, older valid one', { comments: [staleComment, attestationComment()], quotaNotices: [quotaNotice({ at: '2026-09-09T09:50:28Z' })], fetchRunAttempt: runReaderFor([staleComment, attestationComment()]) }],
+    ['Codex activity ties the notice', { comments: [attestationComment()], quotaNotices: [quotaNotice({ at: '2026-09-09T09:50:28Z' })], realActivity: [{ created_at: '2026-09-09T09:50:28Z' }] }],
+    ['run path with @ref suffix', { comments: [attestationComment()], quotaNotices: [quotaNotice({ at: '2026-09-09T09:50:28Z' })], fetchRunAttempt: async () => ({ ...TRUSTED_RUN, path: `${TRUSTED_RUN.path}@main` }) }],
     ['no attestation', { comments: [], quotaNotices: [quotaNotice({ at: '2026-09-09T09:50:28Z' })] }],
     ['no quota episode', { comments: [attestationComment()], quotaNotices: [] }],
     ['previous head', { comments: [attestationComment({ options: { head: PREVIOUS_HEAD } })], quotaNotices: [quotaNotice({ at: '2026-09-09T09:50:28Z' })] }],
@@ -667,10 +925,11 @@ test('override and fail-soft never masquerade as fallback review evidence', () =
   assert.doesNotMatch(override.provenance, /fallback review accepted/);
 
   const technical = decide({ technicalError: true });
-  assert.equal(technical.status, 'clear');
+  assert.equal(technical.status, 'pending', 'a technical error fails closed');
   assert.equal(technical.authority, 'none');
-  assert.equal(technical.reason, 'technical_fail_soft');
+  assert.equal(technical.reason, 'technical_error_fail_closed');
   assert.doesNotMatch(technical.provenance, /fallback review accepted/);
+  assert.doesNotMatch(technical.provenance, /Codex .*review accepted/);
 });
 
 // ---------------------------------------------------------------------------
@@ -766,6 +1025,16 @@ test('15: paywall-bot PR #103 passes only through the valid structured path', ()
     headObservedAt: new Date('2026-09-09T09:51:00Z'),
     attestedAt: new Date('2026-09-09T09:50:28Z').getTime() + QUOTA_EPISODE_TTL_MS + 1000,
   };
+  // Since 2026-11-08 Route A carries the same bound: with the head observed
+  // BEFORE the last notice (09:50:19Z), a fallback minted more than 24 h after
+  // that notice is stale evidence too.
+  mustFail['fallback attested a day after the last decline (on-epoch notice)'] = {
+    attestedAt: new Date('2026-09-09T09:50:28Z').getTime() + QUOTA_EPISODE_TTL_MS + 1000,
+  };
+  // And the attestation must belong to the current epoch of this head.
+  mustFail['attestation written before this head epoch began'] = {
+    attestedAt: new Date('2026-09-09T09:40:00Z').getTime(),
+  };
   for (const [label, override] of Object.entries(mustFail)) {
     const blocked = regression(override);
     assert.notEqual(blocked.status, 'clear', `#103 must not pass: ${label}`);
@@ -829,6 +1098,7 @@ test('14c: the canonical block is byte-identical in all three workflows', () => 
     'reviewed_head_mismatch', 'unresolved_fallback_finding', 'stale_quota_evidence',
     'no_quota_notice', 'quota_episode_closed', 'head_epoch_unknown',
     'fallback_policy_disabled', 'codex_available_on_head', 'structured_fallback_clean',
+    'attestation_predates_head_epoch',
   ]) {
     assert.ok(gate.includes(fragment), `inline block must produce reason ${fragment}`);
     assert.ok(
@@ -901,6 +1171,41 @@ const TRUSTED_RUN = {
 
 function attestationComment({ login = BOT, at = '2026-09-09T10:02:00Z', options = {} } = {}) {
   return { user: { login }, created_at: at, body: attestationMarker(options) };
+}
+
+// The paywall-bot PR #103 shape used by the inline tests: the gate observed
+// the head at 09:50:19Z and the newest trusted notice landed nine seconds
+// later, on this head epoch. STALE_AT is one second past the TTL after it.
+const EPOCH_AT = new Date('2026-09-09T09:50:19Z');
+const NOTICE_AT = '2026-09-09T09:50:28Z';
+const STALE_AT = new Date(
+  new Date(NOTICE_AT).getTime() + QUOTA_EPISODE_TTL_MS + 1000,
+).toISOString();
+
+// A trusted producer run whose execution window brackets `at`.
+function runAround(at, overrides = {}) {
+  const time = new Date(at).getTime();
+  return {
+    ...TRUSTED_RUN,
+    run_started_at: new Date(time - (60 * 1000)).toISOString(),
+    updated_at: new Date(time + (60 * 1000)).toISOString(),
+    ...overrides,
+  };
+}
+
+// An authenticated run reader that resolves each marker's run id to a run
+// bracketing that comment, so every candidate authenticates on its own.
+function runReaderFor(comments) {
+  const byRun = new Map();
+  for (const comment of comments) {
+    for (const parsed of parseFallbackAttestations(comment.body)) {
+      byRun.set(Number(parsed.run), comment.created_at);
+    }
+  }
+  return async (runId) => {
+    if (!byRun.has(Number(runId))) throw new Error(`no run ${runId}`);
+    return runAround(byRun.get(Number(runId)));
+  };
 }
 
 test('inline: the shipped block accepts only fully trusted exact-head evidence', async () => {
@@ -1041,6 +1346,126 @@ test('inline: free-form prose parses to no attestation in the shipped block', as
   assert.equal(decision.reason, 'no_attestation');
 });
 
+test('inline: an attestation from an earlier epoch of the same head is not revived (A -> B -> A)', async () => {
+  // The branch moved A -> B -> A; headObservedAt is the first observation of
+  // the RETURNED A. The attestation minted during the first epoch of A has the
+  // right reviewed_head, a real producer run and an active episode (Route A,
+  // written before the newest notice) — only the epoch binding rejects it.
+  const earlier = attestationComment({ at: '2026-09-09T09:40:00Z', options: { run: 314100 } });
+  const later = attestationComment({ at: '2026-09-09T10:02:00Z', options: { run: 314159 } });
+  const earlierBlocking = attestationComment({
+    at: '2026-09-09T09:40:00Z', options: { run: 314100, p1: 1 },
+  });
+  for (const name of WORKFLOWS) {
+    const api = loadInlineEvidence(name).make();
+    const base = {
+      prNumber: 103,
+      headSha: HEAD,
+      headObservedAt: EPOCH_AT,
+      quotaNotices: [quotaNotice({ at: NOTICE_AT })],
+      realActivity: [],
+      defaultBranch: 'main',
+      codexSignalOnHead: false,
+    };
+    assert.equal(api.evaluateQuotaEpisode(
+      [quotaNotice({ at: NOTICE_AT })],
+      { headObservedAt: EPOCH_AT, realActivity: [], attestedAt: new Date(earlier.created_at).getTime() },
+    ).active, true, `${name}: the episode alone would have admitted it`);
+
+    const revived = await api.acceptedFallbackEvidence({
+      ...base, comments: [earlier], fetchRunAttempt: runReaderFor([earlier]),
+    });
+    assert.equal(revived.accepted, false, `${name}: an earlier-epoch attestation must not be revived`);
+    assert.equal(revived.reason, 'attestation_predates_head_epoch');
+
+    // A later attestation on the returned head is accepted, with or without
+    // the earlier one still on the PR.
+    const fresh = await api.acceptedFallbackEvidence({
+      ...base, comments: [earlier, later], fetchRunAttempt: runReaderFor([earlier, later]),
+    });
+    assert.equal(fresh.accepted, true, `${name}: the returned head can be re-attested`);
+    assert.equal(fresh.reason, 'structured_fallback_clean');
+
+    // Inside the 5 s skew the comment still belongs to this epoch.
+    const skewed = attestationComment({
+      at: new Date(EPOCH_AT.getTime() - 4000).toISOString(), options: { run: 314158 },
+    });
+    assert.equal((await api.acceptedFallbackEvidence({
+      ...base, comments: [skewed], fetchRunAttempt: runReaderFor([skewed]),
+    })).accepted, true, `${name}: the run-window skew applies to the epoch too`);
+
+    // The binding only removes acceptance: a blocking attestation from the
+    // earlier epoch still blocks, because the SHA is byte-identical.
+    const blocked = await api.acceptedFallbackEvidence({
+      ...base, comments: [earlierBlocking], fetchRunAttempt: runReaderFor([earlierBlocking]),
+    });
+    assert.equal(blocked.blocking, true, `${name}: an earlier-epoch unresolved P1 still blocks`);
+    assert.equal(blocked.accepted, false);
+
+    // No authenticated head observation: nothing is accepted, as before.
+    const unknown = await api.acceptedFallbackEvidence({
+      ...base, headObservedAt: null, comments: [later], fetchRunAttempt: runReaderFor([later]),
+    });
+    assert.equal(unknown.accepted, false, `${name}: an unknown epoch fails closed`);
+    assert.equal(unknown.reason, 'head_epoch_unknown');
+  }
+});
+
+test('inline: a newer candidate outside its episode does not hide an older valid one', async () => {
+  const valid = attestationComment({ at: '2026-09-09T10:02:00Z', options: { run: 314159 } });
+  const stale = attestationComment({ at: STALE_AT, options: { run: 314160 } });
+  const blocking = attestationComment({ at: '2026-09-09T10:03:00Z', options: { run: 314161, p2: 1 } });
+  const previousHead = attestationComment({
+    at: '2026-09-09T10:04:00Z', options: { run: 314162, head: PREVIOUS_HEAD },
+  });
+  for (const name of WORKFLOWS) {
+    const api = loadInlineEvidence(name).make();
+    const base = {
+      prNumber: 103,
+      headSha: HEAD,
+      headObservedAt: EPOCH_AT,
+      quotaNotices: [quotaNotice({ at: NOTICE_AT })],
+      realActivity: [],
+      defaultBranch: 'main',
+      codexSignalOnHead: false,
+    };
+    // The stale candidate alone is rejected...
+    const alone = await api.acceptedFallbackEvidence({
+      ...base, comments: [stale], fetchRunAttempt: runReaderFor([stale]),
+    });
+    assert.equal(alone.accepted, false, name);
+    assert.equal(alone.reason, 'stale_quota_evidence');
+    // ...and, being the newest run, used to END the scan. It must not hide
+    // the older exact-head attestation that is still inside its own episode.
+    const both = await api.acceptedFallbackEvidence({
+      ...base, comments: [stale, valid], fetchRunAttempt: runReaderFor([stale, valid]),
+    });
+    assert.equal(both.accepted, true, `${name}: the older valid attestation must still be found`);
+    assert.equal(both.reason, 'structured_fallback_clean');
+    // Two stale candidates stay rejected.
+    const olderStale = attestationComment({ at: STALE_AT, options: { run: 314157 } });
+    assert.equal((await api.acceptedFallbackEvidence({
+      ...base, comments: [stale, olderStale], fetchRunAttempt: runReaderFor([stale, olderStale]),
+    })).accepted, false, `${name}: continuing the scan never widens acceptance`);
+
+    // A blocking newer candidate still wins immediately.
+    const blocked = await api.acceptedFallbackEvidence({
+      ...base, comments: [blocking, valid], fetchRunAttempt: runReaderFor([blocking, valid]),
+    });
+    assert.equal(blocked.blocking, true, `${name}: an unresolved P2 still blocks ahead of an older clean one`);
+    assert.equal(blocked.accepted, false);
+    assert.equal(blocked.reason, 'unresolved_fallback_finding');
+
+    // Diagnostics: the authenticated exact-head rejection is reported even
+    // when a newer marker for another head sits in front of it.
+    const masked = await api.acceptedFallbackEvidence({
+      ...base, comments: [previousHead, stale], fetchRunAttempt: runReaderFor([previousHead, stale]),
+    });
+    assert.equal(masked.accepted, false);
+    assert.equal(masked.reason, 'stale_quota_evidence', `${name}: the exact-head rejection is the useful one`);
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Finding: the mandated precedence was asserted only against the mirror.
 // Prove it against the SHIPPED gate path instead.
@@ -1086,6 +1511,7 @@ test('shipped path: precedence holds for requirements 5, 7 and PR #103', async (
     comments = [attestationComment()],
     quotaNotices = [quotaNotice({ at: '2026-09-09T09:50:28Z' })],
     realActivity = [],
+    fetchRunAttempt = async () => TRUSTED_RUN,
   } = {}) {
     const fallbackEvidence = await api.acceptedFallbackEvidence({
       prNumber: 103,
@@ -1093,7 +1519,7 @@ test('shipped path: precedence holds for requirements 5, 7 and PR #103', async (
       headObservedAt: new Date('2026-09-09T09:50:19Z'),
       defaultBranch: 'main',
       comments, quotaNotices, realActivity, codexSignalOnHead,
-      fetchRunAttempt: async () => TRUSTED_RUN,
+      fetchRunAttempt,
     });
     const gateDecision = decideCodexGate({
       threads, nonInlineFindings,
@@ -1147,6 +1573,8 @@ test('shipped path: precedence holds for requirements 5, 7 and PR #103', async (
   assert.equal(codexClean.authority, 'codex');
 
   // PR #103 — passes, and only through the valid structured path.
+  const staleComment = attestationComment({ at: STALE_AT, options: { run: 314160 } });
+  const earlierEpoch = attestationComment({ at: '2026-09-09T09:40:00Z', options: { run: 314100 } });
   const resolvedRounds = [
     codexThread({ body: '**P2** publication accounting drifts', resolved: true }),
     codexThread({ body: '**P2** direction control trusted too early', resolved: true }),
@@ -1165,6 +1593,13 @@ test('shipped path: precedence holds for requirements 5, 7 and PR #103', async (
     'previous head': { comments: [attestationComment({ options: { head: PREVIOUS_HEAD } })] },
     'no quota episode': { quotaNotices: [] },
     'Codex returned after the notice': { realActivity: [{ created_at: '2026-09-09T10:10:00Z' }] },
+    'Codex activity in the same second as the notice': { realActivity: [{ created_at: '2026-09-09T09:50:28Z' }] },
+    'fallback attested a day after the on-epoch decline': {
+      comments: [staleComment], fetchRunAttempt: runReaderFor([staleComment]),
+    },
+    'attestation from an earlier epoch of this head': {
+      comments: [earlierEpoch], fetchRunAttempt: runReaderFor([earlierEpoch]),
+    },
     'an unresolved P2 remains': { threads: [...resolvedRounds.slice(1), codexThread()] },
   })) {
     const blocked = await shippedGate({ threads: resolvedRounds, ...override });
@@ -1211,6 +1646,18 @@ test('13: the watchdog stops chasing Codex once a fallback goes green', () => {
     workflow('codex-gate.yml').includes(`'${pending[1]}'`),
     `codex-gate.yml must still publish the exact title ${pending[1]} the watchdog matches`,
   );
+  // A technical gate error publishes a distinct non-success verdict. The
+  // watchdog must treat it like pending (re-dispatch on a fresh signal) and
+  // the two titles must stay verbatim-identical.
+  const error = body.match(/const ERROR_TITLE = '([^']+)'/);
+  assert.ok(error, 'watchdog must define ERROR_TITLE');
+  assert.ok(
+    workflow('codex-gate.yml').includes(`const GATE_ERROR_TITLE = '${error[1]}'`),
+    `codex-gate.yml must publish the exact title ${error[1]} the watchdog matches`,
+  );
+  assert.match(candidate, /title === ERROR_TITLE/);
+  assert.notEqual(error[1], pending[1]);
+  assert.doesNotMatch(error[1], /^🟢/, 'an error verdict must never look green');
 });
 
 // P2-B: the two new outdated-thread predicates are security-relevant and sit
@@ -1355,12 +1802,16 @@ async function attemptAttestation(overrides = {}) {
     comments = [quotaNotice({ at: '2026-09-09T09:50:28Z' })],
     reviews = [],
     reviewComments = [],
+    reactions = [],
     threads = [],
     validation = 'passed/suite-661-green',
     p1 = '0',
     p2 = '0',
     found = '6',
     fixed = '6',
+    // The producer mirrors the consumers' 24 h bound against the wall clock;
+    // pin "now" so the historical fixtures stay inside it.
+    producerNow = '2026-09-09T10:02:00Z',
   } = overrides;
 
   const posted = [];
@@ -1385,11 +1836,15 @@ async function attemptAttestation(overrides = {}) {
   github.rest.pulls.listReviews = () => reviews;
   github.rest.issues.listComments = () => comments;
   github.rest.pulls.listReviewComments = () => reviewComments;
+  github.rest.reactions = { listForIssue: () => reactions };
 
   const fn = new Function(
     'github', 'context', 'core', 'process',
     `return (async () => {\n${producerScript()}\n})();`,
   );
+  const realNow = Date.now;
+  Date.now = () => new Date(producerNow).getTime();
+  try {
   await fn(
     github,
     { repo: { owner: 'funzi7', repo: 'automation-core' }, ref },
@@ -1410,6 +1865,9 @@ async function attemptAttestation(overrides = {}) {
       },
     },
   );
+  } finally {
+    Date.now = realNow;
+  }
   return { posted, failure };
 }
 
@@ -1449,6 +1907,16 @@ test('producer: refuses every unsafe attestation', async () => {
     'non-passed validation': { validation: 'failed/suite-red' },
     'unstructured validation': { validation: 'suite-661-green' },
     'non-numeric counts': { found: 'many' },
+    // Mirrors the consumers' QUOTA_EPISODE_TTL_MS at mint time: a decline
+    // older than 24 h no longer proves present unavailability.
+    'quota notice older than the 24 h bound': {
+      comments: [quotaNotice({ at: '2026-09-07T10:00:00Z' })],
+      producerNow: '2026-09-09T10:02:00Z',
+    },
+    'quota notice one second past the bound': {
+      comments: [quotaNotice({ at: '2026-09-08T10:01:59Z' })],
+      producerNow: '2026-09-09T10:02:00Z',
+    },
   };
   for (const [label, override] of Object.entries(cases)) {
     const result = await attemptAttestation(override);
@@ -1471,6 +1939,40 @@ test('producer: refuses when Codex is available or still has active findings', a
   });
   assert.ok(codexOnHead.failure, 'must defer to a genuine Codex result on this head');
   assert.equal(codexOnHead.posted.length, 0);
+
+  // Codex's machine-written review-state summary (edited in place, so its
+  // created_at predates the quota notice) naming a COMPLETED review of this
+  // exact head is also a genuine result: the consumers bind through it, so
+  // the producer must not mint an attestation they would then supersede.
+  const reviewState = (sha, status = 'completed') =>
+    '<!-- codex-pull-request-review-summary -->\n' +
+    `<!-- codex-review-state:v1 {"code_review":{"commit_sha":"${sha}","has_any_findings":false,` +
+    `"has_unresolved_findings":false,"status":"${status}"},"security_review":{"commit_sha":null,` +
+    '"has_any_findings":null,"has_unresolved_findings":null,"status":null}} -->\n\n' +
+    '<details><summary><strong>Codex Review Summary</strong>: ✅ Completed</summary></details>';
+  const summaryOnHead = await attemptAttestation({
+    comments: [
+      { user: { login: CODEX_REST }, created_at: '2026-09-09T01:00:00Z', body: reviewState(HEAD) },
+      quotaNotice({ at: '2026-09-09T09:50:28Z' }),
+    ],
+  });
+  assert.ok(summaryOnHead.failure, 'a completed review-state marker for this head is a genuine Codex result');
+  assert.match(summaryOnHead.failure, /genuine result on this exact head/);
+  assert.equal(summaryOnHead.posted.length, 0);
+  // ...but a summary still in progress, or completed for another head, is not.
+  for (const [label, body] of [
+    ['in progress', reviewState(HEAD, 'in_progress')],
+    ['previous head', reviewState(PREVIOUS_HEAD)],
+  ]) {
+    const notOnHead = await attemptAttestation({
+      comments: [
+        { user: { login: CODEX_REST }, created_at: '2026-09-09T01:00:00Z', body },
+        quotaNotice({ at: '2026-09-09T09:50:28Z' }),
+      ],
+    });
+    assert.equal(notOnHead.failure, null, `${label}: not a result on this head: ${notOnHead.failure}`);
+    assert.equal(notOnHead.posted.length, 1, `${label}: the attestation is minted`);
+  }
 
   // An active unresolved trusted Codex thread.
   const activeFinding = await attemptAttestation({
@@ -1527,6 +2029,49 @@ test('producer: refuses when Codex is available or still has active findings', a
   assert.ok(truncated.failure, 'an unreadable thread must fail closed');
   assert.equal(truncated.posted.length, 0);
 });
+
+test('producer: a trusted Codex reaction is Codex activity, exactly as the consumers count it', async () => {
+  // Every consumer feeds trusted Codex reactions into realActivity, so a
+  // reaction newer than the newest quota notice makes them reject the
+  // attestation as quota_episode_closed. The producer must not mint it.
+  const reaction = (at, login = CODEX_REST) => ({ user: { login }, content: '+1', created_at: at });
+
+  const newer = await attemptAttestation({ reactions: [reaction('2026-09-09T09:55:00Z')] });
+  assert.ok(newer.failure, 'must refuse when a trusted Codex reaction is newer than the quota notice');
+  assert.match(newer.failure, /Codex reaction/);
+  assert.equal(newer.posted.length, 0);
+
+  // A same-second tie fails closed too: the consumers close the episode on
+  // a tie because REST timestamps cannot prove which came last.
+  const tie = await attemptAttestation({ reactions: [reaction('2026-09-09T09:50:28Z')] });
+  assert.ok(tie.failure, 'a tie must refuse');
+  assert.match(tie.failure, /Codex reaction/);
+  assert.equal(tie.posted.length, 0);
+
+  // Older than the notice: the notice still describes the present.
+  const older = await attemptAttestation({ reactions: [reaction('2026-09-09T09:40:00Z')] });
+  assert.equal(older.failure, null, `an older reaction must not refuse: ${older.failure}`);
+  assert.equal(older.posted.length, 1);
+
+  // An untrusted reaction is not Codex activity at all.
+  const untrusted = await attemptAttestation({
+    reactions: [reaction('2026-09-09T09:55:00Z', 'funzi7')],
+  });
+  assert.equal(untrusted.failure, null, `an untrusted reaction is not evidence: ${untrusted.failure}`);
+  assert.equal(untrusted.posted.length, 1);
+
+  // The same tie rule covers the other surfaces, and the message names them.
+  const commentTie = await attemptAttestation({
+    comments: [
+      quotaNotice({ at: '2026-09-09T09:50:28Z' }),
+      { user: { login: CODEX_REST }, created_at: '2026-09-09T09:50:28Z', body: 'Looking at this now.' },
+    ],
+  });
+  assert.ok(commentTie.failure, 'a Codex comment in the same second as the notice must refuse');
+  assert.match(commentTie.failure, /Codex comment/);
+  assert.equal(commentTie.posted.length, 0);
+});
+
 test('the canonical producing workflow validates before it attests', () => {
   const producer = workflow('claude-fallback-review.yml');
   assert.match(producer, /workflow_dispatch/);

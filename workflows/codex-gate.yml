@@ -8,16 +8,19 @@ name: Codex Gate
 # and Codex supplies a current-head signal with no active replacement finding,
 # or the explicit `codex-p1-acknowledged` administrator label is present.
 # Current-head review freshness is bound to exact `commit_id`,
-# `original_commit_id`, or `Reviewed commit` evidence. Task summaries and
-# timestamp-only results never count. Reaction-only clean is limited to an
-# authenticated PR with one observed head. Thread state comes from GraphQL.
+# `original_commit_id`, `Reviewed commit` evidence, or Codex's machine-written
+# `codex-review-state` marker naming a COMPLETED review of the full head SHA.
+# Task summaries and timestamp-only results never count. Reaction-only clean
+# is limited to an authenticated PR with one observed head. Thread state comes
+# from GraphQL; a thread whose comments overflow the one page read fails closed.
 # The authoritative decision implementation stays inline in this trusted
 # default-branch workflow. PR-controlled workflow, checkout and require paths
 # are forbidden; review events are rechecked through a default-branch
 # workflow_run relay. A PAT-independent scheduled sweep covers thread-state
 # changes that have no supported Actions trigger. Trusted actor allowlisting,
-# Summary/Testing quote stripping, trusted-sync grace and intentional technical
-# fail-soft remain.
+# Summary/Testing quote stripping and trusted-sync grace remain. A technical
+# evaluation error FAILS CLOSED: it publishes a non-success verdict that the
+# next trigger or the scheduled sweep replaces, never a green one.
 #
 on:
   # SECURITY: pull_request/review/review_comment workflows execute from the
@@ -62,9 +65,15 @@ concurrency:
 
 permissions:
   contents: read
-  pull-requests: read
   # The trusted default-branch evaluator records each new PR-head epoch in an
-  # authenticated github-actions[bot] marker comment.
+  # authenticated github-actions[bot] marker comment ON THE PULL REQUEST. A
+  # comment on a pull request travels through the issues endpoint but is
+  # authorized as a pull-request write: with `pull-requests: read` the publish
+  # failed on every PR in every repository with "Resource not accessible by
+  # integration" (paywall-bot #120/#122 and automation-core #58, 2026-11-08),
+  # so no PR ever received a marker. Both scopes are declared so the publish
+  # cannot fail on whichever one GitHub checks for the target.
+  pull-requests: write
   issues: write
   # Markerless legacy PRs bootstrap from the current contiguous pull_request-run
   # SHA epoch as a server-observed transition floor.
@@ -213,6 +222,21 @@ jobs:
                 /\[View task(?:\s*(?:→|->))?\s*\]\(/i.test(text);
             }
             const HEAD_EPOCH_MARKER_PATTERN = /<!--\s*codex-head-epoch:v3\s+run=(\d+)\s+attempt=(\d+)\s+pr=(\d+)\s+head=([a-f0-9]{40})\s*-->/i;
+            // Codex keeps ONE summary comment per PR (edited in place) that
+            // opens with a machine-written state marker from the trusted
+            // connector:
+            //   <!-- codex-review-state:v1 {"code_review":{"commit_sha":
+            //        "<40-hex>","has_any_findings":…,"has_unresolved_findings":…,
+            //        "status":"completed"},"security_review":{…}} -->
+            // It names the FULL SHA the code review covered, so it is
+            // exact-head evidence on a PR whose clean result is this summary
+            // plus a 👍 with no `Reviewed commit` receipt (the multi-head
+            // deadlock: a reaction cannot bind once the PR has had two heads).
+            // Only a `completed` code review binds: `in_progress`, `pending`
+            // or null is NOT a review, a SHA prefix is not a SHA, and the
+            // security_review block never speaks for the code review. Who
+            // authored the comment stays the caller's trust decision.
+            const REVIEW_STATE_MARKER_PATTERN = /<!--\s*codex-review-state:v1\s+(\{.*?\})\s*-->/;
             function signalTargetsHead(item, headSha, headObservedAt, dateField = 'created_at') {
               const exactHead = String(headSha || '').toLowerCase();
               if (!/^[a-f0-9]{40}$/.test(exactHead)) return false;
@@ -223,6 +247,26 @@ jobs:
               if (commit) return commit === exactHead;
               const marker = String(item?.body || '').match(REVIEWED_COMMIT_PATTERN)?.[1]?.toLowerCase();
               if (marker) return exactHead.startsWith(marker);
+              const state = String(item?.body || '').match(REVIEW_STATE_MARKER_PATTERN)?.[1];
+              if (state) {
+                // Structured review-state marker (see REVIEW_STATE_MARKER_PATTERN):
+                // a completed code review of exactly this full SHA binds,
+                // anything else (unparseable, not completed, prefix,
+                // security_review only) does not.
+                let review = null;
+                try {
+                  review = JSON.parse(state)?.code_review;
+                } catch (e) {
+                  return false;
+                }
+                if (!review || review.status !== 'completed') return false;
+                // Codex's own state saying findings are still unresolved is
+                // not a clean current-head signal, even before the matching
+                // review threads are visible to this evaluator.
+                if (review.has_unresolved_findings === true) return false;
+                const reviewedSha = String(review.commit_sha || '').toLowerCase();
+                return /^[a-f0-9]{40}$/.test(reviewedSha) && reviewedSha === exactHead;
+              }
               // A delayed old-head task may finish after a new push. Timing
               // alone is never an exact-head review binding.
               return false;
@@ -418,17 +462,22 @@ jobs:
               return [...comments, marker];
             }
 
+            // Returns 'current' (evaluate), 'stale' (an older queued event for
+            // a head the PR has since left — skip silently) or 'lookup_failed'
+            // (the freshness check itself hit an API error — skip fail-closed
+            // AND loudly, so an Actions hiccup is never mistaken for a stale
+            // event).
             async function triggeringHeadEventIsCurrent(prNumber, liveHead) {
               if (
                 context.eventName !== 'pull_request_target' ||
                 Number(context.payload.pull_request?.number) !== Number(prNumber) ||
                 !new Set(['opened', 'synchronize', 'reopened']).has(context.payload.action)
-              ) return true;
+              ) return 'current';
               const payloadHead = String(
                 context.payload.pull_request?.head?.sha || '',
               ).toLowerCase();
               if (!/^[a-f0-9]{40}$/.test(payloadHead) || payloadHead !== liveHead.toLowerCase()) {
-                return false;
+                return 'stale';
               }
               // Repository-wide concurrency can leave an old A event queued
               // until after A -> B -> A. Payload/live SHA equality alone cannot
@@ -452,10 +501,10 @@ jobs:
                   .map((event) => new Date(event.created_at || 0).getTime())
                   .filter((time) => Number.isFinite(time)));
                 return Number.isFinite(runCreatedAt) && runCreatedAt > 0 &&
-                  newestForcePushAt < runCreatedAt;
+                  newestForcePushAt < runCreatedAt ? 'current' : 'stale';
               } catch (e) {
                 core.warning(`PR #${prNumber}: queued head-event freshness lookup failed; skipping fail-closed: ${e.message}`);
-                return false;
+                return 'lookup_failed';
               }
             }
 
@@ -485,20 +534,23 @@ jobs:
               );
             }
 
+            function threadLocation(thread) {
+              return {
+                path: String(thread?.path || ''),
+                line: Number.isInteger(thread?.line) ? thread.line : null,
+                startLine: Number.isInteger(thread?.startLine)
+                  ? thread.startLine
+                  : null,
+                threadId: String(thread?.id || ''),
+              };
+            }
+
             function findingFromThread(thread) {
               for (const comment of thread?.comments || []) {
                 if (!TRUSTED_CODEX_LOGINS.has(authorLogin(comment))) continue;
                 const level = severity(comment?.body || '');
                 if (!level) continue;
-                return {
-                  severity: level,
-                  path: String(thread?.path || ''),
-                  line: Number.isInteger(thread?.line) ? thread.line : null,
-                  startLine: Number.isInteger(thread?.startLine)
-                    ? thread.startLine
-                    : null,
-                  threadId: String(thread?.id || ''),
-                };
+                return { severity: level, ...threadLocation(thread) };
               }
               return null;
             }
@@ -507,14 +559,25 @@ jobs:
               const active = [];
               const outdated = [];
               const resolved = [];
+              // Fail closed: a non-resolved thread whose comments overflowed
+              // the single page fetched below (`commentsTruncated`) may hold a
+              // trusted P1/P2 beyond what was read. With no finding visible on
+              // the first page it cannot be classified, so it is reported
+              // separately and must keep the gate yellow.
+              const truncated = [];
               for (const thread of threads || []) {
                 const finding = findingFromThread(thread);
-                if (!finding) continue;
+                if (!finding) {
+                  if (thread?.isResolved !== true && thread?.commentsTruncated === true) {
+                    truncated.push(threadLocation(thread));
+                  }
+                  continue;
+                }
                 if (thread?.isResolved === true) resolved.push(finding);
                 else if (thread?.isOutdated === true) outdated.push(finding);
                 else active.push(finding);
               }
-              return { active, outdated, resolved };
+              return { active, outdated, resolved, truncated };
             }
 
             function decideCodexGate({
@@ -532,9 +595,13 @@ jobs:
                 };
               }
               if (technicalError) {
+                // A technical failure proves nothing about the head: no review
+                // evidence and no finding state could be read. It must never
+                // become a clean verdict; it stays pending until a later
+                // evaluation succeeds.
                 return {
-                  status: 'clear',
-                  reason: 'technical_fail_soft',
+                  status: 'pending',
+                  reason: 'technical_error_fail_closed',
                   activeFindings: [],
                 };
               }
@@ -551,6 +618,18 @@ jobs:
                   status: 'blocked',
                   reason: 'active_unresolved_review_thread',
                   activeFindings: classified.active,
+                  outdatedFindings: classified.outdated,
+                };
+              }
+              if (classified.truncated.length) {
+                // A thread whose comments could not all be read may still
+                // hide a live trusted P1/P2. Neither a clean current-head
+                // signal nor a fallback can clear what the evaluator never
+                // saw, so the head stays unverified.
+                return {
+                  status: 'pending',
+                  reason: 'review_thread_truncated',
+                  activeFindings: [],
                   outdatedFindings: classified.outdated,
                 };
               }
@@ -600,8 +679,11 @@ jobs:
             //    the Actions API; free-form prose is never authority;
             //  - it binds to the exact 40-character head, so any new commit
             //    invalidates it and a previous-head attestation is worthless;
-            //  - the trusted Codex code-review quota notice must belong to the
-            //    CURRENT head epoch and still sit inside the episode TTL;
+            //  - the trusted Codex code-review quota notice must still describe
+            //    the present: the attestation was minted inside the episode
+            //    TTL of the newest notice and inside the CURRENT head epoch
+            //    (a branch moving A -> B -> A starts a new epoch of A), and no
+            //    genuine Codex activity is as new as that notice;
             //  - a genuine Codex result on this head ends the episode, and
             //    normal Codex evidence remains the default authority;
             //  - an attestation that declares unresolved P1/P2 blocks rather
@@ -762,25 +844,33 @@ jobs:
               };
             }
 
-            // Is a trusted Codex code-review quota episode open right now?
+            // Is a trusted Codex code-review quota episode open for the
+            // fallback that was attested at `attestedAt`?
             //
             // `notices` are trusted-actor capacity notices; `realActivity` is
             // every OTHER trusted Codex surface (reviews, comments, review
             // comments, reactions) excluding non-binding task summaries.
             // Ordinary comments can never reach either list.
             //
-            // Two ways an episode is current, both bound to real evidence:
-            //   Route A — Codex declined on THIS head epoch. The head has not
-            //     moved and Codex has not returned, so the decline still
-            //     describes the present state.
+            // Two ways an episode is current, both bound to real evidence and
+            // both bounded by QUOTA_EPISODE_TTL_MS measured from the newest
+            // notice to the attestation:
+            //   Route A — Codex declined on THIS head epoch. The decline
+            //     describes the present only for the TTL: a fallback minted
+            //     later than that is stale evidence of unavailability (quota
+            //     may have been restored long ago and nobody re-requested a
+            //     review), however little the head moved. An attestation
+            //     minted BEFORE the newest notice is fine — the head-epoch
+            //     binding already bounds it from below.
             //   Route B — the decline predates this head epoch, but Codex has
             //     posted nothing since and the fallback review happened within
-            //     QUOTA_EPISODE_TTL_MS of it. Codex simply stops answering on
-            //     later pushes while its quota is out, so requiring a fresh
-            //     per-head notice would reject genuine exhaustion; the TTL plus
-            //     the closure rule keep it from authorizing anything forever.
-            // Any real Codex activity newer than the newest notice CLOSES the
-            // episode: Codex is demonstrably answering again.
+            //     the TTL AFTER it. Codex simply stops answering on later
+            //     pushes while its quota is out, so requiring a fresh per-head
+            //     notice would reject genuine exhaustion.
+            // Any real Codex activity at least as new as the newest notice
+            // CLOSES the episode: Codex is demonstrably answering again, and
+            // on a same-second tie the order cannot be proven, so the tie
+            // fails closed too.
             function evaluateQuotaEpisode(notices, options) {
               const settings = options || {};
               const itemAt = (item) => new Date(
@@ -803,7 +893,9 @@ jobs:
                 return { active: false, reason: 'no_quota_notice', noticeAt: null };
               }
               const newestReal = newestOf(settings.realActivity);
-              if (newestReal !== null && newestReal > newestNotice) {
+              // `>=`, not `>`: REST timestamps have one-second precision, so
+              // a tie cannot prove the notice came last.
+              if (newestReal !== null && newestReal >= newestNotice) {
                 return {
                   active: false, reason: 'quota_episode_closed',
                   noticeAt: new Date(newestNotice),
@@ -813,17 +905,24 @@ jobs:
               if (!Number.isFinite(observedAt) || observedAt <= 0) {
                 return { active: false, reason: 'head_epoch_unknown', noticeAt: null };
               }
-              if (newestNotice >= observedAt) {
-                return {
-                  active: true, reason: 'trusted_quota_episode',
-                  noticeAt: new Date(newestNotice),
-                };
-              }
               const attestedAt = Number(settings.attestedAt);
-              if (
-                Number.isFinite(attestedAt) && attestedAt >= newestNotice &&
-                attestedAt - newestNotice <= QUOTA_EPISODE_TTL_MS
-              ) {
+              const withinTtl = Number.isFinite(attestedAt) && attestedAt > 0 &&
+                attestedAt - newestNotice <= QUOTA_EPISODE_TTL_MS;
+              // Route A: a negative difference (attested before the newest
+              // notice) is fine; the head-epoch binding bounds it from below.
+              if (newestNotice >= observedAt) {
+                return withinTtl
+                  ? {
+                      active: true, reason: 'trusted_quota_episode',
+                      noticeAt: new Date(newestNotice),
+                    }
+                  : {
+                      active: false, reason: 'stale_quota_evidence',
+                      noticeAt: new Date(newestNotice),
+                    };
+              }
+              // Route B: the attestation must FOLLOW the pre-epoch decline.
+              if (withinTtl && attestedAt >= newestNotice) {
                 return {
                   active: true, reason: 'trusted_quota_episode',
                   noticeAt: new Date(newestNotice),
@@ -851,7 +950,22 @@ jobs:
               // explicit dispatch (which requires write access). A run started
               // from a PR ref would execute PR-controlled YAML, so an unknown
               // default branch fails closed rather than skipping the check.
-              if (String(run.path || '') !== FALLBACK_ATTESTATION_WORKFLOW_PATH) return false;
+              // GitHub documents a run attempt's `path` with an `@ref` suffix
+              // ("…/build.yml@main"); live responses return the bare path.
+              // Accept the bare canonical path or the canonical path suffixed
+              // with THIS run's own branch (`@<head_branch>` or
+              // `@refs/heads/<head_branch>`) and nothing else: stripping any
+              // `@…` tail would also admit a differently named workflow file
+              // such as `…/claude-fallback-review.yml@evil.yml`.
+              const runPath = String(run.path || '');
+              const runBranch = String(run.head_branch || '');
+              const pathIsCanonical = runPath === FALLBACK_ATTESTATION_WORKFLOW_PATH || (
+                runBranch !== '' && (
+                  runPath === `${FALLBACK_ATTESTATION_WORKFLOW_PATH}@${runBranch}` ||
+                  runPath === `${FALLBACK_ATTESTATION_WORKFLOW_PATH}@refs/heads/${runBranch}`
+                )
+              );
+              if (!pathIsCanonical) return false;
               if (String(run.event || '') !== 'workflow_dispatch') return false;
               if (!defaultBranch) return false;
               if (String(run.head_branch || '') !== String(defaultBranch)) return false;
@@ -875,8 +989,9 @@ jobs:
             // The single canonical question every consumer asks. Returns
             // { accepted, blocking, severity, reason, episodeReason }. It must
             // never throw: an exception escaping here would reach the Gate's
-            // technical fail-soft branch, which publishes GREEN. Absence of
-            // evidence must look like absence of evidence, not like success.
+            // technical-error branch (fail-closed since 2026-11-08, but still
+            // a non-verdict). Absence of evidence must look like absence of
+            // evidence, not like success and not like an evaluator error.
             async function acceptedFallbackEvidence(options) {
               try {
                 return await acceptedFallbackEvidenceUnsafe(options);
@@ -930,8 +1045,15 @@ jobs:
               const comments = settings.comments || [];
               const quotaNotices = (settings.quotaNotices || []);
               const realActivity = (settings.realActivity || []);
-              // The episode is evaluated per candidate, because Route B is
-              // bound to when the fallback review itself was attested.
+              // The current head epoch began when the automation first
+              // observed the current head. A branch moving A -> B -> A starts
+              // a NEW epoch of A, so an attestation written before that
+              // moment was minted for the earlier epoch and must not be
+              // revived on the return. Same 5 s skew as the run-window checks.
+              const headObservedAt = new Date(settings.headObservedAt || 0).getTime();
+              const headEpochKnown = Number.isFinite(headObservedAt) && headObservedAt > 0;
+              // The episode is evaluated per candidate, because both routes
+              // are bound to when the fallback review itself was attested.
               const episodeFor = (attestedAt) => evaluateQuotaEpisode(quotaNotices, {
                 headObservedAt: settings.headObservedAt,
                 realActivity,
@@ -970,6 +1092,18 @@ jobs:
               const bounded = candidates.slice(0, MAX_FALLBACK_ATTESTATION_CANDIDATES);
 
               let best = none('no_attestation');
+              // Diagnostics keep the newest AUTHENTICATED exact-head rejection
+              // over any structural one: "stale episode" says more than
+              // "another marker was for another head".
+              let bestAuthenticated = false;
+              const rejected = (reason) => {
+                if (bestAuthenticated) return;
+                best = {
+                  accepted: false, blocking: false, severity: null, reason,
+                  episodeReason: reason,
+                };
+                bestAuthenticated = true;
+              };
               for (const candidate of bounded) {
                 const evaluated = evaluateFallbackAttestation(candidate.attestation, headSha);
                 if (!evaluated.accepted && !evaluated.blocking) {
@@ -1003,6 +1137,11 @@ jobs:
                   );
                   continue;
                 }
+                // A blocking attestation wins immediately, whatever epoch
+                // wrote it: the SHA is byte-identical, so the unresolved
+                // finding it reports is still in the code. Only a newer
+                // attestation (a newer run, hence considered first) can
+                // supersede it.
                 if (evaluated.blocking) {
                   return {
                     accepted: false, blocking: true,
@@ -1011,13 +1150,17 @@ jobs:
                     episodeReason: episode.reason,
                   };
                 }
+                if (headEpochKnown && candidate.commentAt < headObservedAt - 5000) {
+                  rejected('attestation_predates_head_epoch');
+                  continue;
+                }
                 const candidateEpisode = episodeFor(candidate.commentAt);
                 if (!candidateEpisode.active) {
-                  return {
-                    accepted: false, blocking: false, severity: null,
-                    reason: candidateEpisode.reason,
-                    episodeReason: candidateEpisode.reason,
-                  };
+                  // Keep scanning: a newer candidate outside its episode must
+                  // not hide an older exact-head attestation that is still
+                  // inside its own.
+                  rejected(candidateEpisode.reason);
+                  continue;
                 }
                 return {
                   accepted: true, blocking: false, severity: null,
@@ -1037,6 +1180,10 @@ jobs:
             // restriction; each evaluation creates a fresh completed run and
             // latest-per-name readers consume the newest verdict.
             let gatePublishFailed = false;
+            // Exact string: claude-fallback-watchdog.yml matches this title
+            // (ERROR_TITLE) to keep re-dispatching the gate for a fresh review
+            // signal. Do not reword it without changing it there too.
+            const GATE_ERROR_TITLE = '🟠 Gate evaluation error — fail-closed';
             async function publishGateCheck(headSha, conclusion, title, summary) {
               try {
                 await github.rest.checks.create({
@@ -1058,7 +1205,20 @@ jobs:
                 });
                 headSha = pr.head.sha;
                 const head7 = headSha.substring(0, 7);
-                if (!(await triggeringHeadEventIsCurrent(prNumber, headSha))) {
+                const headEventState = await triggeringHeadEventIsCurrent(prNumber, headSha);
+                if (headEventState === 'lookup_failed') {
+                  // FAIL CLOSED AND LOUD: no verdict is published for this
+                  // head (the previous one, if any, stays), the error is
+                  // annotated, and an event-driven evaluator run fails so the
+                  // skipped evaluation is visible (this branch only runs on
+                  // pull_request_target events). The next trigger or the
+                  // scheduled sweep re-evaluates the head.
+                  core.error(`PR #${prNumber}: head-event freshness lookup failed; evaluation skipped fail-closed`);
+                  results.push(`PR #${prNumber}: ⚠️ head-event freshness lookup failed — evaluation skipped fail-closed, no verdict published`);
+                  anyBlocked = true;
+                  continue;
+                }
+                if (headEventState !== 'current') {
                   core.info(`PR #${prNumber}: stale queued head event does not match the latest live head epoch; evaluation skipped`);
                   results.push(`PR #${prNumber}: ⏭️ stale queued head event skipped`);
                   continue;
@@ -1121,6 +1281,7 @@ jobs:
                               line
                               startLine
                               comments(first: 100) {
+                                pageInfo { hasNextPage }
                                 nodes {
                                   body
                                   createdAt
@@ -1139,6 +1300,9 @@ jobs:
                   reviewThreads.push(...connection.nodes.map(t => ({
                     ...t,
                     comments: t.comments.nodes,
+                    // Fail closed: a thread with more comments than one page
+                    // shows may hold a trusted P1/P2 this evaluator never read.
+                    commentsTruncated: !!t.comments?.pageInfo?.hasNextPage,
                   })));
                   threadCursor = connection.pageInfo.hasNextPage
                     ? connection.pageInfo.endCursor
@@ -1248,6 +1412,10 @@ jobs:
                 // finding; a fallback may not clear it.
                 const outdatedUnresolvedFinding =
                   classifyThreads(reviewThreads).outdated.length > 0;
+                // Nor may it clear a non-resolved thread whose comments
+                // overflowed the page read above: an unread P1/P2 is live.
+                const truncatedReviewThread =
+                  classifyThreads(reviewThreads).truncated.length > 0;
                 const fallbackEvidence = await acceptedFallbackEvidence({
                   prNumber,
                   headSha,
@@ -1256,7 +1424,7 @@ jobs:
                   quotaNotices: evidenceInputs.quotaNotices,
                   realActivity: evidenceInputs.realActivity,
                   defaultBranch: pr.base?.repo?.default_branch,
-                  outdatedUnresolvedFinding,
+                  outdatedUnresolvedFinding: outdatedUnresolvedFinding || truncatedReviewThread,
                   codexSignalOnHead: hasCodexSignalOnHead,
                   // This evaluator's default client is GITHUB_TOKEN, which
                   // carries the declared `actions: read` permission.
@@ -1340,7 +1508,9 @@ jobs:
                   const reasonText =
                     gateDecision.reason === 'outdated_finding_needs_current_head_signal'
                       ? 'an outdated finding awaits a clean current-head Codex signal'
-                      : `Codex has not reviewed head ${head7}`;
+                      : gateDecision.reason === 'review_thread_truncated'
+                        ? 'a review thread has more comments than can be read in one page; cannot prove no Codex finding is unresolved'
+                        : `Codex has not reviewed head ${head7}`;
                   // Say plainly why a Claude fallback did not substitute, so an
                   // operator can see which canonical requirement is missing.
                   const fallbackNote =
@@ -1384,21 +1554,31 @@ jobs:
                   `${provenance}. No unresolved non-outdated trusted Codex P1/P2 thread blocks ${head7} (${evidenceReason}).`,
                 );
               } catch (err) {
-                // fail-soft: a TECHNICAL failure (API hiccup, rate limit, etc.)
-                // must NEVER wedge a PR red forever. We did not detect a P1
-                // here, so do not block — log loudly instead. A real P1 is only
-                // ever detected by the pattern above, which blocks; this branch
-                // only fires on genuine exceptions.
+                // FAIL CLOSED: a technical failure (API hiccup, rate limit,
+                // GraphQL outage) proves nothing about this head — neither
+                // review evidence nor finding state could be read. It must not
+                // publish a green `check-codex-status`: Merge Bot and branch
+                // protection read that check as review approval. Publish an
+                // explicit non-success verdict instead. Every event trigger
+                // and the 15-minute scheduled sweep re-evaluate the head, so a
+                // transient error costs one cycle, never an unreviewed merge.
+                // Event-driven runs also fail the evaluator job; a scheduled
+                // sweep keeps its job green on purpose (see the setFailed
+                // rule below) so Merge Bot still wakes for other PRs — the
+                // red verdict and the error annotation carry the signal there.
                 results.push(
-                  `PR #${prNumber}: ⚠️ gate errored technically — not blocking (fail-soft): ${err.message}`
+                  `PR #${prNumber}: ⚠️ gate errored technically — fail-closed, re-evaluated on the next trigger: ${err.message}`
                 );
-                core.warning(`Codex Gate technical error on PR #${prNumber}: ${err.stack || err.message}`);
+                // Annotated as an error so a sweep-wide API failure (which
+                // keeps the scheduled job green by design) is still loud.
+                core.error(`Codex Gate technical error on PR #${prNumber}: ${err.stack || err.message}`);
+                anyBlocked = true;
                 if (headSha) {
                   await publishGateCheck(
                     headSha,
-                    'success',
-                    '🟢 Technical fail-soft',
-                    `The trusted evaluator hit a technical API error for PR #${prNumber}; no active P1/P2 was established.`,
+                    'failure',
+                    GATE_ERROR_TITLE,
+                    `The trusted evaluator hit a technical API error for PR #${prNumber}; no review evidence or finding state could be established, so the head stays unverified until the next evaluation succeeds.`,
                   );
                 } else {
                   gatePublishFailed = true;
@@ -1421,7 +1601,7 @@ jobs:
             // policy blocks remain failed as before.
             if ((anyBlocked && context.eventName !== 'schedule') || gatePublishFailed) {
               core.setFailed(
-                'Blocked by Codex Gate: an active P1 or P2 is unresolved, or Codex has not reviewed the current head yet.\n' +
+                'Blocked by Codex Gate: an active P1 or P2 is unresolved, Codex has not reviewed the current head yet, or the evaluator hit a technical error (fail-closed).\n' +
                 'Resolve by one of:\n' +
                 '  1. Wait — Codex reviews automatically on every push; the gate re-checks on Codex activity and the trusted scheduled sweep (≤15m), and goes green once Codex posts any signal with no active P1/P2.\n' +
                 '  2. Resolve the review thread, or update its relevant diff and wait for GitHub to mark it outdated plus a clean current-head Codex signal.\n' +
