@@ -1453,6 +1453,126 @@ test('P1-I: classify --extra-sensitive and render --deny-read', () => {
   assert.deepEqual(render('glm'), JSON.parse(JSON.stringify(render('glm', []))), 'no --deny-read: unchanged contract');
 });
 
+// ---------------------------------------------------------------------------
+// Round 7: included Git config files the hand parser missed (I-a..I-d). Each case is
+// refused without the override; with it the token stays out of the preflight and the
+// prompt and the file is listed as an included Git config.
+// ---------------------------------------------------------------------------
+function stageIncludedConfig(repo, file, token) {
+  fs.writeFileSync(path.join(repo, file), `[http]\n\textraheader = AUTHORIZATION: bearer ${token}\n`);
+  git(repo, ['add', '--', file]);
+}
+
+function includedConfigOutcome(sb, repo, file, token) {
+  const refused = runOauto(sb, repo, ['--check']);
+  const launched = launchRecordingPrompt(sb, repo, { OAUTO_ALLOW_SENSITIVE_FILES: '1' });
+  return {
+    outcome: {
+      refusedWithoutOverride: refused.status === 1 && refused.stderr.includes(`${file} (included Git config)`),
+      launchedWithOverride: launched.r.status === 0,
+      tokenReachesModel: launched.preflight.includes(token) || launched.prompt.includes(token),
+      listedAsIncluded: excludedLines(launched.preflight).includes(`${file} (included Git config)`),
+    },
+    detail: `${refused.stderr}\n---\n${launched.r.stderr}`,
+  };
+}
+const INCLUDED_OK = { refusedWithoutOverride: true, launchedWithOverride: true, tokenReachesModel: false, listedAsIncluded: true };
+
+test('I-a: an include that hops outside the repository and back in is followed', () => {
+  const sb = sandbox();
+  const token = 'SYNTH-HOP-TOKEN-1a7a';
+  const repo = mkRepo(sb, 'include-hop', { 'src/a.py': 'x = 1\n' });
+  stageIncludedConfig(repo, 'review-config.txt', token);
+  const hop = path.join(sb.root, 'hop.cfg'); // outside the repository
+  fs.writeFileSync(hop, `[include]\n\tpath = ${path.join(repo, 'review-config.txt')}\n`);
+  fs.appendFileSync(path.join(repo, '.git', 'config'), `[include]\n\tpath = ${hop}\n`);
+  const { outcome, detail } = includedConfigOutcome(sb, repo, 'review-config.txt', token);
+  assert.deepEqual(outcome, INCLUDED_OK, detail);
+});
+
+test('I-b: a comment ending in a backslash does not swallow the next include line', () => {
+  const sb = sandbox();
+  const token = 'SYNTH-COMMENT-TOKEN-2b7b';
+  const repo = mkRepo(sb, 'include-comment', { 'src/a.py': 'x = 1\n' });
+  stageIncludedConfig(repo, 'review-config.txt', token);
+  fs.appendFileSync(path.join(repo, '.git', 'config'), '[include]\n\tpath = /dev/null ; c \\\n\tpath = ../review-config.txt\n');
+  const { outcome, detail } = includedConfigOutcome(sb, repo, 'review-config.txt', token);
+  assert.deepEqual(outcome, INCLUDED_OK, detail);
+});
+
+test('I-c: an include in a .git/config that starts with a UTF-8 BOM is followed', () => {
+  const sb = sandbox();
+  const token = 'SYNTH-BOM-TOKEN-3c7c';
+  const repo = mkRepo(sb, 'include-bom', { 'src/a.py': 'x = 1\n' });
+  stageIncludedConfig(repo, 'review-config.txt', token);
+  const cfg = path.join(repo, '.git', 'config');
+  fs.writeFileSync(cfg, `﻿[include]\n\tpath = ../review-config.txt\n${fs.readFileSync(cfg, 'utf8')}`);
+  const { outcome, detail } = includedConfigOutcome(sb, repo, 'review-config.txt', token);
+  assert.deepEqual(outcome, INCLUDED_OK, detail);
+});
+
+test('I-d: reviewing a linked worktree, the main repository config including a file inside it is caught', () => {
+  const sb = sandbox();
+  const token = 'SYNTH-WORKTREE-TOKEN-4d7d';
+  const main = mkRepo(sb, 'wt-main', { 'src/a.py': 'x = 1\n' });
+  const linked = path.join(sb.repos, 'wt-linked');
+  git(main, ['worktree', 'add', '-q', '-b', 'review', linked]);
+  assert.ok(fs.statSync(path.join(linked, '.git')).isFile());
+  stageIncludedConfig(linked, 'review-config.txt', token);
+  fs.appendFileSync(path.join(main, '.git', 'config'), `[include]\n\tpath = ${path.join(linked, 'review-config.txt')}\n`);
+  const { outcome, detail } = includedConfigOutcome(sb, linked, 'review-config.txt', token);
+  assert.deepEqual(outcome, INCLUDED_OK, detail);
+});
+
+test('I: an included config path holding a glob metacharacter is refused, even with the override', () => {
+  const sb = sandbox();
+  const repo = mkRepo(sb, 'include-glob', { 'src/a.py': 'x = 1\n', 'conf/a*b.cfg': '[k]\n\tv = 1\n' });
+  fs.appendFileSync(path.join(repo, '.git', 'config'), '[include]\n\tpath = ../conf/a*b.cfg\n');
+  let r = runOauto(sb, repo, ['--check']);
+  assert.equal(r.status, 1, r.stderr);
+  assert.match(r.stderr, /conf\/a\*b\.cfg: cannot be denied by exact path \(glob metacharacter\)/);
+  r = runOauto(sb, repo, ['--check'], { OAUTO_ALLOW_SENSITIVE_FILES: '1' });
+  assert.equal(r.status, 1, `the override cannot make an inexact deny rule acceptable:\n${r.stderr}`);
+  assert.match(r.stderr, /glob metacharacter/);
+});
+
+test('I: scan --config-origins counts every in-repository file git loaded; other origins are ignored', () => {
+  const sb = sandbox();
+  const repo = mkRepo(sb, 'origins', { 'src/a.py': 'x = 1\n', 'review-config.txt': '[k]\n\tv = 1\n',
+    'conf/team.cfg': '[http]\n\textraHeader = X-Token: SYNTH-TEAM\n' }, { commit: false });
+  const userCfg = path.join(sb.root, 'user.cfg');
+  fs.writeFileSync(userCfg, '[http]\n\textraHeader = X-Token: SYNTH-USER\n');
+  const origins = path.join(sb.root, 'origins.z');
+  fs.writeFileSync(origins, nulJoin('file:.git/config', 'core.bare\nfalse', 'file:.git/../review-config.txt', 'k.v\n1',
+    `file:${path.join(repo, 'conf', 'team.cfg')}`, 'http.extraheader\nX-Token: SYNTH-TEAM',
+    `file:${userCfg}`, 'http.extraheader\nX-Token: SYNTH-USER', 'command line:', 'core.pager\ncat', 'blob:0123abcd', 'x.y\nz'));
+  const scanWith = () => spawnSync('python3', ['-I', POLICY, 'scan', repo, '--budget', '60', '--config-origins', origins], { encoding: 'utf8' });
+  let r = scanWith();
+  assert.equal(r.status, 0, r.stderr);
+  const lines = r.stdout.trim().split('\n');
+  for (const want of ['SENSITIVE review-config.txt (included Git config)', 'SENSITIVE conf/team.cfg (included Git config)',
+    'CONTENT conf/team.cfg: remote URL or http header embeds credentials']) assert.ok(lines.includes(want), `${want}:\n${r.stdout}`);
+  assert.ok(!r.stdout.includes('user.cfg'), 'a user-owned config outside the repository is ignored');
+  fs.writeFileSync(origins, Buffer.from('file:review-config.txt\0'));
+  r = scanWith();
+  assert.notEqual(r.status, 0, 'a malformed origins list fails closed');
+});
+
+test('verify-agents --deny-read proves the per-launch read denial; render refuses an inexact deny path', () => {
+  const base = policy(['verify-agents'], JSON.stringify(resolvedAgents(render('glm'))));
+  assert.equal(base.status, 0, base.stderr);
+  const probes = Number(base.stdout.match(/(\d+) probes each/)[1]);
+  const ok = policy(['verify-agents', '--deny-read=review-config.txt'], JSON.stringify(resolvedAgents(render('glm', ['--deny-read', 'review-config.txt']))));
+  assert.equal(ok.status, 0, ok.stderr);
+  assert.match(ok.stdout, new RegExp(`${probes + 1} probes each`));
+  const missing = policy(['verify-agents', '--deny-read=review-config.txt'], JSON.stringify(resolvedAgents(render('glm'))));
+  assert.notEqual(missing.status, 0, 'a reviewer that can read the included config must fail verification');
+  assert.match(missing.stderr, /read 'review-config\.txt' resolves to allow, expected deny/);
+  for (const bad of ['conf/a*b.cfg', 'a?.cfg', 'x[1].cfg']) {
+    assert.notEqual(policy(['render', '--model', 'glm', `--deny-read=${bad}`]).status, 0, `render must refuse ${bad}`);
+  }
+});
+
 test('F: ordinary changes and non-sensitive special names still reach the preflight', () => {
   const sb = sandbox();
   const names = { naive: 'src/naïve file.py', tab: 'docs/tab\tname.md', dash: '-lead.py', plain: 'src/plain.py' };
@@ -1643,9 +1763,17 @@ test('oauto-run source: no automatic approval, standalone helpers, bounded helpe
   assert.match(code, /if \(\( n_symlinks > 0 \)\); then/);
   assert.match(code, /if \(\( n_sensitive \+ n_content > 0 \)\); then/);
   assert.ok(!/\[\[ -n "\$(outward|sensitive)/.test(code), 'no decision on extracted record text');
-  // Included Git config files reach classify and both renders.
-  assert.match(code, /while IFS= read -r -d '' path; do deny_read_args\+=\("--deny-read=\$path"\); done < "\$included_z"/);
+  // Included Git config files reach classify, both renders and verify-agents; a path
+  // with a glob metacharacter cannot be denied exactly and is refused.
+  assert.match(code, /while IFS= read -r -d '' path; do\n\s*\[\[ "\$path" != \*\[\\\*\\\?\\\[\]\* \]\] \|\|\s*die "[^"]*glob metacharacter[^"]*"\n\s*deny_read_args\+=\("--deny-read=\$path"\)\ndone < "\$included_z"/);
   assert.match(code, /python3 -I "\$POLICY" render --model "\$MODEL_ALIAS" "\$\{deny_read_args\[@\]\}" "\$@"/);
+  assert.match(code, /\| python3 -I "\$POLICY" verify-agents "\$\{deny_read_args\[@\]\}" >&2/);
+  // Git itself lists every config file it loaded, before the scan, through g().
+  const gLine = lines.findIndex((l) => /^g\(\) +\{/.test(l));
+  const scanLine = lines.findIndex((l) => l.includes('python3 -I "$POLICY" scan "$REPO"'));
+  assert.ok(gLine >= 0 && scanLine > gLine, 'the git helpers are defined before the scan');
+  assert.match(code, /g config --list --show-origin -z > "\$origins_z" \|\| die "git configuration cannot be listed \(fail closed\)"/);
+  assert.match(code, /scan "\$REPO" --budget "\$SCAN_BUDGET" --included-out "\$included_z" --config-origins "\$origins_z"/);
   // Content-checked files (gradle.properties ...): every candidate's own diff is checked
   // through gd with a literal pathspec, and anything but "clean" or "found" is fatal.
   const contentLines = lines.filter((l) => l.includes('check-diff-content'));

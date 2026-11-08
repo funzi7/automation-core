@@ -112,61 +112,8 @@ while [[ "$walk" != / ]]; do
 done
 
 # ---------------------------------------------------------------------------
-# 2. One scan: secret-like files (the grep tool returns matching lines from any
-#    file it is pointed at, so a secret in the worktree could reach the model
-#    even though reads are denied), symlinks leaving the repository (OpenCode
-#    2.2.6 checks the requested path, not the canonical one), credential content
-#    in known config files and Git configs, and worktree files a Git config
-#    includes (they are Git configuration the reviewer could read by name).
-# ---------------------------------------------------------------------------
-# The private state directory is created now (the lock is held): the scan hands over
-# the worktree files that a Git config includes, for classify and render.
-mkdir -p "$STATE_ROOT/$REPO_KEY"
-chmod 700 "$STATE_ROOT" "$STATE_ROOT/$REPO_KEY"
-STATE_DIR="$STATE_ROOT/$REPO_KEY"
-tmp_files=()
-trap 'rm -f -- "${tmp_files[@]}"' EXIT
-included_z="$(mktemp "$STATE_DIR/.included.XXXXXX")"
-tmp_files+=("$included_z")
-
-scan_status=0
-scan_out="$(python3 -I "$POLICY" scan "$REPO" --budget "$SCAN_BUDGET" --included-out "$included_z")" || scan_status=$?
-if (( scan_status != 0 )); then
-  printf '%s\n' "$scan_out" | tail -3 >&2
-  die "worktree scan did not complete within ${SCAN_BUDGET}s (status $scan_status); set OAUTO_SCAN_BUDGET higher for large trees"
-fi
-# Decisions rest on the SUMMARY counts only. The records above it (one ASCII line each,
-# names C-quoted) are displayed, never parsed for a decision.
-summary="${scan_out##*$'\n'}"
-summary_re='^SUMMARY files=[0-9]+ sensitive=([0-9]+) symlinks=([0-9]+) content=([0-9]+) elapsed=[0-9.]+s complete=1$'
-[[ "$summary" =~ $summary_re ]] ||
-  die "the worktree scan did not end with a well-formed SUMMARY line"
-n_sensitive="${BASH_REMATCH[1]}"; n_symlinks="${BASH_REMATCH[2]}"; n_content="${BASH_REMATCH[3]}"
-scan_records() { printf '%s\n' "$scan_out" | sed -n "s/^$1 //p"; }
-if (( n_symlinks > 0 )); then
-  printf 'oauto: symlinks leaving the repository or aliasing secret-like paths (hard links included):\n%s\n' "$(scan_records SYMLINK)" >&2
-  die "refusing to launch: OpenCode resolves reads through symlinks but checks only the requested name (and a hard link is the same file under another name), so these would expose paths outside $REPO, or Git metadata and secret-like files inside it, under a harmless name (targets under /usr, /bin, /lib are tolerated)"
-fi
-if (( n_sensitive + n_content > 0 )); then
-  if (( n_sensitive > 0 )); then printf 'oauto: secret-like files present in %s:\n%s\n' "$REPO" "$(scan_records SENSITIVE)" >&2; fi
-  if (( n_content > 0 )); then printf 'oauto: credential-looking content in:\n%s\n' "$(scan_records CONTENT)" >&2; fi
-  if [[ "${OAUTO_ALLOW_SENSITIVE_FILES:-}" != "1" ]]; then
-    die "refusing to launch: the model's grep tool can surface lines from these files. Move them out of the worktree, or set OAUTO_ALLOW_SENSITIVE_FILES=1 to accept that exposure risk explicitly (their diffs stay excluded from the preflight either way)"
-  fi
-  note "WARNING: OAUTO_ALLOW_SENSITIVE_FILES=1 set; continuing with the files above exposed to grep"
-fi
-# Worktree files a Git config includes are Git configuration: the rendered config
-# denies reading them by their exact name too.
-deny_read_args=()
-while IFS= read -r -d '' path; do deny_read_args+=("--deny-read=$path"); done < "$included_z"
-
-# ---------------------------------------------------------------------------
-# 3. Read-only git preflight. It runs before OpenCode's restrictions apply, so no
-#    helper program that the repository (.gitattributes, .git/config, a submodule's
-#    config) or the user's global config selects may run here. Secret-like paths
-#    are excluded from every diff by their exact bytes, including deleted, modified
-#    and renamed tracked secrets, so cleaning up a leak never sends the leaked
-#    content to the model.
+# Git, as every later step runs it: scrubbed, time-bounded and helper-free. Defined
+# before the scan, which asks git which configuration files it loads.
 # ---------------------------------------------------------------------------
 # Scrubbed, time-bounded git. env -i: no GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE /
 # GIT_EXTERNAL_DIFF / GIT_CONFIG_* redirection from the caller's environment. HOME
@@ -209,6 +156,72 @@ g()  { timeout 120 env -i "${git_env[@]}" git -C "$REPO" --work-tree="$REPO" "${
 #                              run with the submodule's own config and filters
 gd() { g diff --no-ext-diff --no-textconv --no-renames --no-relative --no-color --submodule=short --ignore-submodules=dirty "$@"; }
 
+# ---------------------------------------------------------------------------
+# 2. One scan: secret-like files (the grep tool returns matching lines from any
+#    file it is pointed at, so a secret in the worktree could reach the model
+#    even though reads are denied), symlinks leaving the repository (OpenCode
+#    2.2.6 checks the requested path, not the canonical one), credential content
+#    in known config files and Git configs, and worktree files a Git config
+#    includes (they are Git configuration the reviewer could read by name).
+# ---------------------------------------------------------------------------
+# The private state directory is created now (the lock is held): the scan hands over
+# the worktree files that a Git config includes, for classify and render.
+mkdir -p "$STATE_ROOT/$REPO_KEY"
+chmod 700 "$STATE_ROOT" "$STATE_ROOT/$REPO_KEY"
+STATE_DIR="$STATE_ROOT/$REPO_KEY"
+tmp_files=()
+trap 'rm -f -- "${tmp_files[@]}"' EXIT
+included_z="$(mktemp "$STATE_DIR/.included.XXXXXX")"
+origins_z="$(mktemp "$STATE_DIR/.origins.XXXXXX")"
+tmp_files+=("$included_z" "$origins_z")
+# Git names every configuration file it actually loads (includes followed however they
+# are written); the scan treats each one inside the worktree as Git configuration.
+g config --list --show-origin -z > "$origins_z" || die "git configuration cannot be listed (fail closed)"
+
+scan_status=0
+scan_out="$(python3 -I "$POLICY" scan "$REPO" --budget "$SCAN_BUDGET" --included-out "$included_z" --config-origins "$origins_z")" || scan_status=$?
+if (( scan_status != 0 )); then
+  printf '%s\n' "$scan_out" | tail -3 >&2
+  die "worktree scan did not complete within ${SCAN_BUDGET}s (status $scan_status); set OAUTO_SCAN_BUDGET higher for large trees"
+fi
+# Decisions rest on the SUMMARY counts only. The records above it (one ASCII line each,
+# names C-quoted) are displayed, never parsed for a decision.
+summary="${scan_out##*$'\n'}"
+summary_re='^SUMMARY files=[0-9]+ sensitive=([0-9]+) symlinks=([0-9]+) content=([0-9]+) elapsed=[0-9.]+s complete=1$'
+[[ "$summary" =~ $summary_re ]] ||
+  die "the worktree scan did not end with a well-formed SUMMARY line"
+n_sensitive="${BASH_REMATCH[1]}"; n_symlinks="${BASH_REMATCH[2]}"; n_content="${BASH_REMATCH[3]}"
+scan_records() { printf '%s\n' "$scan_out" | sed -n "s/^$1 //p"; }
+if (( n_symlinks > 0 )); then
+  printf 'oauto: symlinks leaving the repository or aliasing secret-like paths (hard links included):\n%s\n' "$(scan_records SYMLINK)" >&2
+  die "refusing to launch: OpenCode resolves reads through symlinks but checks only the requested name (and a hard link is the same file under another name), so these would expose paths outside $REPO, or Git metadata and secret-like files inside it, under a harmless name (targets under /usr, /bin, /lib are tolerated)"
+fi
+if (( n_sensitive + n_content > 0 )); then
+  if (( n_sensitive > 0 )); then printf 'oauto: secret-like files present in %s:\n%s\n' "$REPO" "$(scan_records SENSITIVE)" >&2; fi
+  if (( n_content > 0 )); then printf 'oauto: credential-looking content in:\n%s\n' "$(scan_records CONTENT)" >&2; fi
+  if [[ "${OAUTO_ALLOW_SENSITIVE_FILES:-}" != "1" ]]; then
+    die "refusing to launch: the model's grep tool can surface lines from these files. Move them out of the worktree, or set OAUTO_ALLOW_SENSITIVE_FILES=1 to accept that exposure risk explicitly (their diffs stay excluded from the preflight either way)"
+  fi
+  note "WARNING: OAUTO_ALLOW_SENSITIVE_FILES=1 set; continuing with the files above exposed to grep"
+fi
+# Worktree files a Git config includes are Git configuration: the rendered config
+# denies reading them by their exact name too.
+# A name holding a glob metacharacter cannot be denied exactly (OpenCode would read it
+# as a pattern), so it is refused outright, override or not.
+deny_read_args=()
+while IFS= read -r -d '' path; do
+  [[ "$path" != *[\*\?\[]* ]] || die "an included Git config path holds a glob metacharacter (* ? [) and cannot be denied by its exact name; rename it"
+  deny_read_args+=("--deny-read=$path")
+done < "$included_z"
+
+# ---------------------------------------------------------------------------
+# 3. Read-only git preflight. It runs before OpenCode's restrictions apply, so no
+#    helper program that the repository (.gitattributes, .git/config, a submodule's
+#    config) or the user's global config selects may run here. Secret-like paths
+#    are excluded from every diff by their exact bytes, including deleted, modified
+#    and renamed tracked secrets, so cleaning up a leak never sends the leaked
+#    content to the model.
+# ---------------------------------------------------------------------------
 PREFLIGHT_FILE="$STATE_DIR/preflight.md"
 capped() { # $1 max bytes; stdin -> stdout, byte-exact, with a truncation marker
   local max="$1" tmp size
@@ -423,7 +436,7 @@ render_config "${disable_args[@]}"
 
 (cd "$REPO" && oc 60 debug config --standalone 2>/dev/null) | python3 -I "$POLICY" verify-sources --config-dir "$CONFIG_DIR" >&2
 (cd "$REPO" && oc 120 models --standalone 2>/dev/null) | python3 -I "$POLICY" verify-models >&2
-(cd "$REPO" && oc 60 debug agents --standalone 2>/dev/null) | python3 -I "$POLICY" verify-agents >&2
+(cd "$REPO" && oc 60 debug agents --standalone 2>/dev/null) | python3 -I "$POLICY" verify-agents "${deny_read_args[@]}" >&2
 # Nothing else may have appeared in the private config directory (agents/, plugins/,
 # skills/, cli.json ... would all be loaded from there).
 extra_entries="$(find "$CONFIG_DIR" -mindepth 1 ! -name opencode.json -print)"

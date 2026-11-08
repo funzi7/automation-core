@@ -521,17 +521,20 @@ def _config_value(raw: str) -> str:
 
 def config_include_paths(text: str) -> list[str]:
     """Every `path` value of an [include] or [includeIf "<condition>"] section, in any
-    case, conservatively: conditions are not evaluated (any of them may apply)."""
+    case, conservatively: conditions are not evaluated (any of them may apply). Like
+    git: a leading UTF-8 BOM is skipped, a comment ends at the newline (a trailing
+    backslash continues values only), an odd run of trailing backslashes continues."""
+    if text.startswith("﻿"):
+        text = text[1:]
     paths: list[str] = []
     section = ""
     pending = ""
     for physical in text.split("\n"):
-        line = pending + physical.rstrip("\r")
-        if line.endswith("\\") and not line.endswith("\\\\"):
-            pending = line[:-1]  # continued on the next line
+        line = _strip_config_comment(pending + physical.rstrip("\r"))
+        if (len(line) - len(line.rstrip("\\"))) % 2 == 1:
+            pending = line[:-1]  # the value continues on the next line
             continue
         pending = ""
-        line = _strip_config_comment(line)
         header = _CONFIG_SECTION_HEADER.match(line)
         if header:
             section = header.group(1).split(".", 1)[0].lower()
@@ -656,7 +659,8 @@ def check_excluded(excluded_file: str, remaining_file: str) -> None:
 # Scanner: one walk, no pruning (an explicit grep path bypasses ignore rules)
 # ---------------------------------------------------------------------------
 
-def scan(repo: str, budget: float, included_out: str | None = None) -> int:
+def scan(repo: str, budget: float, included_out: str | None = None,
+         config_origins: str | None = None) -> int:
     """Print one ASCII record per finding (every pathname C-quoted like git) and a final
     SUMMARY line whose counts are what the launcher decides on:
 
@@ -716,11 +720,53 @@ def scan(repo: str, budget: float, included_out: str | None = None) -> int:
         elif os.path.isdir(target):
             dir_links.append((rel(path), target, rel_target))  # judged after the walk
 
-    def check_git_config(found: str, depth: int) -> None:
-        """Credentials in one Git config file, then the files its include directives
-        name, resolved like git: relative to the directory of the file as found. An
-        included file inside the repository but outside .git is Git configuration the
-        reviewer could read by name; one outside the repository is the user's own."""
+    def own_git_dirs() -> list[str]:
+        """This repository's git dir(s): .git itself, or for a .git file (linked
+        worktree, submodule checkout) the gitdir it names and that gitdir's commondir."""
+        if os.path.isdir(git_dir):
+            return [git_dir]
+        try:
+            with open(git_dir, encoding="utf-8", errors="replace") as fh:
+                first = fh.readline().strip()
+        except OSError:
+            return []
+        if not first.startswith("gitdir:"):
+            return []
+        gitdir = os.path.realpath(os.path.join(repo, first[len("gitdir:"):].strip()))
+        dirs = [gitdir]
+        try:
+            with open(os.path.join(gitdir, "commondir"), encoding="utf-8", errors="replace") as fh:
+                dirs.append(os.path.realpath(os.path.join(gitdir, fh.readline().strip())))
+        except OSError:
+            pass
+        return dirs
+
+    git_dirs = own_git_dirs()
+
+    def config_role(canon: str, printed: str | None = None) -> str | None:
+        """Register a Git config file by where it lives. Returns the name its findings
+        are reported under, or None for a file of the user's own outside the repository
+        (still followed, never reported). A file inside the repository but outside .git
+        is Git configuration the reviewer could read by name."""
+        if inside_repo(canon) and not (canon == git_dir or canon.startswith(git_dir + os.sep)):
+            r = rel(canon)
+            if canon not in included:
+                included[canon] = r
+                if any(c in r for c in "*?["):
+                    content.add((r, "cannot be denied by exact path (glob metacharacter)"))
+            return r
+        if inside_repo(canon):
+            return rel(canon)  # under .git
+        if any(canon == d or canon.startswith(d + os.sep) for d in git_dirs):
+            return printed or canon  # this repository's own config, kept outside the worktree
+        return None
+
+    def check_git_config(found: str, depth: int, report: str | None, anchor: str | None) -> None:
+        """Credentials in one Git config file (when it is reportable), then every file its
+        include directives name, resolved like git: relative to the directory of the file
+        as found. Files outside the repository are followed too, as an include may hop
+        back in; only reportable files are reported. ``anchor``: the nearest reportable
+        file of the chain, which a too-deep chain is reported under."""
         canon = os.path.realpath(found)
         if canon in seen_configs:
             return
@@ -730,19 +776,35 @@ def scan(repo: str, budget: float, included_out: str | None = None) -> int:
                 text = fh.read()
         except OSError:
             return
-        if git_config_has_credentials(text):
-            content.add((rel(canon), "remote URL or http header embeds credentials"))
+        if report is not None and git_config_has_credentials(text):
+            content.add((report, "remote URL or http header embeds credentials"))
+        anchor = report if report is not None else anchor
         for inc in config_include_paths(text):
             target = os.path.join(os.path.dirname(found), os.path.expanduser(inc))
             canon_inc = os.path.realpath(target)
-            if not inside_repo(canon_inc) or not os.path.isfile(canon_inc):
+            if not os.path.isfile(canon_inc):
                 continue
             if depth >= MAX_INCLUDE_DEPTH:
-                content.add((rel(canon), f"Git config includes nested deeper than {MAX_INCLUDE_DEPTH} levels"))
+                if anchor is not None:
+                    content.add((anchor, f"Git config includes nested deeper than {MAX_INCLUDE_DEPTH} levels"))
                 continue
-            if not (canon_inc == git_dir or canon_inc.startswith(git_dir + os.sep)):
-                included.setdefault(canon_inc, rel(canon_inc))
-            check_git_config(target, depth + 1)
+            check_git_config(target, depth + 1, config_role(canon_inc), anchor)
+
+    def check_config_origins(path: str) -> None:
+        """Every file git itself reports having loaded (git config --list --show-origin
+        -z: ORIGIN NUL KEY LF VALUE NUL records); paths are as git printed them, relative
+        to the repository root. Other origins (command line, blob, stdin) are ignored."""
+        fields = _nul_fields(_read_bytes(path), "--config-origins", terminated=True)
+        if len(fields) % 2:
+            _die("--config-origins: a record without its key and value (fail closed)")
+        for origin in dict.fromkeys(fields[0::2]):
+            if not origin.startswith(b"file:"):
+                continue
+            printed = os.fsdecode(origin[len(b"file:"):])
+            found = os.path.join(repo, printed)
+            canon = os.path.realpath(found)
+            if os.path.isfile(canon):
+                check_git_config(found, 0, config_role(canon, printed), None)
 
     # .git: links that leave the repository, the inodes of its files (a hard link to
     # one is an alias) and every Git config file (credentials, include directives). Its
@@ -777,7 +839,16 @@ def scan(repo: str, budget: float, included_out: str | None = None) -> int:
                 if not r.startswith(".git/hooks/"):
                     alias_inodes.setdefault((st.st_dev, st.st_ino), r)
                 if _is_git_config(r):
-                    check_git_config(full, 0)
+                    check_git_config(full, 0, r, r)
+    if not os.path.isdir(git_dir):
+        # A .git file: this repository's config lives in the git dir(s) it names.
+        for d in git_dirs:
+            for name in ("config", "config.worktree"):
+                full = os.path.join(d, name)
+                if os.path.isfile(full):
+                    check_git_config(full, 0, full, full)
+    if config_origins:
+        check_config_origins(config_origins)
     # An included Git config is secret-like wherever it lives: by name, as a link target
     # and as a hard-link partner.
     for canon, r in included.items():
@@ -922,9 +993,11 @@ def _model_string(model) -> str:
     return str(model)
 
 
-def verify_agents(payload) -> None:
+def verify_agents(payload, deny_read: list[str] = ()) -> None:
     if not isinstance(payload, list):
         _die("debug agents output is not a JSON array")
+    # The launch's own read denials (included Git config files) must resolve to deny too.
+    probes = PROBES + [("read", p, "deny") for p in deny_read]
     by_id = {a.get("id"): a for a in payload if isinstance(a, dict)}
     expected_visible = set(REVIEW_AGENTS)
     visible = {i for i, a in by_id.items() if not a.get("hidden")}
@@ -937,7 +1010,7 @@ def verify_agents(payload) -> None:
         rules = agent.get("permissions")
         if not isinstance(rules, list) or not rules:
             _die(f"agent {name!r} has no resolved permissions")
-        for action, resource, expected in PROBES:
+        for action, resource, expected in probes:
             got = decide(rules, action, resource)
             if name in REVIEW_AGENTS:
                 if got != expected:
@@ -952,7 +1025,7 @@ def verify_agents(payload) -> None:
                 _die(f"agent {name!r} model is {model_id!r}, expected {want!r}")
             if agent.get("mode") != "primary":
                 _die(f"agent {name!r} mode is {agent.get('mode')!r}, expected primary")
-    print(f"agents ok: {', '.join(sorted(visible))} visible; {len(by_id)} resolved; {len(PROBES)} probes each")
+    print(f"agents ok: {', '.join(sorted(visible))} visible; {len(by_id)} resolved; {len(probes)} probes each")
 
 
 def verify_models(lines: list[str]) -> None:
@@ -1006,6 +1079,8 @@ def main(argv: list[str]) -> None:
     p_scan = sub.add_parser("scan")
     p_scan.add_argument("repo")
     p_scan.add_argument("--budget", type=float, default=180.0, help="seconds before the scan gives up (exit 3)")
+    p_scan.add_argument("--config-origins", metavar="FILE",
+                        help="git config --list --show-origin -z output: every config file git loaded")
     p_scan.add_argument("--included-out", metavar="FILE",
                         help="write the in-repository files .git/config includes, NUL-terminated")
 
@@ -1029,18 +1104,23 @@ def main(argv: list[str]) -> None:
     p_cdc.add_argument("path", help="repository-relative path whose diff is on stdin")
     sub.add_parser("quote-path")
     sub.add_parser("verify-sources").add_argument("--config-dir", required=True)
-    sub.add_parser("verify-agents")
+    sub.add_parser("verify-agents").add_argument("--deny-read", action="append", default=[], metavar="PATH",
+                                                 help="also probe that the reviewers cannot read PATH (repeatable)")
     sub.add_parser("verify-models")
     sub.add_parser("approved")
 
     args = parser.parse_args(argv)
 
     if args.cmd == "render":
-        doc = render(args.model, args.disable_model, list(dict.fromkeys(p for p in args.deny_read if p)))
+        deny_read = list(dict.fromkeys(p for p in args.deny_read if p))
+        inexact = [p for p in deny_read if any(c in p for c in "*?[")]
+        if inexact:
+            _die(f"refusing to render: --deny-read takes exact paths; glob metacharacter in {', '.join(_q(p) for p in inexact)}")
+        doc = render(args.model, args.disable_model, deny_read)
         json.dump(doc, sys.stdout, indent=2)
         sys.stdout.write("\n")
     elif args.cmd == "scan":
-        sys.exit(scan(args.repo, args.budget, args.included_out))
+        sys.exit(scan(args.repo, args.budget, args.included_out, args.config_origins))
     elif args.cmd == "classify":
         if args.nul:
             renames = _read_bytes(args.renames) if args.renames else None
@@ -1064,7 +1144,7 @@ def main(argv: list[str]) -> None:
         config_dir = args.config_dir.rstrip("/")
         verify_sources(json.load(sys.stdin), config_dir, os.path.join(config_dir, "opencode.json"))
     elif args.cmd == "verify-agents":
-        verify_agents(json.load(sys.stdin))
+        verify_agents(json.load(sys.stdin), args.deny_read)
     elif args.cmd == "verify-models":
         verify_models(sys.stdin.read().splitlines())
     elif args.cmd == "approved":

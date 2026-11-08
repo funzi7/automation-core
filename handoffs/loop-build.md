@@ -105,7 +105,8 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
   succeeded — now fatal (`name_pass_failed`), with a source-shape test.
 - Device (Phase 5): `bash launchers/oauto/install.sh` refreshed `/root/work/bin/oauto-run` and
   `oauto-policy.py` after each validated state during the round (previous copies kept as
-  `*.backup-before-oauto-20261108-120902`, `-132239`, `-134043`, `-140044` and `-144953`; `ai-launch`, the
+  `*.backup-before-oauto-20261108-120902`, `-132239`, `-134043`, `-140044`, `-144953` and `-152257`;
+  `ai-launch`, the
   Termux `oauto-launch` wrapper and both `.bashrc` blocks were already identical and untouched; the
   original `ai-launch.backup-before-oauto-20261107` still equals the pristine fixture); `install.sh
   --verify` clean; installed copies byte-identical to the tracked ones (device-parity test passes);
@@ -114,7 +115,7 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
   sources/models/agents (GLM and DeepSeek default agents) and printed the banner; fixture, state dir
   and lock removed; no OpenCode process or service left.
 - Final validation at the pushed head: `bash scripts/validate.sh` green (YAML, JSON, sync/mirror parity,
-  JS syntax, `node --test` 181/181 including `tests/test_oauto_launcher.js` 54/54, 59 github-script
+  JS syntax, `node --test` 188/188 including `tests/test_oauto_launcher.js` 61/61, 59 github-script
   bodies, actionlint, `git diff --check`); real-binary battery (scratchpad script, every scenario of
   this entry) passed on the final launcher, and the six live model probes were repeated on it: shell,
   `/etc/hostname`, `.env`, `opencode/big-pickle` and `--agent build` denied as before, probe secret
@@ -205,6 +206,22 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
   excluded from the preflight diffs and read-denied by name in the rendered permissions and policies
   (`render --deny-read`). Regression tests reproduce both on the previous code; the real-binary
   battery gained both.
+- Fourth pass of the independent reviewer on that round: the quoted-records/count contract held
+  against forged names (a filename that is itself a `SUMMARY` line, names with ` -> `, `(`, quotes,
+  embedded newlines), malformed or empty summaries, budget exhaustion and the "nothing rendered
+  before the scan" property; the include handling held for `~/` into the repo, outside symlinks
+  landing inside, submodule configs, `includeIf "gitdir:..."`, quoted values with comments, real
+  continuations, deny-read paths with metacharacters, and `check-excluded`. One P2 (CONFIRMED): the
+  hand-written include resolver missed files git itself loads — an include that hops through a file
+  outside the repository back into it, a `;` comment ending in a backslash (git ends the comment at
+  the newline), a UTF-8 BOM before `[include]`, and a linked worktree (`.git` is a file, so no config
+  was scanned). Fixed by asking git: the launcher runs `git config --list --show-origin -z` through
+  the hardened helper before the scan and every `file:` origin inside the repository is handled as
+  an included Git config; the parser stays as a conservative complement for includes git did not
+  apply (BOM stripped, comment-continuation fixed, outside hops followed); an included path with
+  glob metacharacters refuses the launch rather than relying on matcher semantics; the per-launch
+  deny-read rules are also probed through `verify-agents --deny-read`. Regression tests reproduce the
+  four misses on the previous code; the battery gained the outside-hop and linked-worktree cases.
 - Review and gate state: the fixes were pushed to the PR branch after this entry's commit; the
   exact-head CI result, the Codex re-review of the pushed head (`@codex review`), the resolution of
   every Codex P1/P2 thread and the Codex Gate verdict are recorded on the PR and in agent-memory
