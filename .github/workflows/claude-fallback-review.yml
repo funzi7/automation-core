@@ -116,6 +116,8 @@ jobs:
             const P1_PATTERN = /(?:P1-orange|(?:^|\n)[\s>*\-_#`]*(?:\*\*\s*P1\s*\*\*|\[P1\]|P1:))/i;
             const P2_PATTERN = /(?:P2-yellow|(?:^|\n)[\s>*\-_#`]*(?:\*\*\s*P2\s*\*\*|\[P2\]|P2:))/i;
             const REVIEWED_COMMIT_PATTERN = /(?:^|\n)\*\*Reviewed commit:\*\*\s*`([a-f0-9]{10,40})`(?:\s|$)/i;
+            // Must match codex-gate.yml / merge-bot.yml / claude-fallback-watchdog.yml.
+            const REVIEW_STATE_MARKER_PATTERN = /<!--\s*codex-review-state:v1\s+(\{.*?\})\s*-->/;
 
             function isCodexCapacityNotice(body) {
               const text = String(body || '').trim();
@@ -149,6 +151,22 @@ jobs:
               if (commit) return commit === exactHead;
               const marker = String(item?.body || '').match(REVIEWED_COMMIT_PATTERN)?.[1]?.toLowerCase();
               if (marker) return exactHead.startsWith(marker);
+              // Codex's machine-written review-state marker (the same binding
+              // the gate, Merge Bot and the watchdog apply): a COMPLETED code
+              // review naming this full SHA is a genuine Codex result on the
+              // head, so no fallback may be minted over it.
+              const state = String(item?.body || '').match(REVIEW_STATE_MARKER_PATTERN)?.[1];
+              if (state) {
+                let review = null;
+                try {
+                  review = JSON.parse(state)?.code_review;
+                } catch (e) {
+                  return false;
+                }
+                if (!review || review.status !== 'completed') return false;
+                const reviewedSha = String(review.commit_sha || '').toLowerCase();
+                return /^[a-f0-9]{40}$/.test(reviewedSha) && reviewedSha === exactHead;
+              }
               return false;
             }
             const isCodex = (user) =>
@@ -229,7 +247,7 @@ jobs:
             }
 
             // ---- Codex availability + finding state -------------------------
-            const [reviews, comments, reviewComments] = await Promise.all([
+            const [reviews, comments, reviewComments, reactions] = await Promise.all([
               github.paginate(github.rest.pulls.listReviews, {
                 owner, repo, pull_number: prNumber, per_page: 100,
               }),
@@ -238,6 +256,13 @@ jobs:
               }),
               github.paginate(github.rest.pulls.listReviewComments, {
                 owner, repo, pull_number: prNumber, per_page: 100,
+              }),
+              // Every consumer counts a trusted Codex reaction as real Codex
+              // activity (collectReviewEvidenceInputs). The producer must see
+              // the same surface, or it mints an attestation the consumers
+              // then reject as quota_episode_closed.
+              github.paginate(github.rest.reactions.listForIssue, {
+                owner, repo, issue_number: prNumber, per_page: 100,
               }),
             ]);
 
@@ -269,18 +294,37 @@ jobs:
                 'Codex review path instead of a fallback.',
               );
             }
-            // The newest Codex review-relevant signal must be the quota notice,
-            // otherwise the quota episode does not describe the current state.
-            const newestAt = (items) => items.reduce((newest, item) => {
+            // The newest Codex review-relevant signal must be STRICTLY older
+            // than the newest quota notice, otherwise the quota episode does
+            // not describe the current state. This mirrors the consumers'
+            // realActivity exactly: reviews, comments, review comments AND
+            // reactions (a reaction has no body and still proves Codex is
+            // answering); a notice that carries a P1/P2 is activity rather
+            // than a notice; and a same-second tie fails closed because REST
+            // timestamps cannot prove which came last.
+            const signalAt = (item) => {
               const at = new Date(item.submitted_at || item.created_at || 0).getTime();
-              return Number.isFinite(at) && at > newest ? at : newest;
-            }, 0);
-            const otherCodexSignals = [...reviews, ...comments, ...reviewComments].filter((item) =>
-              isCodex(item.user) && !isCodexCapacityNotice(item.body) && !isCodexTaskResult(item.body));
-            if (newestAt(otherCodexSignals) > newestAt(quotaNotices)) {
+              return Number.isFinite(at) ? at : 0;
+            };
+            const newestAt = (items) => items.reduce((newest, item) => Math.max(newest, signalAt(item)), 0);
+            const otherCodexSignals = [
+              ...reviews.map((item) => ({ item, kind: 'review' })),
+              ...comments.map((item) => ({ item, kind: 'comment' })),
+              ...reviewComments.map((item) => ({ item, kind: 'review comment' })),
+              ...reactions.map((item) => ({ item, kind: 'reaction' })),
+            ].filter(({ item }) =>
+              isCodex(item.user) &&
+              (!isCodexCapacityNotice(item.body) || severity(item.body)) &&
+              !isCodexTaskResult(item.body));
+            const newestSignal = otherCodexSignals.reduce((newest, signal) =>
+              (!newest || signalAt(signal.item) > signalAt(newest.item)) ? signal : newest, null);
+            const newestNoticeAt = newestAt(quotaNotices);
+            if (newestSignal && signalAt(newestSignal.item) >= newestNoticeAt) {
               return refuse(
-                'a genuine Codex signal is newer than the quota notice; the ' +
-                'quota episode is not current.',
+                `a genuine Codex ${newestSignal.kind} at ` +
+                `${new Date(signalAt(newestSignal.item)).toISOString()} is not older than the ` +
+                `newest quota notice at ${new Date(newestNoticeAt).toISOString()}; ` +
+                'the quota episode is not current.',
               );
             }
 

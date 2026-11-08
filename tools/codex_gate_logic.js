@@ -20,6 +20,18 @@ const P1_PATTERN = /(?:P1-orange|(?:^|\n)[\s>*\-_#`]*(?:\*\*\s*P1\s*\*\*|\[P1\]|
 const P2_PATTERN = /(?:P2-yellow|(?:^|\n)[\s>*\-_#`]*(?:\*\*\s*P2\s*\*\*|\[P2\]|P2:))/i;
 const REVIEWED_COMMIT_PATTERN = /(?:^|\n)\*\*Reviewed commit:\*\*\s*`([a-f0-9]{10,40})`(?:\s|$)/i;
 const HEAD_EPOCH_MARKER_PATTERN = /<!--\s*codex-head-epoch:v3\s+run=(\d+)\s+attempt=(\d+)\s+pr=(\d+)\s+head=([a-f0-9]{40})\s*-->/i;
+// Codex keeps ONE summary comment per PR (edited in place) that opens with a
+// machine-written state marker from the trusted connector:
+//   <!-- codex-review-state:v1 {"code_review":{"commit_sha":"<40-hex>",
+//        "has_any_findings":…,"has_unresolved_findings":…,"status":"completed"},
+//        "security_review":{…}} -->
+// It names the FULL SHA the code review covered, so it is exact-head evidence
+// on a PR whose clean result is this summary plus a 👍 with no `Reviewed
+// commit` receipt. Only a `completed` code review binds: `in_progress`,
+// `pending` or null is NOT a review, a SHA prefix is not a SHA, and the
+// security_review block never speaks for the code review. Who authored the
+// comment stays the caller's trust decision.
+const REVIEW_STATE_MARKER_PATTERN = /<!--\s*codex-review-state:v1\s+(\{.*?\})\s*-->/;
 
 function isCodexCapacityNotice(body) {
   const text = String(body || '').trim();
@@ -43,6 +55,21 @@ function signalTargetsHead(item, headSha, headObservedAt = null, dateField = 'cr
   if (commit) return commit === exactHead;
   const marker = String(item?.body || '').match(REVIEWED_COMMIT_PATTERN)?.[1]?.toLowerCase();
   if (marker) return exactHead.startsWith(marker);
+  const state = String(item?.body || '').match(REVIEW_STATE_MARKER_PATTERN)?.[1];
+  if (state) {
+    // Structured review-state marker (see REVIEW_STATE_MARKER_PATTERN): a
+    // completed code review of exactly this full SHA binds, anything else
+    // (unparseable, not completed, prefix, security_review only) does not.
+    let review = null;
+    try {
+      review = JSON.parse(state)?.code_review;
+    } catch (e) {
+      return false;
+    }
+    if (!review || review.status !== 'completed') return false;
+    const reviewedSha = String(review.commit_sha || '').toLowerCase();
+    return /^[a-f0-9]{40}$/.test(reviewedSha) && reviewedSha === exactHead;
+  }
   // Timing alone cannot bind an asynchronous result to a head: an old-head
   // task can finish after a new push. Affirmative signals must name a commit.
   return false;
@@ -126,19 +153,22 @@ function authorLogin(comment) {
   );
 }
 
+function threadLocation(thread) {
+  return {
+    path: String(thread?.path || ''),
+    line: Number.isInteger(thread?.line) ? thread.line : null,
+    startLine: Number.isInteger(thread?.startLine) ? thread.startLine : null,
+    threadId: String(thread?.id || ''),
+  };
+}
+
 function findingFromThread(thread) {
   for (const comment of thread?.comments || []) {
     const login = authorLogin(comment);
     if (!TRUSTED_CODEX_LOGINS.has(login)) continue;
     const level = severity(comment?.body || '');
     if (!level) continue;
-    return {
-      severity: level,
-      path: String(thread?.path || ''),
-      line: Number.isInteger(thread?.line) ? thread.line : null,
-      startLine: Number.isInteger(thread?.startLine) ? thread.startLine : null,
-      threadId: String(thread?.id || ''),
-    };
+    return { severity: level, ...threadLocation(thread) };
   }
   return null;
 }
@@ -147,9 +177,19 @@ function classifyThreads(threads) {
   const active = [];
   const outdated = [];
   const resolved = [];
+  // Fail closed: a non-resolved thread whose comments overflowed the single
+  // page the reader fetched (`commentsTruncated`) may hold a trusted P1/P2
+  // beyond what was read. With no finding visible on the first page it cannot
+  // be classified, so it is reported separately and must keep the gate yellow.
+  const truncated = [];
   for (const thread of threads || []) {
     const finding = findingFromThread(thread);
-    if (!finding) continue;
+    if (!finding) {
+      if (thread?.isResolved !== true && thread?.commentsTruncated === true) {
+        truncated.push(threadLocation(thread));
+      }
+      continue;
+    }
     if (thread?.isResolved === true) {
       resolved.push(finding);
     } else if (thread?.isOutdated === true) {
@@ -158,7 +198,7 @@ function classifyThreads(threads) {
       active.push(finding);
     }
   }
-  return { active, outdated, resolved };
+  return { active, outdated, resolved, truncated };
 }
 
 function decideCodexGate({
@@ -196,6 +236,18 @@ function decideCodexGate({
     };
   }
 
+  if (classified.truncated.length) {
+    // A thread whose comments could not all be read may still hide a live
+    // trusted P1/P2. Neither a clean current-head signal nor a fallback can
+    // clear what the evaluator never saw, so the head stays unverified.
+    return {
+      status: 'pending',
+      reason: 'review_thread_truncated',
+      activeFindings: [],
+      outdatedFindings: classified.outdated,
+    };
+  }
+
   if (classified.outdated.length && !currentHeadSignal) {
     return {
       status: 'pending',
@@ -229,6 +281,7 @@ module.exports = {
   P2_PATTERN,
   REVIEWED_COMMIT_PATTERN,
   HEAD_EPOCH_MARKER_PATTERN,
+  REVIEW_STATE_MARKER_PATTERN,
   isCodexCapacityNotice,
   isCodexTaskResult,
   signalTargetsHead,

@@ -42,10 +42,15 @@ const FALLBACK_VERDICT = 'clean';
 const FALLBACK_ATTESTATION_WORKFLOW_PATH =
   '.github/workflows/claude-fallback-review.yml';
 
-// Route B bound: a decline from an earlier head epoch authorizes a fallback
-// only this long, so stale evidence cannot authorize a later unrelated
-// fallback forever.
+// Episode bound for BOTH routes, measured from the newest trusted quota
+// notice to the moment the fallback was attested: a decline authorizes a
+// fallback only this long, so stale evidence of unavailability cannot
+// authorize a later fallback forever — not even on an unchanged head.
 const QUOTA_EPISODE_TTL_MS = 24 * 60 * 60 * 1000;
+
+// An attestation must have been written inside the CURRENT head epoch; this
+// is the same clock skew the run-window checks allow.
+const HEAD_EPOCH_SKEW_MS = 5000;
 
 // validation is `<status>/<reference>`, and only a PASSED status can carry
 // evidence: a failed or unknown validation must never mint a clean
@@ -120,7 +125,12 @@ function attestationRunIsTrusted(run, {
   // ran from the trusted default branch through an explicit dispatch (which
   // requires write access). A run started from a PR ref would execute
   // PR-controlled YAML.
-  if (String(run.path || '') !== workflowPath) return false;
+  //
+  // GitHub documents a run attempt's `path` with an `@ref` suffix
+  // ("…/build.yml@main"); live responses return the bare path. Accept both
+  // spellings of the ONE canonical path — the ref itself is pinned separately
+  // by the head_branch check below.
+  if (String(run.path || '').replace(/@.*$/, '') !== workflowPath) return false;
   if (String(run.event || '') !== 'workflow_dispatch') return false;
   // An unknown default branch fails closed rather than skipping the check that
   // keeps a PR-ref run — which would execute PR-controlled YAML — out.
@@ -217,15 +227,20 @@ function evaluateFallbackAttestation(attestation, headSha) {
 }
 
 /**
- * Is a trusted Codex quota/capacity episode active for THIS head right now?
+ * Is a trusted Codex quota/capacity episode open for the fallback that was
+ * attested at `attestedAt`?
  *
  * `notices` must already be filtered by the caller to bodies that a trusted
  * Codex identity actually authored and that `isCodexCapacityNotice` matched,
  * so they are review-relevant and unforgeable by ordinary PR/issue comments.
  *
- * The episode is bound to the current head epoch: a notice from an earlier
- * head never authorizes a fallback on a later head. Without an authenticated
- * head-transition observation there is no episode at all (fail closed).
+ * Both routes are bounded by QUOTA_EPISODE_TTL_MS measured from the newest
+ * notice to the attestation. Route A (the decline landed on this head epoch)
+ * additionally admits an attestation written BEFORE that notice, because the
+ * head-epoch binding already bounds it from below. Without an authenticated
+ * head-transition observation there is no episode at all, and any genuine
+ * Codex activity at least as new as the newest notice closes it — on a
+ * same-second tie the order cannot be proven, so the tie fails closed.
  */
 function evaluateQuotaEpisode(notices = [], {
   headObservedAt = null,
@@ -255,7 +270,10 @@ function evaluateQuotaEpisode(notices = [], {
     return { active: false, reason: 'no_quota_notice', noticeAt: null };
   }
   const newestReal = newestOf(realActivity);
-  if (newestReal !== null && newestReal > newestNotice) {
+  // `>=`, not `>`: REST timestamps have one-second precision, so when a
+  // genuine Codex item and the newest notice share a second the order cannot
+  // be proven. Fail closed and treat Codex as answering again.
+  if (newestReal !== null && newestReal >= newestNotice) {
     return {
       active: false, reason: 'quota_episode_closed', noticeAt: new Date(newestNotice),
     };
@@ -264,19 +282,23 @@ function evaluateQuotaEpisode(notices = [], {
   if (!Number.isFinite(observedAt) || observedAt <= 0) {
     return { active: false, reason: 'head_epoch_unknown', noticeAt: null };
   }
-  // Route A — Codex declined on THIS head epoch.
+  const attested = Number(attestedAt);
+  const withinTtl = Number.isFinite(attested) && attested > 0 &&
+    attested - newestNotice <= QUOTA_EPISODE_TTL_MS;
+  // Route A — Codex declined on THIS head epoch. The decline describes the
+  // present only for the TTL: a fallback minted later than that is stale
+  // evidence of unavailability (quota may have been restored long ago and
+  // nobody re-requested a review), however little the head moved. A negative
+  // difference — attested before the newest notice — is fine, because the
+  // head-epoch binding already bounds the attestation from below.
   if (newestNotice >= observedAt) {
-    return {
-      active: true, reason: 'trusted_quota_episode', noticeAt: new Date(newestNotice),
-    };
+    return withinTtl
+      ? { active: true, reason: 'trusted_quota_episode', noticeAt: new Date(newestNotice) }
+      : { active: false, reason: 'stale_quota_evidence', noticeAt: new Date(newestNotice) };
   }
   // Route B — the decline predates this head epoch, Codex has posted nothing
-  // since, and the fallback review was attested within the TTL of it.
-  const attested = Number(attestedAt);
-  if (
-    Number.isFinite(attested) && attested >= newestNotice &&
-    attested - newestNotice <= QUOTA_EPISODE_TTL_MS
-  ) {
+  // since, and the fallback review was attested within the TTL AFTER it.
+  if (withinTtl && attested >= newestNotice) {
     return {
       active: true, reason: 'trusted_quota_episode', noticeAt: new Date(newestNotice),
     };
@@ -349,13 +371,28 @@ function decideReviewEvidence({
     }
   }
 
-  // Policy gate and episode proof are preconditions for ACCEPTING fallback.
-  // They never soften a blocking self-declared finding.
+  // Policy gate, head-epoch binding and episode proof are preconditions for
+  // ACCEPTING fallback. They never soften a blocking self-declared finding:
+  // the SHA is byte-identical in every epoch, so an unresolved finding a
+  // fallback reported on it is still in the code.
   let fallbackReason = fallback.reason;
   let fallbackAccepted = fallback.accepted;
   if (fallbackAccepted && !fallbackPolicyEnabled) {
     fallbackAccepted = false;
     fallbackReason = 'fallback_policy_disabled';
+  }
+  // A branch that moves A -> B -> A starts a NEW epoch of A. An attestation
+  // written before the current epoch began was minted for the earlier one and
+  // must not be revived on the return (mirrors the inline block's per-comment
+  // check, with the same skew the run-window checks allow).
+  const observedAt = new Date(headObservedAt || 0).getTime();
+  const attested = Number(attestedAt);
+  if (
+    fallbackAccepted && Number.isFinite(observedAt) && observedAt > 0 &&
+    Number.isFinite(attested) && attested < observedAt - HEAD_EPOCH_SKEW_MS
+  ) {
+    fallbackAccepted = false;
+    fallbackReason = 'attestation_predates_head_epoch';
   }
   if (fallbackAccepted && !episode.active) {
     fallbackAccepted = false;
@@ -440,6 +477,7 @@ module.exports = {
   FALLBACK_VERDICT,
   FALLBACK_ATTESTATION_WORKFLOW_PATH,
   QUOTA_EPISODE_TTL_MS,
+  HEAD_EPOCH_SKEW_MS,
   VALIDATION_TOKEN_PATTERN,
   parseMarkerAttributes,
   parseFallbackAttestations,

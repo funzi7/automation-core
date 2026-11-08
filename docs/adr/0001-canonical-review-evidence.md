@@ -69,9 +69,16 @@ existing `codex-head-epoch` markers:
 
 - the comment was authored by `github-actions[bot]`;
 - the referenced run and attempt resolve through the **authenticated** Actions
-  API to a real run of `.github/workflows/claude-fallback-review.yml`;
+  API to a real run of `.github/workflows/claude-fallback-review.yml` (matched
+  with any `@ref` suffix stripped — GitHub documents run-attempt paths as
+  `build.yml@main` even though live responses return the bare path; the ref
+  itself is pinned by the next rule);
 - that run's event is `workflow_dispatch` and its `head_branch` is the default
   branch (a run from a PR ref would execute PR-controlled YAML);
+- the comment was written inside the **current head epoch**: a branch that
+  moves A → B → A starts a new epoch of A, and an attestation minted during the
+  earlier epoch is not revived on the return
+  (`attestation_predates_head_epoch`, with the same 5 s skew as the run window);
 - the run **completed successfully** — a queued run would leave an open-ended
   authentication window, and a run that refused to attest proves nothing;
 - the comment timestamp falls inside that run's execution window;
@@ -90,28 +97,42 @@ A quota notice counts only when the real Codex connector identity authored it
 and the body matches the connector's own code-review usage-limit wording. An
 episode is current in exactly two ways:
 
-- **Route A** — the decline landed on this head epoch. The head has not moved
-  and Codex has not returned, so the decline still describes the present.
+- **Route A** — the decline landed on this head epoch, and the fallback was
+  attested no later than `QUOTA_EPISODE_TTL_MS` (24 h) after it. An attestation
+  written *before* that notice is fine: the head-epoch binding already bounds
+  it from below.
 - **Route B** — the decline predates this head epoch, Codex has posted nothing
-  since, and the fallback was attested within `QUOTA_EPISODE_TTL_MS` (24 h) of
-  it. Codex simply stops answering on later pushes while its quota is out, so
-  demanding a fresh per-head notice would reject genuine exhaustion. PR #103
-  needs this: its last notice beats the final push by nine seconds, which is
-  far too thin to depend on.
+  since, and the fallback was attested within the same 24 h *after* it. Codex
+  simply stops answering on later pushes while its quota is out, so demanding
+  a fresh per-head notice would reject genuine exhaustion. PR #103 needs this:
+  its last notice beats the final push by nine seconds, which is far too thin
+  to depend on.
 
-Any genuine Codex activity newer than the newest notice **closes** the episode.
-Without an authenticated head-epoch observation there is no episode at all. A
-notice that itself carries a P1/P2 marker is a finding, not proof of
-unavailability, and never opens an episode.
+Any genuine Codex activity **at least as new as** the newest notice **closes**
+the episode: REST timestamps carry one-second precision, so a same-second tie
+cannot prove that the notice came last, and the tie fails closed. Without an
+authenticated head-epoch observation there is no episode at all. A notice that
+itself carries a P1/P2 marker is a finding, not proof of unavailability, and
+never opens an episode (it counts as activity instead).
 
-**Route A deliberately carries no TTL.** A decline that landed on this head
-epoch stays valid while the head does not move and Codex does not answer,
-because both of those are observable facts rather than assumptions: any new
-commit invalidates the attestation outright, and any Codex activity closes the
-episode. Adding a wall-clock expiry here would turn a green PR red after a
-fixed delay with nothing having changed, which is churn without a safety gain.
-The anti-staleness requirement is met by head-binding plus Route B's 24 h bound,
-which is where an *older* episode could otherwise leak into a *later* fallback.
+**Route A is bounded by the same TTL.** The original decision gave Route A no
+expiry, reasoning that head-binding plus Codex's silence were observable facts
+and that a wall-clock expiry would only turn a green PR red with nothing having
+changed. Codex's review of the synced block (paywall-bot PR #107, 2026-11-08)
+showed the gap in that reasoning: on a head that never moves, a months-old
+on-epoch decline would authorize a *newly dispatched* fallback attestation,
+although quota may have been restored long ago and nobody re-requested a Codex
+review — the decline no longer describes the present. Route A is therefore
+active only when the candidate attestation time is known and
+`attestedAt − newestNotice ≤ 24 h`; an attestation minted more than 24 h after
+the newest on-epoch decline is stale evidence of unavailability
+(`stale_quota_evidence`). A negative difference is allowed because an
+attestation written before the newest notice is already bounded from below by
+the head-epoch binding. Nothing flips red merely because time passes: an
+already-accepted attestation keeps its own fixed `attestedAt`, so the bound
+constrains when a fallback may be *minted*, not how long an accepted one stays
+valid. The reason codes are unchanged: `trusted_quota_episode` /
+`stale_quota_evidence`.
 
 ### One shared decision
 
@@ -148,6 +169,45 @@ The gate publishes `Codex exact-head review accepted` or
 `Claude Code fallback review accepted for exact head; Codex quota unavailable`.
 It never reports "Codex reviewed" for a Claude review.
 
+### 2026-11-08 hardening
+
+Trigger: Codex reviewed the synced `.github/workflows/codex-gate.yml` in
+paywall-bot PR #107 and left six unresolved findings against this block. All
+six are fixed in the canonical block (the three carriers stay byte-identical),
+the producer, the mirror module and the tests. Every change narrows what is
+accepted; none widens it.
+
+1. **Timestamp ties close the episode (P2).** `evaluateQuotaEpisode` treats
+   `newestReal >= newestNotice` as `quota_episode_closed`; the order of two
+   items in the same second cannot be proven.
+2. **Route A has a TTL (P1).** See above: the fallback must be attested within
+   24 h after the newest on-epoch decline, otherwise `stale_quota_evidence`.
+3. **Attestations bind to the current head epoch (P1).** In
+   `acceptedFallbackEvidenceUnsafe`, when `headObservedAt` is known, a
+   candidate whose comment predates it (5 s skew) is rejected with
+   `attestation_predates_head_epoch` and scanning continues; the module applies
+   the same rule to `attestedAt`. The binding only removes acceptance: a
+   blocking attestation from an earlier epoch of the same SHA still blocks,
+   because identical bytes carry identical findings.
+4. **Candidates with inactive episodes no longer end the scan (P2).** The loop
+   remembers the reason and continues, so a newer stale candidate cannot hide
+   an older still-valid exact-head attestation. A blocking candidate still
+   wins immediately. Diagnostics report the newest *authenticated* exact-head
+   rejection in preference to a structural one.
+5. **Run `path` with an `@ref` suffix (P1, defensive).** GitHub's documented
+   example for "Get a workflow run attempt" shows `build.yml@main`; live
+   responses on 2026-11-08 returned the bare path on both repositories.
+   `attestationRunIsTrusted` compares the path with any `@…` suffix stripped,
+   the ref being pinned by the `head_branch` rule. `trustedHeadMarkers`
+   (outside the block) keeps its exact comparison.
+6. **The producer counts reactions (P2).** `claude-fallback-review.yml` lists
+   the PR's issue reactions and includes trusted Codex reactions in the
+   newest-signal comparison, mirroring `collectReviewEvidenceInputs` exactly
+   (a severity-carrying notice counts as activity there too, and a tie
+   refuses). It refuses with a message naming the surface and the timestamps.
+   Without this the producer could mint an attestation every consumer then
+   rejected as `quota_episode_closed`.
+
 ## Consequences
 
 - `codex-p1-acknowledged`, owner override and reaction acknowledgement keep
@@ -156,9 +216,11 @@ It never reports "Codex reviewed" for a Claude review.
   to `true`; the normal Codex path is unchanged everywhere else.
 - A new commit invalidates the attestation, which is the intended cost: the
   reviewer must review the head that will actually merge.
-- Route B's 24 h bound is the only new time constant. It is deliberately
-  generous enough for a real review cycle and short enough that an old decline
-  cannot authorize an unrelated later fallback.
+- The 24 h bound is the only new time constant, and since 2026-11-08 it applies
+  to both routes, measured from the newest notice to the attestation. It is
+  deliberately generous enough for a real review cycle and short enough that
+  an old decline cannot authorize a later fallback — on another head or on the
+  same one.
 
 ## Alternatives rejected
 

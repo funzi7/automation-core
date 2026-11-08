@@ -6,7 +6,7 @@ Central source of truth for CI/CD automation across all of @funzi7's repositorie
 
 `workflows/` — generic GitHub Actions workflows synced to every participating repo:
 - `codex-auto-fix.yml` — triggers Codex to fix flagged P1/P2 reviews automatically
-- `codex-gate.yml` — blocks PR merge until Codex review evidence binds to the current head and no P1/P2 remains; capacity/task/timing signals never count, and reaction-only clean is limited to an authenticated single-head PR
+- `codex-gate.yml` — blocks PR merge until Codex review evidence binds to the current head and no P1/P2 remains; capacity/task/timing signals never count, reaction-only clean is limited to an authenticated single-head PR, and a technical evaluation error publishes a failure verdict, never a green one
 - `claude.yml` — **Claude Fixer**: Claude Code fixes a `claude-fix` Issue (or an `@claude` mention) on a branch and opens a PR
 - `ci-doctor.yml` — **CI Doctor**: detects failed runs on the default branch and opens `claude-fix` Issues
 - `merge-bot.yml` — **Merge Bot**: squash-merges fully-green PRs once codex-gate passes
@@ -91,6 +91,24 @@ still happen within minutes — the crons are just the backstop.
 | `AUTOMATION_PAT` | `ci-doctor.yml`, `merge-bot.yml`, and trusted post-Claude PR creation | **Required for the loop to chain.** It is never passed to Issue-mode Claude or its model-facing checkout. If absent, trusted writes exit green (fail-soft). Needs Contents/PRs/Issues write, Metadata read. |
 | `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` | optional | Escalation pings on `needs-owner` / protected-path blocks. Messages use `parse_mode: HTML` (Markdown underscores broke us before). Skipped silently if unset. |
 
+### GITHUB_TOKEN permissions for review evidence
+
+Codex Gate and the fallback attestation producer write their evidence as
+comments **on pull requests** (the `codex-head-epoch:v3` marker and the
+`claude-fallback-review:v1` attestation) with the default `GITHUB_TOKEN`. A
+comment on a pull request is authorized as a pull-request write even though it
+travels through the issues endpoint. With `pull-requests: read` the publish
+failed on every PR in every repository with `Resource not accessible by
+integration` (found 2026-11-08 on paywall-bot #120/#122 and automation-core
+#58), so no marker was ever written. Both workflows now declare
+`pull-requests: write` together with `issues: write`, and
+`tests/test_workflow_permissions.js` pins that shape for every default-token
+PR comment writer. A missing marker is always fail-closed: reaction-only clean,
+trusted-sync grace and fallback quota episodes all require an authenticated
+head epoch and otherwise stay pending; exact-head review evidence
+(`commit_id`, `Reviewed commit`, the connector's completed review-state marker)
+never depends on the marker.
+
 ### Repository variables
 
 | Variable | Used by | Notes |
@@ -153,6 +171,18 @@ with a log notice if it is missing. This is deliberate: these files are
 synced to **every** repo, but only repos that opt in (by having the secrets
 set) actually run the automation. Key-less repos never produce red failures
 and burn essentially no Actions minutes.
+
+Fail-soft covers only *missing opt-in secrets*. It never covers a failed
+evaluation: when Codex Gate hits an API or GraphQL error while judging a head,
+it publishes `check-codex-status` as **failure** with the title
+`🟠 Gate evaluation error — fail-closed`, fails its evaluator job, and lets the
+next event or the 15-minute scheduled sweep re-evaluate the head. Until
+2026-11-08 that branch published a green "Technical fail-soft" check, which
+Merge Bot and branch protection read as review approval. The expected
+pre-review state is different and normal: a `pull_request_target` run fires
+seconds after a push, before Codex has reviewed, and publishes
+`🟡 Waiting for Codex review` as `failure`; the gate republishes green once
+Codex posts exact-head evidence.
 
 ### Protected paths
 

@@ -262,6 +262,15 @@ jobs:
                 /\[View task(?:\s*(?:→|->))?\s*\]\(/i.test(text);
             }
             const HEAD_EPOCH_MARKER_PATTERN = /<!--\s*codex-head-epoch:v3\s+run=(\d+)\s+attempt=(\d+)\s+pr=(\d+)\s+head=([a-f0-9]{40})\s*-->/i;
+            // Codex's single per-PR summary comment (edited in place) opens
+            // with a machine-written state marker from the trusted connector
+            // naming the FULL SHA its code review covered — exact-head
+            // evidence when the clean result is that summary plus a 👍 and no
+            // `Reviewed commit` receipt. Only a `completed` code review binds:
+            // `in_progress`, `pending` or null is NOT a review, a prefix is
+            // not a SHA, and security_review never speaks for the code review.
+            // Must match codex-gate.yml / claude-fallback-watchdog.yml.
+            const REVIEW_STATE_MARKER_PATTERN = /<!--\s*codex-review-state:v1\s+(\{.*?\})\s*-->/;
             function signalTargetsHead(item, headSha, headObservedAt, dateField = 'created_at') {
               const exactHead = String(headSha || '').toLowerCase();
               if (!/^[a-f0-9]{40}$/.test(exactHead)) return false;
@@ -272,6 +281,18 @@ jobs:
               if (commit) return commit === exactHead;
               const marker = String(item?.body || '').match(REVIEWED_COMMIT_PATTERN)?.[1]?.toLowerCase();
               if (marker) return exactHead.startsWith(marker);
+              const state = String(item?.body || '').match(REVIEW_STATE_MARKER_PATTERN)?.[1];
+              if (state) {
+                let review = null;
+                try {
+                  review = JSON.parse(state)?.code_review;
+                } catch (e) {
+                  return false;
+                }
+                if (!review || review.status !== 'completed') return false;
+                const reviewedSha = String(review.commit_sha || '').toLowerCase();
+                return /^[a-f0-9]{40}$/.test(reviewedSha) && reviewedSha === exactHead;
+              }
               return false;
             }
 
@@ -436,6 +457,7 @@ jobs:
                             isResolved
                             isOutdated
                             comments(first: 100) {
+                              pageInfo { hasNextPage }
                               nodes { body author { login } }
                             }
                           }
@@ -452,6 +474,9 @@ jobs:
                     TRUSTED_CODEX_LOGINS.has(comment.author?.login || '') &&
                     hasSeverity(comment.body)
                   )) return true;
+                  // Fail closed: a thread with more comments than one page
+                  // shows may hold a trusted P1/P2 beyond what was read.
+                  if (thread.comments?.pageInfo?.hasNextPage) return true;
                 }
                 cursor = connection.pageInfo.hasNextPage
                   ? connection.pageInfo.endCursor
@@ -479,8 +504,11 @@ jobs:
             //    the Actions API; free-form prose is never authority;
             //  - it binds to the exact 40-character head, so any new commit
             //    invalidates it and a previous-head attestation is worthless;
-            //  - the trusted Codex code-review quota notice must belong to the
-            //    CURRENT head epoch and still sit inside the episode TTL;
+            //  - the trusted Codex code-review quota notice must still describe
+            //    the present: the attestation was minted inside the episode
+            //    TTL of the newest notice and inside the CURRENT head epoch
+            //    (a branch moving A -> B -> A starts a new epoch of A), and no
+            //    genuine Codex activity is as new as that notice;
             //  - a genuine Codex result on this head ends the episode, and
             //    normal Codex evidence remains the default authority;
             //  - an attestation that declares unresolved P1/P2 blocks rather
@@ -641,25 +669,33 @@ jobs:
               };
             }
 
-            // Is a trusted Codex code-review quota episode open right now?
+            // Is a trusted Codex code-review quota episode open for the
+            // fallback that was attested at `attestedAt`?
             //
             // `notices` are trusted-actor capacity notices; `realActivity` is
             // every OTHER trusted Codex surface (reviews, comments, review
             // comments, reactions) excluding non-binding task summaries.
             // Ordinary comments can never reach either list.
             //
-            // Two ways an episode is current, both bound to real evidence:
-            //   Route A — Codex declined on THIS head epoch. The head has not
-            //     moved and Codex has not returned, so the decline still
-            //     describes the present state.
+            // Two ways an episode is current, both bound to real evidence and
+            // both bounded by QUOTA_EPISODE_TTL_MS measured from the newest
+            // notice to the attestation:
+            //   Route A — Codex declined on THIS head epoch. The decline
+            //     describes the present only for the TTL: a fallback minted
+            //     later than that is stale evidence of unavailability (quota
+            //     may have been restored long ago and nobody re-requested a
+            //     review), however little the head moved. An attestation
+            //     minted BEFORE the newest notice is fine — the head-epoch
+            //     binding already bounds it from below.
             //   Route B — the decline predates this head epoch, but Codex has
             //     posted nothing since and the fallback review happened within
-            //     QUOTA_EPISODE_TTL_MS of it. Codex simply stops answering on
-            //     later pushes while its quota is out, so requiring a fresh
-            //     per-head notice would reject genuine exhaustion; the TTL plus
-            //     the closure rule keep it from authorizing anything forever.
-            // Any real Codex activity newer than the newest notice CLOSES the
-            // episode: Codex is demonstrably answering again.
+            //     the TTL AFTER it. Codex simply stops answering on later
+            //     pushes while its quota is out, so requiring a fresh per-head
+            //     notice would reject genuine exhaustion.
+            // Any real Codex activity at least as new as the newest notice
+            // CLOSES the episode: Codex is demonstrably answering again, and
+            // on a same-second tie the order cannot be proven, so the tie
+            // fails closed too.
             function evaluateQuotaEpisode(notices, options) {
               const settings = options || {};
               const itemAt = (item) => new Date(
@@ -682,7 +718,9 @@ jobs:
                 return { active: false, reason: 'no_quota_notice', noticeAt: null };
               }
               const newestReal = newestOf(settings.realActivity);
-              if (newestReal !== null && newestReal > newestNotice) {
+              // `>=`, not `>`: REST timestamps have one-second precision, so
+              // a tie cannot prove the notice came last.
+              if (newestReal !== null && newestReal >= newestNotice) {
                 return {
                   active: false, reason: 'quota_episode_closed',
                   noticeAt: new Date(newestNotice),
@@ -692,17 +730,24 @@ jobs:
               if (!Number.isFinite(observedAt) || observedAt <= 0) {
                 return { active: false, reason: 'head_epoch_unknown', noticeAt: null };
               }
-              if (newestNotice >= observedAt) {
-                return {
-                  active: true, reason: 'trusted_quota_episode',
-                  noticeAt: new Date(newestNotice),
-                };
-              }
               const attestedAt = Number(settings.attestedAt);
-              if (
-                Number.isFinite(attestedAt) && attestedAt >= newestNotice &&
-                attestedAt - newestNotice <= QUOTA_EPISODE_TTL_MS
-              ) {
+              const withinTtl = Number.isFinite(attestedAt) && attestedAt > 0 &&
+                attestedAt - newestNotice <= QUOTA_EPISODE_TTL_MS;
+              // Route A: a negative difference (attested before the newest
+              // notice) is fine; the head-epoch binding bounds it from below.
+              if (newestNotice >= observedAt) {
+                return withinTtl
+                  ? {
+                      active: true, reason: 'trusted_quota_episode',
+                      noticeAt: new Date(newestNotice),
+                    }
+                  : {
+                      active: false, reason: 'stale_quota_evidence',
+                      noticeAt: new Date(newestNotice),
+                    };
+              }
+              // Route B: the attestation must FOLLOW the pre-epoch decline.
+              if (withinTtl && attestedAt >= newestNotice) {
                 return {
                   active: true, reason: 'trusted_quota_episode',
                   noticeAt: new Date(newestNotice),
@@ -730,7 +775,11 @@ jobs:
               // explicit dispatch (which requires write access). A run started
               // from a PR ref would execute PR-controlled YAML, so an unknown
               // default branch fails closed rather than skipping the check.
-              if (String(run.path || '') !== FALLBACK_ATTESTATION_WORKFLOW_PATH) return false;
+              // GitHub documents a run attempt's `path` with an `@ref` suffix
+              // ("…/build.yml@main"); live responses return the bare path.
+              // Accept both spellings of the ONE canonical path — the ref
+              // itself is pinned separately by the head_branch check.
+              if (String(run.path || '').replace(/@.*$/, '') !== FALLBACK_ATTESTATION_WORKFLOW_PATH) return false;
               if (String(run.event || '') !== 'workflow_dispatch') return false;
               if (!defaultBranch) return false;
               if (String(run.head_branch || '') !== String(defaultBranch)) return false;
@@ -809,8 +858,15 @@ jobs:
               const comments = settings.comments || [];
               const quotaNotices = (settings.quotaNotices || []);
               const realActivity = (settings.realActivity || []);
-              // The episode is evaluated per candidate, because Route B is
-              // bound to when the fallback review itself was attested.
+              // The current head epoch began when the automation first
+              // observed the current head. A branch moving A -> B -> A starts
+              // a NEW epoch of A, so an attestation written before that
+              // moment was minted for the earlier epoch and must not be
+              // revived on the return. Same 5 s skew as the run-window checks.
+              const headObservedAt = new Date(settings.headObservedAt || 0).getTime();
+              const headEpochKnown = Number.isFinite(headObservedAt) && headObservedAt > 0;
+              // The episode is evaluated per candidate, because both routes
+              // are bound to when the fallback review itself was attested.
               const episodeFor = (attestedAt) => evaluateQuotaEpisode(quotaNotices, {
                 headObservedAt: settings.headObservedAt,
                 realActivity,
@@ -849,6 +905,18 @@ jobs:
               const bounded = candidates.slice(0, MAX_FALLBACK_ATTESTATION_CANDIDATES);
 
               let best = none('no_attestation');
+              // Diagnostics keep the newest AUTHENTICATED exact-head rejection
+              // over any structural one: "stale episode" says more than
+              // "another marker was for another head".
+              let bestAuthenticated = false;
+              const rejected = (reason) => {
+                if (bestAuthenticated) return;
+                best = {
+                  accepted: false, blocking: false, severity: null, reason,
+                  episodeReason: reason,
+                };
+                bestAuthenticated = true;
+              };
               for (const candidate of bounded) {
                 const evaluated = evaluateFallbackAttestation(candidate.attestation, headSha);
                 if (!evaluated.accepted && !evaluated.blocking) {
@@ -882,6 +950,11 @@ jobs:
                   );
                   continue;
                 }
+                // A blocking attestation wins immediately, whatever epoch
+                // wrote it: the SHA is byte-identical, so the unresolved
+                // finding it reports is still in the code. Only a newer
+                // attestation (a newer run, hence considered first) can
+                // supersede it.
                 if (evaluated.blocking) {
                   return {
                     accepted: false, blocking: true,
@@ -890,13 +963,17 @@ jobs:
                     episodeReason: episode.reason,
                   };
                 }
+                if (headEpochKnown && candidate.commentAt < headObservedAt - 5000) {
+                  rejected('attestation_predates_head_epoch');
+                  continue;
+                }
                 const candidateEpisode = episodeFor(candidate.commentAt);
                 if (!candidateEpisode.active) {
-                  return {
-                    accepted: false, blocking: false, severity: null,
-                    reason: candidateEpisode.reason,
-                    episodeReason: candidateEpisode.reason,
-                  };
+                  // Keep scanning: a newer candidate outside its episode must
+                  // not hide an older exact-head attestation that is still
+                  // inside its own.
+                  rejected(candidateEpisode.reason);
+                  continue;
                 }
                 return {
                   accepted: true, blocking: false, severity: null,
@@ -997,6 +1074,7 @@ jobs:
                             isResolved
                             isOutdated
                             comments(first: 100) {
+                              pageInfo { hasNextPage }
                               nodes { body author { login } }
                             }
                           }
@@ -1013,6 +1091,9 @@ jobs:
                     TRUSTED_CODEX_LOGINS.has(comment.author?.login || '') &&
                     hasSeverity(comment.body)
                   )) return true;
+                  // Fail closed: an outdated thread with more comments than
+                  // one page shows may still hold an unread trusted P1/P2.
+                  if (thread.comments?.pageInfo?.hasNextPage) return true;
                 }
                 cursor = connection.pageInfo.hasNextPage
                   ? connection.pageInfo.endCursor
