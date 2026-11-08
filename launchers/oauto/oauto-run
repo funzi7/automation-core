@@ -214,7 +214,11 @@ base=""
 if [[ "$head_sha" != "(no commits)" ]]; then
   for cand in "$upstream" origin/main origin/master main master; do
     [[ -n "$cand" ]] || continue
-    if g rev-parse --verify --quiet "$cand^{commit}" >/dev/null; then base="$cand"; break; fi
+    # A candidate without a merge base (unrelated or shallow history) has no
+    # branch delta; base...HEAD would fail the strict pair pass below.
+    if g rev-parse --verify --quiet "$cand^{commit}" >/dev/null && g merge-base "$cand" HEAD >/dev/null; then
+      base="$cand"; break
+    fi
   done
 fi
 ahead_behind=""
@@ -232,17 +236,30 @@ excluded_z="$(mktemp "$STATE_DIR/.excluded.XXXXXX")"
 display="$(mktemp "$STATE_DIR/.display.XXXXXX")"
 after="$(mktemp "$STATE_DIR/.after.XXXXXX")"
 trap 'rm -f -- "$names" "$pairs" "$excluded_z" "$display" "$after"' EXIT
+# A partial pair list would silently drop the destination-side exclusion, so a
+# failing or timed-out pair pass is fatal (never `|| true`).
+pair_pass_failed() {
+  die "rename/copy detection for the preflight failed or exceeded 120 s; the change set is too large for oauto's secret-exclusion pass (git exit status $1)"
+}
+# Likewise a partial name list or proof list (a transient git failure or timeout)
+# would silently leave a secret-like path unexcluded while the content diff still
+# succeeds, so collection is fatal on failure too.
+name_pass_failed() {
+  die "collecting the changed paths for the preflight failed or exceeded 120 s (git exit status $1)"
+}
 if [[ "$head_sha" != "(no commits)" ]]; then
-  gd --name-only -z HEAD >> "$names" || true
-  # The only rename-detecting diff (-M after gd's --no-renames): pairs whose source
-  # or destination is secret-like get both sides excluded.
-  gd -M --name-status -z HEAD >> "$pairs" || true
+  gd --name-only -z HEAD >> "$names" || name_pass_failed $?
+  # The only rename/copy-detecting diffs (after gd's --no-renames): -M -C pairs
+  # renames and copies of files modified in the same change set, -l0 keeps the
+  # pairing exhaustive whatever diff.renameLimit says. A pair with a secret-like
+  # side gets both sides excluded.
+  gd -M -C -l0 --name-status -z HEAD >> "$pairs" || pair_pass_failed $?
   if [[ -n "$base" ]]; then
-    gd --name-only -z "$base...HEAD" >> "$names" || true
-    gd -M --name-status -z "$base...HEAD" >> "$pairs" || true
+    gd --name-only -z "$base...HEAD" >> "$names" || name_pass_failed $?
+    gd -M -C -l0 --name-status -z "$base...HEAD" >> "$pairs" || pair_pass_failed $?
   fi
 fi
-g ls-files --others --exclude-standard -z >> "$names" || true
+g ls-files --others --exclude-standard -z >> "$names" || name_pass_failed $?
 python3 -I "$POLICY" classify -z --renames "$pairs" --display "$display" < "$names" > "$excluded_z" ||
   die "could not classify the changed paths for the preflight"
 exclude_spec=()
@@ -250,9 +267,9 @@ while IFS= read -r -d '' path; do exclude_spec+=(":(exclude,literal)$path"); don
 # Prove the exclusion applied: the same name diffs, with the pathspecs, may list no
 # excluded or otherwise secret-like path.
 if [[ "$head_sha" != "(no commits)" ]]; then
-  gd --name-only -z HEAD -- "${exclude_spec[@]}" >> "$after" || true
+  gd --name-only -z HEAD -- "${exclude_spec[@]}" >> "$after" || name_pass_failed $?
   if [[ -n "$base" ]]; then
-    gd --name-only -z "$base...HEAD" -- "${exclude_spec[@]}" >> "$after" || true
+    gd --name-only -z "$base...HEAD" -- "${exclude_spec[@]}" >> "$after" || name_pass_failed $?
   fi
 fi
 python3 -I "$POLICY" check-excluded "$excluded_z" "$after" >&2 ||

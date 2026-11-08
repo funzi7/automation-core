@@ -823,6 +823,77 @@ test('P1-C: branch-delta renames exclude both sides, and a non-sensitive rename 
   ]);
 });
 
+// Similar but not identical: one non-secret line changes, the TOKEN line stays.
+const tweakSettings = (text) => text.replace('POOL=8', 'POOL=16');
+const utilPy = (version) => ['def f():', '    return 1', '', 'def g():', '    return 2', '', `V = ${version}`, ''].join('\n');
+
+test('P1-C: a repository diff.renameLimit cannot unpair a renamed secret from its safe-named destination', () => {
+  const sb = sandbox();
+  const secrets = { 'config/one.env': 'SYNTH-LIMIT-SECRET-1a1a', 'keys/two.pem': 'SYNTH-LIMIT-SECRET-2b2b' };
+  const repo = mkRepo(sb, 'rename-limit', {
+    'config/one.env': settings(secrets['config/one.env']), 'keys/two.pem': settings(secrets['keys/two.pem']), 'lib/util.py': utilPy(1),
+  });
+  // Throttles git's inexact rename detection: with more than 1x1 candidates it is skipped.
+  git(repo, ['config', 'diff.renameLimit', '1']);
+  git(repo, ['mv', 'config/one.env', 'config/one.txt']);
+  git(repo, ['mv', 'keys/two.pem', 'keys/two.txt']);
+  git(repo, ['mv', 'lib/util.py', 'lib/helpers.py']);
+  writeFiles(repo, {
+    'config/one.txt': tweakSettings(settings(secrets['config/one.env'])),
+    'keys/two.txt': tweakSettings(settings(secrets['keys/two.pem'])),
+    'lib/helpers.py': utilPy(2),
+  });
+  git(repo, ['add', '-A']);
+  const promptFile = path.join(sb.root, 'prompt-rename-limit.txt');
+  fakeControl(sb, { PROMPT_FILE: promptFile });
+  const r = runOauto(sb, repo, []); // full launch: the recorded --prompt is checked as well
+  assert.equal(r.status, 0, r.stderr);
+  const preflight = readPreflight(sb, repo);
+  const prompt = fs.readFileSync(promptFile, 'utf8');
+  assert.deepEqual(Object.values(secrets).filter((x) => preflight.includes(x) || prompt.includes(x)), [],
+    'a throttled rename detection may not let a renamed secret reach the preflight or the prompt');
+  assert.deepEqual(excludedLines(preflight), [
+    'config/one.env (renamed to "config/one.txt")',
+    'config/one.txt (renamed from "config/one.env")',
+    'keys/two.pem (renamed to "keys/two.txt")',
+    'keys/two.txt (renamed from "keys/two.pem")',
+  ]);
+  assert.match(preflight, /diff --git a\/lib\/util\.py b\/lib\/util\.py\ndeleted file mode 100644\n/);
+  assert.match(preflight, /diff --git a\/lib\/helpers\.py b\/lib\/helpers\.py\nnew file mode 100644\n[\s\S]*?\+V = 2\n/);
+  assert.ok(!/^(rename|copy) (from|to) |^similarity index /m.test(preflight), 'renames must diff as delete + add');
+});
+
+test('P1-C: a copy of a secret modified in the same change set is excluded under its safe name too', () => {
+  const sb = sandbox();
+  const secret = 'SYNTH-COPY-SECRET-3c3c';
+  const repo = mkRepo(sb, 'copy-modified', { '.env': settings(secret), 'src/a.py': 'x = 1\n' });
+  writeFiles(repo, { '.env': tweakSettings(settings(secret)), 'env-backup.txt': settings(secret), 'src/a.py': 'x = 2\n' });
+  git(repo, ['add', '-A']);
+  const r = runOauto(sb, repo, ['--check'], { OAUTO_ALLOW_SENSITIVE_FILES: '1' }); // .env stays in the worktree
+  assert.equal(r.status, 0, r.stderr);
+  const preflight = readPreflight(sb, repo);
+  assert.ok(!preflight.includes(secret), 'the copied secret must not reach the preflight');
+  assert.deepEqual(excludedLines(preflight), ['.env (copied to "env-backup.txt")', 'env-backup.txt (copied from ".env")']);
+  assert.match(preflight, /-x = 1\n\+x = 2\n/);
+});
+
+test('oauto-run has no branch delta when the base shares no history with HEAD (the strict pair pass does not refuse)', () => {
+  const sb = sandbox();
+  const repo = mkRepo(sb, 'orphan', { 'a.txt': 'a\n' });
+  git(repo, ['checkout', '-q', '--orphan', 'island']);
+  git(repo, ['rm', '-rqf', '.']);
+  writeFiles(repo, { 'island.txt': 'i\n' });
+  git(repo, ['add', '-A']);
+  git(repo, ['commit', '-q', '-m', 'island']);
+  fs.writeFileSync(path.join(repo, 'island.txt'), 'j\n');
+  const r = runOauto(sb, repo, ['--check']);
+  assert.equal(r.status, 0, r.stderr);
+  const preflight = readPreflight(sb, repo);
+  assert.match(preflight, /- Base for branch delta: \(none found\) \n/);
+  assert.ok(!preflight.includes('## Branch delta'));
+  assert.match(preflight, /-i\n\+j\n/);
+});
+
 test('F: ordinary changes and non-sensitive special names still reach the preflight', () => {
   const sb = sandbox();
   const names = { naive: 'src/naïve file.py', tab: 'docs/tab\tname.md', dash: '-lead.py', plain: 'src/plain.py' };
@@ -986,9 +1057,22 @@ test('oauto-run source: no automatic approval, standalone helpers, bounded helpe
     assert.ok(gdDef.includes(flag), `gd() must carry ${flag}`);
   }
   assert.equal(code.match(/\bg diff\b/g).length, 1, 'every diff goes through gd()');
+  // Only the two rename/copy-pair passes re-enable detection: exhaustive (-l0), copies
+  // included (-C), and fatal on failure or timeout, never `|| true`.
   const renameLines = lines.filter((l) => /(^|\s)-M(\s|$)/.test(l));
-  assert.equal(renameLines.length, 2, 'only the rename-pair passes re-enable renames');
-  for (const l of renameLines) assert.match(l, /\bgd -M --name-status -z /);
+  assert.equal(renameLines.length, 2, 'only the rename/copy-pair passes re-enable rename detection');
+  for (const l of renameLines) {
+    assert.match(l, /^\s*gd -M -C -l0 --name-status -z (HEAD|"\$base\.\.\.HEAD") >> "\$pairs" \|\| pair_pass_failed \$\?$/);
+    assert.ok(!/\|\|\s*true/.test(l), `the pair pass must not be || true: ${l}`);
+  }
+  assert.match(code, /die "rename\/copy detection for the preflight failed or exceeded 120 s; the change set is too large for oauto's secret-exclusion pass/);
+  // The name passes (changed, branch delta, untracked) and the two proof passes are fatal on
+  // failure as well: a partial list would leave a secret-like path unexcluded.
+  const nameLines = lines.filter((l) => /\bgd --name-only -z\b|\bg ls-files\b/.test(l));
+  assert.equal(nameLines.length, 5, 'two name passes, one untracked pass, two proof passes');
+  for (const l of nameLines) assert.match(l, /\|\| name_pass_failed \$\?$/, `collection must fail closed: ${l}`);
+  assert.ok(!/>> "\$(names|pairs|after)"[^\n]*\|\|\s*true/.test(code), 'no collection pass may be || true');
+  assert.match(code, /die "collecting the changed paths for the preflight failed or exceeded 120 s/);
   assert.equal(code.match(/\bg log\b/g).length, 1);
   assert.match(code, /\bg log --no-show-signature --no-color --oneline -15\b/);
   assert.match(code, /\bg status --short --untracked-files=normal --ignore-submodules=dirty\b/);

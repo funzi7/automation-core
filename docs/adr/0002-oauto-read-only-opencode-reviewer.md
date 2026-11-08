@@ -101,10 +101,17 @@ policy, not by the system prompt alone:
    NUL-delimited (`-z`) into private files, never through command
    substitution, classified bytes-exact, excluded with `:(exclude,literal)`
    pathspecs, listed C-quoted, and the exclusion is proven by re-listing the
-   diff with the pathspecs before anything is written. Renames are detected
-   once, separately, only to exclude *both* sides when either side is
-   secret-like; the diffs themselves show renames as delete + add so a
-   renamed secret's source is always classified under its own name.
+   diff with the pathspecs before anything is written. The diffs themselves
+   show renames as delete + add, so a renamed secret's source is always
+   classified under its own name and excluded. One separate pass runs git's
+   exhaustive rename/copy detection (`-M -C -l0`: limits pinned so repository
+   config cannot throttle it; the launch is refused if that pass fails or
+   times out) and additionally excludes the *other* side of every pair it
+   reports when either side is secret-like. That destination-side exclusion
+   is best effort by nature: it holds when git pairs the files (identical or
+   ≥50 % similar content); a safe-named file that merely still contains
+   secret text is reviewable content under name-based classification, and
+   its hunks are shown.
 
 The config is rendered at every launch into a private directory,
 `~/.local/state/oauto/<repo>-<hash>/xdg-config/opencode/opencode.json`, selected
@@ -144,7 +151,11 @@ DeepSeek pass follows a GLM pass without any other model becoming selectable.
   through such a driver (git-lfs style) diff raw — pointer blob against worktree
   content — and may show as modified in the preflight; they are not reviewable
   content anyway. Rename detection in the diffs is off, so a moved file appears
-  as a deletion plus an addition. Submodules whose only change is a dirty
+  as a deletion plus an addition. Classification is by path, not by content:
+  moving a secret into a safe-named file and editing it beyond git's
+  similarity threshold leaves a reviewable file that still contains the
+  secret, and the preflight shows it like any other added file (the worktree
+  scan cannot see it either). Submodules whose only change is a dirty
   worktree are not reported (`--ignore-submodules=dirty`); changed submodule
   commits still are.
 - `git diff` against the worktree refreshes stat information in `.git/index`
