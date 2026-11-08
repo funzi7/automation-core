@@ -1203,6 +1203,45 @@ test('D2 follow-up: a hook installed as a hard link from the worktree is not an 
   assert.match(out.stdout, /SYMLINK review\.txt -> .*\(hard link to \.git\/config\)/);
 });
 
+test('Git config files that are symlinks, and a symlinked .git, are refused (credentials would land in a readable file)', () => {
+  const sb = sandbox();
+  const repo = mkRepo(sb, 'cfg-link', { 'src/a.py': 'x = 1\n', 'review-config.txt': '# placeholder\n' });
+  // The repository's real config moves into a worktree file; git would then write there.
+  fs.renameSync(path.join(repo, '.git', 'config'), path.join(repo, 'review-config.txt'));
+  fs.symlinkSync('../review-config.txt', path.join(repo, '.git', 'config'));
+  fs.appendFileSync(path.join(repo, 'review-config.txt'), '[http]\n\textraheader = AUTHORIZATION: bearer SYNTH-CFGLINK-TOKEN-77aa\n');
+  let r = runOauto(sb, repo, ['--check']);
+  assert.equal(r.status, 1, r.stderr);
+  assert.match(r.stderr, /\.git\/config -> .*\(Git config file is a symlink\)/);
+  r = runOauto(sb, repo, ['--check'], { OAUTO_ALLOW_SENSITIVE_FILES: '1' });
+  assert.equal(r.status, 1, 'the override must not bypass a symlinked Git config');
+
+  const real = mkRepo(sb, 'real-git', { 'src/a.py': 'x = 1\n' });
+  const moved = path.join(sb.root, 'moved-git-dir');
+  fs.renameSync(path.join(real, '.git'), moved);
+  fs.symlinkSync(moved, path.join(real, '.git'));
+  r = runOauto(sb, real, ['--check']);
+  assert.equal(r.status, 1, r.stderr);
+  assert.match(r.stderr, /\.git -> .*\(\.git itself is a symlink\)/);
+});
+
+test('the gradle.properties content check reads the whole file and refuses one too large to read', () => {
+  const sb = sandbox();
+  const big = `${'# filler\n'.repeat(40000)}repoPassword=SYNTH-LARGE-SECRET-88bb\n`;   // credential after 360 KB
+  assert.ok(Buffer.byteLength(big) > 262144);
+  const repo = mkRepo(sb, 'large-props', { 'src/a.py': 'x = 1\n', 'gradle.properties': big }, { commit: false });
+  let r = runOauto(sb, repo, ['--check']);
+  assert.equal(r.status, 1, 'a credential past 256 KiB must still refuse the launch');
+  assert.match(r.stderr, /gradle\.properties: credential-looking assignment/);
+  fs.writeFileSync(path.join(repo, 'gradle.properties'), Buffer.alloc(16 * 1024 * 1024 + 1, 0x23));
+  r = runOauto(sb, repo, ['--check']);
+  assert.equal(r.status, 1, 'an unreadably large content-checked file must fail closed');
+  assert.match(r.stderr, /gradle\.properties: too large to content-check/);
+  fs.writeFileSync(path.join(repo, 'gradle.properties'), 'org.gradle.jvmargs=-Xmx1g\n');
+  r = runOauto(sb, repo, ['--check']);
+  assert.equal(r.status, 0, r.stderr);
+});
+
 test('E1: gradle.properties credentials are found with =, : or whitespace separators and key-material names', () => {
   const sb = sandbox();
   const hits = ['signingPassword: V', 'signingPassword V', 'signingInMemoryKey=V', 'mavenCentralSecretKey=V',

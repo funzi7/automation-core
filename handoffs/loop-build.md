@@ -104,8 +104,8 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
   transient git failure could have left a secret-like path unexcluded while the content diff still
   succeeded — now fatal (`name_pass_failed`), with a source-shape test.
 - Device (Phase 5): `bash launchers/oauto/install.sh` refreshed `/root/work/bin/oauto-run` and
-  `oauto-policy.py` three times during the round (after each validated state; previous copies kept
-  as `*.backup-before-oauto-20261108-120902`, `-132239` and `-134043`; `ai-launch`, the
+  `oauto-policy.py` after each validated state during the round (previous copies kept as
+  `*.backup-before-oauto-20261108-120902`, `-132239`, `-134043` and `-140044`; `ai-launch`, the
   Termux `oauto-launch` wrapper and both `.bashrc` blocks were already identical and untouched; the
   original `ai-launch.backup-before-oauto-20261107` still equals the pristine fixture); `install.sh
   --verify` clean; installed copies byte-identical to the tracked ones (device-parity test passes);
@@ -114,7 +114,7 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
   sources/models/agents (GLM and DeepSeek default agents) and printed the banner; fixture, state dir
   and lock removed; no OpenCode process or service left.
 - Final validation at the pushed head: `bash scripts/validate.sh` green (YAML, JSON, sync/mirror parity,
-  JS syntax, `node --test` 174/174 including `tests/test_oauto_launcher.js` 47/47, 59 github-script
+  JS syntax, `node --test` 176/176 including `tests/test_oauto_launcher.js` 49/49, 59 github-script
   bodies, actionlint, `git diff --check`); real-binary battery (scratchpad script, every scenario of
   this entry) passed on the final launcher, and the six live model probes were repeated on it: shell,
   `/etc/hostname`, `.env`, `opencode/big-pickle` and `--agent build` denied as before, probe secret
@@ -182,9 +182,18 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
   overridable) and documented; docs now say "in the repository" for hard links, name the `ssh://`
   exemption, call the word list a heuristic, and say "unless `OAUTO_ALLOW_SENSITIVE_FILES=1`" where
   it applies.
+- Codex re-review of the second fixed head (`a174b19`, exact-head CI green, the two P1-D/P1-E
+  threads replied to and resolved): one P1 and one P2, both valid and reproduced by Codex — a
+  `.git/config` that is itself a symlink to a worktree file (`.git/config -> ../review-config.txt`)
+  skipped the credential check while the target stayed readable by name; and the `gradle.properties`
+  content check read only the first 262,144 characters, so a credential after 320 KB of comments in
+  an untracked file passed. Fixed: a symlinked `.git` or any symlinked Git config file is refused
+  unconditionally (`SYMLINK ... (Git config file is a symlink)`), and content-checked files are read
+  in full with a 16 MiB ceiling above which the launch is refused (`too large to content-check`).
+  Regression tests reproduce both on the previous code; the real-binary battery gained both.
 - Review and gate state: the fixes were pushed to the PR branch after this entry's commit; the
   exact-head CI result, the Codex re-review of the pushed head (`@codex review`), the resolution of
-  every Codex P1 thread and the Codex Gate verdict are recorded on the PR and in agent-memory
+  every Codex P1/P2 thread and the Codex Gate verdict are recorded on the PR and in agent-memory
   `automation-core/cc-latest.md` (owner-facing state), never claimed here ahead of the evidence.
 - Needs from the owner: unchanged — run `oauto <repo>` once from Termux; merge the PR once Codex Gate is
   green; decide whether `DEVELOPMENT_RULES_FULL` §7 should list `oauto` next to `cauto`/`clauto`.

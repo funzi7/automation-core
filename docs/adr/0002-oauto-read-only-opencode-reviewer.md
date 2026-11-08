@@ -67,14 +67,18 @@ policy, not by the system prompt alone:
    (`notes.txt -> config/prod.secrets.yaml`, `c -> .docker/config.json`),
    symlinks to a directory that holds secret-like files (`cfgdir -> secrets/`),
    hard links to a secret-like file in the repository or to a file under
-   `.git` other than its hooks, and symlinks inside `.git` that leave the
-   repository (git-annex object links are refused by the `.git` rule); and,
+   `.git` other than its hooks, symlinks inside `.git` that leave the
+   repository (git-annex object links are refused by the `.git` rule), a
+   `.git` that is itself a symlink, and Git config files that are symlinks
+   (git would write credentials through them into a file readable by name);
+   and,
    refused unless `OAUTO_ALLOW_SENSITIVE_FILES=1` is set, credential-looking
    content in `gradle.properties`-style files (`CONTENT_CHECKS`: basename
    equal to the key or key plus a suffix, template suffixes exempt; `=`, `:`
    or whitespace separators; a heuristic word list — password, passwd,
    secret, token, passphrase, credential, and api/access/secret/signing/
-   private key with `_`, `.`, `-` or no separator, plus `inMemoryKey`) or in
+   private key with `_`, `.`, `-` or no separator, plus `inMemoryKey`; files
+   are read in full and one above 16 MiB is refused rather than skipped) or in
    Git config files (`.git/config`, `config.worktree`, linked-worktree and
    submodule configs: any user-info in a remote URL except a bare login name
    in an `ssh://` URL, so `https://org@dev.azure.com/...` is flagged too;

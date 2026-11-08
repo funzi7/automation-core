@@ -152,6 +152,8 @@ CONTENT_CHECKS = {
 # A content-checked name also covers its copies under a further suffix
 # (gradle.properties.bak, .orig ...), but not documented templates.
 CONTENT_CHECK_TEMPLATE_SUFFIXES = (".example", ".sample", ".template", ".dist")
+# Content-checked files are read in full; beyond this size the launch is refused.
+CONTENT_CHECK_MAX_BYTES = 16 * 1024 * 1024
 # Any user-info in a URL is a credential (https://user:secret@..., https://<token>@...),
 # except a bare login name in an ssh URL (ssh://git@host/...), which ssh never uses as one.
 GIT_CONFIG_USERINFO = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*)?://([^/\s@]+)@")
@@ -622,6 +624,9 @@ def scan(repo: str, budget: float) -> int:
     # one is an alias) and every Git config file (credentials). Its object store holds
     # none of these and can be large.
     git_dir = os.path.join(repo, ".git")
+    if os.path.islink(git_dir):
+        # Git would write its config (and credentials) wherever this points; refuse.
+        symlinks.append((".git", f"{os.path.realpath(git_dir)} (.git itself is a symlink)"))
     if os.path.isdir(git_dir):
         for dirpath, dirnames, filenames in os.walk(git_dir, topdown=True, followlinks=False):
             if time.monotonic() - started > budget:
@@ -634,7 +639,11 @@ def scan(repo: str, budget: float) -> int:
             for name in filenames:
                 full = os.path.join(dirpath, name)
                 if os.path.islink(full):
-                    link_target(full)
+                    target, _inside = link_target(full)
+                    if _is_git_config(rel(full)):
+                        # Git writes credentials into its config files; through a link
+                        # they would land in a file the reviewer may read by name.
+                        symlinks.append((rel(full), f"{target} (Git config file is a symlink)"))
                     continue
                 st = lstat(full)
                 if st is None or not stat.S_ISREG(st.st_mode):
@@ -681,9 +690,14 @@ def scan(repo: str, budget: float) -> int:
                 linked.append((r, (st.st_dev, st.st_ino)))
             key = content_check_key(name)
             if key is not None:
+                # The whole file is checked; one too large to read in full is refused
+                # rather than treated as clean past a cut-off.
                 try:
+                    if os.stat(full).st_size > CONTENT_CHECK_MAX_BYTES:
+                        content.append((r, f"too large to content-check (> {CONTENT_CHECK_MAX_BYTES} bytes)"))
+                        continue
                     with open(full, encoding="utf-8", errors="replace") as fh:
-                        if CONTENT_CHECKS[key].search(fh.read(262144)):
+                        if CONTENT_CHECKS[key].search(fh.read()):
                             content.append((r, "credential-looking assignment"))
                 except OSError:
                     pass
