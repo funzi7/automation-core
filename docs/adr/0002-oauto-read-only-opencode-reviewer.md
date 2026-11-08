@@ -89,9 +89,10 @@ policy, not by the system prompt alone:
    An included file that lives inside the repository is Git configuration
    under an ordinary name: it is reported as secret-like (refused unless
    overridden), excluded from the preflight diffs and denied to the `read`
-   tool by an extra per-launch rule that `opencode debug agents` must
-   resolve to deny (a path with glob metacharacters refuses the launch
-   instead). Included files outside the repository are followed for further
+   tool by extra per-launch rules (the exact relative path and its `*/`
+   form, in permissions and `tool.use` policies) that `opencode debug
+   agents` must resolve to deny; a path containing `*`, `?`, `[`, `{`, `}`
+   or `\` cannot be named exactly and refuses the launch instead. Included files outside the repository are followed for further
    hops but not themselves checked; they belong to the user. The scan
    reports pathnames C-quoted and ends with a count summary that the
    launcher decides on, so no filename byte can hide a hit.

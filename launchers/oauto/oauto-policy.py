@@ -154,6 +154,9 @@ CONTENT_CHECKS = {
 CONTENT_CHECK_TEMPLATE_SUFFIXES = (".example", ".sample", ".template", ".dist")
 # Content-checked files are read in full; beyond this size the launch is refused.
 CONTENT_CHECK_MAX_BYTES = 16 * 1024 * 1024
+# A per-launch deny rule names an exact path; a path holding any character a glob
+# matcher might interpret (brace expansion and escapes included) is refused instead.
+GLOB_METACHARACTERS = "*?[{}\\"
 # Any user-info in a URL is a credential (https://user:secret@..., https://<token>@...),
 # except a bare login name in an ssh URL (ssh://git@host/...), which ssh never uses as one.
 GIT_CONFIG_USERINFO = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*)?://([^/\s@]+)@")
@@ -227,7 +230,10 @@ def read_only_ruleset(deny_read: list[str] = ()) -> list[dict]:
     rules += [_rule(a, "*", "allow") for a in ("read", "glob", "grep", "question")]
     rules += [_rule("read", p, "deny") for p in SENSITIVE_READ_PATTERNS]
     rules += [_rule("read", p, "allow") for p in SENSITIVE_READ_EXCEPTIONS]
-    rules += [_rule("read", p, "deny") for p in deny_read]
+    # Both the exact relative path and its `*/` form, so a `./x` or absolute spelling
+    # of the same path is denied too (the static patterns get that from their `*/`).
+    for p in deny_read:
+        rules += [_rule("read", p, "deny"), _rule("read", f"*/{p}", "deny")]
     rules += [_rule("glob", p, "deny") for p in ESCAPING_GLOB_PATTERNS]
     rules += [_rule(a, "*", "deny") for a in DENIED_ACTIONS]
     return rules
@@ -252,7 +258,8 @@ def policies(deny_read: list[str] = ()) -> list[dict]:
     pol += [_rule("tool.use", f"{a}:*", "deny") for a in DENIED_ACTIONS]
     pol += [_rule("tool.use", f"read:{p}", "deny") for p in SENSITIVE_READ_PATTERNS]
     pol += [_rule("tool.use", f"read:{p}", "allow") for p in SENSITIVE_READ_EXCEPTIONS]
-    pol += [_rule("tool.use", f"read:{p}", "deny") for p in deny_read]
+    for p in deny_read:
+        pol += [_rule("tool.use", f"read:{p}", "deny"), _rule("tool.use", f"read:*/{p}", "deny")]
     return pol
 
 
@@ -752,7 +759,7 @@ def scan(repo: str, budget: float, included_out: str | None = None,
             r = rel(canon)
             if canon not in included:
                 included[canon] = r
-                if any(c in r for c in "*?["):
+                if any(c in r for c in GLOB_METACHARACTERS):
                     content.add((r, "cannot be denied by exact path (glob metacharacter)"))
             return r
         if inside_repo(canon):
@@ -1113,7 +1120,7 @@ def main(argv: list[str]) -> None:
 
     if args.cmd == "render":
         deny_read = list(dict.fromkeys(p for p in args.deny_read if p))
-        inexact = [p for p in deny_read if any(c in p for c in "*?[")]
+        inexact = [p for p in deny_read if any(c in p for c in GLOB_METACHARACTERS)]
         if inexact:
             _die(f"refusing to render: --deny-read takes exact paths; glob metacharacter in {', '.join(_q(p) for p in inexact)}")
         doc = render(args.model, args.disable_model, deny_read)

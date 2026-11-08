@@ -105,8 +105,8 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
   succeeded — now fatal (`name_pass_failed`), with a source-shape test.
 - Device (Phase 5): `bash launchers/oauto/install.sh` refreshed `/root/work/bin/oauto-run` and
   `oauto-policy.py` after each validated state during the round (previous copies kept as
-  `*.backup-before-oauto-20261108-120902`, `-132239`, `-134043`, `-140044`, `-144953` and `-152257`;
-  `ai-launch`, the
+  `*.backup-before-oauto-20261108-120902`, `-132239`, `-134043`, `-140044`, `-144953`, `-152257` and
+  `-154043`; `ai-launch`, the
   Termux `oauto-launch` wrapper and both `.bashrc` blocks were already identical and untouched; the
   original `ai-launch.backup-before-oauto-20261107` still equals the pristine fixture); `install.sh
   --verify` clean; installed copies byte-identical to the tracked ones (device-parity test passes);
@@ -222,6 +222,15 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
   glob metacharacters refuses the launch rather than relying on matcher semantics; the per-launch
   deny-read rules are also probed through `verify-agents --deny-read`. Regression tests reproduce the
   four misses on the previous code; the battery gained the outside-hop and linked-worktree cases.
+- Fifth pass of the reviewer on that fix: no P1/P2; the four cases and their neighbours (commondir
+  and `config.worktree` includes in a linked worktree, fake `file:` text inside a multi-line value,
+  `.git/../x` origins, a vanished origin file, malformed origin lists and a config syntax error
+  both failing closed, an include target that is a symlink, a deny-read path with a space, each
+  mechanism alone) all held; the docs matched. Its P3s were taken: the per-launch deny rules now
+  also carry the `*/<path>` form so `./x` or absolute spellings are denied too, and `{`, `}` and
+  `\` join `*`, `?`, `[` as characters that refuse an included path instead of relying on matcher
+  semantics. Behaviour change worth knowing: a repository whose `.git/config` includes a tracked
+  file (`include.path = ../.gitconfig`) is now refused unless `OAUTO_ALLOW_SENSITIVE_FILES=1`.
 - Review and gate state: the fixes were pushed to the PR branch after this entry's commit; the
   exact-head CI result, the Codex re-review of the pushed head (`@codex review`), the resolution of
   every Codex P1/P2 thread and the Codex Gate verdict are recorded on the PR and in agent-memory

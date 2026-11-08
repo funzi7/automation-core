@@ -210,7 +210,7 @@ fi
 # as a pattern), so it is refused outright, override or not.
 deny_read_args=()
 while IFS= read -r -d '' path; do
-  [[ "$path" != *[\*\?\[]* ]] || die "an included Git config path holds a glob metacharacter (* ? [) and cannot be denied by its exact name; rename it"
+  [[ "$path" != *[\*\?\[\{\}\\]* ]] || die "an included Git config path holds a glob metacharacter (* ? [ { } \\) and cannot be denied by its exact name; rename it"
   deny_read_args+=("--deny-read=$path")
 done < "$included_z"
 

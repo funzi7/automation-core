@@ -1446,10 +1446,13 @@ test('P1-I: classify --extra-sensitive and render --deny-read', () => {
   const cfg = render('glm', ['--deny-read', 'review-config.txt', '--deny-read=-dash.cfg']);
   for (const rules of [cfg.permissions, cfg.agents['review-glm'].permissions, cfg.agents['review-deepseek'].permissions]) {
     assert.equal(decide(rules, 'read', 'review-config.txt'), 'deny');
+    assert.equal(decide(rules, 'read', './review-config.txt'), 'deny', 'the */ form covers other spellings of the path');
+    assert.equal(decide(rules, 'read', '/abs/repo/review-config.txt'), 'deny');
     assert.equal(decide(rules, 'read', '-dash.cfg'), 'deny');
     assert.equal(decide(rules, 'read', 'review-config.txt.bak'), 'allow', 'an exact path, not a pattern');
   }
   assert.equal(decide(cfg.policies, 'tool.use', 'read:review-config.txt'), 'deny');
+  assert.equal(decide(cfg.policies, 'tool.use', 'read:./review-config.txt'), 'deny');
   assert.deepEqual(render('glm'), JSON.parse(JSON.stringify(render('glm', []))), 'no --deny-read: unchanged contract');
 });
 
@@ -1568,7 +1571,7 @@ test('verify-agents --deny-read proves the per-launch read denial; render refuse
   const missing = policy(['verify-agents', '--deny-read=review-config.txt'], JSON.stringify(resolvedAgents(render('glm'))));
   assert.notEqual(missing.status, 0, 'a reviewer that can read the included config must fail verification');
   assert.match(missing.stderr, /read 'review-config\.txt' resolves to allow, expected deny/);
-  for (const bad of ['conf/a*b.cfg', 'a?.cfg', 'x[1].cfg']) {
+  for (const bad of ['conf/a*b.cfg', 'a?.cfg', 'x[1].cfg', 'a{b,c}.cfg', 'back\\slash.cfg']) {
     assert.notEqual(policy(['render', '--model', 'glm', `--deny-read=${bad}`]).status, 0, `render must refuse ${bad}`);
   }
 });
@@ -1765,7 +1768,7 @@ test('oauto-run source: no automatic approval, standalone helpers, bounded helpe
   assert.ok(!/\[\[ -n "\$(outward|sensitive)/.test(code), 'no decision on extracted record text');
   // Included Git config files reach classify, both renders and verify-agents; a path
   // with a glob metacharacter cannot be denied exactly and is refused.
-  assert.match(code, /while IFS= read -r -d '' path; do\n\s*\[\[ "\$path" != \*\[\\\*\\\?\\\[\]\* \]\] \|\|\s*die "[^"]*glob metacharacter[^"]*"\n\s*deny_read_args\+=\("--deny-read=\$path"\)\ndone < "\$included_z"/);
+  assert.match(code, /while IFS= read -r -d '' path; do\n\s*\[\[ "\$path" != \*\[\\\*\\\?\\\[\\\{\\\}\\\\\]\* \]\] \|\|\s*die "[^"]*glob metacharacter[^"]*"\n\s*deny_read_args\+=\("--deny-read=\$path"\)\ndone < "\$included_z"/);
   assert.match(code, /python3 -I "\$POLICY" render --model "\$MODEL_ALIAS" "\$\{deny_read_args\[@\]\}" "\$@"/);
   assert.match(code, /\| python3 -I "\$POLICY" verify-agents "\$\{deny_read_args\[@\]\}" >&2/);
   // Git itself lists every config file it loaded, before the scan, through g().
