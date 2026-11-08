@@ -15,7 +15,8 @@ Subcommands
   check-diff-content
                   Read one file's unified diff on stdin; exit 3 when it carries a
                   credential-looking line for that file's content check (removed,
-                  added or context), 0 when not.
+                  added, context or hunk-header text; --checker for a rename/copy
+                  partner), 0 when not.
   quote-path      Print NUL-delimited paths from stdin C-quoted like git, one per line.
   verify-sources  Read ``opencode debug config`` JSON on stdin; fail unless the only
                   configuration sources are the oauto-owned config directory and file.
@@ -37,6 +38,7 @@ import argparse
 import json
 import os
 import re
+import stat
 import sys
 import time
 
@@ -118,11 +120,11 @@ SENSITIVE_READ_PATTERNS = [
     # infrastructure state
     "*.tfstate", "*.tfstate.*", "*.tfvars",
 ]
-# Directories the patterns above protect as a whole (X/*, */X/*, .docker/config.json).
-# An in-repository symlink whose target passes through one of them is refused: OpenCode
-# checks the requested (alias) path, not the canonical one. A test keeps this in step
-# with SENSITIVE_READ_PATTERNS.
-SENSITIVE_DIR_COMPONENTS = frozenset({".git", ".ssh", ".gnupg", ".aws", ".docker"})
+# Directories the patterns above deny as a whole (X/* and */X/*). An in-repository
+# symlink whose target passes through one of them is refused: OpenCode checks the
+# requested (alias) path, not the canonical one. A test keeps this in step with
+# SENSITIVE_READ_PATTERNS. (.docker is not one: only .docker/config.json is denied.)
+SENSITIVE_DIR_COMPONENTS = frozenset({".git", ".ssh", ".gnupg", ".aws"})
 # Documented examples are not secrets; re-allowed after the denies (last match wins).
 SENSITIVE_READ_EXCEPTIONS = [
     "*.env.example",
@@ -135,15 +137,24 @@ SENSITIVE_READ_EXCEPTIONS = [
 ESCAPING_GLOB_PATTERNS = ["/*", "~*", "$HOME*", "..*", "*/../*", "*{/*", "*[*", "*$*"]
 
 # Known config files that are reviewable in general but sometimes carry secrets:
-# the scanner refuses the launch when a line looks like a credential assignment.
+# the scanner refuses the launch when a line looks like a credential assignment, and
+# the preflight excludes such a file when its diff does. Java properties separate
+# key and value by '=', ':' or whitespace.
 CONTENT_CHECKS = {
     "gradle.properties": re.compile(
-        r"^\s*[\w.-]*(password|passwd|secret|token|passphrase|api[_-]?key)[\w.-]*\s*=\s*\S", re.I | re.M),
+        r"^\s*[\w.-]*(password|passwd|secret|token|passphrase|api[_-]?key|access[_-]?key|secret[_-]?key"
+        r"|signing[_-]?key|inmemorykey|private[_-]?key|credential)[\w.-]*(\s*[=:]\s*|\s+)\S", re.I | re.M),
 }
-GIT_CONFIG_USERINFO = re.compile(r"://[^/\s:@]+:[^/\s@]+@")
-# http.<url>.extraHeader lines (any value; CI checkouts store tokens there) and any
-# Authorization: Bearer/Basic value.
-GIT_CONFIG_HTTP_CREDENTIALS = re.compile(r"^\s*extraheader\s*=|authorization:\s*(bearer|basic)\s+\S", re.I | re.M)
+# A content-checked name also covers its copies under a further suffix
+# (gradle.properties.bak, .orig ...), but not documented templates.
+CONTENT_CHECK_TEMPLATE_SUFFIXES = (".example", ".sample", ".template", ".dist")
+# Any user-info in a URL is a credential (https://user:secret@..., https://<token>@...),
+# except a bare login name in an ssh URL (ssh://git@host/...), which ssh never uses as one.
+GIT_CONFIG_USERINFO = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*)?://([^/\s@]+)@")
+SSH_URL_SCHEMES = frozenset({"ssh", "git+ssh", "ssh+git"})
+# http.<url>.extraHeader anywhere on a line (any value, also after a section header on
+# the same line; CI checkouts store tokens there) and any Authorization: Bearer/Basic value.
+GIT_CONFIG_HTTP_CREDENTIALS = re.compile(r"extraheader\s*=|authorization:\s*(bearer|basic)\s+\S", re.I)
 
 # Symlink targets under these read-only system prefixes are not an escape (Python
 # virtualenvs link their interpreter there); anything else outside the repo is.
@@ -435,9 +446,40 @@ def parse_name_status_z(data: bytes) -> tuple[list[bytes], list[tuple[str, bytes
     return paths, pairs
 
 
-def _content_checker(path: bytes):
-    """The CONTENT_CHECKS pattern for a path's basename (case-insensitive), or None."""
-    return CONTENT_CHECKS.get(path.rsplit(b"/", 1)[-1].decode("utf-8", "surrogateescape").lower())
+def content_check_key(name: str) -> str | None:
+    """The CONTENT_CHECKS key covering a file name, case-insensitively: the key itself
+    or the key plus a further suffix (gradle.properties.bak, .orig ...), but not the key
+    plus a template suffix (.example, .sample, .template, .dist)."""
+    lower = name.lower()
+    for key in CONTENT_CHECKS:
+        if lower == key or (lower.startswith(key + ".") and lower[len(key):] not in CONTENT_CHECK_TEMPLATE_SUFFIXES):
+            return key
+    return None
+
+
+def _content_key_bytes(path: bytes) -> str | None:
+    return content_check_key(path.rsplit(b"/", 1)[-1].decode("utf-8", "surrogateescape"))
+
+
+def git_config_has_credentials(text: str) -> bool:
+    """User-info in a URL (other than a bare ssh login name), an http extraHeader, or an
+    Authorization: Bearer/Basic value."""
+    if GIT_CONFIG_HTTP_CREDENTIALS.search(text):
+        return True
+    for m in GIT_CONFIG_USERINFO.finditer(text):
+        if (m.group(1) or "").lower() in SSH_URL_SCHEMES and ":" not in m.group(2):
+            continue
+        return True
+    return False
+
+
+def _is_git_config(rel: str) -> bool:
+    """config / config.worktree directly in .git, in .git/worktrees/<name>/, and anywhere
+    under .git/modules/ (submodule git dirs, nested ones included)."""
+    parts = rel.split("/")
+    if parts[-1] not in ("config", "config.worktree"):
+        return False
+    return len(parts) == 2 or (len(parts) == 4 and parts[1] == "worktrees") or (len(parts) >= 3 and parts[1] == "modules")
 
 
 def classify_z(names: bytes, renames: bytes | None, display: str | None,
@@ -445,9 +487,11 @@ def classify_z(names: bytes, renames: bytes | None, display: str | None,
     """stdout: the unique excluded paths, NUL-terminated, sorted by bytes. A rename or
     copy with a secret-like side excludes BOTH sides: a renamed secret must not
     reappear under a safe name, and a secret's new name must not reveal what its old
-    (safe-named) source contained. ``content_candidates`` receives the paths that are
-    not excluded but have a content check (gradle.properties ...): the launcher checks
-    their diffs, which can carry a credential line the worktree no longer has."""
+    (safe-named) source contained. ``content_candidates`` receives KEY\\0PATH\\0 records
+    for the paths that are not excluded but are content-checked (gradle.properties ...,
+    by their own name or as either side of a rename/copy with such a side): the
+    launcher checks their diffs, which can carry a credential line the worktree no
+    longer has."""
     candidates = _nul_fields(names, "classify -z", terminated=False)
     pairs: list[tuple[str, bytes, bytes]] = []
     if renames is not None:
@@ -467,23 +511,48 @@ def classify_z(names: bytes, renames: bytes | None, display: str | None,
             for path in ordered:
                 fh.write(" ".join([git_quote(path), *sorted(excluded[path])]) + "\n")
     if content_candidates:
-        checked = sorted({p for p in candidates if p not in excluded and _content_checker(p) is not None})
+        checked: dict[bytes, str] = {}
+        for path in candidates:
+            key = _content_key_bytes(path)
+            if key is not None and path not in excluded:
+                checked.setdefault(path, key)
+        for _kind, src, dst in pairs:
+            # The check follows the content: a renamed or copied gradle.properties keeps it.
+            key = _content_key_bytes(src) or _content_key_bytes(dst)
+            if key is not None:
+                for side in (src, dst):
+                    if side not in excluded:
+                        checked.setdefault(side, key)
         with open(content_candidates, "wb") as fh:
-            fh.write(b"".join(path + b"\0" for path in checked))
+            fh.write(b"".join(checked[p].encode() + b"\0" + p + b"\0" for p in sorted(checked)))
     sys.stdout.buffer.write(b"".join(path + b"\0" for path in ordered))
 
 
-def check_diff_content(path: str) -> int:
-    """Exit status for the launcher: 3 when the unified diff on stdin (added, removed or
-    context lines alike) holds a credential-looking assignment for this file's content
-    check, 0 when not; no content check for the name fails closed (exit 2)."""
+def check_diff_content(path: str, checker_key: str | None = None) -> int:
+    """Exit status for the launcher: 3 when the unified diff on stdin holds a
+    credential-looking assignment for the file's content check (``checker_key``, else
+    the one its name selects), 0 when not; no or an unknown check fails closed (exit 2).
+    Added, removed and context lines count, and so does the text git copies after a
+    hunk header (@@ -a,b +c,d @@ <nearest preceding line starting with a letter>)."""
     raw = os.fsencode(path)
-    checker = _content_checker(raw)
+    key = checker_key if checker_key is not None else _content_key_bytes(raw)
+    checker = CONTENT_CHECKS.get(key) if key is not None else None
     if checker is None:
-        _die(f"check-diff-content: no content check for {git_quote(raw)}")
+        _die(f"check-diff-content: no content check for {git_quote(raw)}"
+             + (f" (--checker {checker_key!r})" if checker_key is not None else ""))
     text = sys.stdin.buffer.read().decode("utf-8", "replace")
-    body = "\n".join(line[1:] if line[:1] in ("+", "-", " ") else line for line in text.split("\n"))
-    return 3 if checker.search(body) else 0
+    lines: list[str] = []
+    for line in text.split("\n"):
+        if line.startswith("@@"):
+            end = line.find("@@", 2)
+            if end >= 0:
+                lines.append(line[end + 2:].lstrip())
+            lines.append(line)
+        elif line[:1] in ("+", "-", " "):
+            lines.append(line[1:])
+        else:
+            lines.append(line)
+    return 3 if checker.search("\n".join(lines)) else 0
 
 
 def check_excluded(excluded_file: str, remaining_file: str) -> None:
@@ -509,41 +578,79 @@ def scan(repo: str, budget: float) -> int:
     sensitive: list[str] = []
     symlinks: list[tuple[str, str]] = []
     content: list[tuple[str, str]] = []
+    dir_links: list[tuple[str, str, str]] = []      # in-repo directory aliases (link, target, rel target)
+    alias_inodes: dict[tuple[int, int], str] = {}   # (st_dev, st_ino) of secret-like files and .git files
+    linked: list[tuple[str, tuple[int, int]]] = []  # other regular files with st_nlink > 1
     complete = True
 
     def rel(path: str) -> str:
         return os.path.relpath(path, repo).replace(os.sep, "/")
 
-    def check_symlink(path: str) -> None:
+    def lstat(path: str):
+        try:
+            return os.lstat(path)
+        except OSError:
+            return None
+
+    def link_target(path: str) -> tuple[str, bool]:
+        """(canonical target, inside the repository); reports a link that leaves it,
+        unless the target is under a tolerated system prefix."""
         target = os.path.realpath(path)
         inside = target == repo or target.startswith(repo + os.sep)
-        system = target.startswith(ALLOWED_SYMLINK_PREFIXES) and os.path.exists(target)
-        if not (inside or system):
+        if not inside and not (target.startswith(ALLOWED_SYMLINK_PREFIXES) and os.path.exists(target)):
             symlinks.append((rel(path), target if os.path.lexists(target) else f"{target} (dangling)"))
-        elif inside and target != repo:
-            # Inside, but an alias of Git metadata, a protected directory or a
-            # secret-like file: the alias name would pass OpenCode's read rules.
-            rel_target = rel(target)
-            parts = rel_target.lower().split("/")
-            if any(p in SENSITIVE_DIR_COMPONENTS for p in parts) or is_sensitive_path(rel_target):
-                symlinks.append((rel(path), f"{target} (secret-like target: {rel_target})"))
+        return target, inside
 
+    def check_symlink(path: str) -> None:
+        target, inside = link_target(path)
+        if not inside:
+            return
+        rel_target = "" if target == repo else rel(target)
+        parts = rel_target.lower().split("/") if rel_target else []
+        if any(p in SENSITIVE_DIR_COMPONENTS for p in parts) or (rel_target and is_sensitive_path(rel_target)):
+            # An alias of Git metadata, a protected directory or a secret-like file:
+            # the alias name would pass OpenCode's read rules.
+            symlinks.append((rel(path), f"{target} (secret-like target: {rel_target})"))
+        elif os.path.isdir(target):
+            dir_links.append((rel(path), target, rel_target))  # judged after the walk
+
+    # .git: links that leave the repository, the inodes of its files (a hard link to
+    # one is an alias) and every Git config file (credentials). Its object store holds
+    # none of these and can be large.
     git_dir = os.path.join(repo, ".git")
     if os.path.isdir(git_dir):
-        cfg = os.path.join(git_dir, "config")
-        try:
-            with open(cfg, encoding="utf-8", errors="replace") as fh:
-                text = fh.read()
-            if GIT_CONFIG_USERINFO.search(text) or GIT_CONFIG_HTTP_CREDENTIALS.search(text):
-                content.append((".git/config", "remote URL or http header embeds credentials"))
-        except OSError:
-            pass
+        for dirpath, dirnames, filenames in os.walk(git_dir, topdown=True, followlinks=False):
+            if time.monotonic() - started > budget:
+                complete = False
+                break
+            for d in dirnames:
+                if os.path.islink(os.path.join(dirpath, d)):
+                    link_target(os.path.join(dirpath, d))
+            dirnames[:] = [d for d in dirnames if d != "objects"]
+            for name in filenames:
+                full = os.path.join(dirpath, name)
+                if os.path.islink(full):
+                    link_target(full)
+                    continue
+                st = lstat(full)
+                if st is None or not stat.S_ISREG(st.st_mode):
+                    continue
+                r = rel(full)
+                alias_inodes.setdefault((st.st_dev, st.st_ino), r)
+                if _is_git_config(r):
+                    try:
+                        with open(full, encoding="utf-8", errors="replace") as fh:
+                            text = fh.read()
+                    except OSError:
+                        continue
+                    if git_config_has_credentials(text):
+                        content.append((r, "remote URL or http header embeds credentials"))
 
     for dirpath, dirnames, filenames in os.walk(repo, topdown=True, followlinks=False):
-        if time.monotonic() - started > budget:
+        if not complete or time.monotonic() - started > budget:
             complete = False
             break
-        # .git is checked above (config only); its object store is not reviewable.
+        # .git is examined above; it is not reviewable content.
         dirnames[:] = [d for d in dirnames if not (dirpath == repo and d == ".git")]
         for d in list(dirnames):
             full = os.path.join(dirpath, d)
@@ -552,20 +659,40 @@ def scan(repo: str, budget: float) -> int:
         for name in filenames:
             full = os.path.join(dirpath, name)
             files += 1
-            if os.path.islink(full):
+            is_link = os.path.islink(full)
+            if is_link:
                 check_symlink(full)
             r = rel(full)
+            st = None if is_link else lstat(full)
+            regular = st is not None and stat.S_ISREG(st.st_mode)
             if is_sensitive_path(r):
                 sensitive.append(r)
+                if regular:
+                    alias_inodes.setdefault((st.st_dev, st.st_ino), r)
                 continue
-            checker = CONTENT_CHECKS.get(name.lower())
-            if checker is not None:
+            if regular and st.st_nlink > 1:
+                linked.append((r, (st.st_dev, st.st_ino)))
+            key = content_check_key(name)
+            if key is not None:
                 try:
                     with open(full, encoding="utf-8", errors="replace") as fh:
-                        if checker.search(fh.read(262144)):
+                        if CONTENT_CHECKS[key].search(fh.read(262144)):
                             content.append((r, "credential-looking assignment"))
                 except OSError:
                     pass
+
+    # A directory alias renames every path below its target, so a file that is
+    # secret-like only through a directory name above it would be readable by name.
+    for link, target, rel_target in dir_links:
+        prefix = rel_target + "/" if rel_target else ""
+        flagged = sorted(p for p in sensitive if p.startswith(prefix))
+        if flagged:
+            symlinks.append((link, f"{target} (aliases a directory holding secret-like files: {flagged[0]})"))
+    # A hard link is the same file under another name, which no symlink rule sees.
+    for r, inode in linked:
+        other = alias_inodes.get(inode)
+        if other is not None and other != r:
+            symlinks.append((r, f"{os.path.join(repo, other)} (hard link to {other})"))
 
     for path in sorted(sensitive):
         print(f"SENSITIVE {path}")
@@ -740,7 +867,10 @@ def main(argv: list[str]) -> None:
     p_check = sub.add_parser("check-excluded")
     p_check.add_argument("excluded", help="NUL-delimited excluded paths (classify -z output)")
     p_check.add_argument("remaining", help="NUL-delimited paths the preflight still diffs")
-    sub.add_parser("check-diff-content").add_argument("path", help="repository-relative path whose diff is on stdin")
+    p_cdc = sub.add_parser("check-diff-content")
+    p_cdc.add_argument("--checker", metavar="KEY",
+                       help="CONTENT_CHECKS key to apply (a rename/copy partner's) instead of the one the name selects")
+    p_cdc.add_argument("path", help="repository-relative path whose diff is on stdin")
     sub.add_parser("quote-path")
     sub.add_parser("verify-sources").add_argument("--config-dir", required=True)
     sub.add_parser("verify-agents")
@@ -768,7 +898,7 @@ def main(argv: list[str]) -> None:
     elif args.cmd == "check-excluded":
         check_excluded(args.excluded, args.remaining)
     elif args.cmd == "check-diff-content":
-        sys.exit(check_diff_content(args.path))
+        sys.exit(check_diff_content(args.path, args.checker))
     elif args.cmd == "quote-path":
         for path in _nul_fields(sys.stdin.buffer.read(), "quote-path", terminated=False):
             print(git_quote(path))

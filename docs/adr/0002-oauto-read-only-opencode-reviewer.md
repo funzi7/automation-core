@@ -60,12 +60,21 @@ policy, not by the system prompt alone:
    accepts an explicit path, so a secret in the worktree could reach the model),
    symlinks leaving the repository (OpenCode checks the requested path, not the
    canonical one; targets under `/usr`, `/bin`, `/lib` such as virtualenv
-   interpreters are tolerated), symlinks that alias a secret-like path or Git
-   metadata under a harmless name (`review-config.txt -> .git/config`,
-   `cfg -> .ssh`: the alias would be readable by name, so these are refused
-   unconditionally, like outward links) and credential-looking content in
-   `gradle.properties` or `.git/config` (user:secret URLs, `extraHeader`
-   authorization values).
+   interpreters are tolerated), aliases of denied paths under a harmless name
+   (the alias would be readable by name, so these are refused unconditionally,
+   like outward links): symlinks whose canonical target is or lies under
+   `.git`, `.ssh`, `.gnupg` or `.aws`, symlinks to a secret-like file
+   (`notes.txt -> config/prod.secrets.yaml`, `c -> .docker/config.json`),
+   symlinks to a directory that holds secret-like files (`cfgdir -> secrets/`),
+   hard links to a secret-like file or to a file under `.git`, and symlinks
+   inside `.git` that leave the repository; and credential-looking content in
+   `gradle.properties`-style files (`CONTENT_CHECKS`: basename equal to the
+   key or key plus a suffix, template suffixes exempt; `=`, `:` or whitespace
+   separators; password/secret/token/passphrase/api-, access-, secret-,
+   signing-, private-key/credential names) or in Git config files
+   (`.git/config`, `config.worktree`, linked-worktree and submodule configs:
+   any user-info in a remote URL, `extraHeader` anywhere on a line,
+   `Authorization: Bearer|Basic` values).
 5. **Diagnostics before exec**: `opencode debug config`, `opencode models` and
    `opencode debug agents` are run with `--standalone` and parsed; the launch
    proceeds only if the sole config source is the oauto file, exactly the
@@ -116,9 +125,11 @@ policy, not by the system prompt alone:
    ≥50 % similar content); a safe-named file that merely still contains
    secret text is reviewable content under name-based classification, and
    its hunks are shown. The one content-based exception is the
-   `CONTENT_CHECKS` set (`gradle.properties`): a changed file of that name
-   has its worktree and branch-delta diffs checked for credential-looking
-   assignments on either side, and a hit excludes the file from the
+   `CONTENT_CHECKS` set (`gradle.properties` and `gradle.properties.<suffix>`
+   names, template suffixes exempt): a changed file of that name — and both
+   sides of any rename or copy pair that involves one — has its worktree and
+   branch-delta diffs checked for credential-looking assignments on either
+   side, hunk-header context included, and a hit excludes the file from the
    preflight (listed as `credential-looking content in its diff`), so
    removing a committed credential never sends the removed line.
 

@@ -128,8 +128,8 @@ sensitive="$(printf '%s\n' "$scan_out" | sed -n 's/^SENSITIVE //p')"
 content_hits="$(printf '%s\n' "$scan_out" | sed -n 's/^CONTENT //p')"
 outward="$(printf '%s\n' "$scan_out" | sed -n 's/^SYMLINK //p')"
 if [[ -n "$outward" ]]; then
-  printf 'oauto: symlinks leaving the repository or aliasing secret-like paths:\n%s\n' "$outward" >&2
-  die "refusing to launch: OpenCode resolves reads through symlinks but checks only the requested name, so these would expose paths outside $REPO, or Git metadata and secret-like files inside it under a harmless name (targets under /usr, /bin, /lib are tolerated)"
+  printf 'oauto: symlinks leaving the repository or aliasing secret-like paths (hard links included):\n%s\n' "$outward" >&2
+  die "refusing to launch: OpenCode resolves reads through symlinks but checks only the requested name (and a hard link is the same file under another name), so these would expose paths outside $REPO, or Git metadata and secret-like files inside it, under a harmless name (targets under /usr, /bin, /lib are tolerated)"
 fi
 if [[ -n "$sensitive$content_hits" ]]; then
   [[ -n "$sensitive" ]] && printf 'oauto: secret-like files present in %s:\n%s\n' "$REPO" "$sensitive" >&2
@@ -268,10 +268,13 @@ python3 -I "$POLICY" classify -z --renames "$pairs" --display "$display" --conte
 # in its diff where the worktree scan cannot see it: such a path is excluded when its
 # own diff (uncommitted or branch delta) holds a credential-looking line.
 if [[ "$head_sha" != "(no commits)" ]]; then
-  while IFS= read -r -d '' path <&3; do
+  # Records are KEY\0PATH\0: the content check to apply (a renamed or copied
+  # gradle.properties keeps its own) and the path.
+  while IFS= read -r -d '' key <&3; do
+    IFS= read -r -d '' path <&3 || die "malformed content-check candidate list"
     for rev in HEAD ${base:+"$base...HEAD"}; do
       status=0
-      gd "$rev" -- ":(literal)$path" | python3 -I "$POLICY" check-diff-content -- "$path" || status=$?
+      gd "$rev" -- ":(literal)$path" | python3 -I "$POLICY" check-diff-content --checker "$key" -- "$path" || status=$?
       if (( status == 3 )); then
         printf '%s\0' "$path" >> "$excluded_z"
         quoted="$(printf '%s\0' "$path" | python3 -I "$POLICY" quote-path)" || die "could not quote a path for the preflight"
