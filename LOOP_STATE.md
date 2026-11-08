@@ -134,7 +134,7 @@ is the permanent human opt-out and is never removed by automation.
    review and attestation, or a normal Codex review once quota returns. Do not
    claim it passes before that evidence exists.
 7. **Longer-term:** update minutes-guard target coverage after downstream audit; keep direct-to-main and branch-protection decisions explicit.
-8. **oauto (read-only OpenCode reviewer launcher) — installed, PR pending.** The
+8. **oauto (read-only OpenCode reviewer launcher) — installed, PR #58 pending.** The
    launcher, its policy module, tests and docs live under `launchers/` on branch
    `claude/oauto-opencode-reviewer` (ADR 0002). Validated on the device against
    OpenCode 2.2.6 with disposable fixture repositories (see the 2026-11-07

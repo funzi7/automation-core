@@ -338,7 +338,7 @@ A1. oauto — read-only OpenCode reviewer launcher (2026-11-07):
 
 - `launchers/ai-launch` (tracked copy of the device launcher, + `opencode`
   mode) and `launchers/oauto/` (preflight, policy render/verify, installer,
-  Termux wrapper, tests) are on branch `claude/oauto-opencode-reviewer`;
+  Termux wrapper, tests) are on branch `claude/oauto-opencode-reviewer` (PR #58);
   contract in `docs/adr/0002-oauto-read-only-opencode-reviewer.md`;
 - installed on the device and validated against OpenCode 2.2.6 with disposable
   fixture repositories; full record in the dated `handoffs/loop-build.md` entry;

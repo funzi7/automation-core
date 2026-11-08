@@ -5,7 +5,7 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
 ---
 
 ## [2026-11-08 UTC] oauto — read-only, privacy-restricted OpenCode reviewer launcher
-- PR: see the follow-up line below this entry once opened (recorded in `agent-memory/automation-core/cc-latest.md`)
+- PR: <https://github.com/funzi7/automation-core/pull/58>
 - Branch: `claude/oauto-opencode-reviewer` (from `main` = `15652f663ccf31fac3c03651a5a7b56758257de4`)
 - Status: opened — launcher installed and validated on the device; the Termux hop itself needs one manual run by the owner
 - What changed:
