@@ -16,6 +16,10 @@ Central source of truth for CI/CD automation across all of @funzi7's repositorie
 - `sync-automation-core.yml` — the per-repo sync workflow (installed by Bootstrap)
 - `claude-guard.example.json` — example `.claude-guard.json` protected-paths config for Merge Bot
 
+`launchers/` — the owner's device-side agent launchers (not synced to any repo):
+- `ai-launch` — tracked copy of `/root/work/bin/ai-launch` (`cauto`, `clauto`, `ai`, and the `opencode` mode)
+- `oauto/` — **oauto**: `oauto <repo>` launches OpenCode 2.2.6 as a read-only, privacy-restricted reviewer pinned to two approved zero-retention free models; see `launchers/oauto/README.md` and `docs/adr/0002-oauto-read-only-opencode-reviewer.md`
+
 ## Self-Healing Loop
 
 An autonomous detect → fix → review → merge loop, assembled from the four

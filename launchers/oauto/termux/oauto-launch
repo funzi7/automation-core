@@ -1,0 +1,4 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# Termux entrypoint for the read-only OpenCode reviewer. Same hop as clauto-launch,
+# minus any token pass-through: nothing from the Termux environment reaches OpenCode.
+exec proot-distro login debian -- /root/work/bin/ai-launch opencode "$@"

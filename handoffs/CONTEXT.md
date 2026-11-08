@@ -320,16 +320,32 @@ These are preserved as incident records. They are not current operating instruct
 
 ## 7. Current Open TODO
 
-A0. Canonical Claude fallback review evidence (this pass):
+A0. Canonical Claude fallback review evidence:
 
 - implemented centrally in automation-core and covered deterministically;
-- physically pending: consumer repositories must receive the new workflow
-  through the normal sync, and each must set `CLAUDE_FALLBACK_REVIEW_ENABLED`
-  to `true` before any fallback evidence is honoured there;
+  PR #56 merged 2026-09-15 as `15652f663ccf31fac3c03651a5a7b56758257de4`;
+- physically pending (checked 2026-11-07): no consumer default branch carries
+  `claude-fallback-review.yml` yet — sync PRs paywall-bot #107, OPT #20 and
+  TRF #92 are open and unmerged — and no repository has set
+  `CLAUDE_FALLBACK_REVIEW_ENABLED` to `true`, so no fallback evidence is
+  honoured anywhere yet;
 - no production attestation has been minted or honoured yet;
 - OptionsProfitTracker PR #19 still cannot pass: every trusted quota notice on
   it predates its current head, so it needs either fresh current-head quota
   evidence plus a new exact-head fallback review, or a normal Codex review.
+
+A1. oauto — read-only OpenCode reviewer launcher (2026-11-07):
+
+- `launchers/ai-launch` (tracked copy of the device launcher, + `opencode`
+  mode) and `launchers/oauto/` (preflight, policy render/verify, installer,
+  Termux wrapper, tests) are on branch `claude/oauto-opencode-reviewer`;
+  contract in `docs/adr/0002-oauto-read-only-opencode-reviewer.md`;
+- installed on the device and validated against OpenCode 2.2.6 with disposable
+  fixture repositories; full record in the dated `handoffs/loop-build.md` entry;
+- physically pending: one `oauto <repo>` run from a real Termux shell, the PR
+  merge, and the owner's decision on listing `oauto` in
+  `DEVELOPMENT_RULES_FULL` §7. The launcher refuses any OpenCode version other
+  than 2.2.6 until re-validated.
 
 A. Recovery documentation and expression-safety work completed in this pass:
 

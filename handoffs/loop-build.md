@@ -4,6 +4,111 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
 
 ---
 
+## [2026-11-08 UTC] oauto — read-only, privacy-restricted OpenCode reviewer launcher
+- PR: see the follow-up line below this entry once opened (recorded in `agent-memory/automation-core/cc-latest.md`)
+- Branch: `claude/oauto-opencode-reviewer` (from `main` = `15652f663ccf31fac3c03651a5a7b56758257de4`)
+- Status: opened — launcher installed and validated on the device; the Termux hop itself needs one manual run by the owner
+- What changed:
+  - `launchers/ai-launch` is now the tracked copy of `/root/work/bin/ai-launch` (first commit:
+    byte-identical import of the live file; later: the `opencode` mode). The mode hands off to
+    `oauto-run` right after repository resolution and before the cauto/clauto banner, and a
+    leading `glm`/`deepseek` argument is kept for oauto-run instead of being taken as a repo name.
+    The `codex`/`claude` exec blocks and the `ai` menu are byte-identical (a test rebuilds the file
+    from `tests/fixtures/ai-launch.pristine` plus exactly the intended edits).
+  - `launchers/oauto/oauto-run` + `oauto-policy.py`: per-repo lock taken first (re-exec under
+    `flock --close`, held by the flock parent for the OpenCode process lifetime); fail-closed
+    preflight (OpenCode **2.2.6** only, no `/etc/opencode`, no `opencode.json(c)`/`.opencode/` in
+    the repo, no `opencode.json(c)` in any parent); one unpruned, case-insensitive worktree scan
+    driven by the same pattern list as the `read` denies (secret-like files → refuse unless
+    `OAUTO_ALLOW_SENSITIVE_FILES=1`; symlinks leaving the repo → refuse, `/usr`,`/bin`,`/lib`
+    targets tolerated; credential-looking lines in `gradle.properties` or `.git/config` → refuse);
+    read-only git preflight (`GIT_OPTIONAL_LOCKS=0`, time-bounded, byte-capped, secret-like
+    changed/deleted/untracked paths excluded from every diff and listed by name only); a private
+    config directory per launch via `XDG_CONFIG_HOME` (`~/.config/opencode` is never read or
+    written); deny-all `permissions` + read/glob/grep/question allows, hard `policies` ceiling,
+    provider pinned to `opencode`, every offered model except the approved one(s) disabled
+    (statically and dynamically from `opencode models`); verification through `opencode debug
+    config`/`debug agents`/`models` (all `--standalone`, 40 probes per agent) plus a check that
+    nothing else appeared in the private config dir; scrubbed `env -i`; never `--auto`; the TUI
+    `--prompt` carries the preflight. Approved models: `opencode/glm-5.3-flash-free` (default)
+    and `opencode/deepseek-v4.1-flash-free` (`oauto <repo> deepseek`), both $0 and published as
+    zero-retention/no-training on opencode.ai/docs/zen (read 2026-11-07).
+  - Termux: `/data/data/com.termux/files/usr/bin/oauto-launch` + `oauto()` in Termux `.bashrc`;
+    Debian: `oauto()` in `~/.bashrc`; `launchers/oauto/install.sh` (idempotent, `--verify`,
+    refuses unpaired bashrc markers, backs up replaced files). The original live `ai-launch` is
+    kept as `/root/work/bin/ai-launch.backup-before-oauto-20261107`.
+  - Docs: `docs/adr/0002-oauto-read-only-opencode-reviewer.md`, `launchers/oauto/README.md`,
+    README `launchers/` section, this entry, LOOP_STATE item 8 + "Device launchers", CONTEXT §7 A1.
+- Validation performed (device, OpenCode 2.2.6, disposable fixture repositories only):
+  - Deterministic: `tests/test_oauto_launcher.js` 20/20 pass — rendered contract (every deny,
+    allow, policy, disabled model, agent shape), `classify`/`scan` behaviour (case-insensitive,
+    `node_modules` not pruned, symlink classes, content checks, budget exhaustion), verifiers
+    against good and 13 mutated payloads, and the launcher driven end to end against
+    `tests/fixtures/fake-opencode`: clean `--check`, dynamic model disabling, secret refusal and
+    override, outward vs system symlinks, deleted-secret exclusion from the diff, project/parent
+    config refusal, version pin, bad arguments, lock contention, detached and unborn HEAD,
+    oversized diff truncation, scrubbed launch argv/env, ai-launch routing (including the bare
+    `oauto deepseek` menu path) and parity, `install.sh` idempotency/backup/unpaired markers.
+    `bash scripts/validate.sh` green; `git diff --check` clean.
+  - Real binary, `--check` paths: `oauto-run <clean>` with GLM and DeepSeek, `ai-launch opencode
+    <repo> --check`, the Debian `oauto` function — each: config sources = only the private file,
+    models = exactly the two approved ids, 5 agents resolved with 40 probes each as expected.
+  - Real binary, refusals: `.opencode/` present, outward symlink (even with the secrets override),
+    secret-like files; override → pass with WARNING and 0 secret markers in the preflight.
+  - Real binary, tool level (exact rendered rules, harness prompt): read `.env`,
+    `config/server.pem`, `.git/config`, `.ssh/config` → `Permission denied: read`; read
+    `/etc/hostname` → `Permission denied: external_directory`; `.env.example` and `src/calc.py`
+    readable; write/edit/shell/webfetch/subagent not in the tool list; with `--auto` the same
+    denials hold; glob `{/root,x}/.ssh/*` → `Permission denied: glob` while `**/*.py` works;
+    `--model opencode/big-pickle` → `Model unavailable`; `--agent build` → `Agent not found`.
+    Earlier rounds on the same rules additionally showed: `glob /root/*` denied, websearch absent,
+    `skill` load of the real local skill `docs` → `Unable to load skill` with no skills visible, a
+    project `.opencode/plugins/marker.ts` executing without policies and not executing under the
+    `plugin.use` deny policy, and `plugins: ["-*"]` removing the free-tier provider (so it is not
+    used). No fixture file was ever changed by the model; no process was left behind.
+  - Real launch through the installed `/root/work/bin/oauto-run` under a PTY: lock held by the
+    flock parent, process tree `flock → bash oauto-run → opencode --standalone --prompt → opencode.exe
+    serve --stdio --port 0` (no shared service), the preflight prompt auto-submitted, the model read
+    `src/calc.py`, globbed for tests and returned a review with a P1 on the planted regression;
+    after SIGTERM nothing remained and the lock was free. `~/.config/opencode` was not touched.
+- Independent review: an Opus reviewer subagent (not the implementing agent) reviewed the first
+  complete version and reported 2 P1 / 10 P2 / 10 P3. All were addressed: secret contents could
+  reach the model through the preflight diff of deleted or modified tracked secrets → excluded by
+  pathspec; the scan was narrower than the read-deny list, case-sensitive and pruned
+  `node_modules` → one shared pattern list, case-insensitive, unpruned, plus `.ssh/`, `.gnupg/`,
+  `.git/`, `.npmrc`, `.pypirc`, `.aws/`, `.docker/config.json`, `local.properties`,
+  `client_secret*.json`, `*.p8` and content checks; config rendered before the lock and into the
+  shared global file → lock first and a private `XDG_CONFIG_HOME` directory; `oauto deepseek` ran
+  GLM silently → alias routing; cap arithmetic and chars-vs-bytes → byte caps under a 100,000-byte
+  limit; virtualenv symlinks refused → system prefixes tolerated; skills wording, symlink wording,
+  "every refusal fires", ADR env/probe/parent inaccuracies → corrected; `install.sh` could delete
+  the rest of `.bashrc` on an unpaired marker and took any argument → refuses both, backs up
+  files, checks modes; detached/unborn HEAD rendering, XDG pass-through, basename-keyed lock →
+  fixed; behavioural tests added. Review provenance: `review_provider = claude_code_fallback`
+  style independent review (no Codex review exists yet; PR just opened).
+- Not physically tested: the Termux entrypoint itself — `proot-distro login` refuses to run from
+  inside the Debian PRoot session ("attempted to run proot-distro in a proot session"), so
+  `oauto <repo>` must be run once from a real Termux shell by the owner; a review on a real project
+  repository (only disposable fixtures were used); a full DeepSeek TUI session (only `opencode run`
+  with the DeepSeek agent and `--check`); offline behaviour (fails closed at the `models` step by
+  design, not exercised); the free tier's daily request limit (documented by OpenCode without a
+  number); `/etc/opencode` refusal and the preflight-size refusal (code paths only, not
+  exercised); whether a running TUI re-reads its private config mid-session.
+- Limitations / risks: every model request transmits the selected code context and the preflight
+  diff to OpenCode's remote inference service — zero retention is the provider's published term
+  only; the preflight is visible in `/proc/<pid>/cmdline` to same-user processes while the session
+  runs; `grep` is content-returning and path-unrestricted by OpenCode design (an explicit
+  `path: ".env"` returned the line), so the worktree scan is the real control; project `AGENTS.md`
+  is sent to the model as instructions; OpenCode downloads ripgrep to `~/.cache/opencode/bin/rg`
+  on first grep; helper commands without `--standalone` start the shared background service (one
+  was started and stopped during this investigation; it left `~/.config/opencode/service.json`
+  with a local service password, untouched); the launcher refuses any OpenCode version other than
+  2.2.6 until re-validated; no code-editing OpenCode mode exists.
+- Needs from the owner: run `oauto <repo>` once from Termux; merge the PR; decide whether
+  `DEVELOPMENT_RULES_FULL` §7 should list `oauto` next to `cauto`/`clauto`.
+- Next: after any OpenCode upgrade, re-run `oauto <repo> --check`, the fixture battery and the
+  tool-level probes, then bump `VALIDATED_VERSION` deliberately.
+
 ## [2026-09-15 UTC] Canonical Claude fallback review evidence
 - PR: <https://github.com/funzi7/automation-core/pull/56>
 - Branch: `claude/canonical-fallback-review-evidence`

@@ -1,0 +1,120 @@
+# ADR 0002 — `oauto`: a read-only, privacy-restricted OpenCode reviewer launcher
+
+- Status: accepted
+- Date: 2026-11-07
+- Relates to: `launchers/oauto/`, `launchers/ai-launch`
+
+## Context
+
+The owner's Termux/Debian device launches coding agents through
+`/root/work/bin/ai-launch` (`cauto` for Codex, `clauto` for Claude Code, `ai` for
+the menu). Those agents run with full tool access and are protected by global
+hooks (heavy-build queue, ADB lease, agent-memory Git lock). OpenCode 2.2.6 was
+installed in Debian (npm, `/usr/local/bin/opencode`) to add a second, free
+reviewer. None of the Claude/Codex hooks apply to OpenCode, and OpenCode 2's
+defaults are wide open: every tool is allowed, `external_directory` is allowed,
+project-local `.opencode/plugins/*.ts` execute on open, and a project
+`opencode.json` outranks the user's global config.
+
+Only two OpenCode Zen free models are approved for the owner's code:
+`opencode/glm-5.3-flash-free` and `opencode/deepseek-v4.1-flash-free`. Their
+published terms (https://opencode.ai/docs/zen/, read 2026-11-07) say "Its
+provider follows a zero-retention policy and does not use your data for model
+training"; the same page lists them at $0 input/output. The other free models on
+that page carry retention or training clauses and are not approved.
+
+## Decision
+
+`oauto <repo>` is a fourth mode of the shared launcher that hands off to
+`oauto-run` after repository resolution. It launches OpenCode as a read-only
+reviewer, and every restriction is enforced by OpenCode configuration and
+policy, not by the system prompt alone:
+
+1. **Permissions** (OpenCode 2 `permissions` array, last match wins): deny
+   everything, then allow only `read`, `glob`, `grep` and `question`; deny
+   `read` on secret-like paths (`.env*`, keys, keystores, SSH/GPG material,
+   credentials/service-account JSON, Terraform state), re-allow
+   `.env.example`-style templates; deny escaping glob patterns; deny `shell`,
+   `edit` (covers write/patch), `webfetch`, `websearch`, `subagent`, `skill`,
+   `execute`, `external_directory`, image generation and browser. The same
+   ruleset is attached to both reviewer agents, and the hidden maintenance
+   agents (`title`, `summary`, `compaction`) are deny-all.
+2. **Policies** (OpenCode 2 `policies`, a ceiling that only tightens and that
+   global config wins over project config): `provider.use` deny `*` then allow
+   `opencode`; `integration.connect` deny `*`; `integration.use` allow only the
+   free tier; `mcp.use`, `skill.use`, `plugin.use`, `websearch.use` deny `*`;
+   `tool.use` denies mirroring the permission denies.
+3. **Models**: root `model` and each agent's `model` are the approved IDs; the
+   built-in `build`, `plan`, `general` and `explore` agents are disabled; every
+   model the binary offers except the approved pair is disabled in
+   `providers.opencode.models` — statically for the known free models and
+   dynamically at each launch from `opencode models`. `share` is disabled,
+   `update` is disabled, `snapshots`, `lsp`, `formatter` and `websearch` are
+   off, `mcp.servers` and `skills` are empty.
+4. **Launcher preflight, fail closed**: a per-repository lock is taken before
+   anything is written; validated binary version only; no system config under
+   `/etc/opencode`; no `opencode.json(c)` or `.opencode/` in the repository and
+   no `opencode.json(c)` in any parent directory; one scan of the whole worktree
+   (nothing pruned, case-insensitive, driven by the same pattern list as the
+   `read` denies) refuses secret-like files (grep returns matching lines and
+   accepts an explicit path, so a secret in the worktree could reach the model),
+   symlinks leaving the repository (OpenCode checks the requested path, not the
+   canonical one; targets under `/usr`, `/bin`, `/lib` such as virtualenv
+   interpreters are tolerated) and credential-looking content in
+   `gradle.properties` or `.git/config`.
+5. **Diagnostics before exec**: `opencode debug config`, `opencode models` and
+   `opencode debug agents` are run with `--standalone` and parsed; the launch
+   proceeds only if the sole config source is the oauto file, exactly the
+   approved models are offered, and every resolved agent evaluates each probe
+   to its expected effect (`shell`, `edit`, external, `.env`, `.ssh/`,
+   `.git/config` → deny; `read src/...`, `glob **/*.kt`, `grep`, `question` →
+   allow; hidden agents → deny for everything).
+6. **Process hygiene**: `--standalone` (no background service), scrubbed
+   environment (`env -i` passing only HOME, PATH, TERM, LANG, TMPDIR, SHELL,
+   USER, the private `XDG_CONFIG_HOME`, and COLORTERM/LC_ALL/XDG_*_HOME when set,
+   so no API key or `OPENCODE_*` override can widen the model set), the
+   per-repository `flock` held by the launcher's parent process for the
+   session's lifetime, never `--auto`, never `--worktree`.
+7. **Git context without a shell**: the launcher collects branch, HEAD,
+   upstream, ahead/behind, status, byte-capped diffs and recent log with
+   `GIT_OPTIONAL_LOCKS=0` and time-bounded git calls, excludes every changed,
+   deleted or untracked path that the policy classifies as secret-like from the
+   diffs (listing only their names), stores the result under
+   `~/.local/state/oauto/<repo>-<hash>/` and passes it as the first prompt. The
+   model never runs git.
+
+The config is rendered at every launch into a private directory,
+`~/.local/state/oauto/<repo>-<hash>/xdg-config/opencode/opencode.json`, selected
+through `XDG_CONFIG_HOME`; OpenCode then neither loads nor touches
+`~/.config/opencode`, two sessions on different repositories share no file, and
+the launcher checks after the diagnostics that nothing else appeared in that
+directory. Two primary agents exist, `review-glm` (default) and
+`review-deepseek`; the alias argument selects which one is the default, so a
+DeepSeek pass follows a GLM pass without any other model becoming selectable.
+
+## Consequences
+
+- Reviews cannot run tests, builds, linters or ADB: static review only. Heavy
+  builds and device work stay with `cauto`/`clauto` under the existing hooks.
+- Every model request still transmits the selected code context, including the
+  preflight diff, to OpenCode's remote inference service. Zero retention is the
+  provider's published term, not a local guarantee; the banner says so.
+- Repositories that contain OpenCode project config, outward symlinks or
+  secret-like files are refused; the secret-file refusal can be overridden
+  explicitly with `OAUTO_ALLOW_SENSITIVE_FILES=1` (their diffs stay excluded
+  from the preflight regardless), the others cannot. Large worktrees are scanned
+  in full; `OAUTO_SCAN_BUDGET` (seconds, default 180) bounds the scan and the
+  launch fails closed when it is exceeded.
+- The launcher is pinned to OpenCode 2.2.6. Upgrades change permission
+  semantics (2.x already renamed `permission`/`bash`/`task`), so a new version
+  must be re-validated and the pin bumped deliberately.
+- `grep` is content-returning and path-unrestricted by OpenCode design; the
+  preflight refusal is the mitigation. Ripgrep itself is downloaded by OpenCode
+  into `~/.cache/opencode/bin/rg` on first use (one-time, now cached).
+- The `skill` tool stays in the model's tool list, but every skill is denied by
+  permission and policy, so none is visible or loadable (`Unable to load skill`).
+- Project `AGENTS.md` files are sent to the model as instructions; the reviewer
+  must treat them as untrusted repository content.
+- The preflight travels as a command-line argument, so it is visible in
+  `/proc/<pid>/cmdline` to processes of the same user for the session's lifetime.
+- No code-editing OpenCode mode exists; adding one is a separate decision.

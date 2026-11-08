@@ -1,0 +1,585 @@
+#!/usr/bin/env python3
+"""oauto policy module — renders and verifies the read-only OpenCode reviewer configuration.
+
+Run with ``python3 -I`` (isolated mode). Standard library only.
+
+Subcommands
+  render          Print the opencode.json document for one launch.
+  scan            Walk a repository once: report secret-like files, symlinks that
+                  leave it, and credential-looking content in known config files.
+  classify        Read paths on stdin; print the ones the reviewer may never read.
+  verify-sources  Read ``opencode debug config`` JSON on stdin; fail unless the only
+                  configuration sources are the oauto-owned config directory and file.
+  verify-agents   Read ``opencode debug agents`` JSON on stdin; fail unless every agent
+                  resolves to the read-only ruleset and no unexpected agent exists.
+  verify-models   Read ``opencode models`` output on stdin; fail unless exactly the
+                  approved models are offered.
+  approved        Print the approved model table (alias, model id).
+
+Every verifier exits non-zero on the first violation and prints the reason, so the
+launcher can fail closed. One pattern list (SENSITIVE_READ_PATTERNS) drives the
+``read`` deny rules, the ``tool.use`` policy ceiling, the pre-launch scan and the
+preflight diff exclusion, so the four controls cannot drift apart.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+
+# ---------------------------------------------------------------------------
+# Approved models (OpenCode Zen free tier). Their published terms on
+# https://opencode.ai/docs/zen/ state: "Its provider follows a zero-retention
+# policy and does not use your data for model training." Both are listed with
+# $0 input / $0 output pricing. Nothing else may be offered to the reviewer.
+# ---------------------------------------------------------------------------
+APPROVED_MODELS = {
+    "glm": "opencode/glm-5.3-flash-free",
+    "deepseek": "opencode/deepseek-v4.1-flash-free",
+}
+DEFAULT_ALIAS = "glm"
+APPROVED_PROVIDER = "opencode"
+
+# Free models that the installed binary (2.2.6) or the Zen page listed on 2026-11-07
+# but that are NOT approved: their Zen terms allow retention and/or training. They
+# are disabled statically; the launcher also disables, dynamically, anything else
+# the binary lists at launch time, and then verifies that only the approved set
+# remains.
+KNOWN_UNAPPROVED_MODELS = [
+    "opencode/beam-free",
+    "opencode/big-pickle",
+    "opencode/crouton-alpha-free",
+    "opencode/flint-40b-free",
+    "opencode/iceman-free",
+    "opencode/iceman-contributor-free",
+    "opencode/inkling-2-small-free",
+    "opencode/jev-1.13-free",
+    "opencode/mimo-v2.6-flash-free",
+    "opencode/nemotron-3-ultra-free",
+    "opencode/nemotron-3.5-lightning-free",
+    "opencode/nemotron-3.5-super-vl-free",
+]
+
+REVIEW_AGENTS = {
+    "review-glm": "glm",
+    "review-deepseek": "deepseek",
+}
+BUILTIN_DISABLED = ["build", "plan", "general", "explore"]
+BUILTIN_HIDDEN = ["title", "summary", "compaction"]
+
+# Permission actions the reviewer may never use (OpenCode 2 action names).
+DENIED_ACTIONS = [
+    "shell",
+    "edit",
+    "webfetch",
+    "websearch",
+    "subagent",
+    "skill",
+    "execute",
+    "external_directory",
+    "experimental_image_generate",
+    "browser",
+]
+
+# Files the reviewer may never read even inside the repository, in OpenCode 2
+# resource syntax: resources for ``read`` are location-relative paths, ``*``
+# matches across ``/``, ``?`` matches one character, whole value must match.
+# The same list is matched case-insensitively by the scanner.
+SENSITIVE_READ_PATTERNS = [
+    # dotenv and shell env
+    "*.env", "*.env.*", "*.envrc",
+    # key material and stores
+    "*.pem", "*.key", "*.p12", "*.pfx", "*.p8", "*.jks", "*.keystore", "*.kdbx",
+    "*.gpg", "*.asc", "*.ovpn", "*.htpasswd",
+    "*keystore.properties", "*signing.properties", "local.properties", "*/local.properties",
+    "*id_rsa*", "*id_dsa*", "*id_ecdsa*", "*id_ed25519*",
+    # tool and cloud credential homes
+    ".ssh/*", "*/.ssh/*", ".gnupg/*", "*/.gnupg/*", ".aws/*", "*/.aws/*",
+    ".docker/config.json", "*/.docker/config.json",
+    "*.netrc", "*.git-credentials", "*.npmrc", "*.pypirc",
+    # repository metadata (remote URLs can embed tokens; nothing to review there)
+    ".git/*", "*/.git/*",
+    # credential-shaped JSON/YAML/TOML/properties
+    "*credentials*.json", "*client_secret*.json", "*service-account*.json",
+    "*secrets*.json", "*secrets*.yaml", "*secrets*.yml", "*secrets*.toml", "*secrets*.properties",
+    # infrastructure state
+    "*.tfstate", "*.tfstate.*", "*.tfvars",
+]
+# Documented examples are not secrets; re-allowed after the denies (last match wins).
+SENSITIVE_READ_EXCEPTIONS = [
+    "*.env.example",
+    "*.env.sample",
+    "*.env.template",
+    "*.env.dist",
+]
+# Glob patterns that try to leave the repository (absolute, home, parent, brace or
+# class tricks). Legitimate globs such as ``**/*.{kt,java}`` stay allowed.
+ESCAPING_GLOB_PATTERNS = ["/*", "~*", "$HOME*", "..*", "*/../*", "*{/*", "*[*", "*$*"]
+
+# Known config files that are reviewable in general but sometimes carry secrets:
+# the scanner refuses the launch when a line looks like a credential assignment.
+CONTENT_CHECKS = {
+    "gradle.properties": re.compile(
+        r"^\s*[\w.-]*(password|passwd|secret|token|passphrase|api[_-]?key)[\w.-]*\s*=\s*\S", re.I | re.M),
+}
+GIT_CONFIG_USERINFO = re.compile(r"://[^/\s:@]+:[^/\s@]+@")
+
+# Symlink targets under these read-only system prefixes are not an escape (Python
+# virtualenvs link their interpreter there); anything else outside the repo is.
+ALLOWED_SYMLINK_PREFIXES = ("/usr/", "/bin/", "/sbin/", "/lib/", "/lib32/", "/lib64/")
+
+WATCHER_IGNORE = [
+    "**/node_modules/**",
+    "**/.git/**",
+    "**/build/**",
+    "**/.gradle/**",
+    "**/dist/**",
+    "**/.venv/**",
+    "**/__pycache__/**",
+    "**/go-build-cache/**",
+]
+
+SYSTEM_PROMPT = """You are oauto, a read-only senior code reviewer running inside OpenCode.
+
+Operating contract (enforced by configuration, not only by this prompt):
+- You can only read files, list files with glob and search with grep inside the repository.
+- You cannot edit or create files, run shell commands, fetch the web, search the web,
+  launch subagents, load skills or read anything outside the repository. Any attempt is
+  denied by policy; do not retry it and do not ask the user to approve it.
+- Git metadata (branch, HEAD, status, diffs, recent log) was gathered for you by a
+  read-only preflight and is given to you in the first message. Use it instead of trying
+  to run git.
+- Never ask for secrets, tokens or .env contents. Files that look like secrets are
+  denied on purpose, and their diffs were excluded from the preflight on purpose.
+
+Review method:
+1. Read the preflight summary. If there are uncommitted changes or commits ahead of the
+   base branch, review that delta first; otherwise ask the user what to review.
+2. Read the affected files in full before judging a hunk. Read existing tests that cover
+   the changed code.
+3. Report findings ordered by severity:
+   P1 = correctness, data loss, security or privacy defects that will happen;
+   P2 = probable bugs, missing error handling, race conditions, broken contracts;
+   P3 = maintainability, clarity, test gaps.
+   For each finding give file:line, what is wrong, why it matters and a concrete
+   suggested fix described in words (you cannot apply patches).
+4. Say explicitly what you could not verify. Never claim that tests or builds were run;
+   you cannot run them.
+5. Be concise and factual. No praise, no filler.
+"""
+
+
+def _die(message: str, code: int = 2) -> None:
+    print(f"oauto-policy: {message}", file=sys.stderr)
+    sys.exit(code)
+
+
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
+
+def _rule(action: str, resource: str, effect: str) -> dict:
+    return {"action": action, "resource": resource, "effect": effect}
+
+
+def read_only_ruleset() -> list[dict]:
+    rules = [_rule("*", "*", "deny")]
+    rules += [_rule(a, "*", "allow") for a in ("read", "glob", "grep", "question")]
+    rules += [_rule("read", p, "deny") for p in SENSITIVE_READ_PATTERNS]
+    rules += [_rule("read", p, "allow") for p in SENSITIVE_READ_EXCEPTIONS]
+    rules += [_rule("glob", p, "deny") for p in ESCAPING_GLOB_PATTERNS]
+    rules += [_rule(a, "*", "deny") for a in DENIED_ACTIONS]
+    return rules
+
+
+def deny_all_ruleset() -> list[dict]:
+    return [_rule("*", "*", "deny")]
+
+
+def policies() -> list[dict]:
+    pol = [
+        _rule("provider.use", "*", "deny"),
+        _rule("provider.use", APPROVED_PROVIDER, "allow"),
+        _rule("integration.connect", "*", "deny"),
+        _rule("integration.use", "*", "deny"),
+        _rule("integration.use", APPROVED_PROVIDER, "allow"),
+        _rule("mcp.use", "*", "deny"),
+        _rule("skill.use", "*", "deny"),
+        _rule("plugin.use", "*", "deny"),
+        _rule("websearch.use", "*", "deny"),
+    ]
+    pol += [_rule("tool.use", f"{a}:*", "deny") for a in DENIED_ACTIONS]
+    pol += [_rule("tool.use", f"read:{p}", "deny") for p in SENSITIVE_READ_PATTERNS]
+    pol += [_rule("tool.use", f"read:{p}", "allow") for p in SENSITIVE_READ_EXCEPTIONS]
+    return pol
+
+
+def render(alias: str, extra_disabled: list[str]) -> dict:
+    if alias not in APPROVED_MODELS:
+        _die(f"unknown model alias {alias!r}; approved: {', '.join(APPROVED_MODELS)}")
+    model = APPROVED_MODELS[alias]
+    disabled = []
+    for mid in KNOWN_UNAPPROVED_MODELS + list(extra_disabled):
+        if mid in APPROVED_MODELS.values() or mid in disabled:
+            continue
+        if not mid.startswith(APPROVED_PROVIDER + "/"):
+            # Other providers are already denied by provider.use; a foreign id here
+            # means the launcher saw a provider it must not see.
+            _die(f"refusing to render: non-{APPROVED_PROVIDER} model offered: {mid}")
+        disabled.append(mid)
+
+    agents: dict = {}
+    for name in BUILTIN_DISABLED:
+        agents[name] = {"disabled": True}
+    for name in BUILTIN_HIDDEN:
+        agents[name] = {"model": model, "permissions": deny_all_ruleset()}
+    for name, agent_alias in REVIEW_AGENTS.items():
+        agents[name] = {
+            "description": f"oauto read-only code reviewer on {APPROVED_MODELS[agent_alias]}",
+            "mode": "primary",
+            "model": APPROVED_MODELS[agent_alias],
+            "system": SYSTEM_PROMPT,
+            "permissions": read_only_ruleset(),
+        }
+
+    provider_models = {
+        mid.split("/", 1)[1]: {"disabled": True} for mid in disabled
+    }
+
+    return {
+        "$schema": "https://opencode.ai/config.json",
+        "model": model,
+        "default_agent": f"review-{alias}",
+        "update": "disable",
+        "share": "disabled",
+        "snapshots": False,
+        "lsp": False,
+        "formatter": False,
+        "websearch": False,
+        # No "plugins" key on purpose: a "-*" directive also removes OpenCode's own
+        # built-in free-tier provider plugin (verified: zero models offered). Local
+        # and packaged plugins are blocked by the plugin.use policy below instead
+        # (verified: a project .opencode/plugins module no longer executes).
+        "mcp": {"servers": {}},
+        "skills": [],
+        "instructions": [],
+        "watcher": {"ignore": WATCHER_IGNORE},
+        "experimental": {"todo": False},
+        "providers": {APPROVED_PROVIDER: {"models": provider_models}},
+        "permissions": read_only_ruleset(),
+        "policies": policies(),
+        "agents": agents,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Matching (OpenCode 2 resource semantics) and classification
+# ---------------------------------------------------------------------------
+
+def _glob_match(pattern: str, value: str) -> bool:
+    """``*`` any run (including ``/``), ``?`` one char, whole-value match; a pattern
+    ending in `` *`` also matches the bare value."""
+    if pattern.endswith(" *") and value == pattern[:-2]:
+        return True
+
+    def rec(p: int, v: int) -> bool:
+        while p < len(pattern):
+            c = pattern[p]
+            if c == "*":
+                p += 1
+                if p == len(pattern):
+                    return True
+                for k in range(v, len(value) + 1):
+                    if rec(p, k):
+                        return True
+                return False
+            if v >= len(value):
+                return False
+            if c != "?" and c != value[v]:
+                return False
+            p += 1
+            v += 1
+        return v == len(value)
+
+    return rec(0, 0)
+
+
+def decide(rules: list[dict], action: str, resource: str) -> str:
+    """Last matching rule wins; no match means ``ask``."""
+    effect = "ask"
+    for rule in rules:
+        if _glob_match(rule["action"], action) and _glob_match(rule["resource"], resource):
+            effect = rule["effect"]
+    return effect
+
+
+_SENSITIVE_RULES = [_rule("read", p.lower(), "deny") for p in SENSITIVE_READ_PATTERNS] + \
+                   [_rule("read", p.lower(), "allow") for p in SENSITIVE_READ_EXCEPTIONS]
+
+
+def is_sensitive_path(relpath: str) -> bool:
+    """Case-insensitive classification of a repository-relative path."""
+    rel = relpath.replace(os.sep, "/")
+    while rel.startswith("./"):
+        rel = rel[2:]
+    return decide(_SENSITIVE_RULES, "read", rel.lower()) == "deny"
+
+
+# ---------------------------------------------------------------------------
+# Scanner: one walk, no pruning (an explicit grep path bypasses ignore rules)
+# ---------------------------------------------------------------------------
+
+def scan(repo: str, budget: float) -> int:
+    repo = os.path.realpath(repo)
+    started = time.monotonic()
+    files = 0
+    sensitive: list[str] = []
+    symlinks: list[tuple[str, str]] = []
+    content: list[tuple[str, str]] = []
+    complete = True
+
+    def rel(path: str) -> str:
+        return os.path.relpath(path, repo).replace(os.sep, "/")
+
+    def check_symlink(path: str) -> None:
+        target = os.path.realpath(path)
+        inside = target == repo or target.startswith(repo + os.sep)
+        system = target.startswith(ALLOWED_SYMLINK_PREFIXES) and os.path.exists(target)
+        if not (inside or system):
+            symlinks.append((rel(path), target if os.path.lexists(target) else f"{target} (dangling)"))
+
+    git_dir = os.path.join(repo, ".git")
+    if os.path.isdir(git_dir):
+        cfg = os.path.join(git_dir, "config")
+        try:
+            with open(cfg, encoding="utf-8", errors="replace") as fh:
+                if GIT_CONFIG_USERINFO.search(fh.read()):
+                    content.append((".git/config", "remote URL embeds credentials (user:secret@)"))
+        except OSError:
+            pass
+
+    for dirpath, dirnames, filenames in os.walk(repo, topdown=True, followlinks=False):
+        if time.monotonic() - started > budget:
+            complete = False
+            break
+        # .git is checked above (config only); its object store is not reviewable.
+        dirnames[:] = [d for d in dirnames if not (dirpath == repo and d == ".git")]
+        for d in list(dirnames):
+            full = os.path.join(dirpath, d)
+            if os.path.islink(full):
+                check_symlink(full)
+        for name in filenames:
+            full = os.path.join(dirpath, name)
+            files += 1
+            if os.path.islink(full):
+                check_symlink(full)
+            r = rel(full)
+            if is_sensitive_path(r):
+                sensitive.append(r)
+                continue
+            checker = CONTENT_CHECKS.get(name.lower())
+            if checker is not None:
+                try:
+                    with open(full, encoding="utf-8", errors="replace") as fh:
+                        if checker.search(fh.read(262144)):
+                            content.append((r, "credential-looking assignment"))
+                except OSError:
+                    pass
+
+    for path in sorted(sensitive):
+        print(f"SENSITIVE {path}")
+    for path, target in sorted(symlinks):
+        print(f"SYMLINK {path} -> {target}")
+    for path, reason in sorted(content):
+        print(f"CONTENT {path}: {reason}")
+    elapsed = time.monotonic() - started
+    print(f"SUMMARY files={files} elapsed={elapsed:.1f}s complete={'1' if complete else '0'}")
+    return 0 if complete else 3
+
+
+# ---------------------------------------------------------------------------
+# Verification helpers
+# ---------------------------------------------------------------------------
+
+# (action, resource, expected effect for the reviewer agents)
+PROBES = [
+    ("shell", "git status", "deny"),
+    ("shell", "ls", "deny"),
+    ("shell", "./gradlew assembleDebug", "deny"),
+    ("edit", "src/main.kt", "deny"),
+    ("edit", "README.md", "deny"),
+    ("webfetch", "https://example.com", "deny"),
+    ("websearch", "anything", "deny"),
+    ("subagent", "explore", "deny"),
+    ("subagent", "general", "deny"),
+    ("skill", "anything", "deny"),
+    ("execute", "*", "deny"),
+    ("external_directory", "/root/.ssh", "deny"),
+    ("external_directory", "/etc", "deny"),
+    ("read", ".env", "deny"),
+    ("read", "config/.env.production", "deny"),
+    ("read", "keys/server.pem", "deny"),
+    ("read", "deploy/.ssh/id_ed25519", "deny"),
+    ("read", ".ssh/config", "deny"),
+    ("read", ".gnupg/pubring.kbx", "deny"),
+    ("read", ".git/config", "deny"),
+    ("read", ".npmrc", "deny"),
+    ("read", "app/local.properties", "deny"),
+    ("read", "app/keystore.properties", "deny"),
+    ("read", "config/prod.secrets.yaml", "deny"),
+    ("read", "app-secrets.json", "deny"),
+    ("read", "oauth/client_secret_123.json", "deny"),
+    ("read", "infra/terraform.tfstate", "deny"),
+    ("read", ".env.example", "allow"),
+    ("read", "gradle.properties", "allow"),
+    ("read", "src/main.kt", "allow"),
+    ("glob", "**/*.kt", "allow"),
+    ("glob", "src/**/*.{kt,java}", "allow"),
+    ("glob", "/root/**", "deny"),
+    ("glob", "{/root,x}/.ssh/*", "deny"),
+    ("glob", "../**", "deny"),
+    ("grep", "TODO", "allow"),
+    ("question", "*", "allow"),
+    ("experimental_image_generate", "x", "deny"),
+    ("browser", "x", "deny"),
+    ("unknown_future_tool", "x", "deny"),
+]
+
+
+def _model_string(model) -> str:
+    """Normalise the model reference `debug agents` prints (string or object form).
+
+    The object form has been seen with `model` (config schema) and `id`
+    (resolved agent, 2.2.6: {"id": ..., "providerID": ...}) as the model key;
+    `modelID` is accepted as well, nothing else is."""
+    if isinstance(model, dict):
+        provider = model.get("providerID") or model.get("provider")
+        name = model.get("id") or model.get("modelID") or model.get("model")
+        if not provider or not name:
+            return f"<unparsed model reference {json.dumps(model, sort_keys=True)}>"
+        base = f"{provider}/{name}"
+        if model.get("variant"):
+            base += f"#{model['variant']}"
+        return base
+    return str(model)
+
+
+def verify_agents(payload) -> None:
+    if not isinstance(payload, list):
+        _die("debug agents output is not a JSON array")
+    by_id = {a.get("id"): a for a in payload if isinstance(a, dict)}
+    expected_visible = set(REVIEW_AGENTS)
+    visible = {i for i, a in by_id.items() if not a.get("hidden")}
+    if visible != expected_visible:
+        _die(f"unexpected visible agents: {sorted(visible)} (expected {sorted(expected_visible)})")
+    for name in BUILTIN_DISABLED:
+        if name in by_id:
+            _die(f"built-in agent {name!r} is still enabled")
+    for name, agent in by_id.items():
+        rules = agent.get("permissions")
+        if not isinstance(rules, list) or not rules:
+            _die(f"agent {name!r} has no resolved permissions")
+        for action, resource, expected in PROBES:
+            got = decide(rules, action, resource)
+            if name in REVIEW_AGENTS:
+                if got != expected:
+                    _die(f"agent {name!r}: {action} {resource!r} resolves to {got}, expected {expected}")
+            elif got != "deny":
+                # Hidden maintenance agents must never get a tool at all.
+                _die(f"hidden agent {name!r}: {action} {resource!r} resolves to {got}, expected deny")
+        if name in REVIEW_AGENTS:
+            model_id = _model_string(agent.get("model"))
+            want = APPROVED_MODELS[REVIEW_AGENTS[name]]
+            if model_id != want:
+                _die(f"agent {name!r} model is {model_id!r}, expected {want!r}")
+            if agent.get("mode") != "primary":
+                _die(f"agent {name!r} mode is {agent.get('mode')!r}, expected primary")
+    print(f"agents ok: {', '.join(sorted(visible))} visible; {len(by_id)} resolved; {len(PROBES)} probes each")
+
+
+def verify_models(lines: list[str]) -> None:
+    offered = {line.strip() for line in lines if line.strip()}
+    approved = set(APPROVED_MODELS.values())
+    if offered != approved:
+        extra = sorted(offered - approved)
+        missing = sorted(approved - offered)
+        parts = []
+        if extra:
+            parts.append(f"unapproved models offered: {extra}")
+        if missing:
+            parts.append(f"approved models missing: {missing}")
+        _die("; ".join(parts))
+    print(f"models ok: exactly {sorted(approved)}")
+
+
+def verify_sources(payload, config_dir: str, config_file: str) -> None:
+    if not isinstance(payload, list):
+        _die("debug config output is not a JSON array")
+    seen_file = False
+    for entry in payload:
+        kind = entry.get("type")
+        path = entry.get("path")
+        if kind == "directory" and path == config_dir:
+            continue
+        if kind == "document" and path == config_file:
+            seen_file = True
+            continue
+        _die(f"unexpected configuration source: {kind} {path}")
+    if not seen_file:
+        _die(f"oauto config document {config_file} is not loaded")
+    print(f"config sources ok: only {config_file}")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main(argv: list[str]) -> None:
+    parser = argparse.ArgumentParser(prog="oauto-policy")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_render = sub.add_parser("render")
+    p_render.add_argument("--model", default=DEFAULT_ALIAS, choices=sorted(APPROVED_MODELS))
+    p_render.add_argument("--disable-model", action="append", default=[],
+                          help="additional provider/model id to disable (repeatable)")
+
+    p_scan = sub.add_parser("scan")
+    p_scan.add_argument("repo")
+    p_scan.add_argument("--budget", type=float, default=180.0, help="seconds before the scan gives up (exit 3)")
+
+    sub.add_parser("classify")
+    sub.add_parser("verify-sources").add_argument("--config-dir", required=True)
+    sub.add_parser("verify-agents")
+    sub.add_parser("verify-models")
+    sub.add_parser("approved")
+
+    args = parser.parse_args(argv)
+
+    if args.cmd == "render":
+        doc = render(args.model, args.disable_model)
+        json.dump(doc, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+    elif args.cmd == "scan":
+        sys.exit(scan(args.repo, args.budget))
+    elif args.cmd == "classify":
+        for line in sys.stdin.read().splitlines():
+            if line and is_sensitive_path(line):
+                print(line)
+    elif args.cmd == "verify-sources":
+        config_dir = args.config_dir.rstrip("/")
+        verify_sources(json.load(sys.stdin), config_dir, os.path.join(config_dir, "opencode.json"))
+    elif args.cmd == "verify-agents":
+        verify_agents(json.load(sys.stdin))
+    elif args.cmd == "verify-models":
+        verify_models(sys.stdin.read().splitlines())
+    elif args.cmd == "approved":
+        for alias, mid in APPROVED_MODELS.items():
+            print(f"{alias}\t{mid}")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

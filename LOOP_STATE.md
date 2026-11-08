@@ -134,6 +134,15 @@ is the permanent human opt-out and is never removed by automation.
    review and attestation, or a normal Codex review once quota returns. Do not
    claim it passes before that evidence exists.
 7. **Longer-term:** update minutes-guard target coverage after downstream audit; keep direct-to-main and branch-protection decisions explicit.
+8. **oauto (read-only OpenCode reviewer launcher) — installed, PR pending.** The
+   launcher, its policy module, tests and docs live under `launchers/` on branch
+   `claude/oauto-opencode-reviewer` (ADR 0002). Validated on the device against
+   OpenCode 2.2.6 with disposable fixture repositories (see the 2026-11-07
+   `handoffs/loop-build.md` entry for the full record). Physically pending: one
+   `oauto <repo>` run from a real Termux shell (the hop cannot be exercised from
+   inside the Debian PRoot session), the PR merge, and an owner decision on
+   listing `oauto` in `DEVELOPMENT_RULES_FULL` §7. Any OpenCode upgrade re-opens
+   validation: the launcher refuses every version other than 2.2.6.
 
 Older items below are history. If they conflict with this section, treat them as HISTORICAL or SUPERSEDED and follow this section.
 
@@ -254,6 +263,18 @@ Synced workflows listed in `sync-config.json`: `codex-auto-fix.yml`, `codex-gate
 - `bootstrap.yml`: opens onboarding PRs for newly eligible repos; never auto-merges them.
 - `telegram-morning-report.yml`: read-only daily digest; no write API calls.
 - `minutes-guard.yml`: hub-only Actions-minutes guard. Its target coverage may be stale and needs audit before expansion.
+
+## Device launchers (not synced)
+
+`launchers/ai-launch` is the tracked copy of `/root/work/bin/ai-launch` (`cauto`,
+`clauto`, `ai`, plus the `opencode` mode). `launchers/oauto/` is the `oauto <repo>`
+read-only OpenCode reviewer: OpenCode 2.2.6 pinned to `opencode/glm-5.3-flash-free`
+(default) or `opencode/deepseek-v4.1-flash-free`, read/glob/grep only, every other
+tool, provider, model, plugin, MCP server and external directory denied by
+`permissions` + `policies` in a private per-launch config directory, verified
+before every launch with OpenCode's own diagnostics, one session per repository.
+Install/refresh with `bash launchers/oauto/install.sh`; contract in
+`docs/adr/0002-oauto-read-only-opencode-reviewer.md`.
 
 ## Repos Status
 

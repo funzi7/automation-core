@@ -449,16 +449,24 @@ resolve_direct_repo() {
 }
 
 case "$MODE" in
-  codex|claude)
+  codex|claude|opencode)
     SELECTED_MODE="$MODE"
     ;;
   menu)
     choose_mode
     ;;
   *)
-    die "Usage: ai-launch [codex|claude|menu] [repo]"
+    die "Usage: ai-launch [codex|claude|opencode|menu] [repo]"
     ;;
 esac
+
+# oauto: a leading model alias (`oauto deepseek`) is not a repository name; keep it
+# for oauto-run and fall through to the normal repository menu.
+oauto_alias=""
+if [[ "$SELECTED_MODE" == opencode ]] && (($#)) && [[ "$1" =~ ^(glm|deepseek)$ ]]; then
+  oauto_alias="$1"
+  shift
+fi
 
 if (($#)) && [[ "$1" != -* ]]; then
   direct="$1"
@@ -472,6 +480,13 @@ fi
 is_git_repo_root "$SELECTED_REPO" || die "Selected path is not a Git repository root: $SELECTED_REPO"
 
 cd "$SELECTED_REPO"
+
+# oauto: read-only OpenCode reviewer. Repository resolution above is shared with
+# cauto/clauto; everything OpenCode-specific (preflight, policy, lock, banner)
+# lives in oauto-run, so the codex/claude paths below are untouched.
+if [[ "$SELECTED_MODE" == opencode ]]; then
+  exec /root/work/bin/oauto-run "$SELECTED_REPO" ${oauto_alias:+"$oauto_alias"} "$@"
+fi
 
 echo
 echo "============================================================"

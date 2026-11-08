@@ -1,0 +1,347 @@
+#!/usr/bin/env bash
+# oauto-run — launch OpenCode as a privacy-restricted, read-only code reviewer.
+#
+# Invoked by `/root/work/bin/ai-launch opencode <repo>` (Termux: `oauto <repo>`), which
+# resolves the repository exactly as cauto/clauto do. This script owns everything
+# OpenCode-specific:
+#
+#   0. a per-repository lock, taken before anything is written or rendered;
+#   1. fail-closed preflight (binary version, system config, project config);
+#   2. one scan of the worktree for secret-like files, outward symlinks and
+#      credential-looking config content;
+#   3. read-only git metadata collection outside the model's tool execution, with
+#      every secret-like path excluded from the diffs;
+#   4. rendering of a private OpenCode config directory (XDG_CONFIG_HOME under the
+#      oauto state dir) from oauto-policy.py, with every model the binary offers
+#      except the approved one(s) disabled;
+#   5. verification of the resolved config, agents and models through OpenCode's own
+#      diagnostic commands;
+#   6. exec of OpenCode in a scrubbed environment with --standalone (no background
+#      service), never with --auto.
+#
+# Usage: oauto-run <repo-path> [glm|deepseek] [--check] [--render-only]
+set -euo pipefail
+
+OAUTO_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+POLICY="$OAUTO_DIR/oauto-policy.py"
+OPENCODE_BIN="${OAUTO_OPENCODE_BIN:-/usr/local/bin/opencode}"
+VALIDATED_VERSION="2.2.6"
+STATE_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/oauto"
+LOCK_DIR="${CODEX_RESOURCE_LOCK_DIR:-/root/work/.locks}"
+SCAN_BUDGET="${OAUTO_SCAN_BUDGET:-180}"
+# The preflight travels as one --prompt argument (Linux caps a single argument at
+# 128 KiB). The section caps below sum to 67,000 bytes plus headers, under the limit.
+PREFLIGHT_MAX_BYTES=100000
+DIFF_MAX_BYTES=24000
+STAT_MAX_BYTES=4000
+STATUS_MAX_BYTES=8000
+LOG_MAX_BYTES=3000
+
+die() { printf 'oauto: FAILED (fail closed): %s\n' "$*" >&2; exit 1; }
+note() { printf 'oauto: %s\n' "$*" >&2; }
+
+REPO="${1:-}"
+[[ -n "$REPO" ]] || die "usage: oauto-run <repo-path> [glm|deepseek] [--check] [--render-only]"
+shift
+MODEL_ALIAS=glm
+MODE=launch
+LOCKED=0
+for arg in "$@"; do
+  case "$arg" in
+    glm|deepseek) MODEL_ALIAS="$arg" ;;
+    --check) MODE=check ;;
+    --render-only) MODE=render ;;
+    --locked) LOCKED=1 ;;
+    *) die "unknown argument '$arg' (accepted: glm, deepseek, --check, --render-only)" ;;
+  esac
+done
+
+[[ -d "$REPO/.git" || -f "$REPO/.git" ]] || die "not a Git repository root: $REPO"
+REPO="$(cd "$REPO" && pwd -P)"
+REPO_NAME="$(basename "$REPO")"
+REPO_KEY="$REPO_NAME-$(printf '%s' "$REPO" | sha256sum | cut -c1-8)"
+MODEL_ID="$(python3 -I "$POLICY" approved | awk -v a="$MODEL_ALIAS" '$1 == a {print $2}')"
+[[ -n "$MODEL_ID" ]] || die "model alias '$MODEL_ALIAS' is not approved"
+
+if [[ "$MODE" == render ]]; then
+  exec python3 -I "$POLICY" render --model "$MODEL_ALIAS"
+fi
+
+# ---------------------------------------------------------------------------
+# 0. Lock first. The script re-executes itself under flock; that flock parent
+#    holds the lock for the lifetime of this process and of the OpenCode process
+#    it finally execs into (--close: the descriptor is never inherited).
+# ---------------------------------------------------------------------------
+LOCK_FILE="$LOCK_DIR/oauto-$REPO_KEY.lock"
+if (( ! LOCKED )); then
+  mkdir -p "$LOCK_DIR"
+  FLOCK_BIN="$(command -v flock)" || die "flock is required"
+  if ! "$FLOCK_BIN" -n --exclusive --close "$LOCK_FILE" true 2>/dev/null; then
+    die "another oauto session is already open on $REPO_NAME (lock $LOCK_FILE); finish it before starting a second review"
+  fi
+  mode_flag=()
+  [[ "$MODE" == check ]] && mode_flag=(--check)
+  exec "$FLOCK_BIN" -n -E 75 --exclusive --close "$LOCK_FILE" \
+    "$BASH" "$0" "$REPO" "$MODEL_ALIAS" "${mode_flag[@]}" --locked
+fi
+
+# ---------------------------------------------------------------------------
+# 1. Preflight: binary, system config, project config.
+# ---------------------------------------------------------------------------
+[[ -x "$OPENCODE_BIN" ]] || die "OpenCode binary not found at $OPENCODE_BIN"
+version="$("$OPENCODE_BIN" --version 2>/dev/null | sed -n 's/^opencode v\{0,1\}//p' | head -1)"
+[[ "$version" == "$VALIDATED_VERSION" ]] ||
+  die "OpenCode '$version' is installed but only $VALIDATED_VERSION was validated; permission semantics change between versions, re-validate before use"
+
+for sys_cfg in /etc/opencode/opencode.json /etc/opencode/opencode.jsonc; do
+  [[ -e "$sys_cfg" ]] && die "system-level OpenCode config exists ($sys_cfg); it outranks oauto's config"
+done
+
+# Project-level config outranks the launcher's config for permissions and can add
+# agents, MCP servers or plugins, so a repository carrying one is refused outright.
+for proj in "$REPO/opencode.json" "$REPO/opencode.jsonc" "$REPO/.opencode"; do
+  [[ -e "$proj" ]] && die "repository contains OpenCode project config ($proj); oauto refuses to review repositories that reconfigure OpenCode"
+done
+walk="$REPO"
+while [[ "$walk" != / ]]; do
+  walk="$(dirname "$walk")"
+  for proj in "$walk/opencode.json" "$walk/opencode.jsonc"; do
+    [[ -e "$proj" ]] && die "parent directory carries OpenCode config ($proj)"
+  done
+done
+
+# ---------------------------------------------------------------------------
+# 2. One scan: secret-like files (the grep tool returns matching lines from any
+#    file it is pointed at, so a secret in the worktree could reach the model
+#    even though reads are denied), symlinks leaving the repository (OpenCode
+#    2.2.6 checks the requested path, not the canonical one), and credential
+#    content in known config files.
+# ---------------------------------------------------------------------------
+scan_status=0
+scan_out="$(python3 -I "$POLICY" scan "$REPO" --budget "$SCAN_BUDGET")" || scan_status=$?
+if (( scan_status != 0 )); then
+  printf '%s\n' "$scan_out" | tail -3 >&2
+  die "worktree scan did not complete within ${SCAN_BUDGET}s (status $scan_status); set OAUTO_SCAN_BUDGET higher for large trees"
+fi
+sensitive="$(printf '%s\n' "$scan_out" | sed -n 's/^SENSITIVE //p')"
+content_hits="$(printf '%s\n' "$scan_out" | sed -n 's/^CONTENT //p')"
+outward="$(printf '%s\n' "$scan_out" | sed -n 's/^SYMLINK //p')"
+if [[ -n "$outward" ]]; then
+  printf 'oauto: symlinks leaving the repository:\n%s\n' "$outward" >&2
+  die "refusing to launch: OpenCode resolves reads through symlinks, so these would expose paths outside $REPO (targets under /usr, /bin, /lib are tolerated)"
+fi
+if [[ -n "$sensitive$content_hits" ]]; then
+  [[ -n "$sensitive" ]] && printf 'oauto: secret-like files present in %s:\n%s\n' "$REPO" "$sensitive" >&2
+  [[ -n "$content_hits" ]] && printf 'oauto: credential-looking content in:\n%s\n' "$content_hits" >&2
+  if [[ "${OAUTO_ALLOW_SENSITIVE_FILES:-}" != "1" ]]; then
+    die "refusing to launch: the model's grep tool can surface lines from these files. Move them out of the worktree, or set OAUTO_ALLOW_SENSITIVE_FILES=1 to accept that exposure risk explicitly (their diffs stay excluded from the preflight either way)"
+  fi
+  note "WARNING: OAUTO_ALLOW_SENSITIVE_FILES=1 set; continuing with the files above exposed to grep"
+fi
+
+# ---------------------------------------------------------------------------
+# 3. Read-only git preflight (GIT_OPTIONAL_LOCKS=0: no index refresh writes;
+#    every call time-bounded). Secret-like paths are excluded from every diff,
+#    including deleted or modified tracked secrets, so cleaning up a leak never
+#    sends the leaked content to the model.
+# ---------------------------------------------------------------------------
+g() { GIT_OPTIONAL_LOCKS=0 timeout 120 git -C "$REPO" -c core.pager=cat -c color.ui=never --no-pager "$@" 2>/dev/null; }
+
+mkdir -p "$STATE_ROOT/$REPO_KEY"
+chmod 700 "$STATE_ROOT" "$STATE_ROOT/$REPO_KEY"
+STATE_DIR="$STATE_ROOT/$REPO_KEY"
+PREFLIGHT_FILE="$STATE_DIR/preflight.md"
+capped() { # $1 max bytes; stdin -> stdout, byte-exact, with a truncation marker
+  local max="$1" tmp size
+  tmp="$(mktemp "$STATE_DIR/.capped.XXXXXX")"
+  cat > "$tmp"
+  size="$(wc -c < "$tmp")"
+  head -c "$max" "$tmp"
+  if (( size > max )); then
+    printf '\n[... truncated by oauto: %d of %d bytes shown ...]\n' "$max" "$size"
+  elif (( size > 0 )); then
+    [[ "$(tail -c1 "$tmp")" == "" ]] || printf '\n'
+  fi
+  rm -f "$tmp"
+}
+
+branch="$(g symbolic-ref --short -q HEAD || echo '(detached)')"
+head_sha="$(g rev-parse --verify -q HEAD || echo '(no commits)')"
+upstream="$(g rev-parse --abbrev-ref --symbolic-full-name '@{u}' || true)"
+base=""
+if [[ "$head_sha" != "(no commits)" ]]; then
+  for cand in "$upstream" origin/main origin/master main master; do
+    [[ -n "$cand" ]] || continue
+    if g rev-parse --verify --quiet "$cand^{commit}" >/dev/null; then base="$cand"; break; fi
+  done
+fi
+ahead_behind=""
+if [[ -n "$base" ]]; then
+  ahead_behind="$(g rev-list --left-right --count "$base...HEAD" | awk '{print "behind " $1 ", ahead " $2}' || true)"
+fi
+
+# Paths whose content may never enter the preflight: every changed, deleted or
+# untracked path that the policy classifies as sensitive.
+excluded="$({
+  if [[ "$head_sha" != "(no commits)" ]]; then
+    g diff HEAD --name-only || true
+    [[ -n "$base" ]] && { g diff --name-only "$base...HEAD" || true; }
+  fi
+  g ls-files --others --exclude-standard || true
+} | sort -u | python3 -I "$POLICY" classify)"
+exclude_spec=()
+while IFS= read -r path; do
+  [[ -n "$path" ]] || continue
+  exclude_spec+=(":(exclude,literal)$path")
+done <<< "$excluded"
+
+set +e +o pipefail   # a repository without commits or without a base must still produce a preflight
+{
+  echo "# oauto preflight — $REPO_NAME"
+  echo
+  echo "Collected read-only by the launcher at $(date -u +%Y-%m-%dT%H:%M:%SZ). The reviewer cannot run git; this is its only git context."
+  echo
+  echo "- Repository: $REPO"
+  echo "- Branch: $branch"
+  echo "- HEAD: $head_sha"
+  echo "- Upstream: ${upstream:-(none)}"
+  echo "- Base for branch delta: ${base:-(none found)} ${ahead_behind:+($ahead_behind)}"
+  if [[ -n "$excluded" ]]; then
+    echo
+    echo "## Excluded from this preflight (secret-like paths; names only)"
+    echo '```'
+    printf '%s\n' "$excluded"
+    echo '```'
+  fi
+  echo
+  echo "## git status --short"
+  echo '```'
+  g status --short --untracked-files=normal | capped "$STATUS_MAX_BYTES"
+  echo '```'
+  if [[ "$head_sha" != "(no commits)" ]]; then
+    echo
+    echo "## Uncommitted changes (git diff HEAD --stat / git diff HEAD)"
+    echo '```'
+    g diff HEAD --stat -- "${exclude_spec[@]}" | capped "$STAT_MAX_BYTES"
+    echo '```'
+    echo '```diff'
+    g diff HEAD -- "${exclude_spec[@]}" | capped "$DIFF_MAX_BYTES"
+    echo '```'
+    echo
+    echo "## Recent commits (git log --oneline -15)"
+    echo '```'
+    g log --oneline -15 | capped "$LOG_MAX_BYTES"
+    echo '```'
+  fi
+  if [[ -n "$base" ]]; then
+    echo
+    echo "## Branch delta vs $base (merge-base...HEAD)"
+    echo '```'
+    g diff --stat "$base...HEAD" -- "${exclude_spec[@]}" | capped "$STAT_MAX_BYTES"
+    echo '```'
+    echo '```diff'
+    g diff "$base...HEAD" -- "${exclude_spec[@]}" | capped "$DIFF_MAX_BYTES"
+    echo '```'
+  fi
+} > "$PREFLIGHT_FILE"
+set -e -o pipefail
+chmod 600 "$PREFLIGHT_FILE"
+preflight_bytes="$(wc -c < "$PREFLIGHT_FILE")"
+(( preflight_bytes <= PREFLIGHT_MAX_BYTES )) ||
+  die "preflight is $preflight_bytes bytes (> $PREFLIGHT_MAX_BYTES); the uncommitted or branch diff is too large for one prompt"
+
+# ---------------------------------------------------------------------------
+# 4. Private config directory: XDG_CONFIG_HOME points into the state dir, so the
+#    user's ~/.config/opencode is neither loaded nor touched and two sessions on
+#    different repositories never share a file. Render, disable every model the
+#    binary offers except the approved set, then verify with OpenCode's own
+#    diagnostics. --standalone keeps every helper call off the background service.
+# ---------------------------------------------------------------------------
+CONF_HOME="$STATE_DIR/xdg-config"
+CONFIG_DIR="$CONF_HOME/opencode"
+CONFIG_FILE="$CONFIG_DIR/opencode.json"
+rm -rf "$CONF_HOME"
+mkdir -p "$CONFIG_DIR"
+chmod 700 "$CONF_HOME" "$CONFIG_DIR"
+
+clean_env=(HOME="$HOME" PATH="$PATH" TERM="${TERM:-xterm-256color}" LANG="${LANG:-C.UTF-8}"
+           TMPDIR="${TMPDIR:-/tmp}" SHELL=/bin/bash USER="${USER:-root}" XDG_CONFIG_HOME="$CONF_HOME")
+for passthrough in COLORTERM LC_ALL XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME; do
+  [[ -n "${!passthrough:-}" ]] && clean_env+=("$passthrough=${!passthrough}")
+done
+# oc <seconds> <opencode args...>: a time-bounded OpenCode helper call in the same
+# scrubbed environment the session itself gets (timeout is applied inside the
+# function; `timeout` cannot run a shell function directly).
+oc() {
+  local seconds="$1"; shift
+  timeout "$seconds" env -i "${clean_env[@]}" "$OPENCODE_BIN" "$@"
+}
+render_config() { # $@ = extra render args
+  python3 -I "$POLICY" render --model "$MODEL_ALIAS" "$@" > "$CONFIG_FILE.tmp"
+  mv -f "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+  chmod 600 "$CONFIG_FILE"
+}
+
+render_config
+: > "$STATE_DIR/last-helper.err"
+chmod 600 "$STATE_DIR/last-helper.err"
+offered="$(cd "$REPO" && oc 120 models --standalone 2>"$STATE_DIR/last-helper.err" || true)"
+[[ -n "$offered" ]] || die "OpenCode offered no models at all (network, provider or policy failure; see $STATE_DIR/last-helper.err)"
+disable_args=()
+while IFS= read -r mid; do
+  [[ -n "$mid" ]] || continue
+  [[ "$mid" == "$MODEL_ID" ]] && continue
+  disable_args+=(--disable-model "$mid")
+done <<< "$offered"
+render_config "${disable_args[@]}"
+
+(cd "$REPO" && oc 60 debug config --standalone 2>/dev/null) | python3 -I "$POLICY" verify-sources --config-dir "$CONFIG_DIR" >&2
+(cd "$REPO" && oc 120 models --standalone 2>/dev/null) | python3 -I "$POLICY" verify-models >&2
+(cd "$REPO" && oc 60 debug agents --standalone 2>/dev/null) | python3 -I "$POLICY" verify-agents >&2
+# Nothing else may have appeared in the private config directory (agents/, plugins/,
+# skills/, cli.json ... would all be loaded from there).
+extra_entries="$(find "$CONFIG_DIR" -mindepth 1 ! -name opencode.json -print)"
+[[ -z "$extra_entries" ]] || die "unexpected entries in $CONFIG_DIR: $extra_entries"
+
+# ---------------------------------------------------------------------------
+# 5. Banner, exec.
+# ---------------------------------------------------------------------------
+cat >&2 <<EOF
+
+============================================================
+oauto : OpenCode $version read-only reviewer
+Repo  : $REPO_NAME ($REPO)
+Branch: $branch @ ${head_sha:0:12}  ${ahead_behind:+[$ahead_behind vs $base]}
+Model : $MODEL_ID  (OpenCode Zen, pricing: Free)
+Agent : review-$MODEL_ALIAS   (other models disabled; provider pinned to 'opencode')
+Tools : read / glob / grep only. edit, shell, web, subagents, skills, MCP,
+        plugins, sharing and external directories are denied by config+policy.
+Lock  : $LOCK_FILE
+Config: $CONFIG_FILE (private to this launch)
+Note  : every model request sends the selected code context (and the preflight
+        below) to OpenCode's remote inference service. The published terms for
+        this model state zero retention and no training; it is still a remote
+        transmission of your code.
+Preflight: $PREFLIGHT_FILE ($preflight_bytes bytes${excluded:+, secret-like paths excluded})
+============================================================
+
+EOF
+
+if [[ "$MODE" == check ]]; then
+  note "--check: configuration verified; not launching."
+  exit 0
+fi
+
+initial_prompt="$(cat <<EOF
+You are reviewing the repository "$REPO_NAME". Below is the read-only git preflight collected by the launcher. Review the uncommitted changes and the branch delta it shows (read the affected files in full first). If it shows nothing to review, ask me what to review.
+
+$(cat "$PREFLIGHT_FILE")
+EOF
+)"
+
+# Scrubbed environment: no API keys, tokens or proxy settings reach OpenCode, so no
+# provider other than the built-in free tier can appear, and OPENCODE_* overrides
+# (for example OPENCODE_API_KEY) cannot widen the model set. The flock parent that
+# re-executed this script keeps the lock until OpenCode exits.
+cd "$REPO"
+exec env -i "${clean_env[@]}" "$OPENCODE_BIN" --standalone --prompt "$initial_prompt"
