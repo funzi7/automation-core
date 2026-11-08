@@ -172,7 +172,10 @@ function decideCodexGate({
     return { status: 'clear', reason: 'administrator_override', activeFindings: [] };
   }
   if (technicalError) {
-    return { status: 'clear', reason: 'technical_fail_soft', activeFindings: [] };
+    // A technical failure proves nothing about the head: no review evidence
+    // and no finding state could be read. It must never become a clean
+    // verdict; it stays pending until a later evaluation succeeds.
+    return { status: 'pending', reason: 'technical_error_fail_closed', activeFindings: [] };
   }
 
   if (nonInlineFindings.length) {

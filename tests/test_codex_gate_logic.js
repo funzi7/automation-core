@@ -344,10 +344,19 @@ test('explicit administrator override clears', () => {
   assert.equal(result.reason, 'administrator_override');
 });
 
-test('technical API error retains intentional fail-soft policy', () => {
+test('technical API error fails closed instead of clearing the head', () => {
+  // An API failure proves nothing about the head. The former
+  // `technical_fail_soft` branch published a GREEN check-codex-status on any
+  // exception, which Merge Bot and branch protection read as approval.
   const result = decideCodexGate({ technicalError: true });
-  assert.equal(result.status, 'clear');
-  assert.equal(result.reason, 'technical_fail_soft');
+  assert.notEqual(result.status, 'clear');
+  assert.equal(result.status, 'pending');
+  assert.equal(result.reason, 'technical_error_fail_closed');
+  assert.deepEqual(result.activeFindings, []);
+  // Even an override-less, finding-less head with a clean signal does not
+  // turn green while the evaluation itself failed.
+  const withSignal = decideCodexGate({ technicalError: true, currentHeadSignal: true });
+  assert.equal(withSignal.status, 'pending');
 });
 
 test('one active thread blocks among resolved/outdated threads', () => {
@@ -408,7 +417,24 @@ test('authoritative workflow keeps gate policy inline', () => {
   assert.match(workflow, /return markers\.sort\(\(a, b\) =>\s*b\.observedAt - a\.observedAt \|\| b\.id - a\.id\)/);
   assert.doesNotMatch(workflow, /refs\.sort\(/);
   assert.doesNotMatch(workflow, /if \(head !== exactHead\) break/);
+  // The head-epoch marker is a comment on a PULL REQUEST. `pull-requests: read`
+  // made every publish fail with "Resource not accessible by integration"
+  // (2026-11-08, paywall-bot #120/#122 and automation-core #58).
+  assert.match(workflow, /\n  pull-requests: write\n/);
+  assert.doesNotMatch(workflow, /\n  pull-requests: read\n/);
   assert.match(workflow, /issues: write/);
+  // Technical errors must publish a non-success verdict, never a green one.
+  assert.match(workflow, /const GATE_ERROR_TITLE = '🟠 Gate evaluation error — fail-closed';/);
+  assert.doesNotMatch(workflow, /Technical fail-soft/);
+  assert.doesNotMatch(workflow, /technical_fail_soft/);
+  const technicalCatch = workflow.slice(
+    workflow.indexOf('} catch (err) {'),
+    workflow.indexOf("core.summary.addHeading('Codex Gate Results')"),
+  );
+  assert.ok(technicalCatch.length > 200, 'the technical-error catch block must be located');
+  assert.match(technicalCatch, /anyBlocked = true;/);
+  assert.match(technicalCatch, /'failure',\s*GATE_ERROR_TITLE,/);
+  assert.doesNotMatch(technicalCatch, /'success'/);
   assert.ok(
     workflow.indexOf('comments = await ensureHeadEpochMarker') <
       workflow.indexOf('// Manual override — admin force-merge.'),

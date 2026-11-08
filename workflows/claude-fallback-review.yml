@@ -65,8 +65,13 @@ concurrency:
 
 permissions:
   contents: read
-  pull-requests: read
-  # Post the attestation marker as the trusted automation identity.
+  # Post the attestation marker as the trusted automation identity. The marker
+  # is a comment ON A PULL REQUEST: with `pull-requests: read` the identical
+  # publish in codex-gate.yml failed with "Resource not accessible by
+  # integration" on every PR, so the attestation could never have been minted.
+  # Both scopes are declared so the publish cannot fail on whichever one
+  # GitHub checks for the target.
+  pull-requests: write
   issues: write
 
 jobs:

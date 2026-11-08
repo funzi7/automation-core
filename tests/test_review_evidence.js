@@ -667,10 +667,11 @@ test('override and fail-soft never masquerade as fallback review evidence', () =
   assert.doesNotMatch(override.provenance, /fallback review accepted/);
 
   const technical = decide({ technicalError: true });
-  assert.equal(technical.status, 'clear');
+  assert.equal(technical.status, 'pending', 'a technical error fails closed');
   assert.equal(technical.authority, 'none');
-  assert.equal(technical.reason, 'technical_fail_soft');
+  assert.equal(technical.reason, 'technical_error_fail_closed');
   assert.doesNotMatch(technical.provenance, /fallback review accepted/);
+  assert.doesNotMatch(technical.provenance, /Codex .*review accepted/);
 });
 
 // ---------------------------------------------------------------------------
@@ -1211,6 +1212,18 @@ test('13: the watchdog stops chasing Codex once a fallback goes green', () => {
     workflow('codex-gate.yml').includes(`'${pending[1]}'`),
     `codex-gate.yml must still publish the exact title ${pending[1]} the watchdog matches`,
   );
+  // A technical gate error publishes a distinct non-success verdict. The
+  // watchdog must treat it like pending (re-dispatch on a fresh signal) and
+  // the two titles must stay verbatim-identical.
+  const error = body.match(/const ERROR_TITLE = '([^']+)'/);
+  assert.ok(error, 'watchdog must define ERROR_TITLE');
+  assert.ok(
+    workflow('codex-gate.yml').includes(`const GATE_ERROR_TITLE = '${error[1]}'`),
+    `codex-gate.yml must publish the exact title ${error[1]} the watchdog matches`,
+  );
+  assert.match(candidate, /title === ERROR_TITLE/);
+  assert.notEqual(error[1], pending[1]);
+  assert.doesNotMatch(error[1], /^🟢/, 'an error verdict must never look green');
 });
 
 // P2-B: the two new outdated-thread predicates are security-relevant and sit

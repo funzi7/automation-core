@@ -608,6 +608,11 @@ jobs:
             };
             // Verbatim from codex-gate.yml's pending publish call.
             const PENDING_TITLE = '🟡 Waiting for Codex review';
+            // Verbatim from codex-gate.yml's GATE_ERROR_TITLE: a technical
+            // evaluation error publishes this non-success verdict instead of a
+            // green one. Treat it like a pending verdict so a fresh review
+            // signal still re-dispatches the gate.
+            const ERROR_TITLE = '🟠 Gate evaluation error — fail-closed';
             const GATE_WORKFLOW = 'codex-gate.yml';
             const VERDICT_CHECK = 'check-codex-status';
             // fix #21: trusted-sync grace window (must EQUAL codex-gate.yml's).
@@ -1535,7 +1540,7 @@ jobs:
                   const greenHeadNewFinding = !hasOverride && verdictGreen && activeFindingNow;
                   const redThreadStateChanged = activeFindingVerdict && !activeFindingNow;
                   const isCandidate =
-                    !newestVerdict || title === PENDING_TITLE ||
+                    !newestVerdict || title === PENDING_TITLE || title === ERROR_TITLE ||
                     overrideCandidate || redThreadStateChanged ||
                     greenHeadNewFinding;
                   if (!isCandidate) continue;

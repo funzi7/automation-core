@@ -398,7 +398,7 @@ function decideReviewEvidence({
       provenance: override
         ? 'Administrator override — no review evidence claimed'
         : technicalError
-          ? 'Technical fail-soft — no review evidence claimed'
+          ? 'Technical error — fail-closed, no review evidence claimed'
           : 'Blocked by active exact-head findings',
     };
   }

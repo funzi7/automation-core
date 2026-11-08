@@ -16,8 +16,9 @@ name: Codex Gate
 # are forbidden; review events are rechecked through a default-branch
 # workflow_run relay. A PAT-independent scheduled sweep covers thread-state
 # changes that have no supported Actions trigger. Trusted actor allowlisting,
-# Summary/Testing quote stripping, trusted-sync grace and intentional technical
-# fail-soft remain.
+# Summary/Testing quote stripping and trusted-sync grace remain. A technical
+# evaluation error FAILS CLOSED: it publishes a non-success verdict that the
+# next trigger or the scheduled sweep replaces, never a green one.
 #
 on:
   # SECURITY: pull_request/review/review_comment workflows execute from the
@@ -62,9 +63,15 @@ concurrency:
 
 permissions:
   contents: read
-  pull-requests: read
   # The trusted default-branch evaluator records each new PR-head epoch in an
-  # authenticated github-actions[bot] marker comment.
+  # authenticated github-actions[bot] marker comment ON THE PULL REQUEST. A
+  # comment on a pull request travels through the issues endpoint but is
+  # authorized as a pull-request write: with `pull-requests: read` the publish
+  # failed on every PR in every repository with "Resource not accessible by
+  # integration" (paywall-bot #120/#122 and automation-core #58, 2026-11-08),
+  # so no PR ever received a marker. Both scopes are declared so the publish
+  # cannot fail on whichever one GitHub checks for the target.
+  pull-requests: write
   issues: write
   # Markerless legacy PRs bootstrap from the current contiguous pull_request-run
   # SHA epoch as a server-observed transition floor.
@@ -532,9 +539,13 @@ jobs:
                 };
               }
               if (technicalError) {
+                // A technical failure proves nothing about the head: no review
+                // evidence and no finding state could be read. It must never
+                // become a clean verdict; it stays pending until a later
+                // evaluation succeeds.
                 return {
-                  status: 'clear',
-                  reason: 'technical_fail_soft',
+                  status: 'pending',
+                  reason: 'technical_error_fail_closed',
                   activeFindings: [],
                 };
               }
@@ -1037,6 +1048,10 @@ jobs:
             // restriction; each evaluation creates a fresh completed run and
             // latest-per-name readers consume the newest verdict.
             let gatePublishFailed = false;
+            // Exact string: claude-fallback-watchdog.yml matches this title
+            // (ERROR_TITLE) to keep re-dispatching the gate for a fresh review
+            // signal. Do not reword it without changing it there too.
+            const GATE_ERROR_TITLE = '🟠 Gate evaluation error — fail-closed';
             async function publishGateCheck(headSha, conclusion, title, summary) {
               try {
                 await github.rest.checks.create({
@@ -1384,21 +1399,25 @@ jobs:
                   `${provenance}. No unresolved non-outdated trusted Codex P1/P2 thread blocks ${head7} (${evidenceReason}).`,
                 );
               } catch (err) {
-                // fail-soft: a TECHNICAL failure (API hiccup, rate limit, etc.)
-                // must NEVER wedge a PR red forever. We did not detect a P1
-                // here, so do not block — log loudly instead. A real P1 is only
-                // ever detected by the pattern above, which blocks; this branch
-                // only fires on genuine exceptions.
+                // FAIL CLOSED: a technical failure (API hiccup, rate limit,
+                // GraphQL outage) proves nothing about this head — neither
+                // review evidence nor finding state could be read. It must not
+                // publish a green `check-codex-status`: Merge Bot and branch
+                // protection read that check as review approval. Publish an
+                // explicit non-success verdict instead. Every event trigger
+                // and the 15-minute scheduled sweep re-evaluate the head, so a
+                // transient error costs one cycle, never an unreviewed merge.
                 results.push(
-                  `PR #${prNumber}: ⚠️ gate errored technically — not blocking (fail-soft): ${err.message}`
+                  `PR #${prNumber}: ⚠️ gate errored technically — fail-closed, re-evaluated on the next trigger: ${err.message}`
                 );
                 core.warning(`Codex Gate technical error on PR #${prNumber}: ${err.stack || err.message}`);
+                anyBlocked = true;
                 if (headSha) {
                   await publishGateCheck(
                     headSha,
-                    'success',
-                    '🟢 Technical fail-soft',
-                    `The trusted evaluator hit a technical API error for PR #${prNumber}; no active P1/P2 was established.`,
+                    'failure',
+                    GATE_ERROR_TITLE,
+                    `The trusted evaluator hit a technical API error for PR #${prNumber}; no review evidence or finding state could be established, so the head stays unverified until the next evaluation succeeds.`,
                   );
                 } else {
                   gatePublishFailed = true;
@@ -1421,7 +1440,7 @@ jobs:
             // policy blocks remain failed as before.
             if ((anyBlocked && context.eventName !== 'schedule') || gatePublishFailed) {
               core.setFailed(
-                'Blocked by Codex Gate: an active P1 or P2 is unresolved, or Codex has not reviewed the current head yet.\n' +
+                'Blocked by Codex Gate: an active P1 or P2 is unresolved, Codex has not reviewed the current head yet, or the evaluator hit a technical error (fail-closed).\n' +
                 'Resolve by one of:\n' +
                 '  1. Wait — Codex reviews automatically on every push; the gate re-checks on Codex activity and the trusted scheduled sweep (≤15m), and goes green once Codex posts any signal with no active P1/P2.\n' +
                 '  2. Resolve the review thread, or update its relevant diff and wait for GitHub to mark it outdated plus a clean current-head Codex signal.\n' +
