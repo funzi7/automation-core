@@ -106,7 +106,7 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
 - Device (Phase 5): `bash launchers/oauto/install.sh` refreshed `/root/work/bin/oauto-run` and
   `oauto-policy.py` after each validated state during the round (previous copies kept as
   `*.backup-before-oauto-20261108-120902`, `-132239`, `-134043`, `-140044`, `-144953`, `-152257`,
-  `-154043`, `-160518`, `-163804`, `-171353` and `-174147`; `ai-launch`, the
+  `-154043`, `-160518`, `-163804`, `-171353`, `-174147` and `-183754`; `ai-launch`, the
   Termux `oauto-launch` wrapper and both `.bashrc` blocks were already identical and untouched; the
   original `ai-launch.backup-before-oauto-20261107` still equals the pristine fixture); `install.sh
   --verify` clean; installed copies byte-identical to the tracked ones (device-parity test passes);
@@ -115,7 +115,7 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
   sources/models/agents (GLM and DeepSeek default agents) and printed the banner; fixture, state dir
   and lock removed; no OpenCode process or service left.
 - Final validation at the pushed head: `bash scripts/validate.sh` green (YAML, JSON, sync/mirror parity,
-  JS syntax, `node --test` 197/197 including `tests/test_oauto_launcher.js` 70/70, 59 github-script
+  JS syntax, `node --test` 201/201 including `tests/test_oauto_launcher.js` 74/74, 59 github-script
   bodies, actionlint, `git diff --check`); real-binary battery (scratchpad script, every scenario of
   this entry) passed on the final launcher, and the six live model probes were repeated on it: shell,
   `/etc/hostname`, `.env`, `opencode/big-pickle` and `--agent build` denied as before, probe secret
@@ -275,6 +275,18 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
   the path as joined, canonical only for the inside/outside test and de-duplication; unit test
   added). ADR item 4 now states the deleted-directory-symlink limitation and the up-to-eight-pass
   worst case.
+- Codex re-review of the sixth fixed head (`d789b5d`, exact-head CI green, the previous two threads
+  replied to and resolved): two P1s, both valid and reproduced by Codex, both about canonicalising
+  include paths — a tracked included config replaced by a dangling in-repository symlink
+  (`review.cfg -> missing.cfg`) lost its referenced name, so only the target was registered and the
+  type-change hunk with the committed credential was shown; and de-duplicating traversal by
+  canonical path skipped a second symlinked outside bridge whose relative includes resolved into
+  the repository. Fixed: every in-repository include target is registered under its referenced
+  name AND its canonical target, history is inspected under the referenced name, and traversal
+  (scan, `includes-in-config`, launcher history queue) is keyed by the referenced path — the
+  resolution context — with canonical paths used only for the inside/outside test and the
+  existing-file checks; depth and loop guards unchanged. Regression tests reproduce both on the
+  previous code; the battery gained both.
 - Review and gate state: the fixes were pushed to the PR branch after this entry's commit; the
   exact-head CI result, the Codex re-review of the pushed head (`@codex review`), the resolution of
   every Codex P1/P2 thread and the Codex Gate verdict are recorded on the PR and in agent-memory

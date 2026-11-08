@@ -1736,6 +1736,16 @@ test('includes-in-config: targets of a Git config read from stdin, resolved like
   const linked = spawnSync('python3', ['-I', POLICY, 'includes-in-config', `--repo=${repo}`, `--config-path=${path.join(sb.root, 'bridge-link.cfg')}`],
     { input: fs.readFileSync(path.join(sb.root, 'bridge-link.cfg')) });
   assert.deepEqual(linked.stdout, nulJoin('O', path.join(sb.root, 'r.cfg')), 'resolved against the link directory, not sub/');
+  // A symlinked in-repository name: the referenced name and its canonical target.
+  fs.writeFileSync(path.join(repo, 'real.cfg'), '[k]\n\tv = 1\n');
+  fs.symlinkSync('real.cfg', path.join(repo, 'link.cfg'));
+  const named = spawnSync('python3', ['-I', POLICY, 'includes-in-config', `--repo=${repo}`, '--config-path=conf/a.cfg'],
+    { input: '[include]\n\tpath = ../link.cfg\n\tpath = ../dangling.cfg\n' });
+  fs.symlinkSync('nowhere.cfg', path.join(repo, 'dangling.cfg'));
+  const named2 = spawnSync('python3', ['-I', POLICY, 'includes-in-config', `--repo=${repo}`, '--config-path=conf/a.cfg'],
+    { input: '[include]\n\tpath = ../link.cfg\n\tpath = ../dangling.cfg\n' });
+  assert.deepEqual(named.stdout, nulJoin('I', 'link.cfg', 'I', 'real.cfg', 'I', 'dangling.cfg'));
+  assert.deepEqual(named2.stdout, nulJoin('I', 'link.cfg', 'I', 'real.cfg', 'I', 'dangling.cfg', 'I', 'nowhere.cfg'));
 });
 
 // ---------------------------------------------------------------------------
@@ -1797,6 +1807,86 @@ test('P1-L: a chain needing two scan passes (deleted a -> present b -> deleted c
   // A repository without includes is scanned exactly once.
   const plain = mkRepo(sb, 'plain-one-pass', { 'src/a.py': 'x = 1\n' });
   r = runOauto(sb, plain, ['--check']);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stderr, /worktree scan passes: 1\n/);
+});
+
+// ---------------------------------------------------------------------------
+// Round 11: include targets are registered and traversed under the name they were
+// referenced by (the resolution context), not only under their canonical target.
+// ---------------------------------------------------------------------------
+test('P1-N: an include name replaced by a dangling symlink is excluded under the referenced name', () => {
+  const sb = sandbox();
+  const token = 'SYNTH-N-TOKEN-44dd';
+  const repo = mkRepo(sb, 'include-dangling', { 'src/a.py': 'x = 1\n', 'review.cfg': includedConfigText(token) });
+  fs.appendFileSync(path.join(repo, '.git', 'config'), '[include]\n\tpath = ../review.cfg\n');
+  fs.rmSync(path.join(repo, 'review.cfg'));
+  fs.symlinkSync('missing.cfg', path.join(repo, 'review.cfg')); // type change: the old content is removed in the diff
+  const { r, preflight, prompt } = launchRecordingPrompt(sb, repo); // no override: nothing present is secret-like
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(!preflight.includes(token) && !prompt.includes(token), 'the referenced name must be excluded although its target is missing');
+  assert.deepEqual(excludedLines(preflight), ['review.cfg (included Git config)']);
+});
+
+test('P1-N: an include name symlinked to a present in-repository config: both names excluded, the file counted', () => {
+  const sb = sandbox();
+  const [oldToken, newToken] = ['SYNTH-N-OLD-66ff', 'SYNTH-N-NEW-77aa'];
+  const repo = mkRepo(sb, 'include-symlinked', { 'src/a.py': 'x = 1\n', 'review.cfg': includedConfigText(oldToken) });
+  fs.appendFileSync(path.join(repo, '.git', 'config'), '[include]\n\tpath = ../review.cfg\n');
+  fs.rmSync(path.join(repo, 'review.cfg'));
+  fs.writeFileSync(path.join(repo, 'existing-other.cfg'), includedConfigText(newToken));
+  fs.symlinkSync('existing-other.cfg', path.join(repo, 'review.cfg'));
+  let r = runOauto(sb, repo, ['--check']);
+  assert.equal(r.status, 1, `the present target is Git configuration holding a credential:\n${r.stderr}`);
+  assert.match(r.stderr, /\nexisting-other\.cfg \(included Git config\)\n/);
+  assert.match(r.stderr, /\nexisting-other\.cfg: remote URL or http header embeds credentials\n/);
+  const { r: r2, preflight, prompt } = launchRecordingPrompt(sb, repo, { OAUTO_ALLOW_SENSITIVE_FILES: '1' });
+  assert.equal(r2.status, 0, `the referenced symlink is itself denied by name, not an alias:\n${r2.stderr}`);
+  for (const token of [oldToken, newToken]) assert.ok(!preflight.includes(token) && !prompt.includes(token), token);
+  assert.deepEqual(excludedLines(preflight), ['existing-other.cfg (included Git config)', 'review.cfg (included Git config)']);
+  const cfg = JSON.parse(fs.readFileSync(path.join(stateDir(sb, repo), 'xdg-config', 'opencode', 'opencode.json'), 'utf8'));
+  for (const name of ['review.cfg', 'existing-other.cfg']) assert.equal(decide(cfg.agents['review-glm'].permissions, 'read', name), 'deny', name);
+});
+
+test('P1-O: two symlinked bridges to one file are each followed in their own directory', () => {
+  const sb = sandbox();
+  const token = 'SYNTH-O-TOKEN-55ee';
+  const repo = mkRepo(sb, 'chain-bridges', { 'src/a.py': 'x = 1\n', 'review.cfg': includedConfigText(token) });
+  const real = path.join(sb.root, 'real', 'bridge.cfg');
+  fs.mkdirSync(path.dirname(real), { recursive: true });
+  fs.writeFileSync(real, '[include]\n\tpath = ../chain-bridges/review.cfg\n');
+  const far = path.join(sb.root, 'far', 'away', 'l1.cfg'); // from here ../chain-bridges/review.cfg leads nowhere
+  const near = path.join(sb.repos, 'bridges', 'l2.cfg'); // from here it is the repository's review.cfg
+  for (const link of [far, near]) {
+    fs.mkdirSync(path.dirname(link), { recursive: true });
+    fs.symlinkSync(real, link);
+  }
+  fs.appendFileSync(path.join(repo, '.git', 'config'), `[include]\n\tpath = ${far}\n\tpath = ${near}\n`);
+  fs.rmSync(path.join(repo, 'review.cfg'));
+  const { r, preflight, prompt } = launchRecordingPrompt(sb, repo);
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(!preflight.includes(token) && !prompt.includes(token), 'the second bridge resolves into the repository and must be followed');
+  assert.deepEqual(excludedLines(preflight), ['review.cfg (included Git config)']);
+});
+
+test('P1-O: a symlink loop among outside bridges terminates, live and through history', () => {
+  const sb = sandbox();
+  const loopDir = path.join(sb.root, 'loop');
+  fs.mkdirSync(loopDir);
+  fs.writeFileSync(path.join(loopDir, 'x.cfg'), '[include]\n\tpath = ylink.cfg\n');
+  fs.symlinkSync('x.cfg', path.join(loopDir, 'ylink.cfg'));
+  // Live: git itself gives up (include depth), so the launcher fails closed; the scan ends.
+  const live = mkRepo(sb, 'loop-live', { 'src/a.py': 'x = 1\n' });
+  fs.appendFileSync(path.join(live, '.git', 'config'), `[include]\n\tpath = ${path.join(loopDir, 'x.cfg')}\n`);
+  const scan = spawnSync('python3', ['-I', POLICY, 'scan', live, '--budget', '60'], { encoding: 'utf8', timeout: 30000 });
+  assert.equal(scan.status, 0, `the scan must terminate on its own: ${scan.stderr}`);
+  let r = runOauto(sb, live, ['--check']);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /git configuration cannot be listed \(fail closed\)/);
+  // Through history: a deleted include whose committed content reaches the loop.
+  const hist = chainRepo(sb, 'loop-history', { 'conf/a.cfg': `[include]\n\tpath = ${path.join(loopDir, 'x.cfg')}\n` }, '../conf/a.cfg');
+  fs.rmSync(path.join(hist, 'conf'), { recursive: true });
+  r = runOauto(sb, hist, ['--check']);
   assert.equal(r.status, 0, r.stderr);
   assert.match(r.stderr, /worktree scan passes: 1\n/);
 });

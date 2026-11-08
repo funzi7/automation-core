@@ -101,7 +101,10 @@ policy, not by the system prompt alone:
    helper and its own includes are followed the same way — through files
    outside the repository too — and every in-repository target found this
    way is handed back to the scan, which runs again until nothing new
-   appears, so a present file reached only through history is counted,
+   appears (include targets are tracked under their referenced name and
+   their canonical target, and traversal is keyed by the referenced path,
+   so a symlinked include or bridge is followed the way git resolves it),
+   so a present file reached only through history is counted,
    credential-checked and alias-protected like any other include and a
    deleted chain is excluded hop by hop (a chain that passed through a
    directory symlink deleted together with its target is not resolved; a

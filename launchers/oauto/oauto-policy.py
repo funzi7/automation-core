@@ -560,30 +560,46 @@ def config_include_paths(text: str) -> list[str]:
     return paths
 
 
+def _referenced(joined: str) -> str:
+    """The directory entry an include path names: its directory resolved, its last
+    component as written (a symlink there is the name git opened). It is the context git
+    resolves that file's own relative includes in, so traversal is keyed by it, never by
+    the canonical target alone."""
+    head, tail = os.path.split(joined)
+    if tail in ("", os.curdir, os.pardir):
+        return os.path.realpath(joined)
+    return os.path.join(os.path.realpath(head or os.curdir), tail)
+
+
 def includes_in_config(repo: str, config_path: str, data: bytes) -> list[tuple[bytes, bytes]]:
     """Targets of the include directives in Git config content (``data``), resolved as
     git would for a file at ``config_path`` (repository-relative, or absolute for a file
-    outside the repository; it need not exist). Records, deduplicated, in order:
-    (b"I", repository-relative path) for a target inside the repository and outside
-    .git; (b"O", absolute path) for any other target, a file the launcher follows (an
-    include may leave the repository and come back)."""
+    outside the repository; it need not exist). Records, deduplicated by referenced
+    name, in order: (b"I", repository-relative path) for a name inside the repository
+    and outside .git, then the same for its canonical target when that differs (a
+    symlink); (b"O", absolute referenced path) for any other name, a file the launcher
+    follows in its own directory (an include may leave the repository and come back)."""
     repo = os.path.realpath(repo)
     git_dir = os.path.join(repo, ".git")
     base_dir = os.path.dirname(os.path.join(repo, config_path))
     found: list[tuple[bytes, bytes]] = []
-    seen: set[str] = set()
+
+    def in_worktree(path: str) -> bool:
+        return path.startswith(repo + os.sep) and not (path == git_dir or path.startswith(git_dir + os.sep))
+
+    def rel(path: str) -> bytes:
+        return os.fsencode(os.path.relpath(path, repo).replace(os.sep, "/"))
+
     for inc in config_include_paths(data.decode("utf-8", "surrogateescape")):
-        joined = os.path.normpath(os.path.join(base_dir, os.path.expanduser(inc)))
+        joined = os.path.join(base_dir, os.path.expanduser(inc))
+        named = _referenced(joined)
         canon = os.path.realpath(joined)
-        if canon == repo or canon in seen:
-            continue
-        seen.add(canon)
-        if canon.startswith(repo + os.sep) and not (canon == git_dir or canon.startswith(git_dir + os.sep)):
-            found.append((b"I", os.fsencode(os.path.relpath(canon, repo).replace(os.sep, "/"))))
-        else:
-            # The path as git has it, not its canonical form: git resolves a symlinked
-            # config's relative includes against the link's directory, so must we.
-            found.append((b"O", os.fsencode(joined)))
+        records = [(b"I", rel(named)) if in_worktree(named) else (b"O", os.fsencode(named))]
+        if canon != named and in_worktree(canon):
+            records.append((b"I", rel(canon)))
+        for record in records:
+            if record not in found:
+                found.append(record)
     return found
 
 
@@ -728,7 +744,8 @@ def scan(repo: str, budget: float, included_out: str | None = None,
     linked: list[tuple[str, tuple[int, int]]] = []  # other regular files with st_nlink > 1
     included: dict[str, str] = {}                   # in-repo, non-.git included Git configs: canonical -> rel
     unloadable_includes: dict[str, str] = {}        # in-repo include targets git cannot load (deleted ...)
-    seen_configs: set[str] = set()
+    include_names: dict[str, str] = {}              # in-repo symlinks git opens as includes (target present)
+    seen_configs: set[str] = set()                  # traversal, keyed by referenced name (resolution context)
     complete = True
 
     def rel(path: str) -> str:
@@ -758,8 +775,11 @@ def scan(repo: str, budget: float, included_out: str | None = None,
             return
         rel_target = "" if target == repo else rel(target)
         parts = rel_target.lower().split("/") if rel_target else []
+        # A symlink that is itself the name an include opens is denied by that name: its
+        # target being an included config does not make it a harmless-named alias.
+        own_include_name = path in include_names or path in unloadable_includes
         if (any(p in SENSITIVE_DIR_COMPONENTS for p in parts) or (rel_target and is_sensitive_path(rel_target))
-                or target in included):
+                or (target in included and not own_include_name)):
             # An alias of Git metadata, a protected directory, a secret-like file or an
             # included Git config: the alias name would pass OpenCode's read rules.
             symlinks.add((rel(path), target, f"secret-like target: {_q(rel_target)}"))
@@ -821,16 +841,38 @@ def scan(repo: str, budget: float, included_out: str | None = None,
         if any(c in r for c in GLOB_METACHARACTERS):
             content.add((r, "cannot be denied by exact path (glob metacharacter)"))
 
+    def register_include(joined: str) -> tuple[str, str, bool]:
+        """Register an include target under the name it was referenced by and under its
+        canonical target: (referenced name, canonical target, loadable). A dangling or
+        missing target is registered without counting; a symlinked name of a present
+        file is excluded and denied by that name, the file itself counted by the caller."""
+        named = _referenced(joined)
+        canon = os.path.realpath(joined)
+        loadable = os.path.isfile(canon)
+        in_worktree = inside_repo(named) and named != repo and not (named == git_dir or named.startswith(git_dir + os.sep))
+        if named != canon and in_worktree:
+            if not loadable:
+                note_unloadable_include(named)
+            elif named not in include_names:
+                r = rel(named)
+                include_names[named] = r
+                if any(c in r for c in GLOB_METACHARACTERS):
+                    content.add((r, "cannot be denied by exact path (glob metacharacter)"))
+        if not loadable:
+            note_unloadable_include(canon)
+        return named, canon, loadable
+
     def check_git_config(found: str, depth: int, report: str | None, anchor: str | None) -> None:
         """Credentials in one Git config file (when it is reportable), then every file its
         include directives name, resolved like git: relative to the directory of the file
         as found. Files outside the repository are followed too, as an include may hop
         back in; only reportable files are reported. ``anchor``: the nearest reportable
         file of the chain, which a too-deep chain is reported under."""
-        canon = os.path.realpath(found)
-        if canon in seen_configs:
+        named = _referenced(found)
+        if named in seen_configs:
             return
-        seen_configs.add(canon)
+        seen_configs.add(named)
+        canon = os.path.realpath(found)
         try:
             with open(canon, encoding="utf-8", errors="surrogateescape") as fh:
                 text = fh.read()
@@ -840,16 +882,14 @@ def scan(repo: str, budget: float, included_out: str | None = None,
             content.add((report, "remote URL or http header embeds credentials"))
         anchor = report if report is not None else anchor
         for inc in config_include_paths(text):
-            target = os.path.join(os.path.dirname(found), os.path.expanduser(inc))
-            canon_inc = os.path.realpath(target)
-            if not os.path.isfile(canon_inc):
-                note_unloadable_include(canon_inc)
+            inc_named, inc_canon, loadable = register_include(os.path.join(os.path.dirname(named), os.path.expanduser(inc)))
+            if not loadable:
                 continue
             if depth >= MAX_INCLUDE_DEPTH:
                 if anchor is not None:
                     content.add((anchor, f"Git config includes nested deeper than {MAX_INCLUDE_DEPTH} levels"))
                 continue
-            check_git_config(target, depth + 1, config_role(canon_inc), anchor)
+            check_git_config(inc_named, depth + 1, config_role(inc_canon), anchor)
 
     def check_config_origins(path: str) -> None:
         """Every file git itself reports having loaded (git config --list --show-origin
@@ -862,10 +902,9 @@ def scan(repo: str, budget: float, included_out: str | None = None,
             if not origin.startswith(b"file:"):
                 continue
             printed = os.fsdecode(origin[len(b"file:"):])
-            found = os.path.join(repo, printed)
-            canon = os.path.realpath(found)
-            if os.path.isfile(canon):
-                check_git_config(found, 0, config_role(canon, printed), None)
+            named, canon, loadable = register_include(os.path.join(repo, printed))
+            if loadable:
+                check_git_config(named, 0, config_role(canon, printed), None)
 
     # .git: links that leave the repository, the inodes of its files (a hard link to
     # one is an alias) and every Git config file (credentials, include directives). Its
@@ -912,13 +951,10 @@ def scan(repo: str, budget: float, included_out: str | None = None,
         check_config_origins(config_origins)
     if extra_config:
         for extra in _nul_fields(_read_bytes(extra_config), "--extra-config", terminated=True):
-            found = os.path.join(repo, os.fsdecode(extra))
-            canon = os.path.realpath(found)
-            if os.path.isfile(canon):
+            named, canon, loadable = register_include(os.path.join(repo, os.fsdecode(extra)))
+            if loadable:
                 role = config_role(canon)
-                check_git_config(found, 0, role, role)
-            else:
-                note_unloadable_include(canon)
+                check_git_config(named, 0, role, role)
     # An included Git config is secret-like wherever it lives: by name, as a link target
     # and as a hard-link partner.
     for canon, r in included.items():
@@ -992,7 +1028,7 @@ def scan(repo: str, budget: float, included_out: str | None = None,
           f" elapsed={elapsed:.1f}s complete={'1' if complete else '0'}")
     if included_out:
         with open(included_out, "wb") as fh:
-            handed_over = included_rels | set(unloadable_includes.values())
+            handed_over = included_rels | set(unloadable_includes.values()) | set(include_names.values())
             fh.write(b"".join(os.fsencode(r) + b"\0" for r in sorted(handed_over, key=os.fsencode)))
     if missing_out:
         with open(missing_out, "wb") as fh:
