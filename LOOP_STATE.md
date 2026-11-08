@@ -188,8 +188,9 @@ is the permanent human opt-out and is never removed by automation.
    review and attestation, or a normal Codex review once quota returns. Do not
    claim it passes before that evidence exists.
 7. **Longer-term:** update minutes-guard target coverage after downstream audit; keep direct-to-main and branch-protection decisions explicit.
-8. **Codex Gate fail-closed enforcement (2026-11-08) — PR open, owner merge
-   pending.** Branch `claude/codex-gate-fail-closed`. Physically verified:
+8. **Codex Gate fail-closed enforcement (2026-11-08) — PR #59 open, owner merge
+   pending.** Branch `claude/codex-gate-fail-closed`,
+   <https://github.com/funzi7/automation-core/pull/59>. Physically verified:
    the root cause (403 on the PR-comment marker in both repositories; zero
    markers ever written) and the legitimacy of the three paywall-bot merges;
    the full local suite and CI on the PR head. NOT physically verifiable

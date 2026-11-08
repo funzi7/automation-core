@@ -5,7 +5,7 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
 ---
 
 ## [2026-11-08 UTC] Codex Gate reliability and fail-closed enforcement (paywall-bot Telegraph PRs)
-- PR: <<FINAL_PR_URL>>
+- PR: <https://github.com/funzi7/automation-core/pull/59>
 - Branch: `claude/codex-gate-fail-closed` (based on `main` `15652f6`)
 - Status: opened — owner merge pending; `pull_request_target` loads the gate from `main`, so the fix is only observable after merge
 - What was investigated (paywall-bot, read-only, 2026-11-08):
@@ -51,7 +51,19 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
     episodes are skipped rather than ending the scan; the producer run path tolerates an `@ref` suffix;
     the producer counts Codex reactions as activity.
   - Docs: README (permissions, fail-closed vs fail-soft), LOOP_STATE, CONTEXT, ADR 0001.
-- Validation: <<FINAL_VALIDATION>>
+- Validation: `bash scripts/validate.sh` green at every pushed head — 172/172 node tests
+  (`tests/test_codex_gate_workflow.js` 25 end-to-end scenarios and `tests/test_workflow_permissions.js`
+  4 guards are new; `tests/test_codex_gate_logic.js` 38→48 and `tests/test_review_evidence.js` 43→50),
+  59 github-script bodies syntax-checked, actionlint, `git diff --check`; source/mirror parity and the
+  byte-identical canonical block asserted by tests. Independent adversarial review by a reviewer
+  subagent (own fixtures, 21/22 mutants killed): no P1; its P2/P3 follow-ups are the third commit
+  (own-branch `@ref` suffix only, producer 24 h mint bound, `has_unresolved_findings` guard,
+  `core.error` annotations, docs wording). Evidence gathered read-only from GitHub: run logs of
+  `42477092393`/`42485718581` and every PR #58 gate run, PR timelines/reviews/threads/check-runs of
+  paywall-bot #120–#122 and #107, repository Actions settings of both repos. A branch-only
+  `workflow_dispatch` probe of the permission was attempted and removed — GitHub only registers
+  dispatchable workflows from the default branch, so the first real marker publish is observable
+  only after merge.
 - Needs from the owner: merge this PR (protected paths; `claude/*` branch is not a Merge Bot
   candidate by design); then watch the first `pull_request_target` gate run on any PR for
   `indexed trusted head epoch run` and a `github-actions[bot]` marker comment; then let the daily

@@ -372,7 +372,8 @@ These are preserved as incident records. They are not current operating instruct
 ## 7. Current Open TODO
 
 A00. Codex Gate fail-closed enforcement (2026-11-08, branch
-`claude/codex-gate-fail-closed`, PR open, owner merge pending):
+`claude/codex-gate-fail-closed`, PR #59
+<https://github.com/funzi7/automation-core/pull/59>, owner merge pending):
 
 - DONE in this repository: `pull-requests: write` on the gate and the fallback
   producer (the PR-comment markers were failing with 403 everywhere, never
