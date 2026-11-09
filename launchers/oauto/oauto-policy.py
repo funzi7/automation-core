@@ -1617,12 +1617,6 @@ def main(argv: list[str]) -> None:
     p_inc.add_argument("--repo", required=True, help="repository root")
     p_inc.add_argument("--config-path", required=True, metavar="REL",
                        help="repository-relative path the config content on stdin belongs to")
-    p_link = sub.add_parser("resolve-link")
-    p_link.add_argument("--repo", required=True, help="repository root")
-    p_link.add_argument("--link-path", required=True, metavar="REL",
-                        help="repository-relative path of the committed symlink whose target (blob) is on stdin")
-    p_link.add_argument("--rest", default="", metavar="REL",
-                        help="path components below the link (a directory symlink on an include path), appended after resolution")
     p_sources = sub.add_parser("verify-sources")
     p_sources.add_argument("--config-dir", required=True)
     p_sources.add_argument("--deny-read", action="append", default=[], metavar="PATH",
@@ -1665,9 +1659,6 @@ def main(argv: list[str]) -> None:
         sys.exit(check_diff_content(args.path, args.checker))
     elif args.cmd == "includes-in-config":
         records = includes_in_config(args.repo, args.config_path, sys.stdin.buffer.read())
-        sys.stdout.buffer.write(b"".join(kind + b"\0" + target + b"\0" for kind, target in records))
-    elif args.cmd == "resolve-link":
-        records = resolve_link_target(args.repo, args.link_path, sys.stdin.buffer.read(), args.rest)
         sys.stdout.buffer.write(b"".join(kind + b"\0" + target + b"\0" for kind, target in records))
     elif args.cmd == "quote-path":
         for path in _nul_fields(sys.stdin.buffer.read(), "quote-path", terminated=False):

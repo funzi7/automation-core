@@ -142,20 +142,21 @@ policy, not by the system prompt alone:
    secret-like file; a missing include's last committed content (at HEAD
    and at the branch delta's merge base) is read through the hardened git
    helper and its own includes are followed the same way — through files
-   outside the repository too; a committed symlink met in that history is
-   resolved within the same revision (`git ls-tree` mode `120000`, the blob
-   is the link target, resolved relative to the link's directory; every
-   target is judged by where it lands, both as written and as the live
-   filesystem resolves it, so an absolute target inside the repository, one
-   through a directory symlink retargeted since the commit, or a relative one
-   that escapes and re-enters the repository is an in-repository target like
-   any other) and its target excluded and followed, never parsed as config
-   text; the target's own relative includes are then resolved against the
-   path git opened — the link's referenced name, carried as the traversal
-   context, not the directory the link led to — and a content path reached
-   under two contexts is followed under both (Codex P1s on `0ca1844`,
-   `2c743cf`, `9e8a88d` and `bdc6cef`, 2026-11-09) — and
-   every in-repository target found this
+   outside the repository too; every historical include path is walked
+   through the tree at that revision like a path lookup (`git ls-tree` per
+   component): a committed symlink — file or directory, mode `120000`, its
+   blob the target — is replaced by its target before the next component is
+   looked at, so `..` applies after the link it follows (`conf/../b.cfg`
+   follows `conf` first), an absolute target inside the repository or a
+   relative one that leaves and re-enters it continues inside, and more
+   than 40 hops (the kernel's ELOOP), an empty target or a result at the
+   repository root fail closed; the file reached is excluded and followed,
+   never parsed as config text, and its own relative includes are resolved
+   against the path git opened — the referenced name, carried as the
+   traversal context, not the directory the link led to — with a content
+   path reached under two contexts followed under both (Codex P1s on
+   `0ca1844`, `2c743cf`, `9e8a88d`, `bdc6cef` and `0bc9c29`, 2026-11-09) —
+   and every in-repository target found this
    way is handed back to the scan, which runs again until nothing new
    appears (include targets are tracked under their referenced name and
    their canonical target, and traversal is keyed by the referenced path,
@@ -167,8 +168,8 @@ policy, not by the system prompt alone:
    credential-checked and alias-protected like any other include and a
    deleted chain is excluded hop by hop (a chain that passed through a
    directory symlink deleted together with its target is resolved when the
-   link was committed — its tree entry has mode `120000`, so the hop below it
-   is re-rooted at the link's target — and stays unresolved only for a
+   link was committed — its tree entry has mode `120000`, so the walk
+   continues at the link's target — and stays unresolved only for a
    never-committed link; include paths are registered under their written
    name as well as their resolved one, so a directory symlink retargeted
    after the commit still leads history to the committed link (Codex P1 on

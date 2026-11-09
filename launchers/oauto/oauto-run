@@ -229,22 +229,64 @@ parse_config_includes() { # $1: the path the config content on stdin belongs to
   python3 -I "$POLICY" includes-in-config --repo="$REPO" --config-path="$1" >> "$hops_z" ||
     die "the includes of a Git config file could not be read for the preflight"
 }
-history_dir_link() { # $1: revision; $2: repo-relative include path with no entry at $1
-  # A directory on the way may be a committed symlink (conf -> realconf, with conf/a.cfg
-  # included): resolve the first such ancestor within the revision and hand over the path
-  # below it as another hop, so the real file is excluded and followed too.
-  local rev="$1" rest="$2" prefix="" comp mode
-  while [[ "$rest" == */* ]]; do
-    comp="${rest%%/*}"; rest="${rest#*/}"
-    prefix="${prefix:+$prefix/}$comp"
-    mode="$(g ls-tree -z "$rev" -- "$prefix" | head -c 6)"
-    [[ -n "$mode" ]] || return 0           # nothing by that name at this revision
-    [[ "$mode" == 120000 ]] || continue    # an ordinary directory: look below it
-    g cat-file blob "$rev:$prefix" > "$blob_tmp" || return 0
-    python3 -I "$POLICY" resolve-link --repo="$REPO" --link-path="$prefix" --rest="$rest" < "$blob_tmp" >> "$hops_z" ||
-      die "a committed directory symlink on an included Git config path could not be resolved for the preflight (fail closed)"
-    return 0
+tree_walk() { # $1: revision; $2: repo-relative path as referenced
+  # Resolves the path against the tree at $1 the way a path walk does: each component is
+  # looked up in the tree, a committed symlink (file or directory) is replaced by its target
+  # before the next component is looked at — so `conf/../b.cfg` follows `conf` first — and
+  # `..` pops the directory reached so far. Appends one record to $hops_z: I NUL <resolved
+  # repository-relative path> NUL, or O NUL <absolute path> NUL when the walk leaves the
+  # repository; nothing when the path has no entry at that revision. Fails closed on a
+  # symlink loop (40 hops, like the kernel), an empty link target, or a result that is the
+  # repository root or lies inside .git.
+  local rev="$1" remaining="$2" resolved="" comp candidate mode target hops=0
+  while [[ -n "$remaining" ]]; do
+    comp="${remaining%%/*}"
+    if [[ "$remaining" == */* ]]; then remaining="${remaining#*/}"; else remaining=""; fi
+    [[ -n "$comp" && "$comp" != . ]] || continue
+    if [[ "$comp" == .. ]]; then
+      if [[ -z "$resolved" ]]; then
+        # Above the repository root. A path that re-enters the repository (`../<repo>/x`)
+        # continues the walk inside it; anything else is an outside file, read live.
+        if [[ "$remaining" == "${REPO##*/}"/* ]]; then remaining="${remaining#*/}"; continue; fi
+        if [[ "$remaining" == "${REPO##*/}" ]]; then remaining=""; continue; fi
+        printf 'O\0%s\0' "$(realpath -m -- "$REPO/..${remaining:+/$remaining}")" >> "$hops_z"
+        return 0
+      fi
+      if [[ "$resolved" == */* ]]; then resolved="${resolved%/*}"; else resolved=""; fi
+      continue
+    fi
+    candidate="${resolved:+$resolved/}$comp"
+    mode="$(g ls-tree -z "$rev" -- "$candidate" | head -c 6)"
+    case "$mode" in
+      "") return 0 ;;                      # nothing by that name at this revision
+      120000)
+        hops=$((hops + 1))
+        (( hops <= 40 )) || die "a chain of committed symlinks on an included Git config path exceeds 40 hops (fail closed)"
+        g cat-file blob "$rev:$candidate" > "$blob_tmp" || return 0
+        target="$(<"$blob_tmp")"
+        [[ -n "$target" ]] || die "a committed symlink on an included Git config path has an empty target (fail closed)"
+        if [[ "$target" == /* ]]; then
+          if [[ "$target" == "$REPO"/* ]]; then
+            resolved=""
+            remaining="${target#"$REPO"/}${remaining:+/$remaining}"
+          elif [[ "$target" == "$REPO" ]]; then
+            resolved=""
+          else
+            printf 'O\0%s\0' "$(realpath -m -- "$target${remaining:+/$remaining}")" >> "$hops_z"
+            return 0
+          fi
+        else
+          remaining="$target${remaining:+/$remaining}"   # relative to the link's directory, which is $resolved
+        fi ;;
+      040000) resolved="$candidate" ;;
+      *)
+        [[ -z "$remaining" ]] || return 0  # a blob or gitlink with components below it: no such entry
+        resolved="$candidate" ;;
+    esac
   done
+  [[ -n "$resolved" ]] || die "a historical include path resolves to the repository root (fail closed)"
+  [[ "$resolved" != .git && "$resolved" != .git/* ]] || die "a historical include path resolves into .git (fail closed)"
+  printf 'I\0%s\0' "$resolved" >> "$hops_z"
 }
 history_pass() {
   # Every queued entry carries the CONTEXT git resolves its relative includes against: the
@@ -253,7 +295,7 @@ history_pass() {
   # referenced, because git keeps the pathname it opened, not where the link led. A
   # content path reached with two contexts is processed twice (nested relative includes
   # resolve differently); the depth bound still terminates loops.
-  local known=() visited=() queue=() depth=() ctx=() found=() i=0 entry d c path rev mode
+  local known=() visited=() queue=() depth=() ctx=() found=() i=0 entry d c path rev kind target
   while IFS= read -r -d '' path; do known+=("$path"); done < "$included_z"
   # Paths this traversal itself found in earlier passes (handed to the scan through
   # --extra-config, so the scan hands them back as include targets) are reached again
@@ -293,28 +335,21 @@ history_pass() {
         : > "$hops_z"; parse_config_includes "$c" < "$REPO/$path"; enqueue_records "$hops_z" ""
       fi
       for rev in "${history_revs[@]}"; do
-        mode="$(g ls-tree -z "$rev" -- "$path" | head -c 6)"
-        if [[ -z "$mode" ]]; then
-          # No entry under that name at this revision: either never committed there, or a
-          # directory on the way was a committed symlink — resolved as one more hop whose
-          # target keeps this entry's context.
-          : > "$hops_z"; history_dir_link "$rev" "$path"; enqueue_records "$hops_z" "$c"
-          continue
-        fi
-        g cat-file blob "$rev:$path" > "$blob_tmp" || continue
-        if [[ "$mode" == 120000 ]]; then
-          # A committed symlink: its blob is the link target, not config text. git would
-          # have followed the link, so resolve it within the same revision (relative to
-          # the link's directory) and exclude and follow the target instead — under this
-          # entry's context, since git goes on resolving relative to the path it opened;
-          # parsing the target text as config would miss the target's deleted content.
-          : > "$hops_z"
-          python3 -I "$POLICY" resolve-link --repo="$REPO" --link-path="$path" < "$blob_tmp" >> "$hops_z" ||
-            die "a committed symlink among the included Git configs could not be resolved for the preflight (fail closed)"
+        # Walk the path through the tree at this revision: a committed symlink on the way
+        # (file or directory, `..` applied after the link it follows) leads elsewhere, and
+        # that path is excluded and followed under this entry's context — git goes on
+        # resolving relative to the path it opened. Parsing a link's blob as config text
+        # would miss the target's deleted content.
+        : > "$hops_z"
+        tree_walk "$rev" "$path"
+        [[ -s "$hops_z" ]] || continue                 # no entry at this revision
+        { IFS= read -r -d '' kind; IFS= read -r -d '' target; } < "$hops_z"
+        if [[ "$kind" == I && "$target" == "$path" ]]; then
+          g cat-file blob "$rev:$path" > "$blob_tmp" || continue
+          : > "$hops_z"; parse_config_includes "$c" < "$blob_tmp"; enqueue_records "$hops_z" ""
+        else
           enqueue_records "$hops_z" "$c"
-          continue
         fi
-        : > "$hops_z"; parse_config_includes "$c" < "$blob_tmp"; enqueue_records "$hops_z" ""
       done
     elif [[ -f "$path" ]]; then
       # Outside the repository: read as it is, no git; its includes resolve against the

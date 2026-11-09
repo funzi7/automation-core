@@ -2681,7 +2681,7 @@ test('P1 (Codex on 0ca1844): a committed symlink among deleted included configs 
   assert.deepEqual(excludedLines(preflight), ['conf/a.cfg (included Git config)', 'conf/b.cfg (included Git config)']);
 });
 
-test('P1 (Codex on 0ca1844): symlink chains, loops, escaping targets and a type change in included-config history; resolve-link fails closed', () => {
+test('P1 (Codex on 0ca1844): symlink chains, loops, escaping targets and a type change in included-config history', () => {
   const sb = sandbox();
   const outcome = {};
   const record = (label, repo, tokens, env = {}) => {
@@ -2728,27 +2728,17 @@ test('P1 (Codex on 0ca1844): symlink chains, loops, escaping targets and a type 
   fs.writeFileSync(path.join(typed, 'conf', 'a.cfg'), '[k]\n\tv = 1\n');
   fs.rmSync(path.join(typed, 'conf', 'b.cfg'));
   record('typechange', typed, ['S-LINK-TYPE-3c3c'], { OAUTO_ALLOW_SENSITIVE_FILES: '1' }); // a.cfg is present and included
+  // The tree walk resolves a.cfg -> b.cfg -> ../deep/c.cfg to the file in one step; the
+  // intermediate link conf/b.cfg is a symlink entry (its diff is its target text, not config),
+  // so only the referenced name and the file reached are excluded. A symlink loop among the
+  // deleted configs is unresolvable and fails closed (40 hops, like the kernel's ELOOP).
   assert.deepEqual(Object.fromEntries(Object.entries(outcome).map(([k, v]) => [k, { status: v.status, leaked: v.leaked, excluded: v.excluded }])), {
-    chain: { status: 0, leaked: false, excluded: ['conf/a.cfg (included Git config)', 'conf/b.cfg (included Git config)', 'deep/c.cfg (included Git config)'] },
-    loop: { status: 0, leaked: false, excluded: ['conf/a.cfg (included Git config)', 'conf/b.cfg (included Git config)'] },
+    chain: { status: 0, leaked: false, excluded: ['conf/a.cfg (included Git config)', 'deep/c.cfg (included Git config)'] },
+    loop: { status: 1, leaked: false, excluded: [] },
     escape: { status: 0, leaked: false, excluded: ['conf/a.cfg (included Git config)'] },
     typechange: { status: 0, leaked: false, excluded: ['conf/a.cfg (included Git config)', 'conf/b.cfg (included Git config)'] },
   }, JSON.stringify(outcome, null, 1));
-  // resolve-link itself: empty and .git targets fail closed; absolute and relative targets resolve as git would.
-  for (const [input, want] of [['', /empty or malformed/], ['../.git/config', /cannot be an included config/], ['..', /cannot be an included config|empty or malformed/]]) {
-    const bad = policy(['resolve-link', '--repo', chain, '--link-path', 'conf/a.cfg'], input);
-    assert.notEqual(bad.status, 0, `resolve-link must refuse ${JSON.stringify(input)}`);
-    if (input !== '..') assert.match(bad.stderr, want);
-  }
-  const abs = policy(['resolve-link', '--repo', chain, '--link-path', 'conf/a.cfg'], '/etc/gitconfig');
-  assert.equal(abs.status, 0, abs.stderr);
-  assert.equal(abs.stdout, 'O\0/etc/gitconfig\0');
-  const rel = policy(['resolve-link', '--repo', chain, '--link-path', 'conf/a.cfg'], '../deep/./c.cfg');
-  assert.equal(rel.status, 0, rel.stderr);
-  assert.equal(rel.stdout, 'I\0deep/c.cfg\0');
-  const up = policy(['resolve-link', '--repo', chain, '--link-path', 'conf/a.cfg'], '../../x.cfg');
-  assert.equal(up.status, 0, up.stderr);
-  assert.equal(up.stdout, `O\0${path.join(fs.realpathSync(chain), '..', 'x.cfg')}\0`);
+  assert.match(outcome.loop.stderr, /exceeds 40 hops \(fail closed\)/);
 });
 
 test('P1 (Codex on 2c743cf): a committed symlink with an ABSOLUTE target inside the repository is an in-repository include target', () => {
@@ -2765,18 +2755,17 @@ test('P1 (Codex on 2c743cf): a committed symlink with an ABSOLUTE target inside 
   assert.ok(!preflight.includes(token) && !prompt.includes(token),
     `the deleted target of an absolute in-repository symlink include must not reach the preflight:\n${preflight}`);
   assert.deepEqual(excludedLines(preflight), ['conf/a.cfg (included Git config)', 'conf/b.cfg (included Git config)']);
-  // resolve-link: absolute inside → I with the repository-relative path; .git or the root → fail closed; outside → O.
-  const inside = policy(['resolve-link', '--repo', repo, '--link-path', 'conf/a.cfg'], path.join(real, 'conf', 'b.cfg'));
-  assert.equal(inside.status, 0, inside.stderr);
-  assert.equal(inside.stdout, 'I\0conf/b.cfg\0');
-  for (const bad of [path.join(real, '.git', 'config'), real, `${real}/`]) {
-    const refused = policy(['resolve-link', '--repo', repo, '--link-path', 'conf/a.cfg'], bad);
-    assert.notEqual(refused.status, 0, `resolve-link must refuse ${bad}`);
-    assert.match(refused.stderr, /cannot be an included config/);
-  }
-  const outside = policy(['resolve-link', '--repo', repo, '--link-path', 'conf/a.cfg'], `${real}-sibling/x.cfg`);
-  assert.equal(outside.status, 0, outside.stderr);
-  assert.equal(outside.stdout, `O\0${real}-sibling/x.cfg\0`, 'a sibling directory sharing the prefix is outside');
+  // A committed symlink to the repository root itself (`a.cfg -> .`), deleted: the walk fails closed.
+  // (The include is added after the commit: git itself cannot stage while its include names a directory.)
+  const rootLink = mkRepo(sb, 'link-root', { 'src/b.py': 'y = 2\n' });
+  fs.symlinkSync('.', path.join(rootLink, 'a.cfg'));
+  git(rootLink, ['add', '-A']);
+  git(rootLink, ['commit', '-q', '-m', 'link to the root']);
+  fs.appendFileSync(path.join(rootLink, '.git', 'config'), '[include]\n\tpath = ../a.cfg\n');
+  fs.unlinkSync(path.join(rootLink, 'a.cfg'));
+  const refused = runOauto(sb, rootLink, ['--check']);
+  assert.equal(refused.status, 1, refused.stderr);
+  assert.match(refused.stderr, /resolves to the repository root \(fail closed\)/);
 });
 
 test('a committed DIRECTORY symlink on an included-config path (conf -> realconf), link and target deleted, is resolved within the revision', () => {
@@ -2800,16 +2789,6 @@ test('a committed DIRECTORY symlink on an included-config path (conf -> realconf
   // file; `conf/a.cfg` itself was never a path git tracked, so only the real file is listed.
   assert.deepEqual(excludedLines(preflight), ['realconf/a.cfg (included Git config)']);
   assert.match(preflight, /^-realconf$/m, 'the deleted directory link itself is ordinary content');
-  // resolve-link --rest: the path below the directory link is appended after resolution.
-  const below = policy(['resolve-link', '--repo', repo, '--link-path', 'conf', '--rest', 'deep/a.cfg'], 'elsewhere/real');
-  assert.equal(below.status, 0, below.stderr);
-  assert.equal(below.stdout, 'I\0elsewhere/real/deep/a.cfg\0');
-  const nested = policy(['resolve-link', '--repo', repo, '--link-path', 'etc/conf', '--rest', 'deep/a.cfg'], '../elsewhere/real');
-  assert.equal(nested.status, 0, nested.stderr);
-  assert.equal(nested.stdout, 'I\0elsewhere/real/deep/a.cfg\0', 'a link below the root resolves relative to its own directory');
-  const escaping = policy(['resolve-link', '--repo', repo, '--link-path', 'conf', '--rest', 'a.cfg'], '../../out');
-  assert.equal(escaping.status, 0, escaping.stderr);
-  assert.equal(escaping.stdout, `O\0${path.join(fs.realpathSync(repo), '..', '..', 'out', 'a.cfg')}\0`, 'two levels above the root');
 });
 
 test('P1 (Codex on 4dc70dd): an include path through a directory symlink retargeted to a missing directory keeps its written name for history', () => {
@@ -2879,14 +2858,42 @@ test('P1 (Codex on 9e8a88d): a committed symlink with an absolute target through
   assert.ok(!preflight.includes(token) && !prompt.includes(token),
     `the removed credential behind a retargeted directory symlink must not reach the preflight:\n${preflight}`);
   assert.deepEqual(excludedLines(preflight), ['a.cfg (included Git config)', 'oldconf/b.cfg (included Git config)']);
-  // resolve-link: the written path and the live-resolved path are both handed over (written first).
-  const both = policy(['resolve-link', '--repo', repo, '--link-path', 'a.cfg'], path.join(real, 'conf', 'b.cfg'));
-  assert.equal(both.status, 0, both.stderr);
-  assert.equal(both.stdout, 'I\0conf/b.cfg\0I\0newconf/b.cfg\0');
-  // A relative target that escapes the repository and re-enters it is inside.
-  const back = policy(['resolve-link', '--repo', repo, '--link-path', 'a.cfg'], `../${path.basename(real)}/conf/b.cfg`);
-  assert.equal(back.status, 0, back.stderr);
-  assert.equal(back.stdout, 'I\0conf/b.cfg\0I\0newconf/b.cfg\0');
+  // The same through a relative target that leaves the repository and re-enters it (`../<repo>/conf/b.cfg`).
+  const back = chainRepo(sb, 'abs-reenter', { 'oldconf/b.cfg': includedConfigText('S-REENTER-SYNTH-3e3e') }, '../a.cfg');
+  fs.symlinkSync('oldconf', path.join(back, 'conf'));
+  fs.symlinkSync(`../${path.basename(fs.realpathSync(back))}/conf/b.cfg`, path.join(back, 'a.cfg'));
+  git(back, ['add', '-A']);
+  git(back, ['commit', '-q', '-m', 'link leaving and re-entering the repository']);
+  fs.unlinkSync(path.join(back, 'a.cfg'));
+  fs.rmSync(path.join(back, 'oldconf', 'b.cfg'));
+  fs.unlinkSync(path.join(back, 'conf'));
+  fs.symlinkSync('newconf', path.join(back, 'conf'));
+  const again = launchRecordingPrompt(sb, back);
+  assert.equal(again.r.status, 0, again.r.stderr);
+  assert.ok(!again.preflight.includes('S-REENTER-SYNTH-3e3e') && !again.prompt.includes('S-REENTER-SYNTH-3e3e'), again.preflight);
+  assert.deepEqual(excludedLines(again.preflight), ['a.cfg (included Git config)', 'oldconf/b.cfg (included Git config)']);
+});
+
+test('P1 (Codex on 0bc9c29): a committed symlink target with a symlinked directory followed by `..` is walked through the tree, not collapsed', () => {
+  const sb = sandbox();
+  const token = 'S-DOTDOT-SYNTH-2f2f';
+  // Committed: a.cfg -> conf/../b.cfg, conf -> dirs/nested, dirs/b.cfg (credential); .git/config
+  // includes ../a.cfg. POSIX resolves conf first (dirs/nested), then `..` → dirs/, so the target is
+  // dirs/b.cfg; collapsing `conf/..` lexically yields root b.cfg instead. All deleted.
+  const repo = chainRepo(sb, 'dotdot', { 'dirs/b.cfg': includedConfigText(token), 'dirs/nested/.keep': '' }, '../a.cfg');
+  fs.symlinkSync('dirs/nested', path.join(repo, 'conf'));
+  fs.symlinkSync('conf/../b.cfg', path.join(repo, 'a.cfg'));
+  assert.equal(fs.readFileSync(path.join(repo, 'a.cfg'), 'utf8'), includedConfigText(token), 'the live link resolves to dirs/b.cfg');
+  git(repo, ['add', '-A']);
+  git(repo, ['commit', '-q', '-m', 'links']);
+  fs.unlinkSync(path.join(repo, 'a.cfg'));
+  fs.unlinkSync(path.join(repo, 'conf'));
+  fs.rmSync(path.join(repo, 'dirs', 'b.cfg'));
+  const { r, preflight, prompt } = launchRecordingPrompt(sb, repo); // no override: nothing secret-like is present
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(!preflight.includes(token) && !prompt.includes(token),
+    `the removed credential behind conf/../b.cfg must not reach the preflight:\n${preflight}`);
+  assert.deepEqual(excludedLines(preflight), ['a.cfg (included Git config)', 'dirs/b.cfg (included Git config)']);
 });
 
 test('P1 (Codex on bdc6cef): a symlinked included config keeps its resolution context in history, so nested relative includes resolve like git', () => {
