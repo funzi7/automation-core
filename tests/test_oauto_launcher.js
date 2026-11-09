@@ -3004,6 +3004,36 @@ test('P1 (Codex on 2389a03): a committed symlink target ending in a newline is r
   assert.deepEqual(excludedLines(preflight), ['a.cfg (included Git config)', '"b.cfg\\n" (included Git config)']);
 });
 
+test('P1 (Codex on 68d2fd2): a committed link target that leaves the repository through an outside alias pointing back into it is walked inside', () => {
+  const sb = sandbox();
+  const outcome = {};
+  const record = (label, repo, tokens) => {
+    const { r, preflight, prompt } = launchRecordingPrompt(sb, repo);
+    outcome[label] = { status: r.status, leaked: tokens.some((t) => preflight.includes(t) || prompt.includes(t)), excluded: excludedLines(preflight), stderr: r.stderr };
+  };
+  const build = (name, token, target) => {
+    const repo = chainRepo(sb, name, { 'b.cfg': includedConfigText(token) }, '../a.cfg');
+    const alias = path.join(fs.realpathSync(sb.root), 'outside', `alias-${name}`);
+    fs.mkdirSync(path.dirname(alias), { recursive: true });
+    fs.symlinkSync(fs.realpathSync(repo), alias); // an outside directory that is an alias of the repository
+    fs.symlinkSync(target(alias, repo), path.join(repo, 'a.cfg'));
+    git(repo, ['add', '-A']);
+    git(repo, ['commit', '-q', '-m', 'link through an outside alias']);
+    assert.equal(git(repo, ['config', '--get', 'http.extraheader']).trim(), `AUTHORIZATION: bearer ${token}`, `${name}: git itself loaded b.cfg through the alias`);
+    fs.unlinkSync(path.join(repo, 'a.cfg'));
+    fs.rmSync(path.join(repo, 'b.cfg'));
+    return repo;
+  };
+  // Codex's scenario: an absolute target through the alias.
+  record('absolute', build('alias-abs', 'S-ALIAS-ABS-SYNTH-9f9f', (alias) => path.join(alias, 'b.cfg')), ['S-ALIAS-ABS-SYNTH-9f9f']);
+  // The same with a relative target that climbs out of the repository into the alias.
+  record('relative', build('alias-rel', 'S-ALIAS-REL-SYNTH-8e8e', (alias, repo) => path.join(path.relative(fs.realpathSync(repo), alias), 'b.cfg')), ['S-ALIAS-REL-SYNTH-8e8e']);
+  assert.deepEqual(Object.fromEntries(Object.entries(outcome).map(([k, v]) => [k, { status: v.status, leaked: v.leaked, excluded: v.excluded }])), {
+    absolute: { status: 0, leaked: false, excluded: ['a.cfg (included Git config)', 'b.cfg (included Git config)'] },
+    relative: { status: 0, leaked: false, excluded: ['a.cfg (included Git config)', 'b.cfg (included Git config)'] },
+  }, JSON.stringify(outcome, null, 1));
+});
+
 test('P3-4: case-variant secret-like files are denied by their exact name under the override, in both agents and the ceiling', () => {
   const sb = sandbox();
   const repo = mkRepo(sb, 'case-variants', { 'src/a.py': 'x = 1\n', 'Auth.json': '{"t":"SYNTH"}\n',

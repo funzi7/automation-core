@@ -148,8 +148,10 @@ policy, not by the system prompt alone:
    blob the target, read byte-exact so a trailing newline stays part of the
    name — is replaced by its target before the next component is
    looked at, so `..` applies after the link it follows (`conf/../b.cfg`
-   follows `conf` first), an absolute target inside the repository or a
-   relative one that leaves and re-enters it continues inside, and more
+   follows `conf` first), an absolute target inside the repository, a
+   relative one that leaves and re-enters it, or any outside path that the
+   live filesystem resolves back into the repository (an outside alias
+   directory pointing at it) continues inside, and more
    than 40 hops (the kernel's ELOOP), an empty target or a result at the
    repository root fail closed; the file reached is excluded and followed,
    never parsed as config text, and its own relative includes are resolved

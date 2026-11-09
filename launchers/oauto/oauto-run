@@ -239,18 +239,22 @@ tree_walk() { # $1: revision; $2: repo-relative path as referenced
   # repository; nothing when the path has no entry at that revision. Fails closed on a
   # symlink loop (40 hops, like the kernel), an empty link target, or a result that is the
   # repository root or lies inside .git.
-  local rev="$1" remaining="$2" resolved="" comp candidate mode target hops=0
+  local rev="$1" remaining="$2" resolved="" comp candidate mode target abs hops=0
   while [[ -n "$remaining" ]]; do
     comp="${remaining%%/*}"
     if [[ "$remaining" == */* ]]; then remaining="${remaining#*/}"; else remaining=""; fi
     [[ -n "$comp" && "$comp" != . ]] || continue
     if [[ "$comp" == .. ]]; then
       if [[ -z "$resolved" ]]; then
-        # Above the repository root. A path that re-enters the repository (`../<repo>/x`)
-        # continues the walk inside it; anything else is an outside file, read live.
+        # Above the repository root. A path that re-enters the repository — by name
+        # (`../<repo>/x`) or through an outside alias that resolves back into it — continues
+        # the walk inside it; anything else is an outside file, read live.
         if [[ "$remaining" == "${REPO##*/}"/* ]]; then remaining="${remaining#*/}"; continue; fi
         if [[ "$remaining" == "${REPO##*/}" ]]; then remaining=""; continue; fi
-        printf 'O\0%s\0' "$(realpath -m -- "$REPO/..${remaining:+/$remaining}")" >> "$hops_z"
+        abs="$(realpath -m -- "$REPO/..${remaining:+/$remaining}")"
+        if [[ "$abs" == "$REPO"/* ]]; then resolved=""; remaining="${abs#"$REPO"/}"; continue; fi
+        if [[ "$abs" == "$REPO" ]]; then resolved=""; remaining=""; continue; fi
+        printf 'O\0%s\0' "$abs" >> "$hops_z"
         return 0
       fi
       if [[ "$resolved" == */* ]]; then resolved="${resolved%/*}"; else resolved=""; fi
@@ -278,7 +282,13 @@ tree_walk() { # $1: revision; $2: repo-relative path as referenced
           elif [[ "$target" == "$REPO" ]]; then
             resolved=""
           else
-            printf 'O\0%s\0' "$(realpath -m -- "$target${remaining:+/$remaining}")" >> "$hops_z"
+            # An absolute target elsewhere: an outside file — unless the live filesystem
+            # resolves it back into the repository (an outside alias directory pointing
+            # at it), in which case the walk continues inside from the root.
+            abs="$(realpath -m -- "$target${remaining:+/$remaining}")"
+            if [[ "$abs" == "$REPO"/* ]]; then resolved=""; remaining="${abs#"$REPO"/}"; continue; fi
+            if [[ "$abs" == "$REPO" ]]; then resolved=""; remaining=""; continue; fi
+            printf 'O\0%s\0' "$abs" >> "$hops_z"
             return 0
           fi
         else
