@@ -2811,6 +2811,51 @@ test('a committed DIRECTORY symlink on an included-config path (conf -> realconf
   assert.equal(escaping.stdout, `O\0${path.join(fs.realpathSync(repo), '..', '..', 'out', 'a.cfg')}\0`, 'two levels above the root');
 });
 
+test('P1 (Codex on 4dc70dd): an include path through a directory symlink retargeted to a missing directory keeps its written name for history', () => {
+  const sb = sandbox();
+  const token = 'S-RETARGET-SYNTH-6f6f';
+  // Committed: conf -> realconf and realconf/a.cfg (credential); .git/config includes ../conf/a.cfg.
+  // Then realconf/a.cfg is deleted and conf is retargeted to a missing directory. Resolving the
+  // directory against the current filesystem yields newconf/a.cfg, which history never had;
+  // the written name conf/a.cfg is what leads to the committed conf -> realconf hop.
+  const repo = chainRepo(sb, 'retarget', { 'realconf/a.cfg': includedConfigText(token) }, '../conf/a.cfg');
+  fs.symlinkSync('realconf', path.join(repo, 'conf'));
+  git(repo, ['add', '-A']);
+  git(repo, ['commit', '-q', '-m', 'conf -> realconf']);
+  fs.rmSync(path.join(repo, 'realconf', 'a.cfg'));
+  fs.unlinkSync(path.join(repo, 'conf'));
+  fs.symlinkSync('newconf', path.join(repo, 'conf')); // dangling
+  const { r, preflight, prompt } = launchRecordingPrompt(sb, repo); // no override: nothing secret-like is present
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(!preflight.includes(token) && !prompt.includes(token),
+    `the removed credential behind a retargeted directory symlink must not reach the preflight:\n${preflight}`);
+  assert.deepEqual(excludedLines(preflight), ['realconf/a.cfg (included Git config)']);
+  // includes-in-config hands over the written name next to the resolved one.
+  const recs = policy(['includes-in-config', '--repo', repo, '--config-path', '.git/config'], '[include]\n\tpath = ../conf/a.cfg\n');
+  assert.equal(recs.status, 0, recs.stderr);
+  assert.deepEqual(recs.stdout.split('\0').filter(Boolean), ['I', 'newconf/a.cfg', 'I', 'conf/a.cfg']);
+  // Retargeted to an existing directory holding an innocuous a.cfg: that file is now the live
+  // included config (secret-like), and `conf` is a directory alias over a folder holding a
+  // secret-like file, which the alias rule refuses unconditionally (D1) — override or not — so
+  // nothing is launched and nothing is rendered; the scan still hands over both names.
+  const moved = chainRepo(sb, 'retarget-live', { 'realconf/a.cfg': includedConfigText('S-RETARGET-LIVE-7a7a'), 'otherconf/a.cfg': '[k]\n\tv = 1\n' }, '../conf/a.cfg');
+  fs.symlinkSync('realconf', path.join(moved, 'conf'));
+  git(moved, ['add', '-A']);
+  git(moved, ['commit', '-q', '-m', 'conf -> realconf']);
+  fs.rmSync(path.join(moved, 'realconf', 'a.cfg'));
+  fs.unlinkSync(path.join(moved, 'conf'));
+  fs.symlinkSync('otherconf', path.join(moved, 'conf'));
+  const live = runOauto(sb, moved, ['--check'], { OAUTO_ALLOW_SENSITIVE_FILES: '1' });
+  assert.equal(live.status, 1, `a directory alias over the live included config must be refused:\n${live.stderr}`);
+  assert.match(live.stderr, /conf -> \S+\/otherconf \(aliases a directory holding secret-like files: otherconf\/a\.cfg\)/);
+  assert.ok(nothingRendered(sb, moved), 'nothing is rendered before the scan passes');
+  const out = path.join(sb.root, 'retarget-live-included.z');
+  const scan = spawnSync('python3', ['-I', POLICY, 'scan', moved, '--budget', '60', '--included-out', out], { encoding: 'utf8' });
+  assert.equal(scan.status, 0, scan.stderr);
+  assert.deepEqual(fs.readFileSync(out, 'utf8').split('\0').filter(Boolean).sort(), ['conf/a.cfg', 'otherconf/a.cfg'],
+    'the written name and the resolved live file are both handed over');
+});
+
 test('P3-4: case-variant secret-like files are denied by their exact name under the override, in both agents and the ceiling', () => {
   const sb = sandbox();
   const repo = mkRepo(sb, 'case-variants', { 'src/a.py': 'x = 1\n', 'Auth.json': '{"t":"SYNTH"}\n',

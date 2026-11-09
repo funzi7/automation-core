@@ -609,9 +609,14 @@ def includes_in_config(repo: str, config_path: str, data: bytes) -> list[tuple[b
         joined = os.path.join(base_dir, os.path.expanduser(inc))
         named = _referenced(joined)
         canon = os.path.realpath(joined)
+        # The path exactly as written (normalised lexically, no symlink followed): when a
+        # directory on the way is, or was, a symlink, this is the name history knows.
+        lexical = os.path.normpath(joined)
         records = [(b"I", rel(named)) if in_worktree(named) else (b"O", os.fsencode(named))]
         if canon != named and in_worktree(canon):
             records.append((b"I", rel(canon)))
+        if lexical not in (named, canon) and in_worktree(lexical):
+            records.append((b"I", rel(lexical)))
         for record in records:
             if record not in found:
                 found.append(record)
@@ -1049,23 +1054,40 @@ def scan(repo: str, budget: float, included_out: str | None = None,
         if any(c in r for c in GLOB_METACHARACTERS):
             content.add((r, "cannot be denied by exact path (glob metacharacter)"))
 
+    def note_include_name(path: str) -> None:
+        """A present name git opens for an include (a symlinked file, or a path through a
+        live directory symlink): excluded and denied by that name, never counted."""
+        if path not in include_names:
+            r = rel(path)
+            include_names[path] = r
+            if any(c in r for c in GLOB_METACHARACTERS):
+                content.add((r, "cannot be denied by exact path (glob metacharacter)"))
+
     def register_include(joined: str) -> tuple[str, str, bool]:
-        """Register an include target under the name it was referenced by and under its
-        canonical target: (referenced name, canonical target, loadable). A dangling or
-        missing target is registered without counting; a symlinked name of a present
-        file is excluded and denied by that name, the file itself counted by the caller."""
+        """Register an include target under the name it was referenced by, under its
+        canonical target and under the path exactly as written (normalised lexically, no
+        symlink followed — the name history knows when a directory on the way is, or was,
+        a symlink): (referenced name, canonical target, loadable). A dangling or missing
+        target is registered without counting; a symlinked name of a present file is
+        excluded and denied by that name, the file itself counted by the caller."""
         named = _referenced(joined)
         canon = os.path.realpath(joined)
+        lexical = os.path.normpath(joined)
         loadable = os.path.isfile(canon)
-        in_worktree = inside_repo(named) and named != repo and not (named == git_dir or named.startswith(git_dir + os.sep))
-        if named != canon and in_worktree:
+
+        def in_worktree(path: str) -> bool:
+            return inside_repo(path) and path != repo and not (path == git_dir or path.startswith(git_dir + os.sep))
+
+        if named != canon and in_worktree(named):
             if not loadable:
                 note_unloadable_include(named)
-            elif named not in include_names:
-                r = rel(named)
-                include_names[named] = r
-                if any(c in r for c in GLOB_METACHARACTERS):
-                    content.add((r, "cannot be denied by exact path (glob metacharacter)"))
+            else:
+                note_include_name(named)
+        if lexical not in (named, canon) and in_worktree(lexical):
+            if os.path.isfile(lexical):
+                note_include_name(lexical)
+            else:
+                note_unloadable_include(lexical)
         if not loadable:
             note_unloadable_include(canon)
         return named, canon, loadable

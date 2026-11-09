@@ -162,7 +162,10 @@ policy, not by the system prompt alone:
    directory symlink deleted together with its target is resolved when the
    link was committed — its tree entry has mode `120000`, so the hop below it
    is re-rooted at the link's target — and stays unresolved only for a
-   never-committed link; a
+   never-committed link; include paths are registered under their written
+   name as well as their resolved one, so a directory symlink retargeted
+   after the commit still leads history to the committed link (Codex P1 on
+   `4dc70dd`); a
    repository with such chains can take up to eight scan passes, each
    within the scan budget, before the launch fails closed). Included files outside the repository are followed for
    further hops but not themselves checked; they belong to the user. The scan
