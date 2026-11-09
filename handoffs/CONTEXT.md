@@ -502,7 +502,10 @@ A1. oauto — read-only OpenCode reviewer launcher (2026-11-07):
   under the override, object-store hard-link accounting, secret-named git-dir
   aliases, walk errors failing closed); Codex's review of the pushed head
   `33c0dda` added one P1 of the same class — a real `.git` directory carrying
-  a `commondir` file naming another repository — fixed in `5860e1f`. Shown
+  a `commondir` file naming another repository — fixed in `5860e1f`; its
+  review of `0ca1844` added a P1 in the include-history traversal (a committed
+  symlink among deleted included configs read as text instead of followed) —
+  fixed in `afd4639` (`resolve-link`). Shown
   NOT reproducible on the real binary: the claimed backslash glob escape
   (ripgrep `--glob` filter rooted at the tool path; `external_directory` gates
   the path) — no rule added. Recorded as backlog, not changed here: mutable

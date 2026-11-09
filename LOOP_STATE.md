@@ -285,7 +285,12 @@ is the permanent human opt-out and is never removed by automation.
     head `33c0dda` added one P1 of the same class — a real `.git` directory
     carrying a `commondir` file naming another repository — fixed in `5860e1f`
     (refused before any git command; a submodule git dir is accepted only
-    without one). `main` (PR #59) was merged into the branch (`01f6840`). The Codex review, CI and Codex Gate state of the
+    without one); its review of the next head `0ca1844` added a P1 in the
+    include-history traversal — a committed symlink among deleted included
+    configs was read as text instead of followed, so its target's removed
+    credential travelled — fixed in `afd4639` (`resolve-link`: the target is
+    excluded and followed within the same revision). `main` (PR #59) was
+    merged into the branch (`01f6840`). The Codex review, CI and Codex Gate state of the
     pushed head are recorded in `agent-memory/automation-core/cc-latest.md`.
     DONE by the owner on 2026-11-08: the Termux hop (`oauto <repo>` from a real
     Termux shell) and a review of a real project repository (the GLM audit).
