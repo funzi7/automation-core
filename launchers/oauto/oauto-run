@@ -288,8 +288,8 @@ done
 note "worktree scan passes: $scan_pass"
 scan_records() { printf '%s\n' "$scan_out" | sed -n "s/^$1 //p"; }
 if (( n_symlinks > 0 )); then
-  printf 'oauto: symlinks leaving the repository or aliasing secret-like paths (hard links included):\n%s\n' "$(scan_records SYMLINK)" >&2
-  die "refusing to launch: OpenCode resolves reads through symlinks but checks only the requested name (and a hard link is the same file under another name), so these would expose paths outside $REPO, or Git metadata and secret-like files inside it, under a harmless name (targets under /usr, /bin, /lib are tolerated)"
+  printf 'oauto: symlinks leaving the repository or aliasing secret-like paths (hard links included, and any hard link with a name outside the repository), and symlinked Git config files:\n%s\n' "$(scan_records SYMLINK)" >&2
+  die "refusing to launch: OpenCode resolves reads through symlinks but checks only the requested name (and a hard link is the same file under another name, wherever that name is), so these would expose paths outside $REPO, or Git metadata and secret-like files inside it, under a harmless name (symlink targets under /usr, /bin, /lib are tolerated); a symlinked Git config file would receive the credentials git writes"
 fi
 if (( n_sensitive + n_content > 0 )); then
   if (( n_sensitive > 0 )); then printf 'oauto: secret-like files present in %s:\n%s\n' "$REPO" "$(scan_records SENSITIVE)" >&2; fi
@@ -510,7 +510,9 @@ while IFS= read -r mid; do
 done <<< "$offered"
 render_config "${disable_args[@]}"
 
-(cd "$REPO" && oc 60 debug config --standalone 2>/dev/null) | python3 -I "$POLICY" verify-sources --config-dir "$CONFIG_DIR" >&2
+# verify-sources also replays the probes against the policies and permissions of the
+# document OpenCode loaded, the launch's own read denials included.
+(cd "$REPO" && oc 60 debug config --standalone 2>/dev/null) | python3 -I "$POLICY" verify-sources --config-dir "$CONFIG_DIR" "${deny_read_args[@]}" >&2
 (cd "$REPO" && oc 120 models --standalone 2>/dev/null) | python3 -I "$POLICY" verify-models >&2
 (cd "$REPO" && oc 60 debug agents --standalone 2>/dev/null) | python3 -I "$POLICY" verify-agents "${deny_read_args[@]}" >&2
 # Nothing else may have appeared in the private config directory (agents/, plugins/,

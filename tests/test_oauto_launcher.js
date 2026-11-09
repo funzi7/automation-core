@@ -31,6 +31,14 @@ const APPROVED = {
 };
 const DENIED_ACTIONS = ['shell', 'edit', 'webfetch', 'websearch', 'subagent', 'skill',
   'execute', 'external_directory', 'experimental_image_generate', 'browser'];
+// Credential files of common tools (Composer, PostgreSQL, MySQL, s3cmd, PuTTY, kubectl,
+// Terraform CLI, RubyGems, service-account keys), spelled as the case-sensitive read rules
+// match them; and near misses that stay reviewable.
+const MORE_CREDENTIAL_FILES = ['auth.json', 'vendor/composer/auth.json', '.pgpass', 'db/prod.pgpass', '.my.cnf', 'etc/.my.cnf',
+  '.s3cfg', 'deploy/.s3cfg', 'keys/server.ppk', '.kube/config', 'deploy/.kube/config', 'cluster.kubeconfig', '.terraformrc',
+  'ci/.terraformrc', 'terraform.rc', 'ci/terraform.rc', '.gem/credentials', 'ci/.gem/credentials', 'sa/my_service_account.json',
+  'sa/serviceaccount.json', 'deploy/sa/serviceAccountKey.json'];
+const NOT_CREDENTIAL_FILES = ['docs/oauth.json', 'src/auth.js', 'my.cnf', '.kube/README.md', 'composer.json'];
 
 fs.chmodSync(FAKE, 0o755);
 
@@ -164,9 +172,10 @@ test('rendered config pins the approved model, provider and read-only ruleset', 
     }
     const denied = ['.env', 'config/.env.production', 'deploy/.ssh/id_ed25519', '.ssh/config', '.gnupg/pubring.kbx',
       '.git/config', '.npmrc', 'app/local.properties', 'app/keystore.properties', 'keys/server.pem', 'config/prod.secrets.yaml',
-      'app-secrets.json', 'oauth/client_secret_1.json', 'infra/terraform.tfstate', '.aws/credentials', '.docker/config.json'];
+      'app-secrets.json', 'oauth/client_secret_1.json', 'infra/terraform.tfstate', '.aws/credentials', '.docker/config.json',
+      ...MORE_CREDENTIAL_FILES];
     for (const p of denied) assert.equal(decide(cfg.permissions, 'read', p), 'deny', `read ${p} must be denied`);
-    for (const p of ['src/main.kt', '.env.example', 'gradle.properties', 'README.md']) {
+    for (const p of ['src/main.kt', '.env.example', 'gradle.properties', 'README.md', ...NOT_CREDENTIAL_FILES]) {
       assert.equal(decide(cfg.permissions, 'read', p), 'allow', `read ${p} must be allowed`);
     }
     for (const p of ['/root/*', '{/root,x}/.ssh/*', '../**', '~/x', '$HOME/x']) {
@@ -189,8 +198,7 @@ test('rendered config pins the approved model, provider and read-only ruleset', 
       assert.equal(decide(pol, act, 'anything'), 'deny', `${act} must be denied`);
     }
     for (const action of DENIED_ACTIONS) assert.equal(decide(pol, 'tool.use', `${action}:whatever`), 'deny');
-    assert.equal(decide(pol, 'tool.use', 'read:.env'), 'deny');
-    assert.equal(decide(pol, 'tool.use', 'read:.ssh/config'), 'deny');
+    for (const p of denied) assert.equal(decide(pol, 'tool.use', `read:${p}`), 'deny', `tool.use read:${p} must be denied`);
     assert.equal(decide(pol, 'tool.use', 'read:.env.example'), 'allow');
 
     // Agents: built-ins off, hidden maintenance agents pinned and tool-less, reviewers read-only.
@@ -228,12 +236,15 @@ test('dynamic disable list rejects foreign providers and never disables an appro
 // Classification and the single-pass scan
 // ---------------------------------------------------------------------------
 test('classify denies exactly what the read rules deny, case-insensitively', () => {
+  // The scanner and the preflight match case-insensitively (Vendor/Auth.JSON), the read rules as spelled.
+  const more = [...MORE_CREDENTIAL_FILES, 'Vendor/Composer/Auth.JSON', 'Keys/Server.PPK', 'sa/ServiceAccount-Key.json'];
   const input = ['.env', 'Config/Prod.Secrets.YAML', 'app/Local.Properties', 'deploy/.ssh/key', 'src/main.kt',
-    '.env.example', 'config/server.PEM', '.git/config', 'gradle.properties', 'notes/README.md', 'infra/x.tfvars'].join('\n');
+    '.env.example', 'config/server.PEM', '.git/config', 'gradle.properties', 'notes/README.md', 'infra/x.tfvars',
+    ...more, ...NOT_CREDENTIAL_FILES].join('\n');
   const r = policy(['classify'], `${input}\n`);
   assert.equal(r.status, 0, r.stderr);
   assert.deepEqual(r.stdout.trim().split('\n').sort(), ['.env', '.git/config', 'Config/Prod.Secrets.YAML', 'app/Local.Properties',
-    'config/server.PEM', 'deploy/.ssh/key', 'infra/x.tfvars'].sort());
+    'config/server.PEM', 'deploy/.ssh/key', 'infra/x.tfvars', ...more].sort());
 });
 
 test('scan reports secret-like files, outward symlinks and credential content in one pass', () => {
@@ -248,6 +259,10 @@ test('scan reports secret-like files, outward symlinks and credential content in
     'app/Local.Properties': 'sdk.dir=/x\n',
     'gradle.properties': 'org.gradle.jvmargs=-Xmx1g\nsigningPassword=hunter2\n',
     'clean.properties': 'a=b\n',
+    'vendor/composer/auth.json': '{"http-basic": {}}\n',
+    'deploy/.kube/config': 'apiVersion: v1\n',
+    'keys/putty.PPK': 'synthetic test material\n',
+    'composer.json': '{}\n',
   }, { commit: false });
   fs.symlinkSync(outside, path.join(repo, 'link-out'));
   fs.symlinkSync('/usr/bin/env', path.join(repo, 'link-system'));
@@ -260,15 +275,17 @@ test('scan reports secret-like files, outward symlinks and credential content in
   assert.ok(lines.includes('SENSITIVE Config/Prod.Secrets.YAML'));
   assert.ok(lines.includes('SENSITIVE node_modules/pkg/.env'), 'node_modules must not be pruned');
   assert.ok(lines.includes('SENSITIVE app/Local.Properties'));
+  for (const p of ['vendor/composer/auth.json', 'deploy/.kube/config', 'keys/putty.PPK']) assert.ok(lines.includes(`SENSITIVE ${p}`), `${p}:\n${r.stdout}`);
   assert.ok(!lines.some((l) => l.includes('.env.example')));
   assert.ok(!lines.some((l) => l.includes('clean.properties')));
+  assert.ok(!lines.some((l) => l.includes('composer.json')));
   assert.ok(lines.some((l) => l.startsWith('SYMLINK link-out -> ')));
   assert.ok(lines.some((l) => l.startsWith('SYMLINK link-dangling -> ') && l.endsWith('(dangling)')));
   assert.ok(!lines.some((l) => l.includes('link-system')), 'system interpreter links are tolerated');
   assert.ok(!lines.some((l) => l.includes('link-inside')));
   assert.ok(lines.includes('CONTENT gradle.properties: credential-looking assignment'));
   assert.ok(lines.includes('CONTENT .git/config: remote URL or http header embeds credentials'));
-  assert.match(lines[lines.length - 1], /^SUMMARY files=\d+ sensitive=3 symlinks=2 content=2 elapsed=[\d.]+s complete=1$/);
+  assert.match(lines[lines.length - 1], /^SUMMARY files=\d+ sensitive=6 symlinks=2 content=2 elapsed=[\d.]+s complete=1$/);
   const exhausted = policy(['scan', repo, '--budget', '0']);
   assert.equal(exhausted.status, 3);
   assert.match(exhausted.stdout, /complete=0/);
@@ -344,7 +361,8 @@ test('verify-models accepts exactly the approved set and nothing else', () => {
 
 test('verify-sources refuses any configuration source beyond the oauto directory and file', () => {
   const dir = '/x/state/xdg-config/opencode';
-  const good = [{ type: 'document', path: `${dir}/opencode.json`, info: {} }, { type: 'directory', path: dir }];
+  // `info` is the parsed document as OpenCode 2.2.6 prints it (the rendered config itself).
+  const good = [{ type: 'document', path: `${dir}/opencode.json`, info: render('glm') }, { type: 'directory', path: dir }];
   assert.equal(policy(['verify-sources', '--config-dir', dir], JSON.stringify(good)).status, 0);
   const project = [...good, { type: 'document', path: '/root/work/x/opencode.json', info: {} }];
   const r = policy(['verify-sources', '--config-dir', dir], JSON.stringify(project));
@@ -406,7 +424,7 @@ test('oauto-run --check passes on a clean repository and leaves a private, verif
   fakeControl(sb, { EXTRA_MODELS: 'opencode/new-free opencode/big-pickle' });
   const r = runOauto(sb, repo, ['--check']);
   assert.equal(r.status, 0, r.stderr);
-  for (const line of ['config sources ok', 'models ok', 'agents ok', '--check: configuration verified', 'Model : opencode/glm-5.3-flash-free', 'Agent : review-glm']) {
+  for (const line of ['config sources ok', 'policies ok: ', 'models ok', 'agents ok', '--check: configuration verified', 'Model : opencode/glm-5.3-flash-free', 'Agent : review-glm']) {
     assert.ok(r.stderr.includes(line), `missing "${line}" in\n${r.stderr}`);
   }
   const sd = stateDir(sb, repo);
@@ -2103,6 +2121,7 @@ test('oauto-run source: no automatic approval, standalone helpers, bounded helpe
   assert.match(code, /while IFS= read -r -d '' path; do\n\s*\[\[ "\$path" != \*\[\\\*\\\?\\\[\\\{\\\}\\\\\]\* \]\] \|\|\s*die "[^"]*glob metacharacter[^"]*"\n\s*deny_read_args\+=\("--deny-read=\$path"\)\ndone < "\$included_z"/);
   assert.match(code, /python3 -I "\$POLICY" render --model "\$MODEL_ALIAS" "\$\{deny_read_args\[@\]\}" "\$@"/);
   assert.match(code, /\| python3 -I "\$POLICY" verify-agents "\$\{deny_read_args\[@\]\}" >&2/);
+  assert.match(code, /\| python3 -I "\$POLICY" verify-sources --config-dir "\$CONFIG_DIR" "\$\{deny_read_args\[@\]\}" >&2/);
   // Git itself lists every config file it loaded, before the scan, through g().
   const gLine = lines.findIndex((l) => /^g\(\) +\{/.test(l));
   const scanLine = lines.findIndex((l) => l.includes('python3 -I "$POLICY" scan "$REPO"'));
@@ -2132,6 +2151,345 @@ test('oauto-run source: no automatic approval, standalone helpers, bounded helpe
   assert.match(code, /\(\( status == 0 \)\) \|\|\s*die "/);
   assert.match(code, /python3 -I "\$POLICY" check-excluded "\$excluded_z" "\$after" >&2 \|\|\s*die /);
   assert.ok(!/<<< "\$excluded"/.test(code), 'excluded paths never travel through a shell variable');
+});
+
+// ---------------------------------------------------------------------------
+// Round 12: hard links with a name outside the repository (A), the git dirs of a
+// linked worktree (C), more credential files (D) and the policy ceiling as OpenCode
+// loaded it (E).
+// ---------------------------------------------------------------------------
+const hardOutside = (names, inside) =>
+  `(hard link: ${names} names, ${inside} inside the repository; the other names are outside it or unscanned)`;
+const scanOf = (repo) => policy(['scan', repo, '--budget', '60']);
+const symlinkRecords = (stdout) => stdout.split('\n').filter((l) => l.startsWith('SYMLINK '));
+
+test('A: a hard link whose other name lies outside the repository is refused, even with the override, and nothing is rendered', () => {
+  const sb = sandbox();
+  const outside = path.join(sb.root, 'id_ed25519');
+  fs.writeFileSync(outside, 'SYNTH-OUTSIDE-KEY-MATERIAL-a1a1 (not a key)\n');
+  const repo = mkRepo(sb, 'hard-outside', { 'src/a.py': 'x = 1\n' });
+  fs.linkSync(outside, path.join(repo, 'notes.md')); // an innocent name the read rules allow
+  const r = runOauto(sb, repo, ['--check'], { OAUTO_ALLOW_SENSITIVE_FILES: '1' });
+  assert.equal(r.status, 1, `ln <outside>/id_ed25519 notes.md must be refused even with the override:\n${r.stderr}`);
+  assert.match(r.stderr, /symlinks leaving the repository or aliasing secret-like paths/);
+  assert.ok(r.stderr.includes(`\nnotes.md -> ${fs.realpathSync(repo)}/notes.md ${hardOutside(2, 1)}\n`), r.stderr);
+  assert.match(r.stderr, /refusing to launch: OpenCode resolves reads through symlinks/);
+  assert.ok(nothingRendered(sb, repo), 'nothing is rendered before the scan passes');
+});
+
+test('A: a hard-linked file passes only when the scan saw all its names in the worktree or .git; aliases keep their reason', () => {
+  const sb = sandbox();
+  const outsideFile = (name) => {
+    const p = path.join(sb.root, 'outside', name);
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, `${name}\n`);
+    return p;
+  };
+  const repo = mkRepo(sb, 'hard-names', { 'src/a.py': 'x = 1\n', 'README.md': '# r\n', 'scripts/pre-commit': '#!/bin/sh\nexit 0\n' });
+  const link = (from, rel) => {
+    fs.mkdirSync(path.dirname(path.join(repo, rel)), { recursive: true });
+    fs.linkSync(from, path.join(repo, rel));
+  };
+  link(outsideFile('nested'), 'docs/deep/notes.md');
+  link(outsideFile('module'), 'node_modules/pkg/readme.md'); // the scan prunes nothing
+  link(outsideFile('three'), 'a3.txt'); // three names, two of them inside
+  link(path.join(repo, 'a3.txt'), 'b3.txt');
+  link(outsideFile('odd'), 'odd\tnämé.md');
+  link(path.join(repo, 'README.md'), 'docs/README-copy.md'); // both names inside: fine
+  fs.linkSync(path.join(repo, 'scripts', 'pre-commit'), path.join(repo, '.git', 'hooks', 'pre-commit')); // a hook: fine
+  link(path.join(repo, '.git', 'config'), 'review.txt'); // an alias of .git/config keeps its own reason
+  const r = scanOf(repo);
+  assert.equal(r.status, 0, r.stderr);
+  const real = fs.realpathSync(repo);
+  const lines = r.stdout.trim().split('\n');
+  assert.ok(lines.every((l) => /^(SENSITIVE|SYMLINK|CONTENT|SUMMARY) [\x20-\x7e]*$/.test(l)), r.stdout);
+  assert.deepEqual(symlinkRecords(r.stdout).sort(), [
+    `SYMLINK "odd\\tn\\303\\244m\\303\\251.md" -> "${real}/odd\\tn\\303\\244m\\303\\251.md" ${hardOutside(2, 1)}`,
+    `SYMLINK a3.txt -> ${real}/a3.txt ${hardOutside(3, 2)}`,
+    `SYMLINK b3.txt -> ${real}/b3.txt ${hardOutside(3, 2)}`,
+    `SYMLINK docs/deep/notes.md -> ${real}/docs/deep/notes.md ${hardOutside(2, 1)}`,
+    `SYMLINK node_modules/pkg/readme.md -> ${real}/node_modules/pkg/readme.md ${hardOutside(2, 1)}`,
+    `SYMLINK review.txt -> ${real}/.git/config (hard link to .git/config)`,
+  ].sort(), r.stdout);
+  assert.match(lines[lines.length - 1], /^SUMMARY files=\d+ sensitive=0 symlinks=6 content=0 elapsed=[\d.]+s complete=1$/);
+});
+
+test('A: a secret-named file hard-linked from outside is refused like an outward symlink, override or not', () => {
+  // `ln ~/global.env repo/.env`: the name is denied and counted as secret-like, but the
+  // file is also a name outside the repository, so the unconditional hard-link rule applies
+  // (the override only accepts the grep exposure of in-repository secret-like files).
+  const sb = sandbox();
+  const outside = path.join(sb.root, 'global.env');
+  fs.writeFileSync(outside, 'SYNTH-OUTSIDE-ENV-b2b2=1\n');
+  const repo = mkRepo(sb, 'hard-secret-name', { 'src/a.py': 'x = 1\n' });
+  fs.linkSync(outside, path.join(repo, '.env'));
+  const r = scanOf(repo);
+  assert.equal(r.status, 0, r.stderr);
+  const real = fs.realpathSync(repo);
+  assert.ok(r.stdout.includes('SENSITIVE .env\n'), r.stdout);
+  assert.deepEqual(symlinkRecords(r.stdout), [`SYMLINK .env -> ${real}/.env ${hardOutside(2, 1)}`]);
+  assert.match(r.stdout, /SUMMARY files=\d+ sensitive=1 symlinks=1 content=0 /);
+  const run = runOauto(sb, repo, ['--check'], { OAUTO_ALLOW_SENSITIVE_FILES: '1' });
+  assert.equal(run.status, 1, `the override must not accept a hard link with a name outside the repository:\n${run.stderr}`);
+  assert.match(run.stderr, /symlinks leaving the repository or aliasing secret-like paths/);
+  assert.ok(nothingRendered(sb, repo), 'nothing is rendered before the scan passes');
+});
+
+// A main repository with one linked worktree (its .git is a file); paths are canonical.
+function linkedWorktree(sb, name) {
+  const main = mkRepo(sb, `${name}-main`, { 'src/a.py': 'x = 1\n' });
+  const wt = path.join(sb.repos, `${name}-wt`);
+  git(main, ['worktree', 'add', '-q', '-b', `${name}-review`, wt]);
+  fs.writeFileSync(path.join(wt, 'innocent.txt'), 'innocent\n');
+  const realMain = fs.realpathSync(main);
+  return { main: realMain, wt: fs.realpathSync(wt), admin: path.join(realMain, '.git', 'worktrees', `${name}-wt`) };
+}
+
+test('C: reviewing a linked worktree, a symlinked config.worktree in its git dir is refused, even with the override (into the worktree or dangling)', () => {
+  const sb = sandbox();
+  const { wt, admin } = linkedWorktree(sb, 'cwt');
+  assert.ok(fs.statSync(path.join(wt, '.git')).isFile());
+  assert.deepEqual(symlinkRecords(scanOf(wt).stdout), [], 'a clean linked worktree has no record');
+  const cfg = path.join(admin, 'config.worktree');
+  fs.symlinkSync(path.join(wt, 'innocent.txt'), cfg); // git would write `config --worktree` values into innocent.txt
+  assert.deepEqual(symlinkRecords(scanOf(wt).stdout), [`SYMLINK ${cfg} -> ${wt}/innocent.txt (Git config file is a symlink)`]);
+  let r = runOauto(sb, wt, ['--check'], { OAUTO_ALLOW_SENSITIVE_FILES: '1' });
+  assert.equal(r.status, 1, `a symlinked config.worktree must be refused even with the override:\n${r.stderr}`);
+  assert.ok(r.stderr.includes(`\n${cfg} -> ${wt}/innocent.txt (Git config file is a symlink)\n`), r.stderr);
+  assert.ok(nothingRendered(sb, wt), 'nothing is rendered before the scan passes');
+  fs.unlinkSync(cfg);
+  fs.symlinkSync(path.join(sb.root, 'nowhere.cfg'), cfg);
+  r = runOauto(sb, wt, ['--check'], { OAUTO_ALLOW_SENSITIVE_FILES: '1' });
+  assert.equal(r.status, 1, `a dangling config.worktree link must be refused too:\n${r.stderr}`);
+  assert.ok(r.stderr.includes(`\n${cfg} -> ${fs.realpathSync(sb.root)}/nowhere.cfg (Git config file is a symlink)\n`), r.stderr);
+});
+
+test('C: reviewing a linked worktree, a symlinked config in its commondir is refused, even with the override', () => {
+  const sb = sandbox();
+  const { main, wt } = linkedWorktree(sb, 'ccommon');
+  const moved = path.join(fs.realpathSync(sb.root), 'real-config');
+  fs.renameSync(path.join(main, '.git', 'config'), moved);
+  fs.symlinkSync(moved, path.join(main, '.git', 'config')); // git follows it
+  const r = runOauto(sb, wt, ['--check'], { OAUTO_ALLOW_SENSITIVE_FILES: '1' });
+  assert.equal(r.status, 1, r.stderr);
+  assert.ok(r.stderr.includes(`\n${main}/.git/config -> ${moved} (Git config file is a symlink)\n`), r.stderr);
+});
+
+test('C: a linked-worktree file hard-linked into its git dirs is refused: a config as an alias, a hook as a name outside the worktree', () => {
+  const sb = sandbox();
+  const { main, wt, admin } = linkedWorktree(sb, 'chard');
+  const cfg = path.join(admin, 'config.worktree');
+  fs.writeFileSync(cfg, '[core]\n\tsparseCheckout = false\n');
+  fs.linkSync(cfg, path.join(wt, 'innocent2.txt'));
+  fs.writeFileSync(path.join(main, '.git', 'hooks', 'pre-push'), '#!/bin/sh\nexit 0\n');
+  fs.linkSync(path.join(main, '.git', 'hooks', 'pre-push'), path.join(wt, 'hook-copy.sh'));
+  assert.deepEqual(symlinkRecords(scanOf(wt).stdout).sort(), [
+    `SYMLINK hook-copy.sh -> ${wt}/hook-copy.sh ${hardOutside(2, 1)}`,
+    `SYMLINK innocent2.txt -> ${cfg} (hard link to ${cfg})`,
+  ]);
+  const r = runOauto(sb, wt, ['--check'], { OAUTO_ALLOW_SENSITIVE_FILES: '1' });
+  assert.equal(r.status, 1, r.stderr);
+  assert.ok(r.stderr.includes(`\ninnocent2.txt -> ${cfg} (hard link to ${cfg})\n`), r.stderr);
+});
+
+// Repository-relative .git paths and whether they name a Git config file (the contract
+// _is_git_config had before the git-dir-relative helper was factored out of it).
+const GIT_CONFIG_PATHS = { '.git/config': true, '.git/config.worktree': true, '.git/worktrees/wt/config.worktree': true,
+  '.git/worktrees/wt/config': true, '.git/modules/sub/config': true, '.git/modules/sub/modules/inner/config': true,
+  '.git/modules/sub/worktrees/x/config.worktree': true, '.git/hooks/config': false, '.git/worktrees/config': false,
+  '.git/worktrees/wt/sub/config': false, '.git/info/config.worktree': false, '.git/description': false, '.git/configs': false };
+
+test('C: ordinary symlinks in a git dir outside the worktree are not reported; _is_git_config keeps its .git/ contract', () => {
+  const sb = sandbox();
+  const { main, wt } = linkedWorktree(sb, 'cordinary');
+  fs.symlinkSync('/etc/hostname', path.join(main, '.git', 'info', 'outward'));
+  assert.ok(symlinkRecords(scanOf(main).stdout).some((l) => l.startsWith('SYMLINK .git/info/outward -> /etc/hostname')),
+    'reviewing the main repository refuses it (D4)');
+  assert.deepEqual(symlinkRecords(scanOf(wt).stdout), [], 'nothing in that git dir is reachable from the linked worktree');
+  const r = runOauto(sb, wt, ['--check']);
+  assert.equal(r.status, 0, r.stderr);
+
+  const py = spawnSync('python3', ['-I', '-c', [
+    'import importlib.util, json, sys',
+    'spec = importlib.util.spec_from_file_location("oauto_policy", sys.argv[1])',
+    'mod = importlib.util.module_from_spec(spec)',
+    'spec.loader.exec_module(mod)',
+    'paths = json.loads(sys.argv[2])',
+    'print(json.dumps([[mod._is_git_config(p), mod._is_git_dir_config(p[5:])] for p in paths]))',
+  ].join('\n'), POLICY, JSON.stringify(Object.keys(GIT_CONFIG_PATHS))], { encoding: 'utf8' });
+  assert.equal(py.status, 0, py.stderr);
+  assert.deepEqual(JSON.parse(py.stdout), Object.values(GIT_CONFIG_PATHS).map((v) => [v, v]));
+});
+
+test('D: a repository holding Composer auth.json is refused without the override; with it the file stays read-denied', () => {
+  const sb = sandbox();
+  const repo = mkRepo(sb, 'composer-auth', { 'src/a.php': '<?php echo 1;\n', 'composer.json': '{}\n' });
+  fs.writeFileSync(path.join(repo, 'auth.json'), '{"github-oauth": {"github.com": "SYNTH-COMPOSER-TOKEN-d1d1"}}\n');
+  let r = runOauto(sb, repo, ['--check']);
+  assert.equal(r.status, 1, r.stderr);
+  assert.match(r.stderr, /secret-like files present in [^\n]*:\nauth\.json\n/);
+  assert.match(r.stderr, /refusing to launch: the model's grep tool/);
+  assert.ok(nothingRendered(sb, repo), 'nothing is rendered before the scan passes');
+  r = runOauto(sb, repo, ['--check'], { OAUTO_ALLOW_SENSITIVE_FILES: '1' });
+  assert.equal(r.status, 0, r.stderr);
+  const cfg = JSON.parse(fs.readFileSync(path.join(stateDir(sb, repo), 'xdg-config', 'opencode', 'opencode.json'), 'utf8'));
+  for (const rules of [cfg.permissions, cfg.agents['review-glm'].permissions, cfg.agents['review-deepseek'].permissions]) {
+    assert.equal(decide(rules, 'read', 'auth.json'), 'deny');
+    assert.equal(decide(rules, 'read', 'composer.json'), 'allow');
+  }
+  assert.equal(decide(cfg.policies, 'tool.use', 'read:auth.json'), 'deny');
+  assert.ok(!readPreflight(sb, repo).includes('SYNTH-COMPOSER-TOKEN-d1d1'));
+});
+
+test('D: a deleted auth.json is excluded from the preflight diff (no override needed)', () => {
+  const sb = sandbox();
+  const token = 'SYNTH-COMPOSER-DELETED-d2d2';
+  const repo = mkRepo(sb, 'composer-deleted', { 'auth.json': `{"github-oauth": {"github.com": "${token}"}}\n`, 'src/a.py': 'x = 1\n' });
+  git(repo, ['rm', '-q', 'auth.json']);
+  fs.writeFileSync(path.join(repo, 'src/a.py'), 'x = 2\n');
+  const r = runOauto(sb, repo, ['--check']);
+  assert.equal(r.status, 0, r.stderr);
+  const preflight = readPreflight(sb, repo);
+  assert.ok(!preflight.includes(token), 'the deleted auth.json must not reach the preflight');
+  assert.deepEqual(excludedLines(preflight), ['auth.json']);
+  assert.match(preflight, /-x = 1\n\+x = 2/);
+  assert.match(r.stderr, /secret-like paths excluded/);
+});
+
+const SOURCES_DIR = '/x/state/xdg-config/opencode';
+const sourcesPayload = (info) => [{ type: 'document', path: `${SOURCES_DIR}/opencode.json`, info }, { type: 'directory', path: SOURCES_DIR }];
+const verifySources = (payload, extra = []) => policy(['verify-sources', '--config-dir', SOURCES_DIR, ...extra], JSON.stringify(payload));
+
+test('E: verify-sources replays the probes against the policies and permissions OpenCode loaded, failing closed on any gap', () => {
+  const cfg = render('glm');
+  const ok = verifySources(sourcesPayload(cfg));
+  assert.equal(ok.status, 0, ok.stderr);
+  const m = ok.stdout.match(/^config sources ok: only \/x\/state\/xdg-config\/opencode\/opencode\.json\npolicies ok: (\d+) probes; permissions ok: (\d+) probes\n$/);
+  assert.ok(m, ok.stdout);
+  const [nPol, nPerm] = [Number(m[1]), Number(m[2])];
+  const mutated = (fn) => {
+    const c = JSON.parse(JSON.stringify(cfg));
+    fn(c);
+    return sourcesPayload(c);
+  };
+  const without = (rules, action, resource) => rules.filter((x) => !(x.action === action && x.resource === resource));
+  const flipped = (rules, action, resource) => rules.map((x) => (x.action === action && x.resource === resource ? { ...x, effect: 'allow' } : x));
+  for (const [label, payload, reason] of [
+    ['policies missing', mutated((c) => { delete c.policies; }), /the loaded document \S+ has no policies/],
+    ['policies empty', mutated((c) => { c.policies = []; }), /has no policies/],
+    ['no parsed document', [{ type: 'document', path: `${SOURCES_DIR}/opencode.json` }, { type: 'directory', path: SOURCES_DIR }], /no parsed content \(info\)/],
+    ['tool.use read:*.env removed', mutated((c) => { c.policies = without(c.policies, 'tool.use', 'read:*.env'); }),
+      /loaded policies: tool\.use 'read:\.env' resolves to ask, expected deny/],
+    ['tool.use shell:* removed', mutated((c) => { c.policies = without(c.policies, 'tool.use', 'shell:*'); }),
+      /loaded policies: tool\.use 'shell:anything' resolves to ask, expected deny/],
+    ['tool.use read:auth.json removed', mutated((c) => { c.policies = without(c.policies, 'tool.use', 'read:auth.json'); }),
+      /loaded policies: tool\.use 'read:auth\.json' resolves to ask, expected deny/],
+    ['mcp.use removed', mutated((c) => { c.policies = without(c.policies, 'mcp.use', '*'); }), /loaded policies: mcp\.use 'x' resolves to ask, expected deny/],
+    ['provider.use * flipped to allow', mutated((c) => { c.policies = flipped(c.policies, 'provider.use', '*'); }),
+      /loaded policies: provider\.use 'anthropic' resolves to allow, expected deny/],
+    ['tool.use edit:* flipped to allow', mutated((c) => { c.policies = flipped(c.policies, 'tool.use', 'edit:*'); }),
+      /loaded policies: tool\.use 'edit:anything' resolves to allow, expected deny/],
+    ['integration.connect flipped to allow', mutated((c) => { c.policies = flipped(c.policies, 'integration.connect', '*'); }),
+      /loaded policies: integration\.connect '\*' resolves to allow, expected deny/],
+    ['the .env.example exception removed', mutated((c) => { c.policies = without(c.policies, 'tool.use', 'read:*.env.example'); }),
+      /loaded policies: tool\.use 'read:\.env\.example' resolves to deny, expected allow/],
+    ['the ceiling denies every read', mutated((c) => { c.policies.push({ action: 'tool.use', resource: 'read:*', effect: 'deny' }); }),
+      /loaded policies: tool\.use 'read:\.env\.example' resolves to deny, expected allow/],
+    ['malformed policy rule', mutated((c) => { c.policies.push({ action: 'tool.use' }); }), /has a malformed policies rule/],
+    ['permissions widened', mutated((c) => { c.permissions.push({ action: 'read', resource: '*', effect: 'allow' }); }),
+      /loaded permissions: read '\.env' resolves to allow, expected deny/],
+    ['permissions missing', mutated((c) => { delete c.permissions; }), /has no permissions/],
+  ]) {
+    const r = verifySources(payload);
+    assert.notEqual(r.status, 0, `${label} must fail verification`);
+    assert.match(r.stderr, reason, label);
+    assert.equal(r.stdout, '', `${label}: no ok line`);
+  }
+  // The launch's own read denials: both spellings, in the policies and the permissions.
+  const rendered = render('glm', ['--deny-read', 'review-config.txt']);
+  const notRendered = verifySources(sourcesPayload(cfg), ['--deny-read=review-config.txt']);
+  assert.notEqual(notRendered.status, 0);
+  assert.match(notRendered.stderr, /loaded policies: tool\.use 'read:review-config\.txt' resolves to ask, expected deny/);
+  const half = JSON.parse(JSON.stringify(rendered));
+  half.policies = without(half.policies, 'tool.use', 'read:*/review-config.txt');
+  const halfDenied = verifySources(sourcesPayload(half), ['--deny-read=review-config.txt']);
+  assert.notEqual(halfDenied.status, 0);
+  assert.match(halfDenied.stderr, /loaded policies: tool\.use 'read:\.\/review-config\.txt' resolves to ask, expected deny/);
+  const permHalf = JSON.parse(JSON.stringify(rendered));
+  permHalf.permissions = without(permHalf.permissions, 'read', 'review-config.txt');
+  const permDenied = verifySources(sourcesPayload(permHalf), ['--deny-read=review-config.txt']);
+  assert.notEqual(permDenied.status, 0);
+  assert.match(permDenied.stderr, /loaded permissions: read 'review-config\.txt' resolves to allow, expected deny/);
+  const denied = verifySources(sourcesPayload(rendered), ['--deny-read=review-config.txt']);
+  assert.equal(denied.status, 0, denied.stderr);
+  assert.ok(denied.stdout.includes(`policies ok: ${nPol + 2} probes; permissions ok: ${nPerm + 2} probes`), denied.stdout);
+});
+
+// A copy of PROBES with the effect the policies ceiling (tool.use, `action:resource`) must
+// give: deny where it covers the denial, allow for the documented exceptions, 'not deny' for
+// the reviewer's own tools (left to the permissions) and 'not allow' where only the
+// permissions deny (escaping globs, unknown tools: the ceiling has no rule for them).
+const PROBE_TABLE = [
+  ['shell', 'git status', 'deny', 'deny'], ['shell', 'ls', 'deny', 'deny'], ['shell', './gradlew assembleDebug', 'deny', 'deny'],
+  ['edit', 'src/main.kt', 'deny', 'deny'], ['edit', 'README.md', 'deny', 'deny'], ['webfetch', 'https://example.com', 'deny', 'deny'],
+  ['websearch', 'anything', 'deny', 'deny'], ['subagent', 'explore', 'deny', 'deny'], ['subagent', 'general', 'deny', 'deny'],
+  ['skill', 'anything', 'deny', 'deny'], ['execute', '*', 'deny', 'deny'], ['external_directory', '/root/.ssh', 'deny', 'deny'],
+  ['external_directory', '/etc', 'deny', 'deny'], ['read', '.env', 'deny', 'deny'], ['read', 'config/.env.production', 'deny', 'deny'],
+  ['read', 'keys/server.pem', 'deny', 'deny'], ['read', 'deploy/.ssh/id_ed25519', 'deny', 'deny'], ['read', '.ssh/config', 'deny', 'deny'],
+  ['read', '.gnupg/pubring.kbx', 'deny', 'deny'], ['read', '.git/config', 'deny', 'deny'], ['read', '.npmrc', 'deny', 'deny'],
+  ['read', 'app/local.properties', 'deny', 'deny'], ['read', 'app/keystore.properties', 'deny', 'deny'],
+  ['read', 'config/prod.secrets.yaml', 'deny', 'deny'], ['read', 'app-secrets.json', 'deny', 'deny'],
+  ['read', 'oauth/client_secret_123.json', 'deny', 'deny'], ['read', 'infra/terraform.tfstate', 'deny', 'deny'],
+  ['read', 'auth.json', 'deny', 'deny'], ['read', 'vendor/auth.json', 'deny', 'deny'], ['read', '.kube/config', 'deny', 'deny'],
+  ['read', 'deploy/sa/serviceAccountKey.json', 'deny', 'deny'], ['read', '.env.example', 'allow', 'allow'],
+  ['read', 'gradle.properties', 'allow', 'not deny'], ['read', 'src/main.kt', 'allow', 'not deny'], ['glob', '**/*.kt', 'allow', 'not deny'],
+  ['glob', 'src/**/*.{kt,java}', 'allow', 'not deny'], ['glob', '/root/**', 'deny', 'not allow'], ['glob', '{/root,x}/.ssh/*', 'deny', 'not allow'],
+  ['glob', '../**', 'deny', 'not allow'], ['grep', 'TODO', 'allow', 'not deny'], ['question', '*', 'allow', 'not deny'],
+  ['experimental_image_generate', 'x', 'deny', 'deny'], ['browser', 'x', 'deny', 'deny'], ['unknown_future_tool', 'x', 'deny', 'not allow'],
+];
+const effectHolds = (got, want) => (want === 'not deny' ? got !== 'deny' : want === 'not allow' ? got !== 'allow' : got === want);
+
+test('E: every probe resolves as intended against the rendered permissions and the policies ceiling (the table is PROBES)', () => {
+  const r = spawnSync('python3', ['-I', '-c', [
+    'import importlib.util, json, sys',
+    'spec = importlib.util.spec_from_file_location("oauto_policy", sys.argv[1])',
+    'mod = importlib.util.module_from_spec(spec)',
+    'spec.loader.exec_module(mod)',
+    'print(json.dumps({"probes": mod.PROBES, "policy_probes": mod.policy_probes(["review-config.txt"])}))',
+  ].join('\n'), POLICY], { encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr);
+  const { probes, policy_probes: policyProbes } = JSON.parse(r.stdout);
+  assert.deepEqual(PROBE_TABLE.map(([action, resource, effect]) => [action, resource, effect]), probes, 'the table must be exactly PROBES');
+  const wrong = [];
+  for (const alias of Object.keys(APPROVED)) {
+    const cfg = render(alias);
+    for (const [action, resource, perm, pol] of PROBE_TABLE) {
+      const gotPerm = decide(cfg.permissions, action, resource);
+      const gotPol = decide(cfg.policies, 'tool.use', `${action}:${resource}`);
+      if (gotPerm !== perm) wrong.push(`${alias} permissions: ${action} ${resource} -> ${gotPerm}, want ${perm}`);
+      if (!effectHolds(gotPol, pol)) wrong.push(`${alias} policies: tool.use ${action}:${resource} -> ${gotPol}, want ${pol}`);
+    }
+  }
+  // The verifier's own ceiling probes agree with this independent matcher on the rendered document.
+  const withDenial = render('glm', ['--deny-read', 'review-config.txt']);
+  for (const [action, resource, want] of policyProbes) {
+    const got = decide(withDenial.policies, action, resource);
+    if (!effectHolds(got, want)) wrong.push(`policy_probes: ${action} ${resource} -> ${got}, want ${want}`);
+  }
+  assert.deepEqual(wrong, []);
+});
+
+test('E: oauto-run verifies the loaded policies and permissions including the launch\'s own read denials', () => {
+  const sb = sandbox();
+  const repo = mkRepo(sb, 'policies-deny-read', { 'src/a.py': 'x = 1\n', 'review-config.txt': '[k]\n\tv = 1\n' });
+  fs.appendFileSync(path.join(repo, '.git', 'config'), '[include]\n\tpath = ../review-config.txt\n');
+  const r = runOauto(sb, repo, ['--check'], { OAUTO_ALLOW_SENSITIVE_FILES: '1' });
+  assert.equal(r.status, 0, r.stderr);
+  const direct = verifySources(sourcesPayload(render('glm', ['--deny-read', 'review-config.txt'])), ['--deny-read=review-config.txt']);
+  assert.equal(direct.status, 0, direct.stderr);
+  const line = direct.stdout.split('\n')[1];
+  assert.match(line, /^policies ok: \d+ probes; permissions ok: \d+ probes$/);
+  assert.ok(r.stderr.includes(`\n${line}\n`), `the launcher must hand its read denials to verify-sources:\n${r.stderr}`);
 });
 
 // ---------------------------------------------------------------------------

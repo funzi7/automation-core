@@ -32,8 +32,13 @@ policy, not by the system prompt alone:
 
 1. **Permissions** (OpenCode 2 `permissions` array, last match wins): deny
    everything, then allow only `read`, `glob`, `grep` and `question`; deny
-   `read` on secret-like paths (`.env*`, keys, keystores, SSH/GPG material,
-   credentials/service-account JSON, Terraform state), re-allow
+   `read` on secret-like paths (`.env*`, keys, keystores, PuTTY keys, SSH/GPG
+   material, credentials/service-account JSON, Terraform state, and the
+   credential files of kubectl, Composer (`auth.json`), PostgreSQL
+   (`.pgpass`), MySQL (`.my.cnf`), s3cmd, the Terraform CLI and RubyGems;
+   these rules match as spelled, so common case variants such as
+   `serviceAccount` are listed, while the scan and the preflight match
+   case-insensitively), re-allow
    `.env.example`-style templates; deny escaping glob patterns; deny `shell`,
    `edit` (covers write/patch), `webfetch`, `websearch`, `subagent`, `skill`,
    `execute`, `external_directory`, image generation and browser. The same
@@ -66,11 +71,22 @@ policy, not by the system prompt alone:
    `.git`, `.ssh`, `.gnupg` or `.aws`, symlinks to a secret-like file
    (`notes.txt -> config/prod.secrets.yaml`, `c -> .docker/config.json`),
    symlinks to a directory that holds secret-like files (`cfgdir -> secrets/`),
-   hard links to a secret-like file in the repository or to a file under
-   `.git` other than its hooks, symlinks inside `.git` that leave the
+   hard links to a secret-like file in the repository or to a file of its git
+   dir(s) other than its hooks, any worktree file that has more hard-link
+   names (`st_nlink`) than the scan finds in the worktree and `.git` (another
+   name outside the repository cannot be checked and may be a secret; a link
+   into `.git/objects`, which is not walked, is refused the same way; a
+   filesystem that reports one link for a hard-linked file defeats this),
+   symlinks inside `.git` that leave the
    repository (git-annex object links are refused by the `.git` rule), a
    `.git` that is itself a symlink, and Git config files that are symlinks
-   (git would write credentials through them into a file readable by name);
+   (git would write credentials through them into a file readable by name).
+   For a `.git` file (linked worktree, submodule checkout) the git dir and
+   commondir it names are walked under the same per-file rules — symlinked
+   Git config files refused, their files alias targets for hard links (not
+   names inside the repository), their config files credential-checked —
+   but ordinary symlinks there are not reported, since nothing in those
+   directories is reachable from the worktree;
    and,
    refused unless `OAUTO_ALLOW_SENSITIVE_FILES=1` is set, credential-looking
    content in `gradle.properties`-style files (`CONTENT_CHECKS`: basename
@@ -122,7 +138,14 @@ policy, not by the system prompt alone:
    approved models are offered, and every resolved agent evaluates each probe
    to its expected effect (`shell`, `edit`, external, `.env`, `.ssh/`,
    `.git/config` → deny; `read src/...`, `glob **/*.kt`, `grep`, `question` →
-   allow; hidden agents → deny for everything).
+   allow; hidden agents → deny for everything). The document as `debug
+   config` reports it loaded is verified too (amended 2026-11-09): its
+   `policies` ceiling must deny every denied tool, every secret-like read
+   probe and the launch's own read denials (exact path and `*/` form), allow
+   the documented exceptions and the `opencode` provider, deny the other
+   providers, `integration.connect`, MCP, skills, plugins and web search, and
+   leave the reviewer's own tools to the permissions; its top-level
+   `permissions` must resolve the same probes as the agents.
 6. **Process hygiene**: `--standalone` (no background service), scrubbed
    environment (`env -i` passing only HOME, PATH, TERM, LANG, TMPDIR, SHELL,
    USER, the private `XDG_CONFIG_HOME`, and COLORTERM/LC_ALL/XDG_*_HOME when set,

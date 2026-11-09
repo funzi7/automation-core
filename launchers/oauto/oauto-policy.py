@@ -5,8 +5,9 @@ Run with ``python3 -I`` (isolated mode). Standard library only.
 
 Subcommands
   render          Print the opencode.json document for one launch.
-  scan            Walk a repository once: report secret-like files, symlinks that
-                  leave it, and credential-looking content in known config files.
+  scan            Walk a repository once: report secret-like files, symlinks and hard
+                  links that leave it or alias denied paths, symlinked Git config files,
+                  and credential-looking content in known config files.
   classify        Read paths on stdin; print the ones the reviewer may never read.
                   With -z: NUL-delimited, bytes-exact, rename pairs (--renames) and a
                   C-quoted listing (--display); the form the launcher uses.
@@ -23,7 +24,9 @@ Subcommands
                   outside the repository); print the include targets it names, resolved
                   as git would for --config-path, as I (in-repo) / O (other) records.
   verify-sources  Read ``opencode debug config`` JSON on stdin; fail unless the only
-                  configuration sources are the oauto-owned config directory and file.
+                  configuration sources are the oauto-owned config directory and file,
+                  and the document as OpenCode loaded it resolves every probe through
+                  its policies ceiling and its permissions.
   verify-agents   Read ``opencode debug agents`` JSON on stdin; fail unless every agent
                   resolves to the read-only ruleset and no unexpected agent exists.
   verify-models   Read ``opencode models`` output on stdin; fail unless exactly the
@@ -109,17 +112,26 @@ SENSITIVE_READ_PATTERNS = [
     "*.env", "*.env.*", "*.envrc",
     # key material and stores
     "*.pem", "*.key", "*.p12", "*.pfx", "*.p8", "*.jks", "*.keystore", "*.kdbx",
-    "*.gpg", "*.asc", "*.ovpn", "*.htpasswd",
+    "*.gpg", "*.asc", "*.ovpn", "*.htpasswd", "*.ppk",
     "*keystore.properties", "*signing.properties", "local.properties", "*/local.properties",
     "*id_rsa*", "*id_dsa*", "*id_ecdsa*", "*id_ed25519*",
     # tool and cloud credential homes
     ".ssh/*", "*/.ssh/*", ".gnupg/*", "*/.gnupg/*", ".aws/*", "*/.aws/*",
     ".docker/config.json", "*/.docker/config.json",
+    ".kube/config", "*/.kube/config", "*.kubeconfig",
+    ".gem/credentials", "*/.gem/credentials",
     "*.netrc", "*.git-credentials", "*.npmrc", "*.pypirc",
+    "auth.json", "*/auth.json",                                           # Composer
+    ".pgpass", "*/.pgpass", "*.pgpass",                                   # PostgreSQL
+    ".my.cnf", "*/.my.cnf",                                               # MySQL
+    ".s3cfg", "*/.s3cfg",                                                 # s3cmd
+    ".terraformrc", "*/.terraformrc", "terraform.rc", "*/terraform.rc",   # Terraform CLI
     # repository metadata (remote URLs can embed tokens; nothing to review there)
     ".git/*", "*/.git/*",
-    # credential-shaped JSON/YAML/TOML/properties
+    # credential-shaped JSON/YAML/TOML/properties (the read rules are case-sensitive,
+    # so the common camel-case service-account spelling is listed as well)
     "*credentials*.json", "*client_secret*.json", "*service-account*.json",
+    "*service_account*.json", "*serviceaccount*.json", "*serviceAccount*.json",
     "*secrets*.json", "*secrets*.yaml", "*secrets*.yml", "*secrets*.toml", "*secrets*.properties",
     # infrastructure state
     "*.tfstate", "*.tfstate.*", "*.tfvars",
@@ -608,13 +620,21 @@ def _q(path: str) -> str:
     return git_quote(os.fsencode(path))
 
 
-def _is_git_config(rel: str) -> bool:
-    """config / config.worktree directly in .git, in .git/worktrees/<name>/, and anywhere
-    under .git/modules/ (submodule git dirs, nested ones included)."""
-    parts = rel.split("/")
+def _is_git_dir_config(inner: str) -> bool:
+    """A Git config file by its path inside a git dir: config / config.worktree at the
+    top, in worktrees/<name>/, and anywhere under modules/ (submodule git dirs, nested
+    ones included)."""
+    parts = inner.split("/")
     if parts[-1] not in ("config", "config.worktree"):
         return False
-    return len(parts) == 2 or (len(parts) == 4 and parts[1] == "worktrees") or (len(parts) >= 3 and parts[1] == "modules")
+    return len(parts) == 1 or (len(parts) == 3 and parts[0] == "worktrees") or (len(parts) >= 2 and parts[0] == "modules")
+
+
+def _is_git_config(rel: str) -> bool:
+    """The same for a repository-relative path under .git (.git/config,
+    .git/worktrees/<name>/config.worktree, .git/modules/**/config)."""
+    _top, sep, inner = rel.partition("/")
+    return bool(sep) and _is_git_dir_config(inner)
 
 
 def classify_z(names: bytes, renames: bytes | None, display: str | None,
@@ -740,8 +760,9 @@ def scan(repo: str, budget: float, included_out: str | None = None,
     symlinks: set[tuple[str, str, str]] = set()     # (link, target, reason quoting its own paths)
     content: set[tuple[str, str]] = set()
     dir_links: list[tuple[str, str, str]] = []      # in-repo directory aliases (link, target, rel target)
-    alias_inodes: dict[tuple[int, int], str] = {}   # (st_dev, st_ino) of secret-like files and .git files
-    linked: list[tuple[str, tuple[int, int]]] = []  # other regular files with st_nlink > 1
+    alias_inodes: dict[tuple[int, int], str] = {}   # (st_dev, st_ino) of secret-like files and git dir files
+    names_in_repo: dict[tuple[int, int], int] = {}  # (st_dev, st_ino) -> names seen in the worktree and .git
+    linked: list[tuple[str, tuple[int, int], int, bool]] = []  # worktree files with st_nlink > 1 (+ secret-like?)
     included: dict[str, str] = {}                   # in-repo, non-.git included Git configs: canonical -> rel
     unloadable_includes: dict[str, str] = {}        # in-repo include targets git cannot load (deleted ...)
     include_names: dict[str, str] = {}              # in-repo symlinks git opens as includes (target present)
@@ -906,47 +927,63 @@ def scan(repo: str, budget: float, included_out: str | None = None,
             if loadable:
                 check_git_config(named, 0, config_role(canon, printed), None)
 
-    # .git: links that leave the repository, the inodes of its files (a hard link to
-    # one is an alias) and every Git config file (credentials, include directives). Its
-    # object store holds none of these and can be large.
-    if os.path.islink(git_dir):
-        # Git would write its config (and credentials) wherever this points; refuse.
-        symlinks.add((".git", os.path.realpath(git_dir), ".git itself is a symlink"))
-    if os.path.isdir(git_dir):
-        for dirpath, dirnames, filenames in os.walk(git_dir, topdown=True, followlinks=False):
+    def walk_git_dir(root: str, in_repo: bool) -> bool:
+        """One git dir, its object store skipped (it holds none of these and can be
+        large): a symlinked Git config file is refused (git writes credentials into its
+        config files; through a link they would land in a file the reviewer may read by
+        name), every regular file but a hook is a hard-link alias target, and every Git
+        config file is credential-checked and followed through its includes.
+        ``in_repo``: the repository's own .git, whose links may not leave the repository
+        and whose files are names inside it. A git dir that a .git file names lies
+        outside the worktree and nothing in it is reachable from there, so only its
+        config files and its inodes matter (its files are not names inside the
+        repository). Paths outside the repository are reported absolute. False when the
+        time budget ran out."""
+        for dirpath, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
             if time.monotonic() - started > budget:
-                complete = False
-                break
-            for d in dirnames:
-                if os.path.islink(os.path.join(dirpath, d)):
-                    link_target(os.path.join(dirpath, d))
+                return False
+            if in_repo:
+                for d in dirnames:
+                    if os.path.islink(os.path.join(dirpath, d)):
+                        link_target(os.path.join(dirpath, d))
             dirnames[:] = [d for d in dirnames if d != "objects"]
             for name in filenames:
                 full = os.path.join(dirpath, name)
+                inner = os.path.relpath(full, root).replace(os.sep, "/")
+                shown = rel(full) if in_repo else full
                 if os.path.islink(full):
-                    target, _inside = link_target(full)
-                    if _is_git_config(rel(full)):
-                        # Git writes credentials into its config files; through a link
-                        # they would land in a file the reviewer may read by name.
-                        symlinks.add((rel(full), target, "Git config file is a symlink"))
+                    target = link_target(full)[0] if in_repo else os.path.realpath(full)
+                    if _is_git_dir_config(inner):
+                        symlinks.add((shown, target, "Git config file is a symlink"))
                     continue
                 st = lstat(full)
                 if st is None or not stat.S_ISREG(st.st_mode):
                     continue
-                r = rel(full)
+                inode = (st.st_dev, st.st_ino)
+                if in_repo:
+                    names_in_repo[inode] = names_in_repo.get(inode, 0) + 1
                 # Hooks are scripts, not secrets; a hook installed as a hard link from
                 # the worktree (ln scripts/pre-commit .git/hooks/pre-commit) is not an alias.
-                if not r.startswith(".git/hooks/"):
-                    alias_inodes.setdefault((st.st_dev, st.st_ino), r)
-                if _is_git_config(r):
-                    check_git_config(full, 0, r, r)
-    if not os.path.isdir(git_dir):
-        # A .git file: this repository's config lives in the git dir(s) it names.
-        for d in git_dirs:
-            for name in ("config", "config.worktree"):
-                full = os.path.join(d, name)
-                if os.path.isfile(full):
-                    check_git_config(full, 0, full, full)
+                if not inner.startswith("hooks/"):
+                    alias_inodes.setdefault(inode, shown)
+                if _is_git_dir_config(inner):
+                    check_git_config(full, 0, shown, shown)
+        return True
+
+    # .git: links that leave the repository, the inodes of its files (a hard link to
+    # one is an alias) and every Git config file (credentials, include directives).
+    if os.path.islink(git_dir):
+        # Git would write its config (and credentials) wherever this points; refuse.
+        symlinks.add((".git", os.path.realpath(git_dir), ".git itself is a symlink"))
+    if os.path.isdir(git_dir):
+        complete = walk_git_dir(git_dir, True)
+    else:
+        # A .git file (linked worktree, submodule checkout): this repository's config,
+        # hooks and metadata live in the git dir(s) it names, under the same rules; a
+        # git dir inside another one (worktrees/<name> in its commondir) is walked with it.
+        for d in dict.fromkeys(git_dirs):
+            if complete and not any(o != d and d.startswith(o + os.sep) for o in git_dirs):
+                complete = walk_git_dir(d, False)
     if config_origins:
         check_config_origins(config_origins)
     if extra_config:
@@ -981,13 +1018,17 @@ def scan(repo: str, budget: float, included_out: str | None = None,
             r = rel(full)
             st = None if is_link else lstat(full)
             regular = st is not None and stat.S_ISREG(st.st_mode)
-            if is_sensitive_path(r):
+            secret_name = is_sensitive_path(r)
+            if regular:
+                inode = (st.st_dev, st.st_ino)
+                names_in_repo[inode] = names_in_repo.get(inode, 0) + 1
+                if st.st_nlink > 1:
+                    linked.append((r, inode, st.st_nlink, secret_name))
+            if secret_name:
                 sensitive.add(r)
                 if regular:
                     alias_inodes.setdefault((st.st_dev, st.st_ino), r)
                 continue
-            if regular and st.st_nlink > 1:
-                linked.append((r, (st.st_dev, st.st_ino)))
             key = content_check_key(name)
             if key is not None:
                 # The whole file is checked; one too large to read in full is refused
@@ -1015,11 +1056,19 @@ def scan(repo: str, budget: float, included_out: str | None = None,
         flagged = sorted(p for p in alias_guarded if p.startswith(prefix))
         if flagged:
             symlinks.add((link, target, f"aliases a directory holding secret-like files: {_q(flagged[0])}"))
-    # A hard link is the same file under another name, which no symlink rule sees.
-    for r, inode in linked:
+    # A hard link is the same file under another name, which no symlink rule sees. An
+    # alias of a secret-like or git dir file is refused as such (a secret-like name is
+    # denied by itself); any file with more names than the scan saw in the worktree and
+    # .git (the object store is not walked) shares its content with a name outside the
+    # repository, which may be a secret: refused, since that name cannot be checked.
+    for r, inode, nlink, secret_name in linked:
         other = alias_inodes.get(inode)
-        if other is not None and other != r:
+        seen = names_in_repo.get(inode, 0)
+        if not secret_name and other is not None and other != r:
             symlinks.add((r, os.path.join(repo, other), f"hard link to {_q(other)}"))
+        elif nlink > seen:
+            symlinks.add((r, os.path.join(repo, r), f"hard link: {nlink} names, {seen} inside the repository;"
+                                                    " the other names are outside it or unscanned"))
 
     for path in sorted(secret_like, key=os.fsencode):
         print(f"SENSITIVE {_q(path)}" + (" (included Git config)" if path in included_rels else ""))
@@ -1073,6 +1122,10 @@ PROBES = [
     ("read", "app-secrets.json", "deny"),
     ("read", "oauth/client_secret_123.json", "deny"),
     ("read", "infra/terraform.tfstate", "deny"),
+    ("read", "auth.json", "deny"),
+    ("read", "vendor/auth.json", "deny"),
+    ("read", ".kube/config", "deny"),
+    ("read", "deploy/sa/serviceAccountKey.json", "deny"),
     ("read", ".env.example", "allow"),
     ("read", "gradle.properties", "allow"),
     ("read", "src/main.kt", "allow"),
@@ -1157,22 +1210,79 @@ def verify_models(lines: list[str]) -> None:
     print(f"models ok: exactly {sorted(approved)}")
 
 
-def verify_sources(payload, config_dir: str, config_file: str) -> None:
+def policy_probes(deny_read: list[str] = ()) -> list[tuple[str, str, str]]:
+    """(action, resource, expected) for the ``policies`` ceiling, derived from the same
+    constants as the rendering: providers and integrations, MCP, skills, plugins, web
+    search, every denied tool, every PROBES read spelling and the per-launch read
+    denials (exact path and a ``*/`` spelling). ``not deny``: a tool the reviewer needs,
+    which the ceiling must leave to the permissions. The other PROBES denials
+    (escaping globs, unknown tools) are the permissions' alone."""
+    probes = [("provider.use", APPROVED_PROVIDER, "allow")]
+    probes += [("provider.use", p, "deny") for p in ("anthropic", "openai", "google")]
+    probes += [("integration.connect", "*", "deny"), ("integration.connect", APPROVED_PROVIDER, "deny"),
+               ("integration.use", APPROVED_PROVIDER, "allow"), ("integration.use", "anthropic", "deny")]
+    probes += [(a, "x", "deny") for a in ("mcp.use", "skill.use", "plugin.use", "websearch.use")]
+    probes += [("tool.use", f"{a}:anything", "deny") for a in DENIED_ACTIONS]
+    for action, resource, expected in PROBES:
+        if action in DENIED_ACTIONS or (action == "read" and expected == "deny"):
+            probes.append(("tool.use", f"{action}:{resource}", "deny"))
+        elif expected == "allow":
+            exception = action == "read" and any(_glob_match(p, resource) for p in SENSITIVE_READ_EXCEPTIONS)
+            probes.append(("tool.use", f"{action}:{resource}", "allow" if exception else "not deny"))
+    for p in deny_read:
+        probes += [("tool.use", f"read:{p}", "deny"), ("tool.use", f"read:./{p}", "deny")]
+    return probes
+
+
+def _loaded_rules(info: dict, key: str, config_file: str) -> list[dict]:
+    """A rule array of the parsed document; missing, empty or malformed fails closed."""
+    rules = info.get(key)
+    if not isinstance(rules, list) or not rules:
+        _die(f"the loaded document {config_file} has no {key}")
+    for rule in rules:
+        if not (isinstance(rule, dict) and all(isinstance(rule.get(k), str) for k in ("action", "resource", "effect"))):
+            _die(f"the loaded document {config_file} has a malformed {key} rule: {json.dumps(rule, sort_keys=True)[:200]}")
+    return rules
+
+
+def verify_sources(payload, config_dir: str, config_file: str, deny_read: list[str] = ()) -> None:
+    """The only sources are the oauto directory and document, and the document as
+    OpenCode parsed it (its ``info``) resolves every probe: the ``policies`` ceiling
+    (policy_probes) and the global ``permissions`` (PROBES, as for the agents)."""
     if not isinstance(payload, list):
         _die("debug config output is not a JSON array")
-    seen_file = False
+    documents = []
     for entry in payload:
+        if not isinstance(entry, dict):
+            _die(f"debug config output holds a non-object entry: {json.dumps(entry)[:200]}")
         kind = entry.get("type")
         path = entry.get("path")
         if kind == "directory" and path == config_dir:
             continue
         if kind == "document" and path == config_file:
-            seen_file = True
+            documents.append(entry)
             continue
         _die(f"unexpected configuration source: {kind} {path}")
-    if not seen_file:
+    if not documents:
         _die(f"oauto config document {config_file} is not loaded")
+    pol_probes = policy_probes(deny_read)
+    perm_probes = PROBES + [probe for p in deny_read for probe in (("read", p, "deny"), ("read", f"./{p}", "deny"))]
+    for entry in documents:
+        info = entry.get("info")
+        if not isinstance(info, dict):
+            _die(f"debug config shows no parsed content (info) for {config_file}")
+        rules = _loaded_rules(info, "policies", config_file)
+        for action, resource, expected in pol_probes:
+            got = decide(rules, action, resource)
+            if (got == "deny") if expected == "not deny" else (got != expected):
+                _die(f"loaded policies: {action} {resource!r} resolves to {got}, expected {expected}")
+        rules = _loaded_rules(info, "permissions", config_file)
+        for action, resource, expected in perm_probes:
+            got = decide(rules, action, resource)
+            if got != expected:
+                _die(f"loaded permissions: {action} {resource!r} resolves to {got}, expected {expected}")
     print(f"config sources ok: only {config_file}")
+    print(f"policies ok: {len(pol_probes)} probes; permissions ok: {len(perm_probes)} probes")
 
 
 # ---------------------------------------------------------------------------
@@ -1225,7 +1335,10 @@ def main(argv: list[str]) -> None:
     p_inc.add_argument("--repo", required=True, help="repository root")
     p_inc.add_argument("--config-path", required=True, metavar="REL",
                        help="repository-relative path the config content on stdin belongs to")
-    sub.add_parser("verify-sources").add_argument("--config-dir", required=True)
+    p_sources = sub.add_parser("verify-sources")
+    p_sources.add_argument("--config-dir", required=True)
+    p_sources.add_argument("--deny-read", action="append", default=[], metavar="PATH",
+                           help="also probe that the loaded policies and permissions deny reading PATH (repeatable)")
     sub.add_parser("verify-agents").add_argument("--deny-read", action="append", default=[], metavar="PATH",
                                                  help="also probe that the reviewers cannot read PATH (repeatable)")
     sub.add_parser("verify-models")
@@ -1268,7 +1381,7 @@ def main(argv: list[str]) -> None:
             print(git_quote(path))
     elif args.cmd == "verify-sources":
         config_dir = args.config_dir.rstrip("/")
-        verify_sources(json.load(sys.stdin), config_dir, os.path.join(config_dir, "opencode.json"))
+        verify_sources(json.load(sys.stdin), config_dir, os.path.join(config_dir, "opencode.json"), args.deny_read)
     elif args.cmd == "verify-agents":
         verify_agents(json.load(sys.stdin), args.deny_read)
     elif args.cmd == "verify-models":
