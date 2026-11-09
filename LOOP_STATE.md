@@ -293,8 +293,12 @@ is the permanent human opt-out and is never removed by automation.
     added a P1 in that resolver — an absolute target inside the repository was
     treated as outside — fixed in `62fca59`, which also resolves a committed
     directory symlink on an include path (the last documented gap of this
-    class; only a never-committed, deleted directory link stays unresolvable).
-    `main` (PR #59) was merged into the branch (`01f6840`). The Codex review, CI and Codex Gate state of the
+    class; only a never-committed, deleted directory link stays unresolvable);
+    its review of `4dc70dd` added a P1 — an include path through a directory
+    symlink retargeted later lost its written name, so history never saw the
+    committed link — fixed in `4544f09` (the written name is registered next
+    to the resolved one). `main` (PR #59) was merged into the branch
+    (`01f6840`). The Codex review, CI and Codex Gate state of the
     pushed head are recorded in `agent-memory/automation-core/cc-latest.md`.
     DONE by the owner on 2026-11-08: the Termux hop (`oauto <repo>` from a real
     Termux shell) and a review of a real project repository (the GLM audit).
