@@ -522,7 +522,9 @@ A1. oauto — read-only OpenCode reviewer launcher (2026-11-07):
   `tree_walk`, replacing the per-link resolver); its review of `d64744c`
   added a P1 (an include directive written `conf/../b.cfg` collapsed before
   the walk) — fixed in `f852171` (directives reach the walk uncollapsed, as
-  `W` records and `--walk-out`). Shown
+  `W` records and `--walk-out`); its review of `2389a03` added a P1 (a link
+  target ending in a newline lost it to command substitution) — fixed in
+  `d9b71a1` (targets read byte-exact). Shown
   NOT reproducible on the real binary: the claimed backslash glob escape
   (ripgrep `--glob` filter rooted at the tool path; `external_directory` gates
   the path) — no rule added. Recorded as backlog, not changed here: mutable

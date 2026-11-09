@@ -311,8 +311,10 @@ is the permanent human opt-out and is never removed by automation.
     `d64744c` added a P1 — an include DIRECTIVE written `conf/../b.cfg` was
     collapsed before the walk — fixed in `f852171` (directives keep their
     components, as `W` records from `includes-in-config` and `--walk-out`
-    from the scan, and are walked uncollapsed). `main` (PR #59) was merged
-    into the branch (`01f6840`). The Codex review, CI and Codex Gate state of the
+    from the scan, and are walked uncollapsed); its review of `2389a03`
+    added a P1 — a committed link target ending in a newline lost it to
+    command substitution — fixed in `d9b71a1` (targets read byte-exact).
+    `main` (PR #59) was merged into the branch (`01f6840`). The Codex review, CI and Codex Gate state of the
     pushed head are recorded in `agent-memory/automation-core/cc-latest.md`.
     DONE by the owner on 2026-11-08: the Termux hop (`oauto <repo>` from a real
     Termux shell) and a review of a real project repository (the GLM audit).
