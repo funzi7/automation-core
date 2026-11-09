@@ -144,9 +144,11 @@ policy, not by the system prompt alone:
    helper and its own includes are followed the same way — through files
    outside the repository too; a committed symlink met in that history is
    resolved within the same revision (`git ls-tree` mode `120000`, the blob
-   is the link target, resolved relative to the link's directory) and its
-   target excluded and followed, never parsed as config text (Codex P1 on
-   `0ca1844`, 2026-11-09) — and every in-repository target found this
+   is the link target, resolved relative to the link's directory; an
+   absolute target is judged by where it lands, so one inside the repository
+   is an in-repository target like any other) and its target excluded and
+   followed, never parsed as config text (Codex P1s on `0ca1844` and
+   `2c743cf`, 2026-11-09) — and every in-repository target found this
    way is handed back to the scan, which runs again until nothing new
    appears (include targets are tracked under their referenced name and
    their canonical target, and traversal is keyed by the referenced path,
@@ -157,7 +159,10 @@ policy, not by the system prompt alone:
    so a present file reached only through history is counted,
    credential-checked and alias-protected like any other include and a
    deleted chain is excluded hop by hop (a chain that passed through a
-   directory symlink deleted together with its target is not resolved; a
+   directory symlink deleted together with its target is resolved when the
+   link was committed — its tree entry has mode `120000`, so the hop below it
+   is re-rooted at the link's target — and stays unresolved only for a
+   never-committed link; a
    repository with such chains can take up to eight scan passes, each
    within the scan budget, before the launch fails closed). Included files outside the repository are followed for
    further hops but not themselves checked; they belong to the user. The scan

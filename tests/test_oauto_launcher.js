@@ -2750,6 +2750,67 @@ test('P1 (Codex on 0ca1844): symlink chains, loops, escaping targets and a type 
   assert.equal(up.stdout, `O\0${path.join(fs.realpathSync(chain), '..', 'x.cfg')}\0`);
 });
 
+test('P1 (Codex on 2c743cf): a committed symlink with an ABSOLUTE target inside the repository is an in-repository include target', () => {
+  const sb = sandbox();
+  const token = 'S-LINK-ABSOLUTE-SYNTH-4d4d';
+  const repo = chainRepo(sb, 'link-absolute', { 'conf/b.cfg': includedConfigText(token) }, '../conf/a.cfg');
+  const real = fs.realpathSync(repo);
+  fs.symlinkSync(path.join(real, 'conf', 'b.cfg'), path.join(repo, 'conf', 'a.cfg')); // absolute, inside the repository
+  git(repo, ['add', '-A']);
+  git(repo, ['commit', '-q', '-m', 'absolute link']);
+  fs.rmSync(path.join(repo, 'conf'), { recursive: true });
+  const { r, preflight, prompt } = launchRecordingPrompt(sb, repo); // no override: nothing secret-like is present
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(!preflight.includes(token) && !prompt.includes(token),
+    `the deleted target of an absolute in-repository symlink include must not reach the preflight:\n${preflight}`);
+  assert.deepEqual(excludedLines(preflight), ['conf/a.cfg (included Git config)', 'conf/b.cfg (included Git config)']);
+  // resolve-link: absolute inside → I with the repository-relative path; .git or the root → fail closed; outside → O.
+  const inside = policy(['resolve-link', '--repo', repo, '--link-path', 'conf/a.cfg'], path.join(real, 'conf', 'b.cfg'));
+  assert.equal(inside.status, 0, inside.stderr);
+  assert.equal(inside.stdout, 'I\0conf/b.cfg\0');
+  for (const bad of [path.join(real, '.git', 'config'), real, `${real}/`]) {
+    const refused = policy(['resolve-link', '--repo', repo, '--link-path', 'conf/a.cfg'], bad);
+    assert.notEqual(refused.status, 0, `resolve-link must refuse ${bad}`);
+    assert.match(refused.stderr, /cannot be an included config/);
+  }
+  const outside = policy(['resolve-link', '--repo', repo, '--link-path', 'conf/a.cfg'], `${real}-sibling/x.cfg`);
+  assert.equal(outside.status, 0, outside.stderr);
+  assert.equal(outside.stdout, `O\0${real}-sibling/x.cfg\0`, 'a sibling directory sharing the prefix is outside');
+});
+
+test('a committed DIRECTORY symlink on an included-config path (conf -> realconf), link and target deleted, is resolved within the revision', () => {
+  const sb = sandbox();
+  const token = 'S-DIRLINK-HISTORY-SYNTH-5e5e';
+  // .git/config includes conf/a.cfg; at HEAD `conf` is a symlink to realconf/, which holds a.cfg
+  // with the credential. Both the link and the directory are deleted. git cannot read
+  // HEAD:conf/a.cfg through a tree symlink, so the hop must resolve the directory link.
+  const repo = chainRepo(sb, 'dirlink-history', { 'realconf/a.cfg': includedConfigText(token) }, '../conf/a.cfg');
+  fs.symlinkSync('realconf', path.join(repo, 'conf'));
+  git(repo, ['add', '-A']);
+  git(repo, ['commit', '-q', '-m', 'conf -> realconf']);
+  assert.equal(git(repo, ['ls-tree', 'HEAD', '--', 'conf']).slice(0, 6), '120000');
+  fs.unlinkSync(path.join(repo, 'conf'));
+  fs.rmSync(path.join(repo, 'realconf'), { recursive: true });
+  const { r, preflight, prompt } = launchRecordingPrompt(sb, repo); // no override: nothing secret-like is present
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(!preflight.includes(token) && !prompt.includes(token),
+    `the deleted file behind a deleted committed directory symlink must not reach the preflight:\n${preflight}`);
+  // The diff holds the deleted link `conf` (content "realconf", shown) and the deleted real
+  // file; `conf/a.cfg` itself was never a path git tracked, so only the real file is listed.
+  assert.deepEqual(excludedLines(preflight), ['realconf/a.cfg (included Git config)']);
+  assert.match(preflight, /^-realconf$/m, 'the deleted directory link itself is ordinary content');
+  // resolve-link --rest: the path below the directory link is appended after resolution.
+  const below = policy(['resolve-link', '--repo', repo, '--link-path', 'conf', '--rest', 'deep/a.cfg'], 'elsewhere/real');
+  assert.equal(below.status, 0, below.stderr);
+  assert.equal(below.stdout, 'I\0elsewhere/real/deep/a.cfg\0');
+  const nested = policy(['resolve-link', '--repo', repo, '--link-path', 'etc/conf', '--rest', 'deep/a.cfg'], '../elsewhere/real');
+  assert.equal(nested.status, 0, nested.stderr);
+  assert.equal(nested.stdout, 'I\0elsewhere/real/deep/a.cfg\0', 'a link below the root resolves relative to its own directory');
+  const escaping = policy(['resolve-link', '--repo', repo, '--link-path', 'conf', '--rest', 'a.cfg'], '../../out');
+  assert.equal(escaping.status, 0, escaping.stderr);
+  assert.equal(escaping.stdout, `O\0${path.join(fs.realpathSync(repo), '..', '..', 'out', 'a.cfg')}\0`, 'two levels above the root');
+});
+
 test('P3-4: case-variant secret-like files are denied by their exact name under the override, in both agents and the ceiling', () => {
   const sb = sandbox();
   const repo = mkRepo(sb, 'case-variants', { 'src/a.py': 'x = 1\n', 'Auth.json': '{"t":"SYNTH"}\n',

@@ -229,6 +229,23 @@ parse_config_includes() { # $1: the path the config content on stdin belongs to
   python3 -I "$POLICY" includes-in-config --repo="$REPO" --config-path="$1" >> "$hops_z" ||
     die "the includes of a Git config file could not be read for the preflight"
 }
+history_dir_link() { # $1: revision; $2: repo-relative include path with no entry at $1
+  # A directory on the way may be a committed symlink (conf -> realconf, with conf/a.cfg
+  # included): resolve the first such ancestor within the revision and hand over the path
+  # below it as another hop, so the real file is excluded and followed too.
+  local rev="$1" rest="$2" prefix="" comp mode
+  while [[ "$rest" == */* ]]; do
+    comp="${rest%%/*}"; rest="${rest#*/}"
+    prefix="${prefix:+$prefix/}$comp"
+    mode="$(g ls-tree -z "$rev" -- "$prefix" | head -c 6)"
+    [[ -n "$mode" ]] || return 0           # nothing by that name at this revision
+    [[ "$mode" == 120000 ]] || continue    # an ordinary directory: look below it
+    g cat-file blob "$rev:$prefix" > "$blob_tmp" || return 0
+    python3 -I "$POLICY" resolve-link --repo="$REPO" --link-path="$prefix" --rest="$rest" < "$blob_tmp" >> "$hops_z" ||
+      die "a committed directory symlink on an included Git config path could not be resolved for the preflight (fail closed)"
+    return 0
+  done
+}
 history_pass() {
   local known=() visited=() queue=() depth=() i=0 entry d path rev mode kind target next
   while IFS= read -r -d '' path; do known+=("$path"); done < "$included_z"
@@ -246,9 +263,13 @@ history_pass() {
     if [[ "$entry" == I:* ]]; then
       if [[ -f "$REPO/$path" ]]; then parse_config_includes "$path" < "$REPO/$path"; fi
       for rev in "${history_revs[@]}"; do
-        # No entry at that revision (never committed there): nothing to follow.
         mode="$(g ls-tree -z "$rev" -- "$path" | head -c 6)"
-        [[ -n "$mode" ]] || continue
+        if [[ -z "$mode" ]]; then
+          # No entry under that name at this revision: either never committed there, or a
+          # directory on the way was a committed symlink — resolved as one more hop.
+          history_dir_link "$rev" "$path"
+          continue
+        fi
         g cat-file blob "$rev:$path" > "$blob_tmp" || continue
         if [[ "$mode" == 120000 ]]; then
           # A committed symlink: its blob is the link target, not config text. git would
