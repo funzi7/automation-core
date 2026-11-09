@@ -2856,6 +2856,38 @@ test('P1 (Codex on 4dc70dd): an include path through a directory symlink retarge
     'the written name and the resolved live file are both handed over');
 });
 
+test('P1 (Codex on 9e8a88d): a committed symlink with an absolute target through a later-retargeted directory symlink keeps the written path for history', () => {
+  const sb = sandbox();
+  const token = 'S-ABS-RETARGET-SYNTH-8b8b';
+  // Committed: a.cfg -> /repo/conf/b.cfg (absolute), conf -> oldconf, oldconf/b.cfg (credential);
+  // .git/config includes a.cfg. Then a.cfg and oldconf/b.cfg are deleted and conf is retargeted to
+  // a missing newconf. realpath() alone turns the target into newconf/b.cfg, which history never
+  // had; the written conf/b.cfg leads to the committed conf -> oldconf hop.
+  const repo = chainRepo(sb, 'abs-retarget', { 'oldconf/b.cfg': includedConfigText(token) }, '../a.cfg');
+  const real = fs.realpathSync(repo);
+  fs.symlinkSync('oldconf', path.join(repo, 'conf'));
+  fs.symlinkSync(path.join(real, 'conf', 'b.cfg'), path.join(repo, 'a.cfg'));
+  git(repo, ['add', '-A']);
+  git(repo, ['commit', '-q', '-m', 'absolute link through a directory link']);
+  fs.unlinkSync(path.join(repo, 'a.cfg'));
+  fs.rmSync(path.join(repo, 'oldconf', 'b.cfg'));
+  fs.unlinkSync(path.join(repo, 'conf'));
+  fs.symlinkSync('newconf', path.join(repo, 'conf')); // dangling
+  const { r, preflight, prompt } = launchRecordingPrompt(sb, repo); // no override: nothing secret-like is present
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(!preflight.includes(token) && !prompt.includes(token),
+    `the removed credential behind a retargeted directory symlink must not reach the preflight:\n${preflight}`);
+  assert.deepEqual(excludedLines(preflight), ['a.cfg (included Git config)', 'oldconf/b.cfg (included Git config)']);
+  // resolve-link: the written path and the live-resolved path are both handed over (written first).
+  const both = policy(['resolve-link', '--repo', repo, '--link-path', 'a.cfg'], path.join(real, 'conf', 'b.cfg'));
+  assert.equal(both.status, 0, both.stderr);
+  assert.equal(both.stdout, 'I\0conf/b.cfg\0I\0newconf/b.cfg\0');
+  // A relative target that escapes the repository and re-enters it is inside.
+  const back = policy(['resolve-link', '--repo', repo, '--link-path', 'a.cfg'], `../${path.basename(real)}/conf/b.cfg`);
+  assert.equal(back.status, 0, back.stderr);
+  assert.equal(back.stdout, 'I\0conf/b.cfg\0I\0newconf/b.cfg\0');
+});
+
 test('P3-4: case-variant secret-like files are denied by their exact name under the override, in both agents and the ceiling', () => {
   const sb = sandbox();
   const repo = mkRepo(sb, 'case-variants', { 'src/a.py': 'x = 1\n', 'Auth.json': '{"t":"SYNTH"}\n',

@@ -628,16 +628,19 @@ def _q(path: str) -> str:
     return git_quote(os.fsencode(path))
 
 
-def resolve_link_target(repo: str, link_path: str, target: bytes, rest: str = "") -> tuple[bytes, bytes]:
+def resolve_link_target(repo: str, link_path: str, target: bytes, rest: str = "") -> list[tuple[bytes, bytes]]:
     """A committed symlink's target (its blob content, exactly as git stores it) resolved
     the way git follows the link at runtime: relative to the link's own directory. Pure
-    path arithmetic — the entries are history and need not exist. ``rest``: the path
-    components below the link when the link is a directory on an include path
-    (``conf -> realconf`` with ``conf/a.cfg`` included), appended after resolution. Returns
-    an include record: (b"I", repository-relative path) when the result lies inside the
-    worktree, (b"O", absolute path) for an absolute target outside it or one escaping the
-    repository. An empty target, or a result that is the repository root or lies in .git,
-    fails closed."""
+    path arithmetic on history entries that need not exist. ``rest``: the path components
+    below the link when the link is a directory on an include path (``conf -> realconf``
+    with ``conf/a.cfg`` included), appended after resolution. Every candidate is judged by
+    where it lands — the path exactly as written (normalised lexically, the name history
+    knows) and, when it differs, the path as the live filesystem resolves it (a directory
+    symlink retargeted since the commit) — so a relative target that escapes the
+    repository and re-enters it counts as inside. Returns include records, de-duplicated:
+    (b"I", repository-relative path) for a candidate inside the worktree, (b"O", absolute
+    path) otherwise. An empty target, or a candidate that is the repository root or lies
+    in .git, fails closed."""
     text = target.decode("utf-8", "surrogateescape")
     if not text or "\0" in text:
         _die("a committed symlink include target is empty or malformed (fail closed)")
@@ -648,19 +651,18 @@ def resolve_link_target(repo: str, link_path: str, target: bytes, rest: str = ""
             _die(f"a committed symlink include target resolves to {inner!r}, which cannot be an included config (fail closed)")
         return (b"I", os.fsencode(inner))
 
-    if os.path.isabs(text):
-        # An absolute target is judged by where it lands: inside this repository it is an
-        # in-repository include target like any other (existing directory components are
-        # resolved, so a symlinked spelling of the repository path still counts as inside).
-        absolute = os.path.realpath(os.path.join(text, rest) if rest else text)
-        if absolute == root or absolute.startswith(root + os.sep):
-            return inside(os.path.relpath(absolute, root))
-        return (b"O", os.fsencode(absolute))
-    below = os.path.join(os.path.dirname(link_path), text)
-    joined = os.path.normpath(os.path.join(below, rest) if rest else below)
-    if joined == os.pardir or joined.startswith(os.pardir + os.sep):
-        return (b"O", os.fsencode(os.path.normpath(os.path.join(root, joined))))
-    return inside(joined)
+    base = text if os.path.isabs(text) else os.path.join(root, os.path.dirname(link_path), text)
+    if rest:
+        base = os.path.join(base, rest)
+    records: list[tuple[bytes, bytes]] = []
+    for candidate in dict.fromkeys((os.path.normpath(base), os.path.realpath(base))):
+        if candidate == root or candidate.startswith(root + os.sep):
+            record = inside(os.path.relpath(candidate, root))
+        else:
+            record = (b"O", os.fsencode(candidate))
+        if record not in records:
+            records.append(record)
+    return records
 
 
 def config_value(text: str, section: str, key: str) -> str | None:
@@ -1665,8 +1667,8 @@ def main(argv: list[str]) -> None:
         records = includes_in_config(args.repo, args.config_path, sys.stdin.buffer.read())
         sys.stdout.buffer.write(b"".join(kind + b"\0" + target + b"\0" for kind, target in records))
     elif args.cmd == "resolve-link":
-        kind, target = resolve_link_target(args.repo, args.link_path, sys.stdin.buffer.read(), args.rest)
-        sys.stdout.buffer.write(kind + b"\0" + target + b"\0")
+        records = resolve_link_target(args.repo, args.link_path, sys.stdin.buffer.read(), args.rest)
+        sys.stdout.buffer.write(b"".join(kind + b"\0" + target + b"\0" for kind, target in records))
     elif args.cmd == "quote-path":
         for path in _nul_fields(sys.stdin.buffer.read(), "quote-path", terminated=False):
             print(git_quote(path))

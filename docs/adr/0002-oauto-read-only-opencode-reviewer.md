@@ -144,11 +144,14 @@ policy, not by the system prompt alone:
    helper and its own includes are followed the same way — through files
    outside the repository too; a committed symlink met in that history is
    resolved within the same revision (`git ls-tree` mode `120000`, the blob
-   is the link target, resolved relative to the link's directory; an
-   absolute target is judged by where it lands, so one inside the repository
-   is an in-repository target like any other) and its target excluded and
-   followed, never parsed as config text (Codex P1s on `0ca1844` and
-   `2c743cf`, 2026-11-09) — and every in-repository target found this
+   is the link target, resolved relative to the link's directory; every
+   target is judged by where it lands, both as written and as the live
+   filesystem resolves it, so an absolute target inside the repository, one
+   through a directory symlink retargeted since the commit, or a relative one
+   that escapes and re-enters the repository is an in-repository target like
+   any other) and its target excluded and followed, never parsed as config
+   text (Codex P1s on `0ca1844`, `2c743cf` and `9e8a88d`, 2026-11-09) — and
+   every in-repository target found this
    way is handed back to the scan, which runs again until nothing new
    appears (include targets are tracked under their referenced name and
    their canonical target, and traversal is keyed by the referenced path,
