@@ -343,7 +343,9 @@ tree_walk() { # $1: revision; $2: repo-relative path as referenced
       continue
     fi
     candidate="${resolved:+$resolved/}$comp"
-    mode="$(g ls-tree -z "$rev" -- "$candidate" | head -c 6)"
+    # `:(literal)`: the name is a path, never pathspec magic (a leading `:` would otherwise
+    # be read as magic and the entry silently not found).
+    mode="$(g ls-tree -z "$rev" -- ":(literal)$candidate" | head -c 6)"
     case "$mode" in
       "") return 0 ;;                      # nothing by that name at this revision
       120000)
@@ -424,15 +426,17 @@ history_pass() {
       esac
       next="$kind:$target"
       use_ctx="${inherited:-$target}"
-      if in_list "$next|$use_ctx" "${visited[@]}"; then continue; fi
+      # Visited keys carry the entry's length so a `|` inside a path cannot make two
+      # different (entry, context) pairs collide.
+      if in_list "${#next}:$next|$use_ctx" "${visited[@]}"; then continue; fi
       (( d < 8 )) || die "Git config includes reached through history or outside files nest deeper than 8 levels (fail closed)"
       queue+=("$next"); depth+=("$((d + 1))"); ctx+=("$use_ctx")
     done < "$file"
   }
   while (( i < ${#queue[@]} )); do
     entry="${queue[i]}"; d="${depth[i]}"; c="${ctx[i]}"; i=$((i + 1))
-    if in_list "$entry|$c" "${visited[@]}"; then continue; fi
-    visited+=("$entry|$c")
+    if in_list "${#entry}:$entry|$c" "${visited[@]}"; then continue; fi
+    visited+=("${#entry}:$entry|$c")
     path="${entry#?:}"
     if [[ "$entry" == I:* ]]; then
       if [[ -f "$REPO/$path" ]]; then

@@ -3121,6 +3121,30 @@ test('P1 (Codex on 3833718): outside-alias resolution keeps trailing newlines an
   assert.deepEqual(excludedLines(nested.preflight), ['a.cfg (included Git config)', '"c.cfg\\n" (included Git config)']);
 });
 
+test('independent review: a committed included config whose name starts with ":" is found by the tree walk (literal pathspec), so its chain is followed', () => {
+  const sb = sandbox();
+  const token = 'S-COLON-NESTED-SYNTH-5c5c';
+  // `git ls-tree <rev> -- :inc.cfg` reads the leading ":" as pathspec magic and finds nothing;
+  // the walk must name the entry literally, or the include of nested.cfg is never seen.
+  const repo = chainRepo(sb, 'colon-name', { ':inc.cfg': '[include]\n\tpath = nested.cfg\n', 'nested.cfg': includedConfigText(token) }, '../:inc.cfg');
+  assert.equal(git(repo, ['config', '--get', 'http.extraheader']).trim(), `AUTHORIZATION: bearer ${token}`, 'git itself loaded nested.cfg through :inc.cfg');
+  fs.rmSync(path.join(repo, ':inc.cfg'));
+  fs.rmSync(path.join(repo, 'nested.cfg'));
+  const { r, preflight, prompt } = launchRecordingPrompt(sb, repo); // no override: nothing secret-like is present
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(!preflight.includes(token) && !prompt.includes(token),
+    `the removed credential behind a ":"-named include must not reach the preflight:\n${preflight}`);
+  assert.deepEqual(excludedLines(preflight), [':inc.cfg (included Git config)', 'nested.cfg (included Git config)']);
+  // Two (entry, context) pairs that would collide under a naive "entry|context" key are both followed.
+  const pipe = chainRepo(sb, 'pipe-name', { 'x|y.cfg': '[include]\n\tpath = p.cfg\n', 'p.cfg': includedConfigText('S-PIPE-SYNTH-6d6d'), 'x.cfg': '[include]\n\tpath = q.cfg\n', 'q.cfg': includedConfigText('S-PIPE2-SYNTH-7e7e') }, '../x|y.cfg');
+  fs.appendFileSync(path.join(pipe, '.git', 'config'), '[include]\n\tpath = ../x.cfg\n');
+  for (const f of ['x|y.cfg', 'p.cfg', 'x.cfg', 'q.cfg']) fs.rmSync(path.join(pipe, f));
+  const both = launchRecordingPrompt(sb, pipe);
+  assert.equal(both.r.status, 0, both.r.stderr);
+  assert.ok(!both.preflight.includes('S-PIPE-SYNTH-6d6d') && !both.preflight.includes('S-PIPE2-SYNTH-7e7e'), both.preflight);
+  assert.deepEqual(excludedLines(both.preflight), ['p.cfg (included Git config)', 'q.cfg (included Git config)', 'x.cfg (included Git config)', 'x|y.cfg (included Git config)']);
+});
+
 test('P3-4: case-variant secret-like files are denied by their exact name under the override, in both agents and the ceiling', () => {
   const sb = sandbox();
   const repo = mkRepo(sb, 'case-variants', { 'src/a.py': 'x = 1\n', 'Auth.json': '{"t":"SYNTH"}\n',
