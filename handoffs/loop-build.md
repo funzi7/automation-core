@@ -106,9 +106,10 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
     belong to this worktree`; the victim's `.git/index` unchanged); `Auth.json` under the override is read-denied by
     exact name (rendered `read Auth.json` / `*/Auth.json` and `tool.use read:Auth.json` / `read:*/Auth.json` deny;
     64/46 probes, 45 agent probes). Nothing rendered for refused launches; no OpenCode process or service left.
-  - Final validation at `d2495cd`: `bash scripts/validate.sh` green — YAML, JSON, sync/mirror parity, JS syntax,
-    `node --test` 266/266 (`tests/test_oauto_launcher.js` 94 tests: 75 before this round + 12 in round 1 + 7 in
-    round 2), 59 github-script bodies, actionlint, `git diff --check` — 577 s.
+  - Final validation at `5860e1f` (after the Codex P1 fix below): `bash scripts/validate.sh` green — YAML, JSON,
+    sync/mirror parity, JS syntax, `node --test` 267/267 (`tests/test_oauto_launcher.js` 95 tests: 75 before this
+    round + 12 in round 1 + 7 in round 2 + 1 for the Codex P1), 59 github-script bodies, actionlint,
+    `git diff --check` — 590 s (the run at `d2495cd` was 266/266 in 577 s).
 - Round 2 — resolution of the independent review's findings (`d2495cd`, each reproduced on `43b1708` first):
   P2 → new `check-repo-git` (`parse_dot_git_file`, `own_git_info`, `_git_dir_owned`, `config_value`): `.git` must
   be a real directory, or a `.git` file — parsed exactly as git does — naming a linked-worktree admin dir whose
@@ -139,7 +140,8 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
   `SKIPPED` path is implemented but unexercised. The tightened symlinked-`.git` assertion moved from the scan to
   `check-repo-git` (refused earlier, same outcome).
 - Device: `bash launchers/oauto/install.sh` at `d2495cd` replaced `/root/work/bin/oauto-run` and
-  `oauto-policy.py` (previous copies kept as `*.backup-before-oauto-20261109-020906`); `ai-launch`, the Termux
+  `oauto-policy.py` (previous copies kept as `*.backup-before-oauto-20261109-020906`; `oauto-policy.py` again at
+  `5860e1f`, backup `*-20261109-024432`); `ai-launch`, the Termux
   `oauto-launch` wrapper and both `.bashrc` blocks were already identical and untouched; `install.sh --verify`
   clean; the device-parity test is green; `/root/work/bin/oauto-run <fixture> deepseek --check` through the
   installed copy with the real binary verified sources (verbatim), models and agents (see below). `cauto`,
@@ -179,8 +181,24 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
   linked-worktree config/hook aliases refused, `verify-sources` failing closed on effect casing, array resources,
   missing `info` and an `ask` over `read:*`, scan findings reaching only stderr. Resolution of each finding: see the
   "Round 2" bullet below.
-- Review and gate state: recorded at the end of this entry once the pushed head's exact-head CI, Codex review and
-  Codex Gate verdict exist on the PR; owner-facing state in `agent-memory/automation-core/cc-latest.md`.
+- Codex review of the first pushed head `33c0dda` (`@codex review` 02:20:29Z; receipt 02:27:31Z with `**Reviewed
+  commit:** 33c0dda703`; review-state marker `completed` with `has_unresolved_findings=true`; CI
+  `validate-automation-core` success 02:22:39Z; gate `🟡 Waiting for Codex review` at the push, then `🔴 Active
+  Codex P1/P2 finding` 02:28:25Z): one P1, valid and reproduced by Codex — a real `.git` DIRECTORY carrying a
+  `commondir` file that names another repository was accepted by `own_git_info`'s early return, and git honours
+  that file in any git dir, so the preflight read the victim's refs and objects (its committed file appeared as a
+  deletion in `preflight.md`). Fixed in `5860e1f`: a real `.git` holding a `commondir` file (empty or not) is
+  refused by `check-repo-git` before any git command, the scan reports `SYMLINK .git -> <target> (.git holds a
+  commondir file naming another git dir)`, and a submodule git dir is accepted only without a `commondir` file;
+  regression test `P1 (Codex on 33c0dda)` reproduces the leak shape (victim index untouched, nothing rendered,
+  no preflight) plus the empty-file and planted-submodule variants; README row and ADR item 4 updated;
+  `install.sh` refreshed `oauto-policy.py` (backup `*-20261109-024432`), `--verify` clean. The bridge
+  auto-triggered `@claude fix` on the finding; the Claude fixer hit `billing_error` (0 tokens) and handed off to
+  the watchdog, which cannot run in this repository (rejected `AUTOMATION_PAT`); nothing else touched the branch.
+  The thread was replied to with the fix commit and resolved; a Codex review of the final head was requested.
+- Review and gate state of the final head: recorded in `agent-memory/automation-core/cc-latest.md` (owner-facing
+  state) once the exact-head CI, Codex review and Codex Gate verdict exist on the PR; never claimed here ahead of
+  the evidence.
 - Owner follow-ups: merge PR #58 when satisfied (not merged by this round); rotate the automation-core
   `AUTOMATION_PAT` (LOOP_STATE item 9); the backlog in LOOP_STATE item 11 (action SHA pinning, `validate.sh` YAML
   glob, alias regex, defence-in-depth glob deny); decide whether `DEVELOPMENT_RULES_FULL` §7 lists `oauto`.
@@ -265,6 +283,11 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
   (`completedCodexSummaryTargetsHead` / `codex-pull-request-review-summary` pins) in that repository.
 - Next: after merge, record the first observed marker and `🟠` verdict (if any) in LOOP_STATE item 8;
   confirm paywall-bot #107 goes green with Codex's re-review of the new sync head.
+  - 2026-11-09 02:20Z (recorded by the oauto round above): PR #59 merged as `15e44e6` on 2026-11-08; the first
+    `pull_request_target` gate run from the merged `main` (PR #58 push `33c0dda`, run `42550382183`) logged
+    `indexed trusted head epoch run` and left the `github-actions[bot]` `codex-head-epoch:v3` marker comment on the
+    PR — the marker publish works with `pull-requests: write`. No `🟠` verdict observed (none induced). paywall-bot
+    #107's refresh by the daily sync (03:00 UTC) is still ahead.
 
 ## [2026-11-08 UTC] oauto — Codex P1 round: helper-free git preflight, exact pathnames, no rename hiding
 - PR: <https://github.com/funzi7/automation-core/pull/58> (same PR as the entry below; fixes pushed to its branch)

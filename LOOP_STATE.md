@@ -190,7 +190,15 @@ is the permanent human opt-out and is never removed by automation.
    claim it passes before that evidence exists.
 7. **Longer-term:** update minutes-guard target coverage after downstream audit; keep direct-to-main and branch-protection decisions explicit.
 8. **Codex Gate fail-closed enforcement (2026-11-08) — PR #59 merged to `main`
-   (`15e44e6`, 2026-11-08); post-merge observation pending.** Branch `claude/codex-gate-fail-closed`,
+   (`15e44e6`, 2026-11-08); first post-merge marker publish OBSERVED
+   2026-11-09 02:20Z.** On PR #58's first push after the merge, the
+   `pull_request_target` gate run `42550382183` logged `PR #58: indexed trusted
+   head epoch run 42550382183/1` and left the `github-actions[bot]`
+   `<!-- codex-head-epoch:v3 run=42550382183 attempt=1 pr=58 head=33c0dda… -->`
+   comment on the PR at 02:20:32Z — no `Resource not accessible by
+   integration` any more; the `🟡` pre-review verdict followed as designed. The
+   `🟠` technical-error verdict was not induced and stays covered by the
+   end-to-end tests only. Branch `claude/codex-gate-fail-closed`,
    <https://github.com/funzi7/automation-core/pull/59>. Physically verified:
    the root cause (403 on the PR-comment marker in both repositories; zero
    markers ever written) and the legitimacy of the three paywall-bot merges;
@@ -273,8 +281,11 @@ is the permanent human opt-out and is never removed by automation.
     before any git command runs), plus six P3s fixed (git-exact pointer
     parsing, verbatim rule arrays, exact-name denial of case-variant secret
     files under the override, object-store hard-link accounting, secret-named
-    git-dir aliases, walk errors failing closed). `main` (PR #59) was merged
-    into the branch (`01f6840`). The Codex review, CI and Codex Gate state of the
+    git-dir aliases, walk errors failing closed). Codex's review of the pushed
+    head `33c0dda` added one P1 of the same class — a real `.git` directory
+    carrying a `commondir` file naming another repository — fixed in `5860e1f`
+    (refused before any git command; a submodule git dir is accepted only
+    without one). `main` (PR #59) was merged into the branch (`01f6840`). The Codex review, CI and Codex Gate state of the
     pushed head are recorded in `agent-memory/automation-core/cc-latest.md`.
     DONE by the owner on 2026-11-08: the Termux hop (`oauto <repo>` from a real
     Termux shell) and a review of a real project repository (the GLM audit).

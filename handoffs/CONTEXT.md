@@ -429,9 +429,10 @@ A00. Codex Gate fail-closed enforcement (2026-11-08, branch
   any automated merge here. After the merge, the first
   `pull_request_target` gate run on `main` (any push to an open PR, e.g. #58,
   or a new PR) must log `indexed trusted head epoch run` and leave a
-  `github-actions[bot]` `codex-head-epoch:v3` comment on that PR — this cannot
-  be observed before merge because `pull_request_target` loads the gate from
-  the default branch; the `🟠` verdict cannot be induced safely in production
+  `github-actions[bot]` `codex-head-epoch:v3` comment on that PR — OBSERVED
+  2026-11-09 02:20Z on PR #58's first push after the merge (PR #59 merged as
+  `15e44e6` on 2026-11-08): run `42550382183` logged `indexed trusted head
+  epoch run 42550382183/1` and the marker comment is on the PR, no 403; the `🟠` verdict cannot be induced safely in production
   and stays covered by the end-to-end tests only. Then paywall-bot's daily
   sync (03:00 UTC cron, template-identical `sync-automation-core.yml`; or an
   owner `gh workflow run sync-automation-core.yml --repo funzi7/paywall-bot`)
@@ -499,7 +500,9 @@ A1. oauto — read-only OpenCode reviewer launcher (2026-11-07):
   `check-repo-git` before any git command, plus six P3s (git-exact pointer
   parsing, verbatim arrays, exact-name denial of case-variant secret files
   under the override, object-store hard-link accounting, secret-named git-dir
-  aliases, walk errors failing closed). Shown
+  aliases, walk errors failing closed); Codex's review of the pushed head
+  `33c0dda` added one P1 of the same class — a real `.git` directory carrying
+  a `commondir` file naming another repository — fixed in `5860e1f`. Shown
   NOT reproducible on the real binary: the claimed backslash glob escape
   (ripgrep `--glob` filter rooted at the tool path; `external_directory` gates
   the path) — no rule added. Recorded as backlog, not changed here: mutable
