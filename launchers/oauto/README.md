@@ -8,11 +8,15 @@ else. Rationale and the enforcement model: `docs/adr/0002-oauto-read-only-openco
 ## Usage (from Termux)
 
 ```bash
-oauto <repo>            # GLM-5.3-Flash Free reviewer (default)
-oauto <repo> deepseek   # DeepSeek V4.1 Flash Free reviewer, a separate session
-oauto <repo> --check    # run the whole preflight + verification, print the banner, do not launch
-oauto                   # repository menu, same as cauto/clauto
-oauto deepseek          # repository menu, then the DeepSeek reviewer
+oauto <repo>               # GLM-5.3-Flash Free reviewer (default)
+oauto <repo> deepseek      # DeepSeek V4.1 Flash Free reviewer, a separate session
+oauto <repo> --check       # run the whole preflight + verification, print the banner, do not launch
+oauto <repo> pr            # PR review mode: the current branch's open pull request, against its base
+oauto <repo> deepseek pr   # the same with the DeepSeek reviewer (`pr` and the alias in either order)
+oauto <repo> pr --check    # PR mode preflight + verification, banner with the pull request, no launch
+oauto                      # repository menu, same as cauto/clauto
+oauto deepseek             # repository menu, then the DeepSeek reviewer
+oauto pr                   # repository menu, then PR review mode (`oauto deepseek pr` likewise)
 ```
 
 Only one oauto session per repository can be open at a time
@@ -30,19 +34,79 @@ retention and no training; that is the provider's term, not something the device
 enforce. Session content is also stored locally in `~/.local/share/opencode/opencode.db`;
 treat that directory as sensitive. The preflight is passed as a command-line argument,
 so it is visible in `/proc/<pid>/cmdline` to processes of the same user while the
-session runs.
+session runs. In PR review mode the preflight carries the pull request's delta against
+its base instead of the branch delta against the upstream (see below).
 
 ## Approved models
 
-| Alias | Model id | Pricing | Published terms (opencode.ai/docs/zen, 2026-11-07) |
+| Alias | Model id | Pricing | Published terms (opencode.ai/docs/zen, read 2026-11-07, re-checked 2026-11-09) |
 |---|---|---|---|
-| `glm` (default) | `opencode/glm-5.3-flash-free` | Free ($0 in/out) | zero-retention, no training |
-| `deepseek` | `opencode/deepseek-v4.1-flash-free` | Free ($0 in/out) | zero-retention, no training |
+| `glm` (default) | `opencode/glm-5.3-flash-free` | Free ($0 in/out), still listed Free | "GLM-5.3-Flash Free … Its provider follows a zero-retention policy and does not use your data for model training" |
+| `deepseek` | `opencode/deepseek-v4.1-flash-free` | Free ($0 in/out), still listed Free | "DeepSeek V4.1 Flash Free … Its provider follows a zero-retention policy and does not use your data for model training" |
 
 Every other model the binary offers is disabled before launch and the launch is
 refused unless `opencode models` lists exactly these two. No other provider can be
 used or connected (policy), and the environment is scrubbed so no API key reaches
 OpenCode.
+
+## PR review mode (`oauto <repo> pr`)
+
+The owner chose this on 2026-11-09 as option 1: **the default mode is unchanged** (its
+preflight, prompt and banner are byte-for-byte those of `1e6fbd0`, which a test checks),
+and PR review is a separate, explicit mode. It reviews the open pull request whose head
+is the current branch: the preflight's delta section becomes
+`## Pull request #<n> delta vs origin/<base> (merge-base...HEAD)` (the `--stat` block,
+then the diff), its header names the pull request, GitHub's and the local base, the
+merge base and the reviewed local HEAD, and the first prompt asks for that delta to be
+reviewed, with any uncommitted changes reviewed separately. On a branch whose upstream
+equals HEAD (PR #58 itself) the default mode shows an empty branch delta; PR mode shows
+the whole pull request against `main`.
+
+How the pull request is identified — by the launcher, outside the model's tool
+execution, after the lock and `check-repo-git` and before the scan:
+
+1. `remote.origin.url`, read through the hardened git helper, must be
+   `https://github.com/<owner>/<repo>[.git]`, `git@github.com:<owner>/<repo>[.git]` or
+   `ssh://git@github.com/<owner>/<repo>[.git]`. The URL goes to the policy on stdin and
+   is never printed (it may embed a credential).
+2. One authenticated, read-only REST call:
+   `gh api -H 'Accept: application/vnd.github+json' 'repos/<owner>/<repo>/pulls?state=open&head=<owner>:<branch>&per_page=10'`
+   (branch percent-encoded), under `timeout 60` and `env -i` keeping only `HOME`, `PATH`,
+   `GH_PAGER=cat`, `GH_PROMPT_DISABLED=1`, `GH_NO_UPDATE_NOTIFIER=1`, `TERM=dumb`; gh uses
+   its own stored login. `OAUTO_GH_BIN` replaces the binary (the tests use
+   `tests/fixtures/fake-gh`).
+3. `oauto-policy.py pr-select` validates the response and hands back only the number,
+   `html_url`, base branch, base sha and head sha. The response is deleted at once;
+   nothing else from it (title, body, users …) is used.
+4. The base must exist locally as `origin/<base>`; the existing `base` variable is set to
+   it, so the existing pipeline (name collection, exhaustive rename pairs,
+   classification, content checks, exclusion proof, caps) produces the pull request's
+   delta. When GitHub's base sha differs from the local `origin/<base>`, the launch goes
+   on and the preflight states both and that the merge base comes from the local ref.
+
+It fails closed — the reason printed, nothing scanned or rendered, never a fall back to
+the default review — on: a detached HEAD or a branch without commits; no origin URL, or
+none of the three GitHub forms; gh missing, failing (unauthenticated, network, 4xx/5xx:
+its stderr summarised to three lines with token-shaped words redacted) or timing out;
+a response that is not a JSON array of objects; no open pull request; more than one
+(`ambiguous: PRs #a, #b`); a head branch other than the current one; a head in another
+repository (a fork, or a deleted one); a base in another repository; an empty base
+branch, or one outside git's ref-name rules over a conservative character set; a
+missing or malformed number, `html_url`, base sha or head sha; GitHub's head sha not the
+local HEAD (`push or pull first — the launcher never fetches`); `origin/<base>` missing
+locally (`fetch it first`), ambiguous (a local branch or tag of that name) or without a
+merge base with HEAD. Should HEAD or `origin/<base>` move while the preflight is being
+collected, the preflight is deleted and the launch refused.
+
+The launcher never fetches, pulls, checks out, switches, updates a ref or creates a
+worktree: it reviews what is local and says so. Everything else is the default mode's —
+lock (taken before the GitHub call), scan, history traversal, secret exclusions (in the
+pull request's delta and in the uncommitted changes alike), caps, rendered config,
+permissions, policies and models; no tool, permission or model is added.
+
+What is transmitted: the model receives the pull request's delta instead of the upstream
+delta, plus its number, URL and the base, merge-base and head shas. The launcher itself
+sends the repository and branch name to `api.github.com` with your gh login (one read).
 
 ## What is blocked, and how
 
@@ -92,12 +156,12 @@ contains a credential-looking assignment, in which case the launch is refused.
 | Path | Role |
 |---|---|
 | `launchers/ai-launch` | shared launcher (tracked copy of `/root/work/bin/ai-launch`); the `opencode` mode hands off to `oauto-run` right after repository resolution, before the cauto/clauto banner |
-| `launchers/oauto/oauto-run` | lock, preflight, scan, git metadata, config render, diagnostics, exec |
-| `launchers/oauto/oauto-policy.py` | one pattern list → renders `opencode.json`, scans the worktree, classifies paths, verifies `debug config` / `debug agents` / `models` output |
+| `launchers/oauto/oauto-run` | lock, preflight, PR identification (PR mode), scan, git metadata, config render, diagnostics, exec |
+| `launchers/oauto/oauto-policy.py` | one pattern list → renders `opencode.json`, scans the worktree, classifies paths, verifies `debug config` / `debug agents` / `models` output; `pr-query` / `pr-select` for PR mode |
 | `launchers/oauto/install.sh` | idempotent installer (`--verify` reports drift; replaced files are backed up as `*.backup-before-oauto-<stamp>`) |
 | `launchers/oauto/termux/oauto-launch` | Termux entrypoint (`proot-distro login debian -- ai-launch opencode`) |
 | `launchers/oauto/termux/bashrc-snippet.sh`, `debian-bashrc-snippet.sh` | `oauto()` shell functions |
-| `tests/test_oauto_launcher.js`, `tests/fixtures/` | deterministic contract and behaviour tests driven against `fake-opencode`, a test double of the CLI surface (run by `scripts/validate.sh`) |
+| `tests/test_oauto_launcher.js`, `tests/fixtures/` | deterministic contract and behaviour tests driven against `fake-opencode`, a test double of the CLI surface, and `fake-gh`, one of PR mode's GitHub call (run by `scripts/validate.sh`) |
 
 Install or refresh on the device: `bash launchers/oauto/install.sh` (then open a new
 Termux shell so `.bashrc` is re-read). Per launch, oauto writes only under

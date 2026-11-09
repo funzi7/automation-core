@@ -22,6 +22,15 @@ Subcommands
                   added, context or hunk-header text; --checker for a rename/copy
                   partner), 0 when not.
   quote-path      Print NUL-delimited paths from stdin C-quoted like git, one per line.
+  pr-query        PR review mode. Read remote.origin.url on stdin (never argv: it may
+                  embed a credential); print owner/repo and the GitHub REST endpoint that
+                  lists the open pull requests whose head is --branch, NUL-delimited; exit
+                  2 unless origin is a github.com repository in one of three URL forms.
+  pr-select       PR review mode. Read that endpoint's JSON on stdin; print the single
+                  pull request's number, html_url, base ref, base sha and head sha,
+                  NUL-delimited, once it is validated against --branch, --head and
+                  --repo; exit 2 with the reason otherwise (none, several, fork head,
+                  head not the local HEAD, malformed ...). Nothing else is printed.
   includes-in-config
                   Read Git config content on stdin (a committed blob, or a file
                   outside the repository); print the include targets it names, resolved
@@ -51,6 +60,7 @@ import re
 import stat
 import sys
 import time
+import urllib.parse
 
 # ---------------------------------------------------------------------------
 # Approved models (OpenCode Zen free tier). Their published terms on
@@ -921,6 +931,152 @@ def check_excluded(excluded_file: str, remaining_file: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# PR review mode (`oauto <repo> pr`). The launcher identifies the pull request outside
+# the model's tool execution: the GitHub repository from the origin remote, the pull
+# request from one authenticated, read-only REST call the launcher makes with `gh api`.
+# Only the five fields pr_select validates and prints reach the launcher.
+# ---------------------------------------------------------------------------
+
+# The three github.com remote spellings oauto accepts, each with an optional `.git`;
+# any other host, scheme, user-info, port or path fails closed. GitHub owner names are
+# letters, digits and inner hyphens (at most 39); repository names letters, digits, `.`,
+# `_` and `-`.
+_GITHUB_OWNER = r"(?P<owner>[A-Za-z0-9][A-Za-z0-9-]{0,38})"
+_GITHUB_NAME = r"(?P<name>[A-Za-z0-9._-]{1,100}?)(?:\.git)?"
+GITHUB_REMOTE_FORMS = tuple(re.compile(prefix + _GITHUB_OWNER + "/" + _GITHUB_NAME)
+                            for prefix in (r"https://github\.com/", r"git@github\.com:", r"ssh://git@github\.com/"))
+_GITHUB_REPOSITORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}")
+PR_LIST_PER_PAGE = 10
+_OBJECT_NAME = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")   # SHA-1, or SHA-256
+_PR_HTML_URL = re.compile(r"https://github\.com/(?P<repo>[A-Za-z0-9-]+/[A-Za-z0-9._-]+)/pull/(?P<number>[1-9][0-9]*)")
+# The base branch is handed to git as refs/remotes/origin/<name> and printed in the
+# preflight, the prompt and the banner: git's ref-name rules over a conservative set.
+_BASE_REF_CHARS = re.compile(r"[A-Za-z0-9._+/-]+")
+
+
+def github_repository(url: str) -> str | None:
+    """``owner/repo`` for a remote URL in one of GITHUB_REMOTE_FORMS, else None."""
+    for form in GITHUB_REMOTE_FORMS:
+        m = form.fullmatch(url)
+        if m and m.group("name") not in (".", ".."):
+            return f"{m.group('owner')}/{m.group('name')}"
+    return None
+
+
+def base_ref_ok(ref: str) -> bool:
+    """A pull request base branch name oauto hands to git: letters, digits and ``._+/-``;
+    no empty, ``.``-leading or ``.lock``-ending component (so no leading, trailing or
+    doubled ``/``), no ``..``, no trailing ``.``, and not ``HEAD``."""
+    if ref == "HEAD" or not _BASE_REF_CHARS.fullmatch(ref) or ".." in ref or ref.endswith("."):
+        return False
+    return all(part and not part.startswith(".") and not part.endswith(".lock") for part in ref.split("/"))
+
+
+def _shown(value) -> str:
+    """A value taken from the GitHub response, printable on one ASCII line."""
+    if isinstance(value, str):
+        return git_quote(value.encode("utf-8", "backslashreplace"), always=True)
+    return json.dumps(value)[:80]
+
+
+def _is_pr_number(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _full_name(side: dict) -> str | None:
+    repo = side.get("repo")
+    name = repo.get("full_name") if isinstance(repo, dict) else None
+    return name if isinstance(name, str) else None
+
+
+def pr_query(remote_url: bytes, branch: str) -> bytes:
+    """NUL-terminated ``owner/repo`` and the REST endpoint (relative to api.github.com)
+    listing the open pull requests whose head is ``branch`` there: head filter
+    ``<owner>:<branch>``, the branch percent-encoded. ``remote_url`` arrives on stdin and is
+    never printed: it may embed a credential."""
+    repo = github_repository(remote_url.decode("utf-8", "surrogateescape").rstrip("\n"))
+    if repo is None:
+        _die("origin is not a GitHub repository: remote.origin.url is none of https://github.com/<owner>/<repo>[.git], "
+             "git@github.com:<owner>/<repo>[.git] and ssh://git@github.com/<owner>/<repo>[.git] "
+             "(the URL is not printed, it may embed a credential)")
+    raw = os.fsencode(branch)
+    if not raw:
+        _die("pr-query: empty branch name")
+    owner = repo.split("/", 1)[0]
+    head = urllib.parse.quote_from_bytes(raw, safe="/")
+    endpoint = f"repos/{repo}/pulls?state=open&head={owner}:{head}&per_page={PR_LIST_PER_PAGE}"
+    return repo.encode() + b"\0" + endpoint.encode() + b"\0"
+
+
+def pr_select(data: bytes, branch: str, head: str, repo: str) -> bytes:
+    """The one open pull request of ``branch`` in ``repo`` (owner/repo), taken from the
+    ``GET repos/<repo>/pulls?state=open&head=<owner>:<branch>`` response, as five
+    NUL-terminated fields: number, html_url, base ref, base sha, head sha. Exit 2 with the
+    reason, printing nothing, unless the response is a JSON array holding exactly one pull
+    request whose head is ``branch`` of ``repo`` itself (not a fork) at the local HEAD
+    ``head``, whose base is a branch of ``repo``, and whose number, html_url and shas are
+    well formed. Owner and repository names compare case-insensitively, as GitHub treats
+    them; branch names and shas compare exactly. Nothing else in the response is used."""
+    if not _GITHUB_REPOSITORY.fullmatch(repo):
+        _die(f"pr-select: --repo {_shown(repo)} is not owner/repo")
+    if not _OBJECT_NAME.fullmatch(head):
+        _die(f"pr-select: --head {_shown(head)} is not a full object name")
+    shown_branch = git_quote(os.fsencode(branch))
+    try:
+        pulls = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        _die("the pull request list GitHub returned is not valid JSON (fail closed)")
+    if not isinstance(pulls, list) or not all(isinstance(p, dict) for p in pulls):
+        _die("the pull request list GitHub returned is not a JSON array of pull request objects (fail closed)")
+    if not pulls:
+        _die(f"no open pull request for branch {shown_branch} in {repo}: PR mode reviews the open pull request "
+             "whose head is the current branch")
+    if len(pulls) > 1:
+        numbers = ", ".join(f"#{p['number']}" if _is_pr_number(p.get("number")) else "#?" for p in pulls)
+        _die(f"ambiguous: PRs {numbers} are open for branch {shown_branch} in {repo}; PR mode reviews exactly one")
+    pr = pulls[0]
+    number = pr.get("number")
+    if not _is_pr_number(number):
+        _die("the pull request GitHub returned has no valid number (fail closed)")
+    head_side, base_side = pr.get("head"), pr.get("base")
+    if not isinstance(head_side, dict) or not isinstance(base_side, dict):
+        _die(f"pull request #{number} has no head or base object (fail closed)")
+    head_ref = head_side.get("ref")
+    try:
+        same_branch = isinstance(head_ref, str) and head_ref.encode("utf-8") == os.fsencode(branch)
+    except UnicodeEncodeError:
+        same_branch = False
+    if not same_branch:
+        _die(f"pull request #{number}'s head branch is {_shown(head_ref)}, not the local branch {shown_branch} (fail closed)")
+    head_repo = _full_name(head_side)
+    if head_repo is None or head_repo.lower() != repo.lower():
+        where = _shown(head_repo) if head_repo is not None else "an unknown (deleted) repository"
+        _die(f"pull request #{number}'s head is in {where}, not in {repo}: a fork head is not this repository's branch (fail closed)")
+    base_repo = _full_name(base_side)
+    if base_repo is None or base_repo.lower() != repo.lower():
+        where = _shown(base_repo) if base_repo is not None else "an unknown repository"
+        _die(f"pull request #{number}'s base is in {where}, not in {repo} (fail closed)")
+    base_ref = base_side.get("ref")
+    if not isinstance(base_ref, str) or not base_ref:
+        _die(f"pull request #{number} has an empty base branch (fail closed)")
+    if not base_ref_ok(base_ref):
+        _die(f"pull request #{number}'s base branch {_shown(base_ref)} is not a branch name oauto hands to git (fail closed)")
+    base_sha = base_side.get("sha")
+    if not (isinstance(base_sha, str) and _OBJECT_NAME.fullmatch(base_sha)):
+        _die(f"pull request #{number} has no valid base.sha (fail closed)")
+    head_sha = head_side.get("sha")
+    if not (isinstance(head_sha, str) and _OBJECT_NAME.fullmatch(head_sha)):
+        _die(f"pull request #{number} has no valid head.sha (fail closed)")
+    url = pr.get("html_url")
+    m = _PR_HTML_URL.fullmatch(url) if isinstance(url, str) else None
+    if m is None or m.group("repo").lower() != repo.lower() or int(m.group("number")) != number:
+        _die(f"pull request #{number} has no html_url of the form https://github.com/{repo}/pull/{number} (fail closed)")
+    if head_sha != head:
+        _die(f"the PR head is {head_sha}, the local HEAD is {head}: push or pull first — the launcher never fetches")
+    return b"".join(field.encode() + b"\0" for field in (str(number), url, base_ref, base_sha, head_sha))
+
+
+# ---------------------------------------------------------------------------
 # Scanner: one walk, no pruning (an explicit grep path bypasses ignore rules)
 # ---------------------------------------------------------------------------
 
@@ -1627,6 +1783,12 @@ def main(argv: list[str]) -> None:
                        help="CONTENT_CHECKS key to apply (a rename/copy partner's) instead of the one the name selects")
     p_cdc.add_argument("path", help="repository-relative path whose diff is on stdin")
     sub.add_parser("quote-path")
+    p_prq = sub.add_parser("pr-query")
+    p_prq.add_argument("--branch", required=True, help="local branch (refs/heads/<branch>) whose pull request is wanted")
+    p_prs = sub.add_parser("pr-select")
+    p_prs.add_argument("--branch", required=True, help="local branch the pull request's head must be")
+    p_prs.add_argument("--head", required=True, help="local HEAD object name the pull request's head sha must equal")
+    p_prs.add_argument("--repo", required=True, help="owner/repo (from pr-query) holding the pull request's head and base")
     p_inc = sub.add_parser("includes-in-config")
     p_inc.add_argument("--repo", required=True, help="repository root")
     p_inc.add_argument("--config-path", required=True, metavar="REL",
@@ -1677,6 +1839,10 @@ def main(argv: list[str]) -> None:
     elif args.cmd == "quote-path":
         for path in _nul_fields(sys.stdin.buffer.read(), "quote-path", terminated=False):
             print(git_quote(path))
+    elif args.cmd == "pr-query":
+        sys.stdout.buffer.write(pr_query(sys.stdin.buffer.read(), args.branch))
+    elif args.cmd == "pr-select":
+        sys.stdout.buffer.write(pr_select(sys.stdin.buffer.read(), args.branch, args.head, args.repo))
     elif args.cmd == "verify-sources":
         config_dir = args.config_dir.rstrip("/")
         verify_sources(json.load(sys.stdin), config_dir, os.path.join(config_dir, "opencode.json"), args.deny_read)

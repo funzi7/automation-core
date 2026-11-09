@@ -20,7 +20,14 @@
 #   6. exec of OpenCode in a scrubbed environment with --standalone (no background
 #      service), never with --auto.
 #
-# Usage: oauto-run <repo-path> [glm|deepseek] [--check] [--render-only]
+# `pr` selects the PR review mode (owner decision 2026-11-09; the default mode is
+# unchanged): the open pull request whose head is the current branch is identified
+# before the scan through one read-only GitHub API call (gh, scrubbed environment),
+# and the branch delta of step 3 is taken against that pull request's base,
+# origin/<base>, which must already exist locally. Nothing is ever fetched, checked out
+# or moved; any doubt about the pull request fails closed.
+#
+# Usage: oauto-run <repo-path> [glm|deepseek] [pr] [--check] [--render-only]
 set -euo pipefail
 
 OAUTO_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
@@ -42,18 +49,20 @@ die() { printf 'oauto: FAILED (fail closed): %s\n' "$*" >&2; exit 1; }
 note() { printf 'oauto: %s\n' "$*" >&2; }
 
 REPO="${1:-}"
-[[ -n "$REPO" ]] || die "usage: oauto-run <repo-path> [glm|deepseek] [--check] [--render-only]"
+[[ -n "$REPO" ]] || die "usage: oauto-run <repo-path> [glm|deepseek] [pr] [--check] [--render-only]"
 shift
 MODEL_ALIAS=glm
 MODE=launch
+PR_MODE=0
 LOCKED=0
 for arg in "$@"; do
   case "$arg" in
     glm|deepseek) MODEL_ALIAS="$arg" ;;
+    pr) PR_MODE=1 ;;
     --check) MODE=check ;;
     --render-only) MODE=render ;;
     --locked) LOCKED=1 ;;
-    *) die "unknown argument '$arg' (accepted: glm, deepseek, --check, --render-only)" ;;
+    *) die "unknown argument '$arg' (accepted: glm, deepseek, pr, --check, --render-only)" ;;
   esac
 done
 
@@ -88,6 +97,7 @@ if (( ! LOCKED )); then
   fi
   mode_flag=()
   [[ "$MODE" == check ]] && mode_flag=(--check)
+  (( PR_MODE )) && mode_flag+=(pr)
   exec "$FLOCK_BIN" -n -E 75 --exclusive --close "$LOCK_FILE" \
     "$BASH" "$0" "$REPO" "$MODEL_ALIAS" "${mode_flag[@]}" --locked
 fi
@@ -192,12 +202,73 @@ tmp_files+=("$included_z" "$origins_z" "$missing_z" "$extra_z" "$unruled_z" "$wa
 # are written); the scan treats each one inside the worktree as Git configuration.
 g config --list --show-origin -z > "$origins_z" || die "git configuration cannot be listed (fail closed)"
 
-# The commits the history pass reads: HEAD, and its merge base with the branch-delta base.
+# PR review mode: the pull request is identified here, outside the model's tool
+# execution and before the scan, so a doubtful pull request fails before anything is
+# scanned or rendered. The GitHub repository comes from the origin remote, the pull
+# request from one authenticated, read-only REST call through gh in a scrubbed
+# environment; oauto-policy.py validates the response and hands back five fields, and
+# nothing else from it is used or kept. The base must already be present locally as
+# origin/<base>: no fetch, checkout or ref update ever happens, and no failure falls
+# back to the default review.
+GH_BIN="${OAUTO_GH_BIN:-gh}"
+gh_error_summary() { # $1: gh's stderr -> one printable ASCII line (first three non-empty lines, token-shaped words redacted)
+  LC_ALL=C sed -E -e 's/\r//g' -e 's/[^[:print:]]/?/g' -e '/^[[:space:]]*$/d' \
+    -e 's/(gh[pousr]_|github_pat_)[A-Za-z0-9_]+/\1[redacted]/g' \
+    -e 's/([Bb]earer|[Tt]oken|[Bb]asic)[[:space:]]+[^[:space:]]+/\1 [redacted]/g' -- "$1" 2>/dev/null |
+    head -n 3 | cut -c1-200 | paste -s -d '|' - | sed 's/|/ | /g' || true
+}
+pr_identify() { # sets pr_branch pr_repo pr_number pr_url pr_base_ref pr_base_sha pr_head_sha pr_local_base, or dies
+  local full_ref remote_url endpoint gh_status=0 summary pr_query_z pulls_json gh_err pr_fields
+  full_ref="$(g symbolic-ref -q HEAD)" && [[ "$full_ref" == refs/heads/?* ]] ||
+    die "PR mode reviews the pull request of the current branch, but HEAD is detached"
+  pr_branch="${full_ref#refs/heads/}"
+  [[ "$head_sha" != "(no commits)" ]] || die "PR mode: branch $pr_branch has no commits"
+  remote_url="$(g config --get remote.origin.url)" ||
+    die "PR mode needs the GitHub repository of the origin remote, but remote.origin.url is not set"
+  pr_query_z="$(mktemp "$STATE_DIR/.prquery.XXXXXX")"
+  pulls_json="$(mktemp "$STATE_DIR/.pulls.XXXXXX")"
+  gh_err="$(mktemp "$STATE_DIR/.gherr.XXXXXX")"
+  pr_fields="$(mktemp "$STATE_DIR/.prfields.XXXXXX")"
+  tmp_files+=("$pr_query_z" "$pulls_json" "$gh_err" "$pr_fields")
+  # The URL travels on stdin, never in argv or a message: it may embed a credential.
+  printf '%s' "$remote_url" | python3 -I "$POLICY" pr-query --branch="$pr_branch" > "$pr_query_z" ||
+    die "PR mode: the GitHub repository could not be taken from the origin remote (see the reason above)"
+  { IFS= read -r -d '' pr_repo && IFS= read -r -d '' endpoint; } < "$pr_query_z" ||
+    die "PR mode: malformed pr-query output (fail closed)"
+  command -v "$GH_BIN" >/dev/null 2>&1 ||
+    die "PR mode needs the GitHub CLI to identify the pull request, but '$GH_BIN' was not found"
+  timeout 60 env -i HOME="$HOME" PATH="$PATH" GH_PAGER=cat GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 TERM=dumb "$GH_BIN" api -H 'Accept: application/vnd.github+json' "$endpoint" > "$pulls_json" 2> "$gh_err" || gh_status=$?
+  if (( gh_status != 0 )); then
+    summary="$(gh_error_summary "$gh_err")"
+    if (( gh_status == 124 )); then summary="timed out after 60 s${summary:+; $summary}"; fi
+    die "PR mode: the read-only GitHub API call listing the open pull requests of branch $pr_branch in $pr_repo failed (gh exit $gh_status: ${summary:-no error text}); nothing was scanned or rendered, and the default review is not used instead"
+  fi
+  python3 -I "$POLICY" pr-select --branch="$pr_branch" --head="$head_sha" --repo="$pr_repo" < "$pulls_json" > "$pr_fields" ||
+    die "PR mode: the pull request of branch $pr_branch could not be identified (see the reason above); nothing was scanned or rendered, and the default review is not used instead"
+  rm -f -- "$pulls_json" "$gh_err"   # only the validated fields are kept
+  { IFS= read -r -d '' pr_number && IFS= read -r -d '' pr_url && IFS= read -r -d '' pr_base_ref &&
+    IFS= read -r -d '' pr_base_sha && IFS= read -r -d '' pr_head_sha; } < "$pr_fields" ||
+    die "PR mode: malformed pr-select output (fail closed)"
+  [[ "$pr_head_sha" == "$head_sha" ]] || die "PR mode: the pull request head is not the local HEAD (fail closed)"
+  pr_local_base="$(g rev-parse --verify --quiet "refs/remotes/origin/$pr_base_ref^{commit}")" ||
+    die "the PR base $pr_base_ref is not present locally as origin/$pr_base_ref; fetch it first — the launcher never fetches"
+  # The delta names origin/<base>; a local branch or tag of that name would resolve first.
+  [[ "$(g rev-parse --verify --quiet "origin/$pr_base_ref^{commit}")" == "$pr_local_base" ]] ||
+    die "PR mode: origin/$pr_base_ref is ambiguous (a branch or tag of that name resolves to another commit than refs/remotes/origin/$pr_base_ref); rename it"
+  g merge-base "origin/$pr_base_ref" HEAD >/dev/null ||
+    die "origin/$pr_base_ref and HEAD have no merge base (unrelated or shallow history), so pull request #$pr_number has no delta to review here; the launcher never fetches"
+}
+
+# The commits the history pass reads: HEAD, and its merge base with the branch-delta base
+# (in PR mode the pull request's base, origin/<base>).
 branch="$(g symbolic-ref --short -q HEAD || echo '(detached)')"
 head_sha="$(g rev-parse --verify -q HEAD || echo '(no commits)')"
 upstream="$(g rev-parse --abbrev-ref --symbolic-full-name '@{u}' || true)"
 base=""
-if [[ "$head_sha" != "(no commits)" ]]; then
+if (( PR_MODE )); then
+  pr_identify
+  base="origin/$pr_base_ref"
+elif [[ "$head_sha" != "(no commits)" ]]; then
   for cand in "$upstream" origin/main origin/master main master; do
     [[ -n "$cand" ]] || continue
     # A candidate without a merge base (unrelated or shallow history) has no
@@ -555,6 +626,15 @@ set +e +o pipefail   # a repository without commits or without a base must still
   echo "- HEAD: $head_sha"
   echo "- Upstream: ${upstream:-(none)}"
   echo "- Base for branch delta: ${base:-(none found)} ${ahead_behind:+($ahead_behind)}"
+  if (( PR_MODE )); then
+    echo "- Pull request: #$pr_number $pr_url"
+    echo "- PR base branch: $pr_base_ref (GitHub base ${pr_base_sha:0:12}; local origin/$pr_base_ref ${pr_local_base:0:12})"
+    if [[ "$pr_base_sha" != "$pr_local_base" ]]; then
+      echo "- Note: GitHub's base $pr_base_sha is not the local origin/$pr_base_ref $pr_local_base; the merge base below is computed from the local ref (the launcher never fetches)"
+    fi
+    echo "- Merge base: $merge_base"
+    echo "- Reviewed local HEAD: $head_sha (= PR head)"
+  fi
   if [[ -s "$display" ]]; then
     echo
     echo "## Excluded from this preflight (secret-like paths; names only)"
@@ -584,7 +664,11 @@ set +e +o pipefail   # a repository without commits or without a base must still
   fi
   if [[ -n "$base" ]]; then
     echo
-    echo "## Branch delta vs $base (merge-base...HEAD)"
+    if (( PR_MODE )); then
+      echo "## Pull request #$pr_number delta vs origin/$pr_base_ref (merge-base...HEAD)"
+    else
+      echo "## Branch delta vs $base (merge-base...HEAD)"
+    fi
     echo '```'
     gd --stat "$base...HEAD" -- "${exclude_spec[@]}" | capped "$STAT_MAX_BYTES"
     echo '```'
@@ -595,6 +679,14 @@ set +e +o pipefail   # a repository without commits or without a base must still
 } > "$PREFLIGHT_FILE"
 set -e -o pipefail
 chmod 600 "$PREFLIGHT_FILE"
+if (( PR_MODE )); then
+  # The preflight names one exact head and base: refused if either moved while it was collected.
+  if [[ "$(g rev-parse --verify -q HEAD)" != "$head_sha" ||
+        "$(g rev-parse --verify --quiet "refs/remotes/origin/$pr_base_ref^{commit}")" != "$pr_local_base" ]]; then
+    rm -f -- "$PREFLIGHT_FILE"
+    die "HEAD or origin/$pr_base_ref moved while the preflight was collected; run oauto again"
+  fi
+fi
 excluded_note=""
 if [[ -s "$display" ]]; then excluded_note=", secret-like paths excluded"; fi
 rm -f -- "${tmp_files[@]}"
@@ -662,12 +754,16 @@ extra_entries="$(find "$CONFIG_DIR" -mindepth 1 ! -name opencode.json -print)"
 # ---------------------------------------------------------------------------
 # 5. Banner, exec.
 # ---------------------------------------------------------------------------
+mode_banner=""
+if (( PR_MODE )); then
+  mode_banner=$'\n'"Mode  : pull request #$pr_number → origin/$pr_base_ref (merge base ${merge_base:0:12})"
+fi
 cat >&2 <<EOF
 
 ============================================================
 oauto : OpenCode $version read-only reviewer
 Repo  : $REPO_NAME ($REPO)
-Branch: $branch @ ${head_sha:0:12}  ${ahead_behind:+[$ahead_behind vs $base]}
+Branch: $branch @ ${head_sha:0:12}  ${ahead_behind:+[$ahead_behind vs $base]}$mode_banner
 Model : $MODEL_ID  (OpenCode Zen, pricing: Free)
 Agent : review-$MODEL_ALIAS   (other models disabled; provider pinned to 'opencode')
 Tools : read / glob / grep only. edit, shell, web, subagents, skills, MCP,
@@ -688,12 +784,21 @@ if [[ "$MODE" == check ]]; then
   exit 0
 fi
 
-initial_prompt="$(cat <<EOF
+if (( PR_MODE )); then
+  initial_prompt="$(cat <<EOF
+You are reviewing pull request #$pr_number ($pr_url) of the repository "$REPO_NAME". Below is the read-only git preflight collected by the launcher. It holds the delta of pull request #$pr_number against $pr_base_ref: origin/$pr_base_ref...HEAD, from the merge base ${merge_base:0:12} to the reviewed local HEAD ${head_sha:0:12}, which is the pull request's head. Review that delta (read the affected files in full first). If the preflight also lists uncommitted changes, they are not part of the pull request: review them separately.
+
+$(cat "$PREFLIGHT_FILE")
+EOF
+)"
+else
+  initial_prompt="$(cat <<EOF
 You are reviewing the repository "$REPO_NAME". Below is the read-only git preflight collected by the launcher. Review the uncommitted changes and the branch delta it shows (read the affected files in full first). If it shows nothing to review, ask me what to review.
 
 $(cat "$PREFLIGHT_FILE")
 EOF
 )"
+fi
 
 # Scrubbed environment: no API keys, tokens or proxy settings reach OpenCode, so no
 # provider other than the built-in free tier can appear, and OPENCODE_* overrides

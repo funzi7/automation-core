@@ -460,13 +460,14 @@ case "$MODE" in
     ;;
 esac
 
-# oauto: a leading model alias (`oauto deepseek`) is not a repository name; keep it
-# for oauto-run and fall through to the normal repository menu.
-oauto_alias=""
-if [[ "$SELECTED_MODE" == opencode ]] && (($#)) && [[ "$1" =~ ^(glm|deepseek)$ ]]; then
-  oauto_alias="$1"
+# oauto: leading model aliases and the PR mode (`oauto deepseek`, `oauto pr`,
+# `oauto deepseek pr`) are not repository names; keep them for oauto-run, ahead of the
+# remaining arguments, and fall through to the normal repository menu.
+oauto_args=()
+while [[ "$SELECTED_MODE" == opencode ]] && (($#)) && [[ "$1" =~ ^(glm|deepseek|pr)$ ]]; do
+  oauto_args+=("$1")
   shift
-fi
+done
 
 if (($#)) && [[ "$1" != -* ]]; then
   direct="$1"
@@ -485,7 +486,7 @@ cd "$SELECTED_REPO"
 # cauto/clauto; everything OpenCode-specific (preflight, policy, lock, banner)
 # lives in oauto-run, so the codex/claude paths below are untouched.
 if [[ "$SELECTED_MODE" == opencode ]]; then
-  exec /root/work/bin/oauto-run "$SELECTED_REPO" ${oauto_alias:+"$oauto_alias"} "$@"
+  exec /root/work/bin/oauto-run "$SELECTED_REPO" "${oauto_args[@]}" "$@"
 fi
 
 echo

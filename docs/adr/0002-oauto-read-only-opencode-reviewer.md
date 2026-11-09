@@ -256,6 +256,39 @@ policy, not by the system prompt alone:
    side, hunk-header context included, and a hit excludes the file from the
    preflight (listed as `credential-looking content in its diff`), so
    removing a committed credential never sends the removed line.
+9. **PR review mode** (`oauto <repo> pr`, owner-approved 2026-11-09 as option
+   1: the default behaviour above is kept unchanged — a test compares its
+   preflight, prompt, banner and config with those of `1e6fbd0` — and PR review
+   is a separate, explicit mode, with `pr` and the model alias in either order,
+   `--check` included, and `oauto pr` / `oauto deepseek pr` before the
+   repository menu). After the lock, `check-repo-git` and the hardened git
+   helpers, and before the scan, the launcher identifies the pull request
+   outside the model's tool execution: the GitHub repository from
+   `remote.origin.url` (only `https://github.com/<o>/<r>[.git]`,
+   `git@github.com:<o>/<r>[.git]` and `ssh://git@github.com/<o>/<r>[.git]`; the
+   URL reaches the policy on stdin and is never printed), then one
+   authenticated, read-only REST call,
+   `gh api repos/<o>/<r>/pulls?state=open&head=<o>:<branch>&per_page=10`
+   (`timeout 60`; `env -i` keeping only HOME, PATH, `GH_PAGER=cat`,
+   `GH_PROMPT_DISABLED=1`, `GH_NO_UPDATE_NOTIFIER=1`, `TERM=dumb`). `oauto-policy.py
+   pr-select` accepts exactly one open pull request whose head is the current
+   branch of that repository (not a fork) at the local HEAD and whose base is a
+   branch of it, and hands back only number, `html_url`, base ref, base sha and
+   head sha; the response file is deleted. The base must exist locally as
+   `origin/<base>` — unambiguous, with a merge base with HEAD — and the
+   existing `base` variable is set to it, so the existing pipeline (name
+   collection, exhaustive rename pairs, classification, content checks,
+   exclusion proof, caps, `--stat` and diff) produces the pull request's delta:
+   no second implementation. Every doubt fails closed with its reason before
+   anything is scanned or rendered and never falls back to the default review;
+   a GitHub base sha that differs from the local ref is stated in the preflight,
+   whose merge base comes from the local ref; HEAD or the base ref moving while
+   the preflight is collected refuses it. The launcher never fetches, pulls,
+   checks out, switches, updates a ref or creates a worktree. The prompt names
+   the pull request and asks for its delta to be reviewed (uncommitted changes
+   separately); the banner adds `Mode  : pull request #<n> → origin/<base>
+   (merge base <sha12>)`. Scan, history traversal, exclusions, caps, rendered
+   config, permissions, policies, models and lock are the default mode's.
 
 The config is rendered at every launch into a private directory,
 `~/.local/state/oauto/<repo>-<hash>/xdg-config/opencode/opencode.json`, selected
@@ -315,4 +348,11 @@ DeepSeek pass follows a GLM pass without any other model becoming selectable.
   when entries are stat-dirty (`GIT_OPTIONAL_LOCKS=0` stops `git status` from
   doing so, not `git diff`); no content, ref or hook runs from it, but the
   preflight is not byte-for-byte free of writes under `.git/`.
+- PR review mode (item 9) reads the GitHub API once per launch with the owner's
+  `gh` login, sending the repository and branch name to `api.github.com`, and it
+  reviews the local `origin/<base>`: a stale base gives a stale delta, stated in
+  the preflight when GitHub's base differs, because the launcher never fetches; a
+  local HEAD that is not the pull request's head (unpushed, or behind) refuses the
+  launch. The model receives the pull request's delta instead of the upstream
+  delta, plus its number, URL and shas.
 - No code-editing OpenCode mode exists; adding one is a separate decision.

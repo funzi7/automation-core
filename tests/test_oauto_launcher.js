@@ -24,6 +24,7 @@ const INSTALL = path.join(OAUTO, 'install.sh');
 const AI_LAUNCH = path.join(ROOT, 'launchers', 'ai-launch');
 const PRISTINE = path.join(__dirname, 'fixtures', 'ai-launch.pristine');
 const FAKE = path.join(__dirname, 'fixtures', 'fake-opencode');
+const FAKE_GH = path.join(__dirname, 'fixtures', 'fake-gh');
 
 const APPROVED = {
   glm: 'opencode/glm-5.3-flash-free',
@@ -41,6 +42,7 @@ const MORE_CREDENTIAL_FILES = ['auth.json', 'vendor/composer/auth.json', '.pgpas
 const NOT_CREDENTIAL_FILES = ['docs/oauth.json', 'src/auth.js', 'my.cnf', '.kube/README.md', 'composer.json'];
 
 fs.chmodSync(FAKE, 0o755);
+fs.chmodSync(FAKE_GH, 0o755);
 
 function policy(args, input) {
   return spawnSync('python3', ['-I', POLICY, ...args], { input, encoding: 'utf8' });
@@ -109,17 +111,20 @@ function fakeControl(sb, settings) {
   fs.writeFileSync(path.join(sb.home, '.fake-opencode-control'), `${lines}\n`);
 }
 
-function runOauto(sb, repo, args = [], extraEnv = {}) {
+// OAUTO_GH_BIN: PR review mode's one GitHub call always reaches the test double
+// (tests/fixtures/fake-gh), never the real gh. `script`: another copy of oauto-run.
+function runOauto(sb, repo, args = [], extraEnv = {}, script = RUN) {
   const env = {
     PATH: process.env.PATH,
     HOME: sb.home,
     XDG_STATE_HOME: sb.state,
     CODEX_RESOURCE_LOCK_DIR: sb.locks,
     OAUTO_OPENCODE_BIN: FAKE,
+    OAUTO_GH_BIN: FAKE_GH,
     LANG: 'C.UTF-8',
     ...extraEnv,
   };
-  return spawnSync('bash', [RUN, repo, ...args], { encoding: 'utf8', env, timeout: 120000 });
+  return spawnSync('bash', [script, repo, ...args], { encoding: 'utf8', env, timeout: 120000 });
 }
 
 function repoKey(repo) {
@@ -142,7 +147,7 @@ function nothingRendered(sb, repo) {
 // Rendered configuration contract
 // ---------------------------------------------------------------------------
 test('scripts parse under bash -n', () => {
-  for (const script of [RUN, AI_LAUNCH, INSTALL, FAKE,
+  for (const script of [RUN, AI_LAUNCH, INSTALL, FAKE, FAKE_GH,
     path.join(OAUTO, 'termux', 'oauto-launch'), path.join(OAUTO, 'termux', 'bashrc-snippet.sh'),
     path.join(OAUTO, 'debian-bashrc-snippet.sh')]) {
     execFileSync('bash', ['-n', script]);
@@ -2163,6 +2168,27 @@ test('oauto-run source: no automatic approval, standalone helpers, bounded helpe
   assert.match(code, /\(\( status == 0 \)\) \|\|\s*die "/);
   assert.match(code, /python3 -I "\$POLICY" check-excluded "\$excluded_z" "\$after" >&2 \|\|\s*die /);
   assert.ok(!/<<< "\$excluded"/.test(code), 'excluded paths never travel through a shell variable');
+  // PR review mode: one read-only GitHub API call through gh, scrubbed and time-bounded,
+  // after check-repo-git and the hardened git helpers and before the scan; the response
+  // goes to pr-select alone, the origin URL to pr-query on stdin, and no git call fetches,
+  // checks out or moves a ref.
+  assert.match(code, /^GH_BIN="\$\{OAUTO_GH_BIN:-gh\}"$/m);
+  const ghCallLines = lines.filter((l) => /"\$GH_BIN" api\b/.test(l));
+  assert.equal(ghCallLines.length, 1, 'exactly one gh call');
+  assert.match(ghCallLines[0], /^\s*timeout 60 env -i HOME="\$HOME" PATH="\$PATH" GH_PAGER=cat GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 TERM=dumb "\$GH_BIN" api -H 'Accept: application\/vnd\.github\+json' "\$endpoint" > "\$pulls_json" 2> "\$gh_err" \|\| gh_status=\$\?$/);
+  assert.equal(code.match(/"\$GH_BIN"/g).length, 2, 'gh is only located (command -v) and called once');
+  assert.match(code, /remote_url="\$\(g config --get remote\.origin\.url\)" \|\|\n\s*die "/);
+  assert.match(code, /printf '%s' "\$remote_url" \| python3 -I "\$POLICY" pr-query --branch="\$pr_branch" > "\$pr_query_z" \|\|\n\s*die "/);
+  assert.match(code, /python3 -I "\$POLICY" pr-select --branch="\$pr_branch" --head="\$head_sha" --repo="\$pr_repo" < "\$pulls_json" > "\$pr_fields" \|\|\n\s*die "/);
+  assert.match(code, /^if \(\( PR_MODE \)\); then\n  pr_identify\n  base="origin\/\$pr_base_ref"\nelif \[\[ "\$head_sha" != "\(no commits\)" \]\]; then\n  for cand in /m);
+  assert.equal(lines.filter((l) => /^\s*pr_identify$/.test(l)).length, 1);
+  const ghLine = lines.findIndex((l) => /"\$GH_BIN" api\b/.test(l));
+  const prCallLine = lines.findIndex((l) => /^\s*pr_identify$/.test(l));
+  assert.ok(crgLine < gLine && gLine < ghLine && ghLine < prCallLine && prCallLine < scanLine,
+    `check-repo-git (${crgLine}) < g() (${gLine}) < gh (${ghLine}) < pr_identify (${prCallLine}) < scan (${scanLine})`);
+  assert.ok(!/\bg (fetch|pull|push|checkout|switch|update-ref|worktree|reset|restore|stash|clean|merge|rebase|branch|tag|commit|remote|gc)(?![-\w])/.test(code),
+    'no git call may fetch, check out or move a ref');
+  for (const m of code.matchAll(/\bg config\b[^\n]*/g)) assert.match(m[0], /^g config (--list --show-origin -z|--get remote\.origin\.url)\b/, m[0]);
 });
 
 // ---------------------------------------------------------------------------
@@ -3209,6 +3235,485 @@ test('P3-6: a secret-named hard link to a .git dir file is refused unconditional
 });
 
 // ---------------------------------------------------------------------------
+// PR review mode (`oauto <repo> pr`, owner decision 2026-11-09): the pull request is
+// identified through one read-only GitHub API call (tests: tests/fixtures/fake-gh) and
+// the existing pipeline diffs origin/<base>...HEAD. The default mode stays unchanged.
+// ---------------------------------------------------------------------------
+const FIXTURE_ORIGIN = 'https://github.com/funzi7/fixture.git';
+const FIXTURE_REPO = 'funzi7/fixture';
+const PR_BRANCH = 'claude/feature';
+const PR_SECRETS = { legacy: 'SYNTH-PR-LEGACY-SECRET-1a2b', added: 'SYNTH-PR-ADDED-SECRET-3c4d' };
+const NOT_FORWARDED = ['SYNTH-PR-TITLE-NOT-FORWARDED', 'SYNTH-PR-BODY-NOT-FORWARDED'];
+
+// oauto-run runs gh in a scrubbed environment, so the double reads $HOME/.fake-gh-control.
+function fakeGh(sb, settings) {
+  const lines = Object.entries(settings).map(([k, v]) => `${k}=${v}`).join('\n');
+  fs.writeFileSync(path.join(sb.home, '.fake-gh-control'), `${lines}\n`);
+}
+
+// One pull request as GitHub's REST API lists it: the fields oauto reads, and unrelated
+// ones (title, body, user) that must never reach the preflight or the prompt.
+function pullRequest({ number = 58, branch = PR_BRANCH, headSha, baseRef = 'main', baseSha, headRepo = FIXTURE_REPO,
+  baseRepo = FIXTURE_REPO, htmlUrl } = {}) {
+  return {
+    url: `https://api.github.com/repos/${baseRepo}/pulls/${number}`, number, state: 'open',
+    html_url: htmlUrl === undefined ? `https://github.com/${baseRepo}/pull/${number}` : htmlUrl,
+    title: NOT_FORWARDED[0], body: NOT_FORWARDED[1], user: { login: 'funzi7' },
+    head: { label: `funzi7:${branch}`, ref: branch, sha: headSha, repo: headRepo === null ? null : { full_name: headRepo } },
+    base: { label: `funzi7:${baseRef}`, ref: baseRef, sha: baseSha, repo: { full_name: baseRepo } },
+  };
+}
+
+function servePulls(sb, pulls, extra = {}) {
+  const file = path.join(sb.root, `pulls-${crypto.randomBytes(4).toString('hex')}.json`);
+  fs.writeFileSync(file, typeof pulls === 'string' ? pulls : JSON.stringify(pulls));
+  fakeGh(sb, { PULLS_JSON: file, ...extra });
+}
+
+// The recorded gh calls: [{ args, env }] (env: variable names only).
+function ghCalls(log) {
+  if (!fs.existsSync(log)) return [];
+  return fs.readFileSync(log, 'utf8').split('ARGS_BEGIN\n').slice(1).map((chunk) => ({
+    args: chunk.split('\nARGS_END')[0].split('\n'),
+    env: chunk.split('ENV_BEGIN\n')[1].split('\nENV_END')[0].split('\n'),
+  }));
+}
+
+const revOf = (repo, rev) => git(repo, ['rev-parse', rev]).trim();
+const longPy = (version) => ['def area(w, h):', '    return w * h', '', 'def perimeter(w, h):', '    return 2 * (w + h)', '',
+  'def square(s):', '    return area(s, s)', '', `VERSION = "${version}"`, ''].join('\n');
+
+// A PR #58-style fixture. main C0 forks the branch: C1 modifies, adds, deletes and renames
+// files (and, with `secrets`, deletes a tracked secret-like file and adds another), C2 edits
+// the README; main then moves on (C3). origin is a GitHub URL nothing ever contacts;
+// refs/remotes/origin/main = C3 and the upstream refs/remotes/origin/<branch> = HEAD are
+// created here with update-ref (the launcher itself never fetches or moves a ref).
+function prFixture(sb, name, { branch = PR_BRANCH, secrets = false } = {}) {
+  const repo = mkRepo(sb, name, {
+    'src/app.py': 'def run():\n    return 1\n', 'src/util.py': longPy(1), 'docs/obsolete.md': '# obsolete\n', 'README.md': '# fixture\n',
+    ...(secrets ? { 'legacy.env': `# legacy settings\nHOST=db.internal\nTOKEN=${PR_SECRETS.legacy}\n` } : {}),
+  });
+  git(repo, ['remote', 'add', 'origin', FIXTURE_ORIGIN]);
+  const c0 = revOf(repo, 'HEAD');
+  git(repo, ['checkout', '-q', '-b', branch]);
+  writeFiles(repo, { 'src/app.py': 'def run():\n    return 2\n', 'src/feature.py': 'FEATURE = True\n' });
+  fs.rmSync(path.join(repo, 'docs/obsolete.md'));
+  git(repo, ['mv', 'src/util.py', 'src/helpers.py']);
+  writeFiles(repo, { 'src/helpers.py': longPy(2) });
+  if (secrets) {
+    git(repo, ['rm', '-q', 'legacy.env']);
+    writeFiles(repo, { 'deploy/prod.env': `TOKEN=${PR_SECRETS.added}\n` });
+  }
+  git(repo, ['add', '-A']);
+  git(repo, ['commit', '-q', '-m', 'feature, part 1']);
+  const c1 = revOf(repo, 'HEAD');
+  writeFiles(repo, { 'README.md': '# fixture\n\nFeature notes.\n' });
+  git(repo, ['commit', '-q', '-am', 'feature, part 2']);
+  const c2 = revOf(repo, 'HEAD');
+  git(repo, ['checkout', '-q', 'main']);
+  writeFiles(repo, { 'main-only.txt': 'SYNTH-MAIN-ONLY-MARKER\n' });
+  git(repo, ['add', '-A']);
+  git(repo, ['commit', '-q', '-m', 'main moves on']);
+  const c3 = revOf(repo, 'HEAD');
+  git(repo, ['checkout', '-q', branch]);
+  git(repo, ['update-ref', 'refs/remotes/origin/main', c3]);
+  git(repo, ['update-ref', `refs/remotes/origin/${branch}`, c2]);
+  git(repo, ['config', `branch.${branch}.remote`, 'origin']);
+  git(repo, ['config', `branch.${branch}.merge`, `refs/heads/${branch}`]);
+  return { repo, c0, c1, c2, c3 };
+}
+
+test('PR mode: a PR #58-style branch (upstream = HEAD, origin/main ahead) is reviewed as its pull request delta against the base GitHub names', () => {
+  const sb = sandbox();
+  const { repo, c0, c2, c3 } = prFixture(sb, 'pr-main', { secrets: true });
+  // Uncommitted changes on top: one edit, the secret-like file the PR adds deleted again
+  // (so it is in the PR delta AND in the uncommitted diff), an untracked note.
+  writeFiles(repo, { 'src/app.py': 'def run():\n    return 3\n', 'notes/todo.md': '- todo\n' });
+  fs.rmSync(path.join(repo, 'deploy/prod.env'));
+  const ghLog = path.join(sb.root, 'gh.log');
+  servePulls(sb, [pullRequest({ headSha: c2, baseSha: c3 })], { ARGV_LOG: ghLog });
+  const promptFile = path.join(sb.root, 'prompt-pr.txt');
+  fakeControl(sb, { PROMPT_FILE: promptFile });
+  const r = runOauto(sb, repo, ['pr'], { TEST_LEAK_TOKEN: 'must-not-reach-gh', GH_TOKEN: 'SYNTH-GH-TOKEN', GITHUB_TOKEN: 'SYNTH-GITHUB-TOKEN' });
+  assert.equal(r.status, 0, r.stderr);
+  const preflight = readPreflight(sb, repo);
+  const prompt = fs.readFileSync(promptFile, 'utf8');
+
+  // One read-only call, exactly this endpoint, no token-bearing argument, a scrubbed environment.
+  const calls = ghCalls(ghLog);
+  assert.deepEqual(calls.map((c) => c.args), [['api', '-H', 'Accept: application/vnd.github+json',
+    'repos/funzi7/fixture/pulls?state=open&head=funzi7:claude/feature&per_page=10']]);
+  assert.deepEqual(calls[0].env.filter((n) => !['PWD', 'SHLVL', '_', 'OLDPWD'].includes(n)),
+    ['GH_NO_UPDATE_NOTIFIER', 'GH_PAGER', 'GH_PROMPT_DISABLED', 'HOME', 'PATH', 'TERM']);
+
+  assert.ok(preflight.includes([
+    `- Branch: ${PR_BRANCH}`, `- HEAD: ${c2}`, `- Upstream: origin/${PR_BRANCH}`, '- Base for branch delta: origin/main (behind 1, ahead 2)',
+    '- Pull request: #58 https://github.com/funzi7/fixture/pull/58',
+    `- PR base branch: main (GitHub base ${c3.slice(0, 12)}; local origin/main ${c3.slice(0, 12)})`,
+    `- Merge base: ${c0}`, `- Reviewed local HEAD: ${c2} (= PR head)`, ''].join('\n')), preflight);
+  assert.ok(!preflight.includes('- Note: '), 'the GitHub base equals the local ref: no note');
+  assert.ok(!preflight.includes('## Branch delta'), preflight);
+  const title = '## Pull request #58 delta vs origin/main (merge-base...HEAD)';
+  const delta = sectionOf(preflight, title);
+  const uncommitted = sectionOf(preflight, '## Uncommitted changes', '## Recent commits');
+  assert.ok(delta && uncommitted, preflight);
+  // The --stat block comes first, then the diff; modified, added, deleted and renamed
+  // (as delete + add) files appear; main's own later change does not.
+  assert.match(delta, new RegExp(`^${title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\n\`\`\`\n( \\S+ +\\| .*\n)+ \\d+ files changed[^\n]*\n\`\`\`\n\`\`\`diff\ndiff --git `));
+  for (const name of ['src/app.py', 'src/feature.py', 'docs/obsolete.md', 'src/util.py', 'src/helpers.py', 'README.md']) {
+    assert.ok(sectionOf(delta, '```', '```diff').includes(` ${name} `), `${name} in the --stat block:\n${delta}`);
+  }
+  assert.match(delta, /diff --git a\/src\/app\.py b\/src\/app\.py\n[\s\S]*?-    return 1\n\+    return 2\n/);
+  assert.match(delta, /diff --git a\/src\/feature\.py b\/src\/feature\.py\nnew file mode 100644\n/);
+  assert.match(delta, /diff --git a\/docs\/obsolete\.md b\/docs\/obsolete\.md\ndeleted file mode 100644\n/);
+  assert.match(delta, /diff --git a\/src\/util\.py b\/src\/util\.py\ndeleted file mode 100644\n/);
+  assert.match(delta, /diff --git a\/src\/helpers\.py b\/src\/helpers\.py\nnew file mode 100644\n[\s\S]*?\+VERSION = "2"\n/);
+  assert.match(delta, /\+Feature notes\.\n/);
+  assert.ok(!/^(rename|copy) (from|to) |^similarity index /m.test(preflight), 'renames diff as delete + add');
+  assert.ok(!preflight.includes('main-only.txt') && !preflight.includes('SYNTH-MAIN-ONLY-MARKER'), 'C3 is not part of the PR delta');
+  assert.ok(!delta.includes('return 3'), 'the uncommitted edit is not part of the PR delta');
+  // The uncommitted changes stay a separate section.
+  assert.match(uncommitted, /diff --git a\/src\/app\.py b\/src\/app\.py\n[\s\S]*?-    return 2\n\+    return 3\n/);
+  assert.ok(!uncommitted.includes('src/feature.py'), uncommitted);
+  // The secret-like files: deleted (legacy.env) and added (deploy/prod.env) in the PR, the
+  // latter deleted again in the worktree — excluded from both sections, names only.
+  assert.deepEqual(excludedLines(preflight), ['deploy/prod.env', 'legacy.env']);
+  for (const p of ['deploy/prod.env', 'legacy.env']) assert.ok(!preflight.includes(`diff --git a/${p} `), p);
+  const leaked = [...Object.values(PR_SECRETS), ...NOT_FORWARDED].filter((x) => preflight.includes(x) || prompt.includes(x));
+  assert.deepEqual(leaked, [], 'no secret, and nothing from the API response but the parsed fields, reaches the preflight or the prompt');
+
+  // The prompt names the pull request and its delta, and never says "ask what to review".
+  assert.ok(prompt.startsWith('You are reviewing pull request #58 (https://github.com/funzi7/fixture/pull/58) of the repository "pr-main". '), prompt.slice(0, 300));
+  assert.ok(prompt.includes(`It holds the delta of pull request #58 against main: origin/main...HEAD, from the merge base ${c0.slice(0, 12)} to the reviewed local HEAD ${c2.slice(0, 12)}, which is the pull request's head. Review that delta`), prompt.slice(0, 600));
+  assert.ok(prompt.includes('If the preflight also lists uncommitted changes, they are not part of the pull request: review them separately.'));
+  assert.ok(!/ask me what to review/i.test(prompt));
+  assert.ok(prompt.includes(preflight.trimEnd()), 'the prompt carries the preflight verbatim');
+  assert.ok(r.stderr.includes(`\nBranch: ${PR_BRANCH} @ ${c2.slice(0, 12)}  [behind 1, ahead 2 vs origin/main]\nMode  : pull request #58 → origin/main (merge base ${c0.slice(0, 12)})\nModel : `), r.stderr);
+
+  // H: everything else is the default mode's — the rendered config is identical. And the
+  // default mode on this very repository diffs against the upstream (= HEAD: an empty
+  // branch delta), has no PR section, and never calls gh (E: only PR mode shows the PR).
+  const cfgPr = fs.readFileSync(path.join(stateDir(sb, repo), 'xdg-config', 'opencode', 'opencode.json'), 'utf8');
+  const d = runOauto(sb, repo, ['--check']);
+  assert.equal(d.status, 0, d.stderr);
+  assert.equal(fs.readFileSync(path.join(stateDir(sb, repo), 'xdg-config', 'opencode', 'opencode.json'), 'utf8'), cfgPr);
+  const def = readPreflight(sb, repo);
+  assert.match(def, /- Base for branch delta: origin\/claude\/feature \(behind 0, ahead 0\)\n\n/);
+  assert.ok(!/Pull request|PR base|Reviewed local HEAD|Merge base/.test(def), def);
+  assert.ok(!sectionOf(def, '## Branch delta vs origin/claude/feature').includes('diff --git'));
+  assert.ok(!d.stderr.includes('Mode  :'));
+  assert.equal(ghCalls(ghLog).length, 1, 'the default mode makes no GitHub call');
+});
+
+test('PR mode: the base comes from the metadata (another base branch); a GitHub base the local ref differs from is stated, not guessed', () => {
+  const sb = sandbox();
+  const { repo, c0, c1, c2 } = prFixture(sb, 'pr-release');
+  git(repo, ['update-ref', 'refs/remotes/origin/release/2.0', c1]);
+  servePulls(sb, [pullRequest({ number: 7, headSha: c2, baseRef: 'release/2.0', baseSha: c0 })]);
+  const r = runOauto(sb, repo, ['pr', '--check']);
+  assert.equal(r.status, 0, r.stderr);
+  const preflight = readPreflight(sb, repo);
+  assert.ok(preflight.includes([
+    '- Pull request: #7 https://github.com/funzi7/fixture/pull/7',
+    `- PR base branch: release/2.0 (GitHub base ${c0.slice(0, 12)}; local origin/release/2.0 ${c1.slice(0, 12)})`,
+    `- Note: GitHub's base ${c0} is not the local origin/release/2.0 ${c1}; the merge base below is computed from the local ref (the launcher never fetches)`,
+    `- Merge base: ${c1}`, `- Reviewed local HEAD: ${c2} (= PR head)`, ''].join('\n')), preflight);
+  const delta = sectionOf(preflight, '## Pull request #7 delta vs origin/release/2.0 (merge-base...HEAD)');
+  assert.ok(delta, preflight);
+  assert.match(delta, /\+Feature notes\.\n/);
+  assert.ok(!delta.includes('src/app.py') && !delta.includes('src/feature.py'), `only C2 is past the local base:\n${delta}`);
+  assert.ok(r.stderr.includes(`\nMode  : pull request #7 → origin/release/2.0 (merge base ${c1.slice(0, 12)})\n`), r.stderr);
+});
+
+test('PR mode fails closed, before any scan or render and without falling back, on every doubt about the pull request', () => {
+  const sb = sandbox();
+  const { repo, c0, c1, c2, c3 } = prFixture(sb, 'pr-refuse');
+  const good = (over = {}) => pullRequest({ headSha: c2, baseSha: c3, ...over });
+  const orphan = git(repo, ['commit-tree', git(repo, ['hash-object', '-t', 'tree', '-w', '--stdin'], '').trim(), '-m', 'unrelated root'], '').trim();
+  git(repo, ['update-ref', 'refs/remotes/origin/unrelated', orphan]);
+  const cases = [
+    // [label, response (array, object or raw text), expected reason, setup(), teardown(), extra env]
+    ['no open PR', [], /oauto-policy: no open pull request for branch claude\/feature in funzi7\/fixture: /],
+    ['two open PRs', [good(), good({ number: 59, baseRef: 'release' })], /oauto-policy: ambiguous: PRs #58, #59 are open for branch claude\/feature in funzi7\/fixture; PR mode reviews exactly one/],
+    ['PR head is not the local HEAD', [good({ headSha: c1 })],
+      new RegExp(`oauto-policy: the PR head is ${c1}, the local HEAD is ${c2}: push or pull first — the launcher never fetches`)],
+    ['fork head', [good({ headRepo: 'someone/fixture' })], /head is in "someone\/fixture", not in funzi7\/fixture: a fork head is not this repository's branch/],
+    ['deleted fork head', [good({ headRepo: null })], /head is in an unknown \(deleted\) repository, not in funzi7\/fixture/],
+    ['base in another repository', [good({ baseRepo: 'other/fixture', htmlUrl: 'https://github.com/funzi7/fixture/pull/58' })], /base is in "other\/fixture", not in funzi7\/fixture/],
+    ['head branch differs', [good({ branch: 'claude/other' })], /head branch is "claude\/other", not the local branch claude\/feature/],
+    ['empty base branch', [good({ baseRef: '' })], /pull request #58 has an empty base branch/],
+    ['base branch name git could misread', [good({ baseRef: 'main..x' })], /base branch "main\.\.x" is not a branch name oauto hands to git/],
+    ['number missing', [Object.fromEntries(Object.entries(good()).filter(([k]) => k !== 'number'))], /has no valid number/],
+    ['html_url missing', [good({ htmlUrl: null })], /pull request #58 has no html_url of the form https:\/\/github\.com\/funzi7\/fixture\/pull\/58/],
+    ['base.sha missing', [good({ baseSha: undefined })], /pull request #58 has no valid base\.sha/],
+    ['not JSON', 'oops <html>', /not valid JSON/],
+    ['not an array', { message: 'Not Found' }, /not a JSON array of pull request objects/],
+    ['base absent locally', [good({ baseRef: 'develop' })], /the PR base develop is not present locally as origin\/develop; fetch it first — the launcher never fetches/],
+    ['no merge base', [good({ baseRef: 'unrelated' })], /origin\/unrelated and HEAD have no merge base/],
+    ['origin/<base> ambiguous', [good()], /origin\/main is ambiguous/,
+      () => git(repo, ['update-ref', 'refs/heads/origin/main', c0]), () => git(repo, ['update-ref', '-d', 'refs/heads/origin/main'])],
+    ['origin not on GitHub (URL with a credential)', [good()], /origin is not a GitHub repository/,
+      () => git(repo, ['remote', 'set-url', 'origin', 'https://SYNTH-URL-TOKEN-7e7e@gitlab.example/funzi7/fixture.git']),
+      () => git(repo, ['remote', 'set-url', 'origin', FIXTURE_ORIGIN])],
+    ['no origin URL', [good()], /remote\.origin\.url is not set/,
+      () => git(repo, ['config', '--unset', 'remote.origin.url']), () => git(repo, ['config', 'remote.origin.url', FIXTURE_ORIGIN])],
+    ['detached HEAD', [good()], /PR mode reviews the pull request of the current branch, but HEAD is detached/,
+      () => git(repo, ['checkout', '-q', '--detach']), () => git(repo, ['checkout', '-q', PR_BRANCH])],
+    ['gh not installed', [good()], /PR mode needs the GitHub CLI to identify the pull request, but '\/nonexistent\/gh' was not found/,
+      null, null, { OAUTO_GH_BIN: '/nonexistent/gh' }],
+  ];
+  const outcome = {};
+  for (const [label, response, reason, setup, teardown, env] of cases) {
+    if (setup) setup();
+    servePulls(sb, response);
+    const r = runOauto(sb, repo, ['pr', '--check'], env || {});
+    if (teardown) teardown();
+    outcome[label] = {
+      status: r.status,
+      reason: reason.test(r.stderr),
+      failedBeforeTheScan: !r.stderr.includes('worktree scan passes'),
+      nothingRendered: nothingRendered(sb, repo),
+      noFallback: !r.stderr.includes('read-only reviewer\n') && !r.stderr.includes('configuration verified'),
+      quiet: !/SYNTH-URL-TOKEN|SYNTH-PR-(TITLE|BODY)/.test(r.stderr),
+      stderr: r.stderr,
+    };
+  }
+  const want = { status: 1, reason: true, failedBeforeTheScan: true, nothingRendered: true, noFallback: true, quiet: true };
+  const wrong = Object.entries(outcome).filter(([, o]) => Object.keys(want).some((k) => o[k] !== want[k]))
+    .map(([label, o]) => `${label}: ${JSON.stringify({ ...o, stderr: undefined })}\n${o.stderr}`);
+  assert.deepEqual(wrong, []);
+  // The same repository passes once nothing is in doubt (the teardowns restored it).
+  servePulls(sb, [good()]);
+  const ok = runOauto(sb, repo, ['pr', '--check']);
+  assert.equal(ok.status, 0, ok.stderr);
+  // An unborn branch has no pull request head to compare.
+  const unborn = mkRepo(sb, 'pr-unborn', { 'a.txt': 'a\n' }, { commit: false });
+  git(unborn, ['remote', 'add', 'origin', FIXTURE_ORIGIN]);
+  const u = runOauto(sb, unborn, ['pr', '--check']);
+  assert.equal(u.status, 1, u.stderr);
+  assert.match(u.stderr, /PR mode: branch main has no commits/);
+  assert.ok(nothingRendered(sb, unborn));
+});
+
+test('PR mode: a failing GitHub call (auth, timeout) fails closed with gh\'s reason summarised, token-shaped text redacted, nothing rendered', () => {
+  const sb = sandbox();
+  const { repo } = prFixture(sb, 'pr-gh-fails');
+  const token = 'gho_SYNTH0LEAKED0TOKEN0abcdef0123456789';
+  const outcome = {};
+  for (const [label, control, reason] of [
+    ['unauthenticated', { EXIT: 1, STDERR: `HTTP 401: Bad credentials (https://api.github.com/repos/funzi7/fixture/pulls) ${token}` },
+      /gh exit 1: HTTP 401: Bad credentials \(https:\/\/api\.github\.com\/repos\/funzi7\/fixture\/pulls\) gho_\[redacted\]\)/],
+    ['header echoed', { EXIT: 4, STDERR: 'authorization: Bearer SYNTH-BEARER-VALUE-0f0f' }, /gh exit 4: authorization: Bearer \[redacted\]\)/],
+    ['network', { EXIT: 1, STDERR: 'error connecting to api.github.com' }, /gh exit 1: error connecting to api\.github\.com\)/],
+    ['timeout', { EXIT: 124, STDERR: '' }, /gh exit 124: timed out after 60 s; gh: Bad credentials \(HTTP 401\)\)/],
+  ]) {
+    fakeGh(sb, control);
+    const r = runOauto(sb, repo, ['pr', '--check']);
+    outcome[label] = { status: r.status, reason: reason.test(r.stderr), leaked: r.stderr.includes(token) || r.stderr.includes('SYNTH-BEARER-VALUE'),
+      nothingRendered: nothingRendered(sb, repo), failedBeforeTheScan: !r.stderr.includes('worktree scan passes'), stderr: r.stderr };
+  }
+  const want = { status: 1, reason: true, leaked: false, nothingRendered: true, failedBeforeTheScan: true };
+  assert.deepEqual(Object.entries(outcome).filter(([, o]) => Object.keys(want).some((k) => o[k] !== want[k])).map(([l, o]) => `${l}:\n${o.stderr}`), []);
+  assert.match(outcome.unauthenticated.stderr, /the read-only GitHub API call listing the open pull requests of branch claude\/feature in funzi7\/fixture failed .*nothing was scanned or rendered, and the default review is not used instead/);
+});
+
+test('PR mode: both model aliases, before or after `pr`, with --check printing the PR banner line', () => {
+  const sb = sandbox();
+  const { repo, c0, c2, c3 } = prFixture(sb, 'pr-aliases');
+  servePulls(sb, [pullRequest({ headSha: c2, baseSha: c3 })]);
+  const outcome = {};
+  for (const args of [['pr', '--check'], ['deepseek', 'pr', '--check'], ['pr', 'deepseek', '--check'], ['glm', 'pr', '--check'], ['--check', 'pr', 'glm']]) {
+    const r = runOauto(sb, repo, args);
+    const cfg = r.status === 0 ? JSON.parse(fs.readFileSync(path.join(stateDir(sb, repo), 'xdg-config', 'opencode', 'opencode.json'), 'utf8')) : {};
+    outcome[args.join(' ')] = {
+      status: r.status,
+      model: (r.stderr.match(/\nModel : (\S+) /) || [])[1],
+      agent: cfg.default_agent,
+      mode: r.stderr.includes(`\nMode  : pull request #58 → origin/main (merge base ${c0.slice(0, 12)})\n`),
+      checked: r.stderr.includes('--check: configuration verified; not launching.'),
+      prSection: r.status === 0 && readPreflight(sb, repo).includes('## Pull request #58 delta vs origin/main (merge-base...HEAD)'),
+    };
+  }
+  const glm = { status: 0, model: APPROVED.glm, agent: 'review-glm', mode: true, checked: true, prSection: true };
+  const deepseek = { ...glm, model: APPROVED.deepseek, agent: 'review-deepseek' };
+  assert.deepEqual(outcome, { 'pr --check': glm, 'deepseek pr --check': deepseek, 'pr deepseek --check': deepseek, 'glm pr --check': glm, '--check pr glm': glm });
+});
+
+test('PR mode takes the per-repository lock before the GitHub call', async () => {
+  const sb = sandbox();
+  const { repo, c2, c3 } = prFixture(sb, 'pr-locked');
+  const ghLog = path.join(sb.root, 'gh.log');
+  servePulls(sb, [pullRequest({ headSha: c2, baseSha: c3 })], { ARGV_LOG: ghLog });
+  const lock = path.join(sb.locks, `oauto-${repoKey(repo)}.lock`);
+  const holder = spawn('flock', ['--exclusive', '--close', lock, 'sleep', '6']);
+  await new Promise((resolve) => setTimeout(resolve, 700));
+  try {
+    const busy = runOauto(sb, repo, ['pr', '--check']);
+    assert.equal(busy.status, 1);
+    assert.match(busy.stderr, /another oauto session is already open on pr-locked/);
+    assert.deepEqual(ghCalls(ghLog), [], 'no GitHub call while another session holds the lock');
+  } finally {
+    holder.kill('SIGTERM');
+    await new Promise((resolve) => holder.on('exit', resolve));
+  }
+  const free = runOauto(sb, repo, ['pr', '--check']);
+  assert.equal(free.status, 0, free.stderr);
+  assert.equal(ghCalls(ghLog).length, 1);
+});
+
+// Every file under .git (path, size, mtime, content hash), the ref listing and HEAD.
+function gitDirSnapshot(repo) {
+  const gitDir = path.join(repo, '.git');
+  const entries = [];
+  const walk = (dir) => {
+    for (const name of fs.readdirSync(dir).sort()) {
+      const full = path.join(dir, name);
+      const st = fs.lstatSync(full);
+      const rel = path.relative(gitDir, full);
+      if (st.isDirectory()) {
+        entries.push(`${rel}/`);
+        walk(full);
+      } else {
+        entries.push(`${rel} size=${st.size} mtime=${st.mtimeMs} sha256=${crypto.createHash('sha256').update(fs.readFileSync(full)).digest('hex')}`);
+      }
+    }
+  };
+  walk(gitDir);
+  return { entries, refs: git(repo, ['for-each-ref', '--format=%(refname) %(objectname) %(symref)']), head: fs.readFileSync(path.join(gitDir, 'HEAD'), 'utf8') };
+}
+
+test('PR mode changes nothing in the repository\'s git metadata: refs, HEAD, index, packed-refs, objects', () => {
+  const sb = sandbox();
+  const { repo, c2, c3 } = prFixture(sb, 'pr-untouched');
+  git(repo, ['update-ref', 'refs/remotes/origin/release/2.0', c3]);
+  git(repo, ['pack-refs', '--all']);
+  writeFiles(repo, { 'src/app.py': 'def run():\n    return 3\n', 'notes/todo.md': '- todo\n' });
+  // An index that no diff needs to refresh: every worktree file older than the index, the
+  // index rewritten once (git diff rewrites a stat-dirty index, which is not the point here).
+  const past = new Date('2001-01-01T00:00:00Z');
+  for (const rel of git(repo, ['ls-files', '-z', '--cached', '--others', '--exclude-standard']).split('\0').filter(Boolean)) {
+    fs.utimesSync(path.join(repo, rel), past, past);
+  }
+  git(repo, ['update-index', '-q', '--refresh']);
+  const ghLog = path.join(sb.root, 'gh.log');
+  servePulls(sb, [pullRequest({ headSha: c2, baseSha: c3 })], { ARGV_LOG: ghLog });
+  const before = gitDirSnapshot(repo);
+  assert.ok(before.entries.some((e) => e.startsWith('packed-refs ')), 'the fixture has packed refs');
+  const r = runOauto(sb, repo, ['pr', '--check']);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(ghCalls(ghLog).length, 1, 'the PR path ran');
+  assert.deepEqual(gitDirSnapshot(repo), before, 'nothing under .git may change');
+});
+
+// The default mode is the pre-PR-mode launcher's, byte for byte: the scripts of 1e6fbd0
+// (the commit before PR mode) run on the same repository state must produce the same
+// preflight (but for its collection timestamp), prompt, banner and config.
+const PRE_PR_MODE_COMMIT = '1e6fbd0a39cde153a7dcdd6eafcf147ee7973a75';
+
+test('default mode is byte-for-byte unchanged against the launcher before PR mode (1e6fbd0)', (t) => {
+  if (spawnSync('git', ['-C', ROOT, 'cat-file', '-e', `${PRE_PR_MODE_COMMIT}^{commit}`]).status !== 0) {
+    t.skip(`${PRE_PR_MODE_COMMIT} is not in this clone's history`);
+    return;
+  }
+  const sb = sandbox();
+  const oldDir = path.join(sb.root, 'pre-pr-mode');
+  fs.mkdirSync(oldDir);
+  for (const file of ['oauto-run', 'oauto-policy.py']) {
+    fs.writeFileSync(path.join(oldDir, file), execFileSync('git', ['-C', ROOT, 'show', `${PRE_PR_MODE_COMMIT}:launchers/oauto/${file}`]));
+  }
+  // Fixture 1: the PR-style branch with a GitHub origin, its upstream = HEAD, uncommitted
+  // changes and a secret-like path excluded. Fixture 2: a branch without upstream (base
+  // main) whose commits rename a secret-like file and edit gradle.properties.
+  const { repo: prRepo } = prFixture(sb, 'unchanged-pr', { secrets: true });
+  writeFiles(prRepo, { 'src/app.py': 'def run():\n    return 3\n', 'notes/todo.md': '- todo\n' });
+  fs.rmSync(path.join(prRepo, 'deploy/prod.env'));
+  const plain = mkRepo(sb, 'unchanged-plain', { '.env': settings('SYNTH-UNCHANGED-SECRET-5a5a'), 'a.py': longPy(1), 'gradle.properties': gradleProps() });
+  git(plain, ['checkout', '-q', '-b', 'feature']);
+  git(plain, ['mv', '.env', 'settings.txt']);
+  writeFiles(plain, { 'settings.txt': settings('PLACEHOLDER-5b5b'), 'a.py': longPy(2), 'gradle.properties': gradleProps({ password: false }) });
+  git(plain, ['add', '-A']);
+  git(plain, ['commit', '-q', '-m', 'feature']);
+  writeFiles(plain, { 'b.py': 'y = 1\n' });
+  const ghLog = path.join(sb.root, 'gh.log');
+  fakeGh(sb, { ARGV_LOG: ghLog });
+  const stamp = (text) => text.replace(/^Collected read-only by the launcher at \S+\. /m, 'Collected read-only by the launcher at <timestamp>. ');
+  const outputs = (script, repo) => {
+    const promptFile = path.join(sb.root, 'prompt-unchanged.txt');
+    fs.rmSync(promptFile, { force: true });
+    fakeControl(sb, { PROMPT_FILE: promptFile });
+    const r = runOauto(sb, repo, [], {}, script);
+    const sd = stateDir(sb, repo);
+    return {
+      status: r.status,
+      stderr: r.stderr,
+      preflight: stamp(fs.readFileSync(path.join(sd, 'preflight.md'), 'utf8')),
+      prompt: stamp(fs.readFileSync(promptFile, 'utf8')),
+      config: fs.readFileSync(path.join(sd, 'xdg-config', 'opencode', 'opencode.json'), 'utf8'),
+    };
+  };
+  for (const repo of [prRepo, plain]) {
+    const before = outputs(path.join(oldDir, 'oauto-run'), repo);
+    const now = outputs(RUN, repo);
+    assert.equal(before.status, 0, before.stderr);
+    assert.deepEqual(now, before, `${path.basename(repo)}: the default mode must not change`);
+  }
+  assert.equal(readPreflight(sb, plain).match(/^- Base for branch delta: main \(behind 0, ahead 1\)$/m) !== null, true);
+  assert.deepEqual(ghCalls(ghLog), [], 'the default mode makes no GitHub call');
+});
+
+test('pr-query and pr-select: three accepted origin forms, an encoded head filter, exactly five validated fields', () => {
+  const query = (url, branch = 'claude/feature') => policyBytes(['pr-query', `--branch=${branch}`], Buffer.from(url));
+  for (const url of ['https://github.com/funzi7/fixture', 'https://github.com/funzi7/fixture.git', 'git@github.com:funzi7/fixture',
+    'git@github.com:funzi7/fixture.git', 'ssh://git@github.com/funzi7/fixture', 'ssh://git@github.com/funzi7/fixture.git']) {
+    const r = query(url);
+    assert.equal(r.status, 0, `${url}: ${r.stderr}`);
+    assert.deepEqual(r.stdout, nulJoin('funzi7/fixture', 'repos/funzi7/fixture/pulls?state=open&head=funzi7:claude/feature&per_page=10'), url);
+  }
+  for (const url of ['http://github.com/funzi7/fixture.git', 'https://github.com/funzi7/fixture/', 'https://github.com/funzi7/fixture/x.git',
+    'https://SYNTH-QUERY-TOKEN-1c1c@github.com/funzi7/fixture.git', 'https://github.com:443/funzi7/fixture', 'https://gitlab.com/funzi7/fixture.git',
+    'git@gitlab.com:funzi7/fixture.git', 'ssh://git@github.com:22/funzi7/fixture', 'ssh://deploy@github.com/funzi7/fixture', 'github.com/funzi7/fixture',
+    '/root/work/fixture', 'https://github.com/-bad/fixture', 'https://github.com/funzi7/..', '']) {
+    const r = query(url);
+    assert.equal(r.status, 2, `${url} must fail closed`);
+    assert.match(r.stderr.toString(), /origin is not a GitHub repository/, url);
+    assert.ok(!r.stderr.toString().includes('SYNTH-QUERY-TOKEN'), 'the URL is never printed');
+    assert.equal(r.stdout.length, 0);
+  }
+  // Query metacharacters in a branch name are percent-encoded; `/` is kept.
+  assert.deepEqual(query('https://github.com/o/r.git', 'feat/a+b#c&d%e=f').stdout,
+    nulJoin('o/r', 'repos/o/r/pulls?state=open&head=o:feat/a%2Bb%23c%26d%25e%3Df&per_page=10'));
+
+  const head = 'a'.repeat(40);
+  const base = 'b'.repeat(40);
+  const select = (pulls, { branch = PR_BRANCH, at = head, repo = FIXTURE_REPO } = {}) =>
+    policyBytes(['pr-select', `--branch=${branch}`, `--head=${at}`, `--repo=${repo}`], Buffer.from(JSON.stringify(pulls)));
+  let r = select([pullRequest({ headSha: head, baseSha: base, baseRef: 'release/2.0' })]);
+  assert.equal(r.status, 0, r.stderr.toString());
+  assert.deepEqual(r.stdout, nulJoin('58', 'https://github.com/funzi7/fixture/pull/58', 'release/2.0', base, head));
+  // GitHub owner and repository names are case-insensitive; a SHA-256 head is a full name too.
+  r = select([pullRequest({ headSha: head, baseSha: base, headRepo: 'Funzi7/Fixture' })], { repo: 'funzi7/FIXTURE' });
+  assert.equal(r.status, 0, r.stderr.toString());
+  const sha256 = 'c'.repeat(64);
+  assert.equal(select([pullRequest({ headSha: sha256, baseSha: base })], { at: sha256 }).status, 0);
+  // Branch names are exact; so is every base-name rule.
+  assert.match(select([pullRequest({ headSha: head, baseSha: base })], { branch: 'Claude/Feature' }).stderr.toString(), /head branch is "claude\/feature", not the local branch Claude\/Feature/);
+  const unsafe = ['HEAD', 'a..b', '/main', 'main/', 'a//b', '.hidden', 'a/.b', 'main.lock', 'a/b.lock/c', 'main.', 'a b', 'a~1', 'a^2',
+    'a:b', 'a\\b', 'a*', 'a?', 'a[1]', 'a@{u}', 'résumé', 'a\nb'];
+  const accepted = unsafe.filter((ref) => select([pullRequest({ headSha: head, baseSha: base, baseRef: ref })]).status !== 2);
+  assert.deepEqual(accepted, [], 'every unsafe base branch name fails closed');
+  for (const ref of ['main', 'release/2.0', 'feature/x_y-z+1', 'v1.2.3']) {
+    assert.equal(select([pullRequest({ headSha: head, baseSha: base, baseRef: ref })]).status, 0, ref);
+  }
+  for (const [label, bad] of [['--head', { at: 'HEAD' }], ['--repo', { repo: 'funzi7' }]]) {
+    r = select([pullRequest({ headSha: head, baseSha: base })], bad);
+    assert.equal(r.status, 2, label);
+    assert.equal(r.stdout.length, 0, label);
+  }
+  r = select([pullRequest({ headSha: head.toUpperCase(), baseSha: base })]);
+  assert.match(r.stderr.toString(), /has no valid head\.sha/, 'shas are lowercase full object names');
+});
+
+// ---------------------------------------------------------------------------
 // ai-launch: routing of the opencode mode and parity with the pristine launcher
 // ---------------------------------------------------------------------------
 test('ai-launch equals the pristine device launcher plus exactly the opencode-mode edits', () => {
@@ -3221,11 +3726,12 @@ test('ai-launch equals the pristine device launcher plus exactly the opencode-mo
   replaceOnce('  codex|claude)\n    SELECTED_MODE="$MODE"', '  codex|claude|opencode)\n    SELECTED_MODE="$MODE"');
   replaceOnce('die "Usage: ai-launch [codex|claude|menu] [repo]"', 'die "Usage: ai-launch [codex|claude|opencode|menu] [repo]"');
   replaceOnce('if (($#)) && [[ "$1" != -* ]]; then\n  direct="$1"',
-    '# oauto: a leading model alias (`oauto deepseek`) is not a repository name; keep it\n'
-    + '# for oauto-run and fall through to the normal repository menu.\n'
-    + 'oauto_alias=""\n'
-    + 'if [[ "$SELECTED_MODE" == opencode ]] && (($#)) && [[ "$1" =~ ^(glm|deepseek)$ ]]; then\n'
-    + '  oauto_alias="$1"\n  shift\nfi\n\n'
+    '# oauto: leading model aliases and the PR mode (`oauto deepseek`, `oauto pr`,\n'
+    + '# `oauto deepseek pr`) are not repository names; keep them for oauto-run, ahead of the\n'
+    + '# remaining arguments, and fall through to the normal repository menu.\n'
+    + 'oauto_args=()\n'
+    + 'while [[ "$SELECTED_MODE" == opencode ]] && (($#)) && [[ "$1" =~ ^(glm|deepseek|pr)$ ]]; do\n'
+    + '  oauto_args+=("$1")\n  shift\ndone\n\n'
     + 'if (($#)) && [[ "$1" != -* ]]; then\n  direct="$1"');
   replaceOnce('cd "$SELECTED_REPO"\n\necho\necho "============================================================"',
     'cd "$SELECTED_REPO"\n\n'
@@ -3233,7 +3739,7 @@ test('ai-launch equals the pristine device launcher plus exactly the opencode-mo
     + '# cauto/clauto; everything OpenCode-specific (preflight, policy, lock, banner)\n'
     + '# lives in oauto-run, so the codex/claude paths below are untouched.\n'
     + 'if [[ "$SELECTED_MODE" == opencode ]]; then\n'
-    + '  exec /root/work/bin/oauto-run "$SELECTED_REPO" ${oauto_alias:+"$oauto_alias"} "$@"\nfi\n\n'
+    + '  exec /root/work/bin/oauto-run "$SELECTED_REPO" "${oauto_args[@]}" "$@"\nfi\n\n'
     + 'echo\necho "============================================================"');
   assert.equal(fs.readFileSync(AI_LAUNCH, 'utf8'), expected);
 });
@@ -3267,6 +3773,32 @@ test('ai-launch routes opencode arguments to oauto-run and keeps the menu for a 
   assert.equal(r.status, 0, r.stderr);
   assert.match(r.stdout, /Choose repository:/);
   assert.deepEqual(fs.readFileSync(log, 'utf8').trim().split('\n'), [fs.realpathSync(repo), 'deepseek']);
+
+  // PR review mode: `pr` after the repository is forwarded like any argument; leading `pr`
+  // and model aliases (any order) are kept for oauto-run, ahead of the remaining arguments,
+  // and the menu appears when no repository follows them.
+  const real = fs.realpathSync(repo);
+  const routed = {};
+  for (const [args, input] of [
+    [['alpha', 'pr'], ''], [['alpha', 'deepseek', 'pr'], ''], [['alpha', 'pr', 'deepseek', '--check'], ''],
+    [['pr'], '1\n'], [['deepseek', 'pr'], '1\n'], [['pr', 'deepseek'], '1\n'], [['glm', 'pr', '--check'], '1\n'],
+    [['pr', 'alpha', '--check'], ''],
+  ]) {
+    fs.rmSync(log, { force: true });
+    const res = spawnSync('bash', [launcher, 'opencode', ...args], { encoding: 'utf8', env, input });
+    routed[args.join(' ')] = { status: res.status, menu: /Choose repository:/.test(res.stdout),
+      forwarded: fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n') : null };
+  }
+  assert.deepEqual(routed, {
+    'alpha pr': { status: 0, menu: false, forwarded: [real, 'pr'] },
+    'alpha deepseek pr': { status: 0, menu: false, forwarded: [real, 'deepseek', 'pr'] },
+    'alpha pr deepseek --check': { status: 0, menu: false, forwarded: [real, 'pr', 'deepseek', '--check'] },
+    pr: { status: 0, menu: true, forwarded: [real, 'pr'] },
+    'deepseek pr': { status: 0, menu: true, forwarded: [real, 'deepseek', 'pr'] },
+    'pr deepseek': { status: 0, menu: true, forwarded: [real, 'pr', 'deepseek'] },
+    'glm pr --check': { status: 0, menu: true, forwarded: [real, 'glm', 'pr', '--check'] },
+    'pr alpha --check': { status: 0, menu: false, forwarded: [real, 'pr', '--check'] },
+  });
 
   r = spawnSync('bash', [launcher, 'bogus'], { encoding: 'utf8', env, input: '' });
   assert.equal(r.status, 1);
