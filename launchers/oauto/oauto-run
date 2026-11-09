@@ -264,7 +264,12 @@ tree_walk() { # $1: revision; $2: repo-relative path as referenced
         hops=$((hops + 1))
         (( hops <= 40 )) || die "a chain of committed symlinks on an included Git config path exceeds 40 hops (fail closed)"
         g cat-file blob "$rev:$candidate" > "$blob_tmp" || return 0
-        target="$(<"$blob_tmp")"
+        # The target is read byte-exact: a trailing newline is part of the name (command
+        # substitution would strip it and walk the wrong path); a NUL cannot be a path.
+        [[ "$(tr -d -c '\000' < "$blob_tmp" | wc -c)" -eq 0 ]] ||
+          die "a committed symlink on an included Git config path has a NUL byte in its target (fail closed)"
+        target=""
+        IFS= read -r -d '' target < "$blob_tmp" || true
         [[ -n "$target" ]] || die "a committed symlink on an included Git config path has an empty target (fail closed)"
         if [[ "$target" == /* ]]; then
           if [[ "$target" == "$REPO"/* ]]; then

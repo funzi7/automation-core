@@ -2983,6 +2983,27 @@ test('P1 (Codex on d64744c): an include DIRECTIVE written as conf/../b.cfg keeps
   assert.ok(!plain.stdout.split('\0').includes('W'), 'a directive without . or .. components needs no walk record');
 });
 
+test('P1 (Codex on 2389a03): a committed symlink target ending in a newline is read byte-exact, so the real file is excluded', () => {
+  const sb = sandbox();
+  const token = 'S-TRAILING-NL-SYNTH-7e7e';
+  // Committed: a.cfg -> "b.cfg\n" (the target file's name ends in a literal newline) holding the
+  // credential; .git/config includes ../a.cfg; both deleted. Command substitution would strip the
+  // newline and walk "b.cfg", a file that never existed.
+  const repo = chainRepo(sb, 'trailing-newline', { 'b.cfg\n': includedConfigText(token) }, '../a.cfg');
+  fs.symlinkSync('b.cfg\n', path.join(repo, 'a.cfg'));
+  git(repo, ['add', '-A']);
+  git(repo, ['commit', '-q', '-m', 'link to a name ending in a newline']);
+  assert.equal(git(repo, ['config', '--get', 'http.extraheader']).trim(), `AUTHORIZATION: bearer ${token}`, 'git itself loaded the file through the link');
+  fs.unlinkSync(path.join(repo, 'a.cfg'));
+  fs.rmSync(path.join(repo, 'b.cfg\n'));
+  const { r, preflight, prompt } = launchRecordingPrompt(sb, repo); // no override: nothing secret-like is present
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(!preflight.includes(token) && !prompt.includes(token),
+    `the removed credential behind a newline-terminated link target must not reach the preflight:\n${preflight}`);
+  // The display list is sorted by the raw path bytes (`a.cfg` before `b.cfg\n`), then C-quoted.
+  assert.deepEqual(excludedLines(preflight), ['a.cfg (included Git config)', '"b.cfg\\n" (included Git config)']);
+});
+
 test('P3-4: case-variant secret-like files are denied by their exact name under the override, in both agents and the ceiling', () => {
   const sb = sandbox();
   const repo = mkRepo(sb, 'case-variants', { 'src/a.py': 'x = 1\n', 'Auth.json': '{"t":"SYNTH"}\n',

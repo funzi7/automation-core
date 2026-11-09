@@ -145,7 +145,8 @@ policy, not by the system prompt alone:
    outside the repository too; every historical include path is walked
    through the tree at that revision like a path lookup (`git ls-tree` per
    component): a committed symlink — file or directory, mode `120000`, its
-   blob the target — is replaced by its target before the next component is
+   blob the target, read byte-exact so a trailing newline stays part of the
+   name — is replaced by its target before the next component is
    looked at, so `..` applies after the link it follows (`conf/../b.cfg`
    follows `conf` first), an absolute target inside the repository or a
    relative one that leaves and re-enters it continues inside, and more
