@@ -761,7 +761,7 @@ def scan(repo: str, budget: float, included_out: str | None = None,
     content: set[tuple[str, str]] = set()
     dir_links: list[tuple[str, str, str]] = []      # in-repo directory aliases (link, target, rel target)
     alias_inodes: dict[tuple[int, int], str] = {}   # (st_dev, st_ino) of secret-like files and git dir files
-    names_in_repo: dict[tuple[int, int], int] = {}  # (st_dev, st_ino) -> names seen in the worktree and .git
+    names_in_repo: dict[tuple[int, int], int] = {}  # (st_dev, st_ino) -> names seen in the worktree and .git (st_nlink > 1 only)
     linked: list[tuple[str, tuple[int, int], int, bool]] = []  # worktree files with st_nlink > 1 (+ secret-like?)
     included: dict[str, str] = {}                   # in-repo, non-.git included Git configs: canonical -> rel
     unloadable_includes: dict[str, str] = {}        # in-repo include targets git cannot load (deleted ...)
@@ -960,7 +960,7 @@ def scan(repo: str, budget: float, included_out: str | None = None,
                 if st is None or not stat.S_ISREG(st.st_mode):
                     continue
                 inode = (st.st_dev, st.st_ino)
-                if in_repo:
+                if in_repo and st.st_nlink > 1:
                     names_in_repo[inode] = names_in_repo.get(inode, 0) + 1
                 # Hooks are scripts, not secrets; a hook installed as a hard link from
                 # the worktree (ln scripts/pre-commit .git/hooks/pre-commit) is not an alias.
@@ -1019,11 +1019,12 @@ def scan(repo: str, budget: float, included_out: str | None = None,
             st = None if is_link else lstat(full)
             regular = st is not None and stat.S_ISREG(st.st_mode)
             secret_name = is_sensitive_path(r)
-            if regular:
+            if regular and st.st_nlink > 1:
+                # Only a file with several names can be anyone's partner, so only those
+                # are counted: one entry per hard-linked file, not per file in the tree.
                 inode = (st.st_dev, st.st_ino)
                 names_in_repo[inode] = names_in_repo.get(inode, 0) + 1
-                if st.st_nlink > 1:
-                    linked.append((r, inode, st.st_nlink, secret_name))
+                linked.append((r, inode, st.st_nlink, secret_name))
             if secret_name:
                 sensitive.add(r)
                 if regular:
