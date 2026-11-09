@@ -183,10 +183,11 @@ origins_z="$(mktemp "$STATE_DIR/.origins.XXXXXX")"
 missing_z="$(mktemp "$STATE_DIR/.missing.XXXXXX")"
 extra_z="$(mktemp "$STATE_DIR/.extra.XXXXXX")"
 unruled_z="$(mktemp "$STATE_DIR/.unruled.XXXXXX")"
+walk_z="$(mktemp "$STATE_DIR/.walk.XXXXXX")"
 new_z="$(mktemp "$STATE_DIR/.new.XXXXXX")"
 blob_tmp="$(mktemp "$STATE_DIR/.blob.XXXXXX")"
 hops_z="$(mktemp "$STATE_DIR/.hops.XXXXXX")"
-tmp_files+=("$included_z" "$origins_z" "$missing_z" "$extra_z" "$unruled_z" "$new_z" "$blob_tmp" "$hops_z")
+tmp_files+=("$included_z" "$origins_z" "$missing_z" "$extra_z" "$unruled_z" "$walk_z" "$new_z" "$blob_tmp" "$hops_z")
 # Git names every configuration file it actually loads (includes followed however they
 # are written); the scan treats each one inside the worktree as Git configuration.
 g config --list --show-origin -z > "$origins_z" || die "git configuration cannot be listed (fail closed)"
@@ -308,6 +309,11 @@ history_pass() {
   while IFS= read -r -d '' path; do
     if [[ -f "$REPO/$path" ]] && ! in_list "$path" "${found[@]}"; then queue+=("I:$path"); depth+=(1); ctx+=("$path"); fi
   done < "$included_z"
+  # Include directives whose `.`/`..` components survive (`conf/../b.cfg`), as the scan
+  # met them in the live Git configs: walked through the tree at each revision, where a
+  # committed `conf` symlink is followed before `..` applies; the walk's result is what
+  # gets excluded, so these raw spellings are never themselves handed over as names.
+  while IFS= read -r -d '' path; do queue+=("I:$path"); depth+=(1); ctx+=("$path"); done < "$walk_z"
   : > "$new_z"
   enqueue_records() { # $1: records file (KIND NUL TARGET NUL); $2: inherited context, or "" for the record's own path
     local file="$1" inherited="$2" kind target next use_ctx
@@ -316,6 +322,7 @@ history_pass() {
       case "$kind" in
         I) if ! in_list "$target" "${known[@]}"; then known+=("$target"); printf '%s\0' "$target" >> "$new_z"; fi ;;
         O) ;;
+        W) kind=I ;;   # an uncollapsed directive path: walked through the tree, never handed over as a name
         *) die "a malformed include record reached the launcher" ;;
       esac
       next="$kind:$target"
@@ -368,7 +375,7 @@ while :; do
   scan_pass=$((scan_pass + 1))
   (( scan_pass <= 8 )) || die "Git config includes found through history did not settle within 8 scan passes (fail closed)"
   scan_status=0
-  scan_out="$(python3 -I "$POLICY" scan "$REPO" --budget "$SCAN_BUDGET" --included-out "$included_z" --config-origins "$origins_z" --missing-out "$missing_z" --extra-config "$extra_z" --unruled-out "$unruled_z")" || scan_status=$?
+  scan_out="$(python3 -I "$POLICY" scan "$REPO" --budget "$SCAN_BUDGET" --included-out "$included_z" --config-origins "$origins_z" --missing-out "$missing_z" --extra-config "$extra_z" --unruled-out "$unruled_z" --walk-out "$walk_z")" || scan_status=$?
   if (( scan_status != 0 )); then
     printf '%s\n' "$scan_out" | tail -3 >&2
     die "worktree scan did not complete (status $scan_status): a directory could not be listed or the scan budget of ${SCAN_BUDGET}s ran out; see the records above (set OAUTO_SCAN_BUDGET higher for large trees)"

@@ -617,10 +617,42 @@ def includes_in_config(repo: str, config_path: str, data: bytes) -> list[tuple[b
             records.append((b"I", rel(canon)))
         if lexical not in (named, canon) and in_worktree(lexical):
             records.append((b"I", rel(lexical)))
+        walk = uncollapsed_include_path(repo, config_path, inc)
+        if walk is not None:
+            records.append((b"W", os.fsencode(walk)))
         for record in records:
             if record not in found:
                 found.append(record)
     return found
+
+
+def uncollapsed_include_path(repo: str, config_path: str, inc: str) -> str | None:
+    """An include directive's path with its ``.`` and ``..`` components preserved,
+    repository-relative, for the launcher's tree walk through history: ``conf/../b.cfg``
+    must follow a committed ``conf`` symlink before ``..`` applies, which any lexical or
+    live normalisation collapses away. ``config_path`` is the including file as git opened
+    it: repository-relative (possibly itself uncollapsed), or ``.git/...`` for the
+    repository's own config, whose relative includes start one level up (``.git/..`` is
+    the root). None when the directive has no such component, lies outside the repository
+    or belongs to a file outside it (those are resolved live)."""
+    inc = os.path.expanduser(inc)
+    repo = os.path.realpath(repo)
+    if os.path.isabs(inc):
+        if not inc.startswith(repo + os.sep):
+            return None
+        raw = inc[len(repo) + 1:]
+    elif os.path.isabs(config_path):
+        return None
+    elif config_path == ".git" or config_path.startswith(".git" + os.sep):
+        if not inc.startswith(os.pardir + os.sep):
+            return None
+        raw = inc[len(os.pardir) + 1:]
+    else:
+        base = os.path.dirname(config_path)
+        raw = os.path.join(base, inc) if base else inc
+    if not raw or os.path.normpath(raw) == raw:
+        return None
+    return raw
 
 
 def _q(path: str) -> str:
@@ -894,7 +926,8 @@ def check_excluded(excluded_file: str, remaining_file: str) -> None:
 
 def scan(repo: str, budget: float, included_out: str | None = None,
          config_origins: str | None = None, missing_out: str | None = None,
-         extra_config: str | None = None, unruled_out: str | None = None) -> int:
+         extra_config: str | None = None, unruled_out: str | None = None,
+         walk_out: str | None = None) -> int:
     """Print one ASCII record per finding (every pathname C-quoted like git) and a final
     SUMMARY line whose counts are what the launcher decides on:
 
@@ -915,7 +948,10 @@ def scan(repo: str, budget: float, included_out: str | None = None,
     each is handled exactly like an include target the scan found itself. ``unruled_out``
     receives every SENSITIVE worktree path whose exact spelling the static read rules do
     not deny (a case variant such as ``Auth.json``): the launcher denies each by its
-    exact name for that launch, so the override cannot expose it to ``read``."""
+    exact name for that launch, so the override cannot expose it to ``read``.
+    ``walk_out`` receives every include directive path met in the live Git configs whose
+    ``.``/``..`` components survive (``conf/../b.cfg``), NUL-terminated, for the launcher's
+    tree walk through history (uncollapsed_include_path)."""
     repo = os.path.realpath(repo)
     git_dir = os.path.join(repo, ".git")
     started = time.monotonic()
@@ -933,6 +969,7 @@ def scan(repo: str, budget: float, included_out: str | None = None,
     included: dict[str, str] = {}                   # in-repo, non-.git included Git configs: canonical -> rel
     unloadable_includes: dict[str, str] = {}        # in-repo include targets git cannot load (deleted ...)
     include_names: dict[str, str] = {}              # in-repo symlinks git opens as includes (target present)
+    walk_paths: set[str] = set()                    # include directive paths with . or .. components, for the tree walk
     seen_configs: set[str] = set()                  # traversal, keyed by referenced name (resolution context)
     complete = True
 
@@ -1076,7 +1113,16 @@ def scan(repo: str, budget: float, included_out: str | None = None,
         if report is not None and git_config_has_credentials(text):
             content.add((report, "remote URL or http header embeds credentials"))
         anchor = report if report is not None else anchor
+        if found == git_dir or found.startswith(git_dir + os.sep):
+            found_rel = rel(found)
+        elif inside_repo(found):
+            found_rel = rel(found)
+        else:
+            found_rel = found  # outside the repository: no walk path (resolved live)
         for inc in config_include_paths(text):
+            walk = uncollapsed_include_path(repo, found_rel, inc)
+            if walk is not None:
+                walk_paths.add(walk)
             inc_named, inc_canon, loadable = register_include(os.path.join(os.path.dirname(named), os.path.expanduser(inc)))
             if not loadable:
                 continue
@@ -1305,6 +1351,9 @@ def scan(repo: str, budget: float, included_out: str | None = None,
     if missing_out:
         with open(missing_out, "wb") as fh:
             fh.write(b"".join(os.fsencode(r) + b"\0" for r in sorted(unloadable_includes.values(), key=os.fsencode)))
+    if walk_out:
+        with open(walk_out, "wb") as fh:
+            fh.write(b"".join(os.fsencode(r) + b"\0" for r in sorted(walk_paths, key=os.fsencode)))
     return 0 if complete else 3
 
 
@@ -1553,6 +1602,8 @@ def main(argv: list[str]) -> None:
                         help="write the in-repository files .git/config includes, NUL-terminated")
     p_scan.add_argument("--unruled-out", metavar="FILE",
                         help="write the SENSITIVE worktree paths the static read rules do not deny by exact name, NUL-terminated")
+    p_scan.add_argument("--walk-out", metavar="FILE",
+                        help="write the include directive paths that keep . or .. components (for the history tree walk), NUL-terminated")
 
     p_crg = sub.add_parser("check-repo-git")
     p_crg.add_argument("repo", help="repository root whose .git must be a real dir or a .git file this worktree owns")
@@ -1601,7 +1652,7 @@ def main(argv: list[str]) -> None:
         sys.stdout.write("\n")
     elif args.cmd == "scan":
         sys.exit(scan(args.repo, args.budget, args.included_out, args.config_origins, args.missing_out,
-                      args.extra_config, args.unruled_out))
+                      args.extra_config, args.unruled_out, args.walk_out))
     elif args.cmd == "check-repo-git":
         check_repo_git(args.repo)
     elif args.cmd == "classify":

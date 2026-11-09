@@ -1741,10 +1741,12 @@ test('includes-in-config: targets of a Git config read from stdin, resolved like
     + '[include]\n\tpath = ../../outside.cfg\n\tpath = ../.git/config\n\tpath = b.cfg\n';
   const r = spawnSync('python3', ['-I', POLICY, 'includes-in-config', `--repo=${repo}`, '--config-path=conf/a.cfg'], { input: text });
   assert.equal(r.status, 0, r.stderr.toString());
-  // I records: in-repository targets (relative); O records: anything else, a file to follow (absolute).
+  // I records: in-repository targets (relative); O records: anything else, a file to follow (absolute);
+  // W records: the directive's own spelling when it keeps `.`/`..` components, for the history tree walk.
   const real = fs.realpathSync(repo);
-  assert.deepEqual(r.stdout, nulJoin('I', 'conf/b.cfg', 'I', 'top.cfg', 'I', 'conf/sub dir/c.cfg',
-    'O', path.join(path.dirname(real), 'outside.cfg'), 'O', path.join(real, '.git', 'config')));
+  assert.deepEqual(r.stdout, nulJoin('I', 'conf/b.cfg', 'I', 'top.cfg', 'W', 'conf/../top.cfg', 'I', 'conf/sub dir/c.cfg',
+    'O', path.join(path.dirname(real), 'outside.cfg'), 'W', 'conf/../../outside.cfg',
+    'O', path.join(real, '.git', 'config'), 'W', 'conf/../.git/config'));
   // An outside file's content resolves relative to its own (absolute) location.
   const outside = spawnSync('python3', ['-I', POLICY, 'includes-in-config', `--repo=${repo}`, `--config-path=${path.join(sb.root, 'bridge.cfg')}`],
     { input: `[include]\n\tpath = ${path.join(real, 'conf', 'b.cfg')}\n\tpath = elsewhere.cfg\n` });
@@ -1765,8 +1767,8 @@ test('includes-in-config: targets of a Git config read from stdin, resolved like
   fs.symlinkSync('nowhere.cfg', path.join(repo, 'dangling.cfg'));
   const named2 = spawnSync('python3', ['-I', POLICY, 'includes-in-config', `--repo=${repo}`, '--config-path=conf/a.cfg'],
     { input: '[include]\n\tpath = ../link.cfg\n\tpath = ../dangling.cfg\n' });
-  assert.deepEqual(named.stdout, nulJoin('I', 'link.cfg', 'I', 'real.cfg', 'I', 'dangling.cfg'));
-  assert.deepEqual(named2.stdout, nulJoin('I', 'link.cfg', 'I', 'real.cfg', 'I', 'dangling.cfg', 'I', 'nowhere.cfg'));
+  assert.deepEqual(named.stdout, nulJoin('I', 'link.cfg', 'I', 'real.cfg', 'W', 'conf/../link.cfg', 'I', 'dangling.cfg', 'W', 'conf/../dangling.cfg'));
+  assert.deepEqual(named2.stdout, nulJoin('I', 'link.cfg', 'I', 'real.cfg', 'W', 'conf/../link.cfg', 'I', 'dangling.cfg', 'I', 'nowhere.cfg', 'W', 'conf/../dangling.cfg'));
 });
 
 // ---------------------------------------------------------------------------
@@ -2147,7 +2149,7 @@ test('oauto-run source: no automatic approval, standalone helpers, bounded helpe
   // One decision point: the scan runs in a bounded loop, fed what history reveals, and the
   // verdict, the deny rules and classify use the final pass.
   assert.match(code, /\(\( scan_pass <= 8 \)\) \|\| die "/);
-  assert.match(code, /--missing-out "\$missing_z" --extra-config "\$extra_z" --unruled-out "\$unruled_z"\)" \|\| scan_status=\$\?/);
+  assert.match(code, /--missing-out "\$missing_z" --extra-config "\$extra_z" --unruled-out "\$unruled_z" --walk-out "\$walk_z"\)" \|\| scan_status=\$\?/);
   assert.match(code, /\n\s*history_pass\n\s*\[\[ -s "\$new_z" \]\] \|\| break\n\s*cat "\$new_z" >> "\$extra_z"\ndone\n/);
   const loopEnd = lines.findIndex((l) => l.startsWith('note "worktree scan passes: $scan_pass"'));
   assert.ok(loopEnd > 0 && lines.findIndex((l) => l.startsWith('if (( n_symlinks > 0 )); then')) > loopEnd, 'the verdict follows the last pass');
@@ -2937,6 +2939,48 @@ test('P1 (Codex on bdc6cef): a symlinked included config keeps its resolution co
     dirlink: { status: 0, leaked: false, excluded: ['realconf/a.cfg (included Git config)', 'realconf/x.cfg (included Git config)'] },
     two: { status: 0, leaked: false, excluded: ['a.cfg (included Git config)', 'c.cfg (included Git config)', 'configs/b.cfg (included Git config)', 'configs/c.cfg (included Git config)'] },
   }, JSON.stringify(outcome, null, 1));
+});
+
+test('P1 (Codex on d64744c): an include DIRECTIVE written as conf/../b.cfg keeps its components for the tree walk, from history and from .git/config', () => {
+  const sb = sandbox();
+  const outcome = {};
+  const record = (label, repo, tokens, env = {}) => {
+    const { r, preflight, prompt } = launchRecordingPrompt(sb, repo, env);
+    outcome[label] = { status: r.status, leaked: tokens.some((t) => preflight.includes(t) || prompt.includes(t)), excluded: excludedLines(preflight), stderr: r.stderr };
+  };
+  // Codex's scenario: committed a.cfg says `path = conf/../b.cfg`, conf -> dirs/nested, the credential
+  // in dirs/b.cfg; .git/config includes ../a.cfg. Git loaded dirs/b.cfg (conf first, then `..`); a
+  // normalised conf/../b.cfg is root b.cfg. a.cfg, conf and dirs/b.cfg deleted.
+  const viaFile = chainRepo(sb, 'dotdot-directive', { 'a.cfg': '[include]\n\tpath = conf/../b.cfg\n', 'dirs/b.cfg': includedConfigText('S-DIRECTIVE-FILE-1b1b'),
+    'dirs/nested/.keep': '' }, '../a.cfg');
+  fs.symlinkSync('dirs/nested', path.join(viaFile, 'conf'));
+  git(viaFile, ['add', '-A']);
+  git(viaFile, ['commit', '-q', '-m', 'conf -> dirs/nested']);
+  assert.equal(git(viaFile, ['config', '--get', 'http.extraheader']).trim(), `AUTHORIZATION: bearer S-DIRECTIVE-FILE-1b1b`, 'git itself loaded dirs/b.cfg');
+  for (const f of ['a.cfg', 'conf', 'dirs/b.cfg']) fs.rmSync(path.join(viaFile, f));
+  record('file', viaFile, ['S-DIRECTIVE-FILE-1b1b']);
+  // The directive directly in .git/config (`path = ../conf/../b.cfg`), conf and dirs/b.cfg deleted.
+  const viaGit = chainRepo(sb, 'dotdot-gitconfig', { 'dirs/b.cfg': includedConfigText('S-DIRECTIVE-GIT-2c2c'), 'dirs/nested/.keep': '' }, '../conf/../b.cfg');
+  fs.symlinkSync('dirs/nested', path.join(viaGit, 'conf'));
+  git(viaGit, ['add', '-A']);
+  git(viaGit, ['commit', '-q', '-m', 'conf -> dirs/nested']);
+  assert.equal(git(viaGit, ['config', '--get', 'http.extraheader']).trim(), `AUTHORIZATION: bearer S-DIRECTIVE-GIT-2c2c`, 'git itself loaded dirs/b.cfg');
+  for (const f of ['conf', 'dirs/b.cfg']) fs.rmSync(path.join(viaGit, f));
+  record('gitconfig', viaGit, ['S-DIRECTIVE-GIT-2c2c']);
+  assert.deepEqual(Object.fromEntries(Object.entries(outcome).map(([k, v]) => [k, { status: v.status, leaked: v.leaked, excluded: v.excluded }])), {
+    file: { status: 0, leaked: false, excluded: ['a.cfg (included Git config)', 'dirs/b.cfg (included Git config)'] },
+    gitconfig: { status: 0, leaked: false, excluded: ['dirs/b.cfg (included Git config)'] },
+  }, JSON.stringify(outcome, null, 1));
+  // includes-in-config hands over the uncollapsed spelling as a W record next to the collapsed names.
+  const recs = policy(['includes-in-config', '--repo', viaFile, '--config-path', 'a.cfg'], '[include]\n\tpath = conf/../b.cfg\n');
+  assert.equal(recs.status, 0, recs.stderr);
+  const fields = recs.stdout.split('\0').filter(Boolean);
+  assert.ok(fields.includes('W') && fields[fields.indexOf('W') + 1] === 'conf/../b.cfg', recs.stdout);
+  const fromGit = policy(['includes-in-config', '--repo', viaGit, '--config-path', '.git/config'], '[include]\n\tpath = ../conf/../b.cfg\n');
+  const gitFields = fromGit.stdout.split('\0').filter(Boolean);
+  assert.ok(gitFields.includes('W') && gitFields[gitFields.indexOf('W') + 1] === 'conf/../b.cfg', fromGit.stdout);
+  const plain = policy(['includes-in-config', '--repo', viaGit, '--config-path', '.git/config'], '[include]\n\tpath = ../conf/b.cfg\n');
+  assert.ok(!plain.stdout.split('\0').includes('W'), 'a directive without . or .. components needs no walk record');
 });
 
 test('P3-4: case-variant secret-like files are denied by their exact name under the override, in both agents and the ceiling', () => {

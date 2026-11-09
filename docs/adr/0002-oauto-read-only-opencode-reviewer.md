@@ -154,9 +154,12 @@ policy, not by the system prompt alone:
    never parsed as config text, and its own relative includes are resolved
    against the path git opened — the referenced name, carried as the
    traversal context, not the directory the link led to — with a content
-   path reached under two contexts followed under both (Codex P1s on
-   `0ca1844`, `2c743cf`, `9e8a88d`, `bdc6cef` and `0bc9c29`, 2026-11-09) —
-   and every in-repository target found this
+   path reached under two contexts followed under both; an include directive
+   whose own spelling keeps `.`/`..` components (`path = conf/../b.cfg`, in
+   `.git/config` or in any config met live or in history) is handed to the
+   same walk uncollapsed instead of being normalised first (Codex P1s on
+   `0ca1844`, `2c743cf`, `9e8a88d`, `bdc6cef`, `0bc9c29` and `d64744c`,
+   2026-11-09) — and every in-repository target found this
    way is handed back to the scan, which runs again until nothing new
    appears (include targets are tracked under their referenced name and
    their canonical target, and traversal is keyed by the referenced path,
