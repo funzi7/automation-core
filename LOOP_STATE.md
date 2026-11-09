@@ -289,8 +289,12 @@ is the permanent human opt-out and is never removed by automation.
     include-history traversal — a committed symlink among deleted included
     configs was read as text instead of followed, so its target's removed
     credential travelled — fixed in `afd4639` (`resolve-link`: the target is
-    excluded and followed within the same revision). `main` (PR #59) was
-    merged into the branch (`01f6840`). The Codex review, CI and Codex Gate state of the
+    excluded and followed within the same revision); its review of `2c743cf`
+    added a P1 in that resolver — an absolute target inside the repository was
+    treated as outside — fixed in `62fca59`, which also resolves a committed
+    directory symlink on an include path (the last documented gap of this
+    class; only a never-committed, deleted directory link stays unresolvable).
+    `main` (PR #59) was merged into the branch (`01f6840`). The Codex review, CI and Codex Gate state of the
     pushed head are recorded in `agent-memory/automation-core/cc-latest.md`.
     DONE by the owner on 2026-11-08: the Termux hop (`oauto <repo>` from a real
     Termux shell) and a review of a real project repository (the GLM audit).

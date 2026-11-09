@@ -106,10 +106,11 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
     belong to this worktree`; the victim's `.git/index` unchanged); `Auth.json` under the override is read-denied by
     exact name (rendered `read Auth.json` / `*/Auth.json` and `tool.use read:Auth.json` / `read:*/Auth.json` deny;
     64/46 probes, 45 agent probes). Nothing rendered for refused launches; no OpenCode process or service left.
-  - Final validation at `afd4639` (after the two Codex P1 fixes below): `bash scripts/validate.sh` green — YAML,
-    JSON, sync/mirror parity, JS syntax, `node --test` 269/269 (`tests/test_oauto_launcher.js` 97 tests: 75 before
-    this round + 12 in round 1 + 7 in round 2 + 1 + 2 for the two Codex P1s), 59 github-script bodies, actionlint,
-    `git diff --check` — 596 s (earlier runs: `d2495cd` 266/266 in 577 s, `5860e1f` 267/267 in 590 s).
+  - Final validation at `62fca59` (after the three Codex P1 fixes below): `bash scripts/validate.sh` green — YAML,
+    JSON, sync/mirror parity, JS syntax, `node --test` 271/271 (`tests/test_oauto_launcher.js` 99 tests: 75 before
+    this round + 12 in round 1 + 7 in round 2 + 1 + 2 + 2 for the three Codex P1 rounds), 59 github-script bodies,
+    actionlint, `git diff --check` — about 10 minutes (earlier runs: `d2495cd` 266/266 in 577 s, `5860e1f` 267/267
+    in 590 s, `afd4639` 269/269 in 596 s).
 - Round 2 — resolution of the independent review's findings (`d2495cd`, each reproduced on `43b1708` first):
   P2 → new `check-repo-git` (`parse_dot_git_file`, `own_git_info`, `_git_dir_owned`, `config_value`): `.git` must
   be a real directory, or a `.git` file — parsed exactly as git does — naming a linked-worktree admin dir whose
@@ -141,7 +142,8 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
   `check-repo-git` (refused earlier, same outcome).
 - Device: `bash launchers/oauto/install.sh` at `d2495cd` replaced `/root/work/bin/oauto-run` and
   `oauto-policy.py` (previous copies kept as `*.backup-before-oauto-20261109-020906`; `oauto-policy.py` again at
-  `5860e1f`, backup `*-20261109-024432`; both again at `afd4639`, backups `*-20261109-031603`); `ai-launch`, the Termux
+  `5860e1f`, backup `*-20261109-024432`; both again at `afd4639`, backups `*-20261109-031603`, and at `62fca59`,
+  backups `*-20261109-034619`); `ai-launch`, the Termux
   `oauto-launch` wrapper and both `.bashrc` blocks were already identical and untouched; `install.sh --verify`
   clean; the device-parity test is green; `/root/work/bin/oauto-run <fixture> deepseek --check` through the
   installed copy with the real binary verified sources (verbatim), models and agents (see below). `cauto`,
@@ -213,7 +215,26 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
   stage through a looping include), an escaping target, a type change (symlink at HEAD, ordinary file now) and
   `resolve-link`'s refusals and resolutions; README row and ADR item 4 updated; `install.sh` refreshed `oauto-run`
   and `oauto-policy.py` (backups `*-20261109-031603`), `--verify` clean. The thread was replied to with the fix
-  commit and resolved; a Codex review of the final head was requested.
+  commit and resolved; a Codex review of the next head was requested.
+- Codex review of the third pushed head `2c743cf` (`@codex review` 03:27:08Z; receipt 03:33:32Z with `**Reviewed
+  commit:** 2c743cfb8b`; review-state marker `completed`, `has_unresolved_findings=true`; CI
+  `validate-automation-core` success 03:29:29Z; gate `🟡` at the push (head marker published again, run
+  `42556471850`), then `🔴 Active Codex P1/P2 finding` 03:34:03Z): one P1, valid, reproduced by Codex and
+  re-reproduced here — `resolve-link` labelled every ABSOLUTE symlink target `O` (outside), so a committed include
+  symlink `conf/a.cfg -> /abs/<repo>/conf/b.cfg` with both files deleted left `b.cfg` neither excluded nor
+  followed and its removed credential reached the preflight (old launcher: token present; fixed: absent, both
+  names excluded). Fixed in `62fca59`: an absolute target is judged by where it lands (existing components
+  realpath-resolved): inside the repository → an `I` record with the repository-relative path, the repository
+  root or `.git` → fail closed, elsewhere → `O`. The same commit closes the last documented gap of this class
+  — a committed DIRECTORY symlink on an include path (`conf -> realconf`, `conf/a.cfg` included, link and
+  directory deleted): git cannot read `HEAD:conf/a.cfg` through a tree symlink, so the history pass now walks
+  the path's ancestors at that revision, resolves the first `120000` entry (`resolve-link --rest=<path below
+  it>`) and follows the re-rooted path (reproduced on the previous launcher: credential in the preflight;
+  fixed: `realconf/a.cfg` excluded); the ADR/README limitation now holds only for a never-committed link. Tests:
+  the Codex absolute-target scenario plus `resolve-link`'s inside / root / `.git` / sibling-prefix cases; the
+  directory-symlink scenario plus `--rest` resolutions (root-level and nested links, escaping target).
+  `install.sh` refreshed `oauto-run` and `oauto-policy.py` (backups `*-20261109-034619`), `--verify` clean. The
+  thread was replied to with the fix commit and resolved; a Codex review of the final head was requested.
 - Review and gate state of the final head: recorded in `agent-memory/automation-core/cc-latest.md` (owner-facing
   state) once the exact-head CI, Codex review and Codex Gate verdict exist on the PR; never claimed here ahead of
   the evidence.
