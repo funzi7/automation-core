@@ -299,8 +299,12 @@ is the permanent human opt-out and is never removed by automation.
     committed link — fixed in `4544f09` (the written name is registered next
     to the resolved one); its review of `9e8a88d` added the same gap inside
     `resolve-link` for absolute targets — fixed in `09dfcc8` (every symlink
-    target is judged both as written and as live-resolved). `main` (PR #59)
-    was merged into the branch (`01f6840`). The Codex review, CI and Codex Gate state of the
+    target is judged both as written and as live-resolved); its review of
+    `bdc6cef` added a P1 in the same traversal — nested relative includes of
+    a symlinked config were resolved against the link's target directory
+    instead of the path git opened — fixed in `2d5d7b7` (every history entry
+    carries its resolution context). `main` (PR #59) was merged into the
+    branch (`01f6840`). The Codex review, CI and Codex Gate state of the
     pushed head are recorded in `agent-memory/automation-core/cc-latest.md`.
     DONE by the owner on 2026-11-08: the Termux hop (`oauto <repo>` from a real
     Termux shell) and a review of a real project repository (the GLM audit).

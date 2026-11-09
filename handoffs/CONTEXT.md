@@ -512,8 +512,10 @@ A1. oauto — read-only OpenCode reviewer launcher (2026-11-07):
   a later-retargeted directory symlink lost its written name) — fixed in
   `4544f09` (written name registered next to the resolved one); its review
   of `9e8a88d` added the same gap inside `resolve-link` for absolute targets
-  — fixed in `09dfcc8` (targets judged both as written and as live-resolved).
-  Shown
+  — fixed in `09dfcc8` (targets judged both as written and as live-resolved);
+  its review of `bdc6cef` added a P1 (nested relative includes of a symlinked
+  config resolved against the target's directory, not the path git opened) —
+  fixed in `2d5d7b7` (history entries carry their resolution context). Shown
   NOT reproducible on the real binary: the claimed backslash glob escape
   (ripgrep `--glob` filter rooted at the tool path; `external_directory` gates
   the path) — no rule added. Recorded as backlog, not changed here: mutable
