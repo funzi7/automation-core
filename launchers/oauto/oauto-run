@@ -230,6 +230,17 @@ parse_config_includes() { # $1: the path the config content on stdin belongs to
   python3 -I "$POLICY" includes-in-config --repo="$REPO" --config-path="$1" >> "$hops_z" ||
     die "the includes of a Git config file could not be read for the preflight"
 }
+resolve_outside() { # $1: a path outside the repository, as written; sets $abs byte-exact
+  # realpath -m resolves the components that exist and keeps the rest; its output is taken
+  # NUL-terminated (-z) and read with `read -d ''`, so a pathname ending in newline bytes
+  # survives (command substitution would strip them and name the wrong file). A failure or
+  # an empty result fails closed.
+  abs=""
+  realpath -z -m -- "$1" > "$blob_tmp" 2>/dev/null ||
+    die "an outside path on an included Git config chain could not be resolved (fail closed)"
+  IFS= read -r -d '' abs < "$blob_tmp" || true
+  [[ -n "$abs" ]] || die "an outside path on an included Git config chain resolved to nothing (fail closed)"
+}
 tree_walk() { # $1: revision; $2: repo-relative path as referenced
   # Resolves the path against the tree at $1 the way a path walk does: each component is
   # looked up in the tree, a committed symlink (file or directory) is replaced by its target
@@ -251,7 +262,7 @@ tree_walk() { # $1: revision; $2: repo-relative path as referenced
         # the walk inside it; anything else is an outside file, read live.
         if [[ "$remaining" == "${REPO##*/}"/* ]]; then remaining="${remaining#*/}"; continue; fi
         if [[ "$remaining" == "${REPO##*/}" ]]; then remaining=""; continue; fi
-        abs="$(realpath -m -- "$REPO/..${remaining:+/$remaining}")"
+        resolve_outside "$REPO/..${remaining:+/$remaining}"
         if [[ "$abs" == "$REPO"/* ]]; then resolved=""; remaining="${abs#"$REPO"/}"; continue; fi
         if [[ "$abs" == "$REPO" ]]; then resolved=""; remaining=""; continue; fi
         printf 'O\0%s\0' "$abs" >> "$hops_z"
@@ -285,7 +296,7 @@ tree_walk() { # $1: revision; $2: repo-relative path as referenced
             # An absolute target elsewhere: an outside file — unless the live filesystem
             # resolves it back into the repository (an outside alias directory pointing
             # at it), in which case the walk continues inside from the root.
-            abs="$(realpath -m -- "$target${remaining:+/$remaining}")"
+            resolve_outside "$target${remaining:+/$remaining}"
             if [[ "$abs" == "$REPO"/* ]]; then resolved=""; remaining="${abs#"$REPO"/}"; continue; fi
             if [[ "$abs" == "$REPO" ]]; then resolved=""; remaining=""; continue; fi
             printf 'O\0%s\0' "$abs" >> "$hops_z"

@@ -3034,6 +3034,67 @@ test('P1 (Codex on 68d2fd2): a committed link target that leaves the repository 
   }, JSON.stringify(outcome, null, 1));
 });
 
+test('P1 (Codex on 3833718): outside-alias resolution keeps trailing newlines and other odd bytes in the resolved pathname', () => {
+  const sb = sandbox();
+  const outcome = {};
+  const expected = {};
+  // Committed: a.cfg -> <outside alias of the repository>/<name>, the credential in <name>; .git/config
+  // includes ../a.cfg; both deleted. `realpath` output captured by command substitution lost trailing
+  // newline bytes, so the walk named a file that never existed and the real one was not excluded.
+  const cases = [
+    ['lf', 'b.cfg\n', '"b.cfg\\n"', 'absolute'],
+    ['lf-relative', 'b.cfg\n', '"b.cfg\\n"', 'relative'],           // the `..`-above-root branch
+    ['lflf', 'b.cfg\n\n', '"b.cfg\\n\\n"', 'absolute'],
+    ['tab-space', 'b cfg\t.cfg', '"b cfg\\t.cfg"', 'absolute'],
+    ['quote-backslash', 'b"\\.cfg', '"b\\"\\\\.cfg"', 'absolute'],
+    ['unicode', 'bé.cfg', '"b\\303\\251.cfg"', 'relative'],
+  ];
+  for (const [label, name, quoted, form] of cases) {
+    const token = `S-ALIAS-${label.toUpperCase()}-SYNTH-0a0a`;
+    const repo = chainRepo(sb, `alias-${label}`, { [name]: includedConfigText(token) }, '../a.cfg');
+    const real = fs.realpathSync(repo);
+    const alias = path.join(fs.realpathSync(sb.root), 'outside', `alias-${label}`);
+    fs.mkdirSync(path.dirname(alias), { recursive: true });
+    fs.symlinkSync(real, alias); // an outside directory that is an alias of the repository
+    const target = form === 'absolute' ? path.join(alias, name) : path.join(path.relative(real, alias), name);
+    fs.symlinkSync(target, path.join(repo, 'a.cfg'));
+    git(repo, ['add', '-A']);
+    git(repo, ['commit', '-q', '-m', `link through an outside alias (${label})`]);
+    assert.equal(git(repo, ['config', '--get', 'http.extraheader']).trim(), `AUTHORIZATION: bearer ${token}`, `${label}: git itself loaded the file through the alias`);
+    fs.unlinkSync(path.join(repo, 'a.cfg'));
+    fs.rmSync(path.join(repo, name));
+    const { r, preflight, prompt } = launchRecordingPrompt(sb, repo); // no override: nothing secret-like is present
+    outcome[label] = { status: r.status, leaked: preflight.includes(token) || prompt.includes(token), excluded: excludedLines(preflight), stderr: r.stderr };
+    if (label === 'quote-backslash') {
+      // A backslash in an included config's name cannot be denied by exact path (glob
+      // metacharacter rule): the launch is refused outright — fail closed, nothing rendered.
+      expected[label] = { status: 1, leaked: false, excluded: [] };
+      assert.match(r.stderr, /"b\\"\\\\\.cfg": cannot be denied by exact path \(glob metacharacter\)/);
+      assert.match(r.stderr, /refusing to launch/);
+      assert.ok(nothingRendered(sb, repo), `${label}: nothing may be rendered`);
+    } else {
+      expected[label] = { status: 0, leaked: false, excluded: ['a.cfg (included Git config)', `${quoted} (included Git config)`] };
+    }
+  }
+  assert.deepEqual(Object.fromEntries(Object.entries(outcome).map(([k, v]) => [k, { status: v.status, leaked: v.leaked, excluded: v.excluded }])), expected,
+    JSON.stringify(outcome, null, 1));
+  // Nested: the alias leads to a committed in-repository link that leads on to the newline-named file.
+  const chain = chainRepo(sb, 'alias-chain', { 'c.cfg\n': includedConfigText('S-ALIAS-CHAIN-SYNTH-1b1b') }, '../a.cfg');
+  const chainReal = fs.realpathSync(chain);
+  const chainAlias = path.join(fs.realpathSync(sb.root), 'outside', 'alias-chain');
+  fs.symlinkSync(chainReal, chainAlias);
+  fs.symlinkSync('c.cfg\n', path.join(chain, 'b.cfg'));
+  fs.symlinkSync(path.join(chainAlias, 'b.cfg'), path.join(chain, 'a.cfg'));
+  git(chain, ['add', '-A']);
+  git(chain, ['commit', '-q', '-m', 'alias then link']);
+  assert.equal(git(chain, ['config', '--get', 'http.extraheader']).trim(), 'AUTHORIZATION: bearer S-ALIAS-CHAIN-SYNTH-1b1b');
+  for (const f of ['a.cfg', 'b.cfg', 'c.cfg\n']) fs.rmSync(path.join(chain, f));
+  const nested = launchRecordingPrompt(sb, chain);
+  assert.equal(nested.r.status, 0, nested.r.stderr);
+  assert.ok(!nested.preflight.includes('S-ALIAS-CHAIN-SYNTH-1b1b') && !nested.prompt.includes('S-ALIAS-CHAIN-SYNTH-1b1b'), nested.preflight);
+  assert.deepEqual(excludedLines(nested.preflight), ['a.cfg (included Git config)', '"c.cfg\\n" (included Git config)']);
+});
+
 test('P3-4: case-variant secret-like files are denied by their exact name under the override, in both agents and the ceiling', () => {
   const sb = sandbox();
   const repo = mkRepo(sb, 'case-variants', { 'src/a.py': 'x = 1\n', 'Auth.json': '{"t":"SYNTH"}\n',

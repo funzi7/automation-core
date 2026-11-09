@@ -151,7 +151,10 @@ policy, not by the system prompt alone:
    follows `conf` first), an absolute target inside the repository, a
    relative one that leaves and re-enters it, or any outside path that the
    live filesystem resolves back into the repository (an outside alias
-   directory pointing at it) continues inside, and more
+   directory pointing at it) continues inside — outside paths are resolved
+   NUL-terminated (`realpath -z -m`, read with `read -d ''`) so a pathname
+   ending in newline bytes is kept byte-exact (Codex P1 on `3833718`) — and
+   more
    than 40 hops (the kernel's ELOOP), an empty target or a result at the
    repository root fail closed; the file reached is excluded and followed,
    never parsed as config text, and its own relative includes are resolved
