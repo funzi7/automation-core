@@ -268,15 +268,23 @@ policy, not by the system prompt alone:
    `git@github.com:<o>/<r>[.git]` and `ssh://git@github.com/<o>/<r>[.git]`; the
    URL reaches the policy on stdin and is never printed), then one
    authenticated, read-only REST call,
-   `gh api repos/<o>/<r>/pulls?state=open&head=<o>:<branch>&per_page=10`
+   `gh api repos/<o>/<r>/pulls?state=open&head=<o>%3A<branch>&per_page=10`
    (`timeout 60`; `env -i` keeping only HOME, PATH, `GH_PAGER=cat`,
-   `GH_PROMPT_DISABLED=1`, `GH_NO_UPDATE_NOTIFIER=1`, `TERM=dumb`). `oauto-policy.py
+   `GH_PROMPT_DISABLED=1`, `GH_NO_UPDATE_NOTIFIER=1`, `TERM=dumb`), run from `/`:
+   `gh api` rewrites `:owner`, `:repo`, `:branch` and `{…}` in an endpoint by
+   running git in its working directory (amended 2026-11-09 after the independent
+   review found `head=<o>:branch-x` sent as `head=<o>branch-x-x` and gh's git run
+   inside the reviewed repository), so the endpoint holds no `:`, `{` or `}` —
+   the branch percent-encoded, the filter's colon `%3A`, anything else refused —
+   and gh never runs in the repository. `oauto-policy.py
    pr-select` accepts exactly one open pull request whose head is the current
    branch of that repository (not a fork) at the local HEAD and whose base is a
    branch of it, and hands back only number, `html_url`, base ref, base sha and
    head sha; the response file is deleted. The base must exist locally as
    `origin/<base>` — unambiguous, with a merge base with HEAD — and the
-   existing `base` variable is set to it, so the existing pipeline (name
+   existing `base` variable is set to the commit it names, verified once
+   (`origin/<base>` is only the label shown, so a branch or tag of that name
+   appearing mid-run cannot redirect a diff), so the existing pipeline (name
    collection, exhaustive rename pairs, classification, content checks,
    exclusion proof, caps, `--stat` and diff) produces the pull request's delta:
    no second implementation. Every doubt fails closed with its reason before

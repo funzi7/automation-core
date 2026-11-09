@@ -7,8 +7,10 @@
 #   EXIT=<code>         a non-zero code fails the call like gh does: STDERR's text (default:
 #                       an authentication error) on stderr, nothing useful on stdout
 #   STDERR=<text>       the error text for EXIT
-#   ARGV_LOG=<file>     every call appends its argv (one per line) and its environment
-#                       variable NAMES (never values) to this file
+#   ARGV_LOG=<file>     every call appends its argv (one per line), its working directory
+#                       and its environment variable NAMES (never values) to this file
+# Like gh 2.46, an endpoint holding `:owner`, `:repo`, `:branch` or `{word}` is not sent as
+# written (gh fills those from git in its working directory); the double refuses it.
 set -euo pipefail
 CONTROL="$HOME/.fake-gh-control"
 control() { # KEY -> value or empty
@@ -25,6 +27,7 @@ if [[ -n "$ARGV_LOG" ]]; then
     echo "ARGS_BEGIN"
     printf '%s\n' "$@"
     echo "ARGS_END"
+    echo "CWD $PWD"
     echo "ENV_BEGIN"
     env | cut -d= -f1 | sort
     echo "ENV_END"
@@ -38,6 +41,12 @@ if [[ -n "$EXIT_CODE" && "$EXIT_CODE" != 0 ]]; then
 fi
 case "${1:-}" in
   api)
+    endpoint="${!#}"
+    placeholder_re='(:(owner|repo|branch)([^A-Za-z0-9_]|$)|\{[a-z]+\})'
+    if [[ "$endpoint" =~ $placeholder_re ]]; then
+      echo "fake-gh: the endpoint holds the gh placeholder '${BASH_REMATCH[1]}', which gh would rewrite: $endpoint" >&2
+      exit 3
+    fi
     [[ -n "$PULLS_JSON" ]] || { echo "fake-gh: no PULLS_JSON in $CONTROL" >&2; exit 2; }
     cat -- "$PULLS_JSON"
     ;;

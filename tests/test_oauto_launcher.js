@@ -112,8 +112,9 @@ function fakeControl(sb, settings) {
 }
 
 // OAUTO_GH_BIN: PR review mode's one GitHub call always reaches the test double
-// (tests/fixtures/fake-gh), never the real gh. `script`: another copy of oauto-run.
-function runOauto(sb, repo, args = [], extraEnv = {}, script = RUN) {
+// (tests/fixtures/fake-gh), never the real gh. `script`: another copy of oauto-run;
+// `spawnOptions`: e.g. the working directory (ai-launch runs oauto-run from the repository).
+function runOauto(sb, repo, args = [], extraEnv = {}, script = RUN, spawnOptions = {}) {
   const env = {
     PATH: process.env.PATH,
     HOME: sb.home,
@@ -124,7 +125,7 @@ function runOauto(sb, repo, args = [], extraEnv = {}, script = RUN) {
     LANG: 'C.UTF-8',
     ...extraEnv,
   };
-  return spawnSync('bash', [script, repo, ...args], { encoding: 'utf8', env, timeout: 120000 });
+  return spawnSync('bash', [script, repo, ...args], { encoding: 'utf8', env, timeout: 120000, ...spawnOptions });
 }
 
 function repoKey(repo) {
@@ -2173,16 +2174,27 @@ test('oauto-run source: no automatic approval, standalone helpers, bounded helpe
   // goes to pr-select alone, the origin URL to pr-query on stdin, and no git call fetches,
   // checks out or moves a ref.
   assert.match(code, /^GH_BIN="\$\{OAUTO_GH_BIN:-gh\}"$/m);
-  const ghCallLines = lines.filter((l) => /"\$GH_BIN" api\b/.test(l));
+  const ghCallLines = lines.filter((l) => /\bapi -H /.test(l));
   assert.equal(ghCallLines.length, 1, 'exactly one gh call');
-  assert.match(ghCallLines[0], /^\s*timeout 60 env -i HOME="\$HOME" PATH="\$PATH" GH_PAGER=cat GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 TERM=dumb "\$GH_BIN" api -H 'Accept: application\/vnd\.github\+json' "\$endpoint" > "\$pulls_json" 2> "\$gh_err" \|\| gh_status=\$\?$/);
-  assert.equal(code.match(/"\$GH_BIN"/g).length, 2, 'gh is only located (command -v) and called once');
+  // From `/`: gh api fills `:owner`/`:repo`/`:branch` placeholders by running git in its
+  // working directory, which must never be the reviewed repository.
+  assert.match(ghCallLines[0], /^\s*\( cd \/ && timeout 60 env -i HOME="\$HOME" PATH="\$PATH" GH_PAGER=cat GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 TERM=dumb "\$gh_path" api -H 'Accept: application\/vnd\.github\+json' "\$endpoint" \) > "\$pulls_json" 2> "\$gh_err" \|\| gh_status=\$\?$/);
+  assert.match(code, /gh_path="\$\(command -v "\$GH_BIN" 2>\/dev\/null\)" \|\|\n\s*die "[^"]*"\n\s*\[\[ "\$gh_path" == \/\* \]\] \|\| gh_path="\$PWD\/\$gh_path"\n/);
+  assert.equal(code.match(/"\$GH_BIN"/g).length, 1, 'GH_BIN is only resolved to the absolute path that is called');
   assert.match(code, /remote_url="\$\(g config --get remote\.origin\.url\)" \|\|\n\s*die "/);
   assert.match(code, /printf '%s' "\$remote_url" \| python3 -I "\$POLICY" pr-query --branch="\$pr_branch" > "\$pr_query_z" \|\|\n\s*die "/);
   assert.match(code, /python3 -I "\$POLICY" pr-select --branch="\$pr_branch" --head="\$head_sha" --repo="\$pr_repo" < "\$pulls_json" > "\$pr_fields" \|\|\n\s*die "/);
-  assert.match(code, /^if \(\( PR_MODE \)\); then\n  pr_identify\n  base="origin\/\$pr_base_ref"\nelif \[\[ "\$head_sha" != "\(no commits\)" \]\]; then\n  for cand in /m);
+  // PR mode computes every delta from the base commit pr_identify verified (merge-base check
+  // included); origin/<base> is only the label the preflight and the banner show.
+  assert.match(code, /^if \(\( PR_MODE \)\); then\n  pr_identify\n  base="\$pr_local_base"\n  base_label="origin\/\$pr_base_ref"\nelif \[\[ "\$head_sha" != "\(no commits\)" \]\]; then\n  for cand in /m);
+  assert.match(code, /^base_label="\$\{base_label:-\$base\}"/m);
+  assert.match(code, /g merge-base "\$pr_local_base" HEAD >\/dev\/null \|\|\n\s*die "/);
+  assert.match(code, /echo "- Base for branch delta: \$\{base_label:-\(none found\)\} /);
+  assert.match(code, /echo "## Branch delta vs \$base_label \(merge-base\.\.\.HEAD\)"/);
+  assert.match(code, /\[\$ahead_behind vs \$base_label\]/);
+  assert.ok(!/vs \$base[\] ]|\$\{base:-|merge-base "origin\//.test(code), 'no display shows the raw base, no merge-base names origin/<base>');
   assert.equal(lines.filter((l) => /^\s*pr_identify$/.test(l)).length, 1);
-  const ghLine = lines.findIndex((l) => /"\$GH_BIN" api\b/.test(l));
+  const ghLine = lines.findIndex((l) => /\bapi -H /.test(l));
   const prCallLine = lines.findIndex((l) => /^\s*pr_identify$/.test(l));
   assert.ok(crgLine < gLine && gLine < ghLine && ghLine < prCallLine && prCallLine < scanLine,
     `check-repo-git (${crgLine}) < g() (${gLine}) < gh (${ghLine}) < pr_identify (${prCallLine}) < scan (${scanLine})`);
@@ -3294,11 +3306,12 @@ function servePulls(sb, pulls, extra = {}) {
   fakeGh(sb, { PULLS_JSON: file, ...extra });
 }
 
-// The recorded gh calls: [{ args, env }] (env: variable names only).
+// The recorded gh calls: [{ args, cwd, env }] (env: variable names only).
 function ghCalls(log) {
   if (!fs.existsSync(log)) return [];
   return fs.readFileSync(log, 'utf8').split('ARGS_BEGIN\n').slice(1).map((chunk) => ({
     args: chunk.split('\nARGS_END')[0].split('\n'),
+    cwd: (chunk.match(/\nCWD (.*)\n/) || [])[1],
     env: chunk.split('ENV_BEGIN\n')[1].split('\nENV_END')[0].split('\n'),
   }));
 }
@@ -3363,10 +3376,12 @@ test('PR mode: a PR #58-style branch (upstream = HEAD, origin/main ahead) is rev
   const preflight = readPreflight(sb, repo);
   const prompt = fs.readFileSync(promptFile, 'utf8');
 
-  // One read-only call, exactly this endpoint, no token-bearing argument, a scrubbed environment.
+  // One read-only call, exactly this endpoint (nothing gh would rewrite: the head filter's
+  // colon is %3A), no token-bearing argument, from `/`, in a scrubbed environment.
   const calls = ghCalls(ghLog);
   assert.deepEqual(calls.map((c) => c.args), [['api', '-H', 'Accept: application/vnd.github+json',
-    'repos/funzi7/fixture/pulls?state=open&head=funzi7:claude/feature&per_page=10']]);
+    'repos/funzi7/fixture/pulls?state=open&head=funzi7%3Aclaude/feature&per_page=10']]);
+  assert.equal(calls[0].cwd, '/', 'gh never runs in the reviewed repository');
   assert.deepEqual(calls[0].env.filter((n) => !['PWD', 'SHLVL', '_', 'OLDPWD'].includes(n)),
     ['GH_NO_UPDATE_NOTIFIER', 'GH_PAGER', 'GH_PROMPT_DISABLED', 'HOME', 'PATH', 'TERM']);
 
@@ -3519,26 +3534,87 @@ test('PR mode fails closed, before any scan or render and without falling back, 
   assert.ok(nothingRendered(sb, unborn));
 });
 
-test('PR mode: a failing GitHub call (auth, timeout) fails closed with gh\'s reason summarised, token-shaped text redacted, nothing rendered', () => {
+test('PR mode: a failing GitHub call (auth, timeout) fails closed with gh\'s reason summarised, credentials redacted, nothing rendered', () => {
   const sb = sandbox();
   const { repo } = prFixture(sb, 'pr-gh-fails');
   const token = 'gho_SYNTH0LEAKED0TOKEN0abcdef0123456789';
   const outcome = {};
-  for (const [label, control, reason] of [
+  // [label, fake-gh control, the summary as it must read, secrets that must not appear]
+  for (const [label, control, reason, secrets] of [
     ['unauthenticated', { EXIT: 1, STDERR: `HTTP 401: Bad credentials (https://api.github.com/repos/funzi7/fixture/pulls) ${token}` },
-      /gh exit 1: HTTP 401: Bad credentials \(https:\/\/api\.github\.com\/repos\/funzi7\/fixture\/pulls\) gho_\[redacted\]\)/],
-    ['header echoed', { EXIT: 4, STDERR: 'authorization: Bearer SYNTH-BEARER-VALUE-0f0f' }, /gh exit 4: authorization: Bearer \[redacted\]\)/],
-    ['network', { EXIT: 1, STDERR: 'error connecting to api.github.com' }, /gh exit 1: error connecting to api\.github\.com\)/],
-    ['timeout', { EXIT: 124, STDERR: '' }, /gh exit 124: timed out after 60 s; gh: Bad credentials \(HTTP 401\)\)/],
+      /gh exit 1: HTTP 401: Bad credentials \(https:\/\/api\.github\.com\/repos\/funzi7\/fixture\/pulls\) gho_\[redacted\]\)/, [token]],
+    ['header echoed', { EXIT: 4, STDERR: 'authorization: Bearer SYNTH-BEARER-VALUE-0f0f' }, /gh exit 4: authorization: Bearer \[redacted\]\)/, ['SYNTH-BEARER-VALUE-0f0f']],
+    ['network', { EXIT: 1, STDERR: 'error connecting to api.github.com' }, /gh exit 1: error connecting to api\.github\.com\)/, []],
+    ['timeout', { EXIT: 124, STDERR: '' }, /gh exit 124: timed out after 60 s; gh: Bad credentials \(HTTP 401\)\)/, []],
+    // URL user-info of any shape, and a value after bearer/token/basic in any case and form.
+    ['x-access-token user-info', { EXIT: 128, STDERR: 'fatal: unable to access https://x-access-token:SYNTH-XAT-1a1a@github.com/funzi7/fixture.git' },
+      /gh exit 128: fatal: unable to access https:\/\/\[redacted\]@github\.com\/funzi7\/fixture\.git\)/, ['SYNTH-XAT-1a1a', 'x-access-token']],
+    ['user:password user-info', { EXIT: 1, STDERR: 'proxy https://deploy:SYNTH-USERPASS-2b2b@proxy.invalid:8080 refused' },
+      /gh exit 1: proxy https:\/\/\[redacted\]@proxy\.invalid:8080 refused\)/, ['SYNTH-USERPASS-2b2b', 'deploy:']],
+    ['token: value', { EXIT: 1, STDERR: 'token: SYNTH-COLON-3c3c' }, /gh exit 1: token: \[redacted\]\)/, ['SYNTH-COLON-3c3c']],
+    ['JSON "token":"value"', { EXIT: 1, STDERR: '{"token":"SYNTH-JSON-4d4d","scopes":"repo"}' },
+      /gh exit 1: \{"token":"\[redacted\]","scopes":"repo"\}\)/, ['SYNTH-JSON-4d4d']],
+    ['token=value', { EXIT: 1, STDERR: 'GET /user?access_token=SYNTH-EQ-5e5e&page=1' }, /gh exit 1: GET \/user\?access_token=\[redacted\]&page=1\)/, ['SYNTH-EQ-5e5e']],
+    ['upper-case header', { EXIT: 1, STDERR: 'AUTHORIZATION: BEARER SYNTH-UPPER-6f6f' }, /gh exit 1: AUTHORIZATION: BEARER \[redacted\]\)/, ['SYNTH-UPPER-6f6f']],
   ]) {
     fakeGh(sb, control);
     const r = runOauto(sb, repo, ['pr', '--check']);
-    outcome[label] = { status: r.status, reason: reason.test(r.stderr), leaked: r.stderr.includes(token) || r.stderr.includes('SYNTH-BEARER-VALUE'),
-      nothingRendered: nothingRendered(sb, repo), failedBeforeTheScan: !r.stderr.includes('worktree scan passes'), stderr: r.stderr };
+    outcome[label] = { status: r.status, reason: reason.test(r.stderr), leaked: secrets.some((s) => r.stderr.includes(s)),
+      nothingRendered: nothingRendered(sb, repo), failedBeforeTheScan: !r.stderr.includes('worktree scan passes'),
+      oneAsciiLine: (r.stderr.split('\n').find((l) => l.includes('GitHub API call')) || 'ÿ').split('').every((ch) => ch >= ' ' && ch <= '~'),
+      stderr: r.stderr };
   }
-  const want = { status: 1, reason: true, leaked: false, nothingRendered: true, failedBeforeTheScan: true };
+  const want = { status: 1, reason: true, leaked: false, nothingRendered: true, failedBeforeTheScan: true, oneAsciiLine: true };
   assert.deepEqual(Object.entries(outcome).filter(([, o]) => Object.keys(want).some((k) => o[k] !== want[k])).map(([l, o]) => `${l}:\n${o.stderr}`), []);
   assert.match(outcome.unauthenticated.stderr, /the read-only GitHub API call listing the open pull requests of branch claude\/feature in funzi7\/fixture failed .*nothing was scanned or rendered, and the default review is not used instead/);
+});
+
+test('PR mode: branch names gh would read as placeholders (branch-x, owner, repo-1) reach GitHub verbatim, gh running from /', () => {
+  // gh 2.46 rewrites `:owner`, `:repo`, `:branch` and `{word}` in an endpoint, running git in
+  // its working directory to fill them; fake-gh refuses such an endpoint like that.
+  const sb = sandbox();
+  const outcome = {};
+  for (const branch of ['branch-x', 'owner', 'repo-1']) {
+    const { repo, c2, c3 } = prFixture(sb, `pr-placeholder-${branch}`, { branch });
+    const ghLog = path.join(sb.root, `gh-${branch}.log`);
+    servePulls(sb, [pullRequest({ branch, headSha: c2, baseSha: c3 })], { ARGV_LOG: ghLog });
+    // Started from inside the repository, as ai-launch starts it: gh still runs from /.
+    const r = runOauto(sb, repo, ['pr', '--check'], {}, RUN, { cwd: repo });
+    const calls = ghCalls(ghLog);
+    outcome[branch] = { status: r.status, endpoints: calls.map((c) => c.args[c.args.length - 1]), cwds: calls.map((c) => c.cwd),
+      prSection: r.status === 0 && readPreflight(sb, repo).includes('## Pull request #58 delta vs origin/main (merge-base...HEAD)') };
+  }
+  const sent = (branch) => ({ status: 0, endpoints: [`repos/funzi7/fixture/pulls?state=open&head=funzi7%3A${branch}&per_page=10`], cwds: ['/'], prSection: true });
+  assert.deepEqual(outcome, { 'branch-x': sent('branch-x'), owner: sent('owner'), 'repo-1': sent('repo-1') });
+});
+
+test('PR mode diffs against the base commit it verified, even when a branch named origin/<base> appears mid-run', () => {
+  const sb = sandbox();
+  const { repo, c0, c1, c2, c3 } = prFixture(sb, 'pr-race');
+  const realGit = execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim();
+  const shimDir = path.join(sb.root, 'git-shim');
+  const planted = path.join(sb.root, 'planted');
+  fs.mkdirSync(shimDir);
+  // A git wrapper first on PATH: after pr_identify verified origin/main (C3) and found it
+  // unambiguous, the first name-collection diff plants a local branch named origin/main at
+  // C1, which `origin/main` by name resolves to before refs/remotes/origin/main.
+  fs.writeFileSync(path.join(shimDir, 'git'), ['#!/bin/bash', 'case " $* " in',
+    `  *" --name-only -z HEAD "*) [[ -e '${planted}' ]] || { : > '${planted}'; '${realGit}' -C '${repo}' update-ref refs/heads/origin/main ${c1}; } ;;`,
+    'esac', `exec '${realGit}' "$@"`, ''].join('\n'));
+  fs.chmodSync(path.join(shimDir, 'git'), 0o755);
+  servePulls(sb, [pullRequest({ headSha: c2, baseSha: c3 })]);
+  const r = runOauto(sb, repo, ['pr', '--check'], { PATH: `${shimDir}:${process.env.PATH}` });
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(fs.existsSync(planted), 'the shadowing branch appeared during the run');
+  assert.equal(revOf(repo, 'origin/main'), c1, 'by name, origin/main now resolves to the planted branch');
+  const preflight = readPreflight(sb, repo);
+  assert.ok(preflight.includes(`- PR base branch: main (GitHub base ${c3.slice(0, 12)}; local origin/main ${c3.slice(0, 12)})\n`), preflight);
+  assert.ok(preflight.includes(`- Merge base: ${c0}\n`), preflight);
+  // The verified base's delta (C0..C2), not the planted name's (C1..C2: README.md alone).
+  const delta = sectionOf(preflight, '## Pull request #58 delta vs origin/main (merge-base...HEAD)');
+  for (const p of ['src/app.py', 'src/feature.py', 'src/helpers.py', 'README.md']) {
+    assert.ok(delta.includes(`diff --git a/${p} b/${p}\n`), `${p} must be in the delta:\n${delta}`);
+  }
 });
 
 test('PR mode: both model aliases, before or after `pr`, with --check printing the PR banner line', () => {
@@ -3691,7 +3767,7 @@ test('pr-query and pr-select: three accepted origin forms, an encoded head filte
     'git@github.com:funzi7/fixture.git', 'ssh://git@github.com/funzi7/fixture', 'ssh://git@github.com/funzi7/fixture.git']) {
     const r = query(url);
     assert.equal(r.status, 0, `${url}: ${r.stderr}`);
-    assert.deepEqual(r.stdout, nulJoin('funzi7/fixture', 'repos/funzi7/fixture/pulls?state=open&head=funzi7:claude/feature&per_page=10'), url);
+    assert.deepEqual(r.stdout, nulJoin('funzi7/fixture', 'repos/funzi7/fixture/pulls?state=open&head=funzi7%3Aclaude/feature&per_page=10'), url);
   }
   for (const url of ['http://github.com/funzi7/fixture.git', 'https://github.com/funzi7/fixture/', 'https://github.com/funzi7/fixture/x.git',
     'https://SYNTH-QUERY-TOKEN-1c1c@github.com/funzi7/fixture.git', 'https://github.com:443/funzi7/fixture', 'https://gitlab.com/funzi7/fixture.git',
@@ -3705,7 +3781,16 @@ test('pr-query and pr-select: three accepted origin forms, an encoded head filte
   }
   // Query metacharacters in a branch name are percent-encoded; `/` is kept.
   assert.deepEqual(query('https://github.com/o/r.git', 'feat/a+b#c&d%e=f').stdout,
-    nulJoin('o/r', 'repos/o/r/pulls?state=open&head=o:feat/a%2Bb%23c%26d%25e%3Df&per_page=10'));
+    nulJoin('o/r', 'repos/o/r/pulls?state=open&head=o%3Afeat/a%2Bb%23c%26d%25e%3Df&per_page=10'));
+  // Nothing gh api would rewrite as a placeholder (`:owner`, `:repo`, `:branch`, `{word}`) remains.
+  const placeholders = {};
+  for (const branch of ['branch-x', 'owner', 'repo-1', 'branch', '{owner}', 'a{repo}b']) {
+    const endpoint = query('https://github.com/funzi7/fixture.git', branch).stdout.toString().split('\0')[1];
+    placeholders[branch] = /[:{}]/.test(endpoint) ? endpoint : 'clean';
+  }
+  assert.deepEqual(Object.values(placeholders), Array(6).fill('clean'), JSON.stringify(placeholders));
+  assert.equal(query('https://github.com/funzi7/fixture.git', 'branch-x').stdout.toString().split('\0')[1],
+    'repos/funzi7/fixture/pulls?state=open&head=funzi7%3Abranch-x&per_page=10');
 
   const head = 'a'.repeat(40);
   const base = 'b'.repeat(40);

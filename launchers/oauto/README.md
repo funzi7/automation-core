@@ -19,6 +19,10 @@ oauto deepseek             # repository menu, then the DeepSeek reviewer
 oauto pr                   # repository menu, then PR review mode (`oauto deepseek pr` likewise)
 ```
 
+A leading `glm`, `deepseek` or `pr` is always read as an option, so a repository literally
+named one of those words is not selected by its bare name (`oauto pr` opens the menu);
+name it as a path instead: `oauto ./pr`.
+
 Only one oauto session per repository can be open at a time
 (`/root/work/.locks/oauto-<repo>-<hash>.lock`); run the DeepSeek pass after the GLM
 pass finishes. The first message is pre-filled with a read-only git preflight (branch,
@@ -70,24 +74,34 @@ execution, after the lock and `check-repo-git` and before the scan:
    `ssh://git@github.com/<owner>/<repo>[.git]`. The URL goes to the policy on stdin and
    is never printed (it may embed a credential).
 2. One authenticated, read-only REST call:
-   `gh api -H 'Accept: application/vnd.github+json' 'repos/<owner>/<repo>/pulls?state=open&head=<owner>:<branch>&per_page=10'`
-   (branch percent-encoded), under `timeout 60` and `env -i` keeping only `HOME`, `PATH`,
-   `GH_PAGER=cat`, `GH_PROMPT_DISABLED=1`, `GH_NO_UPDATE_NOTIFIER=1`, `TERM=dumb`; gh uses
-   its own stored login. `OAUTO_GH_BIN` replaces the binary (the tests use
+   `gh api -H 'Accept: application/vnd.github+json' 'repos/<owner>/<repo>/pulls?state=open&head=<owner>%3A<branch>&per_page=10'`
+   (the branch percent-encoded), run from `/` under `timeout 60` and `env -i` keeping only
+   `HOME`, `PATH`, `GH_PAGER=cat`, `GH_PROMPT_DISABLED=1`, `GH_NO_UPDATE_NOTIFIER=1`,
+   `TERM=dumb`; gh uses its own stored login. `gh api` rewrites `:owner`, `:repo`,
+   `:branch` and `{…}` in an endpoint, filling them by running git in its working
+   directory, so the endpoint holds no `:`, `{` or `}` at all (the filter's colon is
+   `%3A`; one that would is refused) and gh never runs in the repository: GitHub receives
+   exactly this string. `OAUTO_GH_BIN` replaces the binary (the tests use
    `tests/fixtures/fake-gh`).
 3. `oauto-policy.py pr-select` validates the response and hands back only the number,
    `html_url`, base branch, base sha and head sha. The response is deleted at once;
    nothing else from it (title, body, users …) is used.
 4. The base must exist locally as `origin/<base>`; the existing `base` variable is set to
-   it, so the existing pipeline (name collection, exhaustive rename pairs,
-   classification, content checks, exclusion proof, caps) produces the pull request's
-   delta. When GitHub's base sha differs from the local `origin/<base>`, the launch goes
-   on and the preflight states both and that the merge base comes from the local ref.
+   the commit it names, verified once (every diff names that commit; `origin/<base>` is
+   only the label the preflight and the banner show, so a branch or tag of that name
+   appearing mid-run cannot redirect a diff), and the existing pipeline (name
+   collection, exhaustive rename pairs, classification, content checks, exclusion proof,
+   caps) produces the pull request's delta. When GitHub's base sha differs from the local
+   `origin/<base>`, the launch goes on and the preflight states both and that the merge
+   base comes from the local ref.
 
 It fails closed — the reason printed, nothing scanned or rendered, never a fall back to
 the default review — on: a detached HEAD or a branch without commits; no origin URL, or
 none of the three GitHub forms; gh missing, failing (unauthenticated, network, 4xx/5xx:
-its stderr summarised to three lines with token-shaped words redacted) or timing out;
+its stderr summarised to three lines of printable ASCII in which URL user-info
+(`://user:secret@`), gh token shapes (`gh?_…`, `github_pat_…`) and the value after
+`bearer`, `token` or `basic` — any case, after whitespace, `:` or `=`, JSON quotes
+included — read `[redacted]`) or timing out;
 a response that is not a JSON array of objects; no open pull request; more than one
 (`ambiguous: PRs #a, #b`); a head branch other than the current one; a head in another
 repository (a fork, or a deleted one); a base in another repository; an empty base

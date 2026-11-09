@@ -211,14 +211,19 @@ g config --list --show-origin -z > "$origins_z" || die "git configuration cannot
 # origin/<base>: no fetch, checkout or ref update ever happens, and no failure falls
 # back to the default review.
 GH_BIN="${OAUTO_GH_BIN:-gh}"
-gh_error_summary() { # $1: gh's stderr -> one printable ASCII line (first three non-empty lines, token-shaped words redacted)
+# gh_error_summary: $1 is gh's stderr -> one printable ASCII line, the first three non-empty
+# lines at 200 bytes each, with every URL user-info (`://user:secret@`), every gh token
+# shape (gh?_..., github_pat_...) and the value after `bearer`, `token` or `basic` (any case;
+# after whitespace, `:` or `=`, JSON quotes included) replaced by [redacted].
+gh_error_summary() {
   LC_ALL=C sed -E -e 's/\r//g' -e 's/[^[:print:]]/?/g' -e '/^[[:space:]]*$/d' \
+    -e 's#://[^/@[:space:]]+@#://[redacted]@#g' \
     -e 's/(gh[pousr]_|github_pat_)[A-Za-z0-9_]+/\1[redacted]/g' \
-    -e 's/([Bb]earer|[Tt]oken|[Bb]asic)[[:space:]]+[^[:space:]]+/\1 [redacted]/g' -- "$1" 2>/dev/null |
+    -e 's/(bearer|token|basic)("?[[:space:]]*[:=][[:space:]]*"?|[[:space:]]+)[^[:space:]",;}&]+/\1\2[redacted]/gI' -- "$1" 2>/dev/null |
     head -n 3 | cut -c1-200 | paste -s -d '|' - | sed 's/|/ | /g' || true
 }
 pr_identify() { # sets pr_branch pr_repo pr_number pr_url pr_base_ref pr_base_sha pr_head_sha pr_local_base, or dies
-  local full_ref remote_url endpoint gh_status=0 summary pr_query_z pulls_json gh_err pr_fields
+  local full_ref remote_url endpoint gh_path gh_status=0 summary pr_query_z pulls_json gh_err pr_fields
   full_ref="$(g symbolic-ref -q HEAD)" && [[ "$full_ref" == refs/heads/?* ]] ||
     die "PR mode reviews the pull request of the current branch, but HEAD is detached"
   pr_branch="${full_ref#refs/heads/}"
@@ -235,9 +240,13 @@ pr_identify() { # sets pr_branch pr_repo pr_number pr_url pr_base_ref pr_base_sh
     die "PR mode: the GitHub repository could not be taken from the origin remote (see the reason above)"
   { IFS= read -r -d '' pr_repo && IFS= read -r -d '' endpoint; } < "$pr_query_z" ||
     die "PR mode: malformed pr-query output (fail closed)"
-  command -v "$GH_BIN" >/dev/null 2>&1 ||
+  gh_path="$(command -v "$GH_BIN" 2>/dev/null)" ||
     die "PR mode needs the GitHub CLI to identify the pull request, but '$GH_BIN' was not found"
-  timeout 60 env -i HOME="$HOME" PATH="$PATH" GH_PAGER=cat GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 TERM=dumb "$GH_BIN" api -H 'Accept: application/vnd.github+json' "$endpoint" > "$pulls_json" 2> "$gh_err" || gh_status=$?
+  [[ "$gh_path" == /* ]] || gh_path="$PWD/$gh_path"
+  # From `/`, never from the repository: gh api fills `:owner`/`:repo`/`:branch`/`{...}`
+  # placeholders by running git in its working directory (the endpoint holds none, which
+  # pr-query enforces), and no other git than the hardened g() may ever run against it.
+  ( cd / && timeout 60 env -i HOME="$HOME" PATH="$PATH" GH_PAGER=cat GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 TERM=dumb "$gh_path" api -H 'Accept: application/vnd.github+json' "$endpoint" ) > "$pulls_json" 2> "$gh_err" || gh_status=$?
   if (( gh_status != 0 )); then
     summary="$(gh_error_summary "$gh_err")"
     if (( gh_status == 124 )); then summary="timed out after 60 s${summary:+; $summary}"; fi
@@ -255,7 +264,7 @@ pr_identify() { # sets pr_branch pr_repo pr_number pr_url pr_base_ref pr_base_sh
   # The delta names origin/<base>; a local branch or tag of that name would resolve first.
   [[ "$(g rev-parse --verify --quiet "origin/$pr_base_ref^{commit}")" == "$pr_local_base" ]] ||
     die "PR mode: origin/$pr_base_ref is ambiguous (a branch or tag of that name resolves to another commit than refs/remotes/origin/$pr_base_ref); rename it"
-  g merge-base "origin/$pr_base_ref" HEAD >/dev/null ||
+  g merge-base "$pr_local_base" HEAD >/dev/null ||
     die "origin/$pr_base_ref and HEAD have no merge base (unrelated or shallow history), so pull request #$pr_number has no delta to review here; the launcher never fetches"
 }
 
@@ -265,9 +274,13 @@ branch="$(g symbolic-ref --short -q HEAD || echo '(detached)')"
 head_sha="$(g rev-parse --verify -q HEAD || echo '(no commits)')"
 upstream="$(g rev-parse --abbrev-ref --symbolic-full-name '@{u}' || true)"
 base=""
+base_label=""   # what the preflight and the banner call the base
 if (( PR_MODE )); then
   pr_identify
-  base="origin/$pr_base_ref"
+  # Every computation below names the commit pr_identify verified, never origin/<base>
+  # again: a branch or tag of that name appearing meanwhile cannot redirect a diff.
+  base="$pr_local_base"
+  base_label="origin/$pr_base_ref"
 elif [[ "$head_sha" != "(no commits)" ]]; then
   for cand in "$upstream" origin/main origin/master main master; do
     [[ -n "$cand" ]] || continue
@@ -278,6 +291,7 @@ elif [[ "$head_sha" != "(no commits)" ]]; then
     fi
   done
 fi
+base_label="${base_label:-$base}"   # default mode: the candidate's own name
 ahead_behind=""
 if [[ -n "$base" ]]; then
   ahead_behind="$(g rev-list --left-right --count "$base...HEAD" | awk '{print "behind " $1 ", ahead " $2}' || true)"
@@ -286,7 +300,7 @@ history_revs=()
 if [[ "$head_sha" != "(no commits)" ]]; then
   history_revs+=(HEAD)
   if [[ -n "$base" ]]; then
-    merge_base="$(g merge-base "$base" HEAD)" || die "the merge base of $base and HEAD cannot be computed"
+    merge_base="$(g merge-base "$base" HEAD)" || die "the merge base of $base_label and HEAD cannot be computed"
     history_revs+=("$merge_base")
   fi
 fi
@@ -629,7 +643,7 @@ set +e +o pipefail   # a repository without commits or without a base must still
   echo "- Branch: $branch"
   echo "- HEAD: $head_sha"
   echo "- Upstream: ${upstream:-(none)}"
-  echo "- Base for branch delta: ${base:-(none found)} ${ahead_behind:+($ahead_behind)}"
+  echo "- Base for branch delta: ${base_label:-(none found)} ${ahead_behind:+($ahead_behind)}"
   if (( PR_MODE )); then
     echo "- Pull request: #$pr_number $pr_url"
     echo "- PR base branch: $pr_base_ref (GitHub base ${pr_base_sha:0:12}; local origin/$pr_base_ref ${pr_local_base:0:12})"
@@ -671,7 +685,7 @@ set +e +o pipefail   # a repository without commits or without a base must still
     if (( PR_MODE )); then
       echo "## Pull request #$pr_number delta vs origin/$pr_base_ref (merge-base...HEAD)"
     else
-      echo "## Branch delta vs $base (merge-base...HEAD)"
+      echo "## Branch delta vs $base_label (merge-base...HEAD)"
     fi
     echo '```'
     gd --stat "$base...HEAD" -- "${exclude_spec[@]}" | capped "$STAT_MAX_BYTES"
@@ -767,7 +781,7 @@ cat >&2 <<EOF
 ============================================================
 oauto : OpenCode $version read-only reviewer
 Repo  : $REPO_NAME ($REPO)
-Branch: $branch @ ${head_sha:0:12}  ${ahead_behind:+[$ahead_behind vs $base]}$mode_banner
+Branch: $branch @ ${head_sha:0:12}  ${ahead_behind:+[$ahead_behind vs $base_label]}$mode_banner
 Model : $MODEL_ID  (OpenCode Zen, pricing: Free)
 Agent : review-$MODEL_ALIAS   (other models disabled; provider pinned to 'opencode')
 Tools : read / glob / grep only. edit, shell, web, subagents, skills, MCP,

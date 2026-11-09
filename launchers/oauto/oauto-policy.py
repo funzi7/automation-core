@@ -24,8 +24,9 @@ Subcommands
   quote-path      Print NUL-delimited paths from stdin C-quoted like git, one per line.
   pr-query        PR review mode. Read remote.origin.url on stdin (never argv: it may
                   embed a credential); print owner/repo and the GitHub REST endpoint that
-                  lists the open pull requests whose head is --branch, NUL-delimited; exit
-                  2 unless origin is a github.com repository in one of three URL forms.
+                  lists the open pull requests whose head is --branch, NUL-delimited, with
+                  nothing gh api would expand as a placeholder (head=<owner>%3A<branch>);
+                  exit 2 unless origin is a github.com repository in one of three URL forms.
   pr-select       PR review mode. Read that endpoint's JSON on stdin; print the single
                   pull request's number, html_url, base ref, base sha and head sha,
                   NUL-delimited, once it is validated against --branch, --head and
@@ -992,8 +993,15 @@ def _full_name(side: dict) -> str | None:
 def pr_query(remote_url: bytes, branch: str) -> bytes:
     """NUL-terminated ``owner/repo`` and the REST endpoint (relative to api.github.com)
     listing the open pull requests whose head is ``branch`` there: head filter
-    ``<owner>:<branch>``, the branch percent-encoded. ``remote_url`` arrives on stdin and is
-    never printed: it may embed a credential."""
+    ``<owner>%3A<branch>``, the branch percent-encoded. ``remote_url`` arrives on stdin and
+    is never printed: it may embed a credential.
+
+    ``gh api`` rewrites ``:owner``, ``:repo``, ``:branch`` and ``{word}`` in an endpoint
+    (filled by running git in its working directory), so a literal ``owner:branch`` filter
+    for a branch named ``branch-x`` or ``owner`` would reach GitHub altered. The endpoint
+    therefore holds no ``:``, ``{`` or ``}`` at all (the filter's colon is ``%3A``; the
+    branch is percent-encoded; owner and repository names cannot contain them), and one
+    that would is refused."""
     repo = github_repository(remote_url.decode("utf-8", "surrogateescape").rstrip("\n"))
     if repo is None:
         _die("origin is not a GitHub repository: remote.origin.url is none of https://github.com/<owner>/<repo>[.git], "
@@ -1004,7 +1012,9 @@ def pr_query(remote_url: bytes, branch: str) -> bytes:
         _die("pr-query: empty branch name")
     owner = repo.split("/", 1)[0]
     head = urllib.parse.quote_from_bytes(raw, safe="/")
-    endpoint = f"repos/{repo}/pulls?state=open&head={owner}:{head}&per_page={PR_LIST_PER_PAGE}"
+    endpoint = f"repos/{repo}/pulls?state=open&head={owner}%3A{head}&per_page={PR_LIST_PER_PAGE}"
+    if any(c in endpoint for c in ":{}"):
+        _die("pr-query: the endpoint would hold ':', '{' or '}', which gh api rewrites as placeholders (fail closed)")
     return repo.encode() + b"\0" + endpoint.encode() + b"\0"
 
 
