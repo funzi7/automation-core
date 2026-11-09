@@ -524,7 +524,10 @@ A1. oauto — read-only OpenCode reviewer launcher (2026-11-07):
   the walk) — fixed in `f852171` (directives reach the walk uncollapsed, as
   `W` records and `--walk-out`); its review of `2389a03` added a P1 (a link
   target ending in a newline lost it to command substitution) — fixed in
-  `d9b71a1` (targets read byte-exact). Shown
+  `d9b71a1` (targets read byte-exact); its review of `68d2fd2` added a P1
+  (a link target leaving through an outside alias pointing back into the
+  repository treated as outside) — fixed in `8308090` (such paths re-enter
+  the walk). Shown
   NOT reproducible on the real binary: the claimed backslash glob escape
   (ripgrep `--glob` filter rooted at the tool path; `external_directory` gates
   the path) — no rule added. Recorded as backlog, not changed here: mutable

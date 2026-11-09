@@ -106,13 +106,13 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
     belong to this worktree`; the victim's `.git/index` unchanged); `Auth.json` under the override is read-denied by
     exact name (rendered `read Auth.json` / `*/Auth.json` and `tool.use read:Auth.json` / `read:*/Auth.json` deny;
     64/46 probes, 45 agent probes). Nothing rendered for refused launches; no OpenCode process or service left.
-  - Final validation at `d9b71a1` (after the nine Codex P1 fixes below): `bash scripts/validate.sh` green — YAML,
-    JSON, sync/mirror parity, JS syntax, `node --test` 277/277 (`tests/test_oauto_launcher.js` 105 tests: 75 before
-    this round + 12 in round 1 + 7 in round 2 + 1 + 2 + 2 + 1 + 1 + 1 + 1 + 1 + 1 for the nine Codex P1 rounds),
-    59 github-script bodies, actionlint, `git diff --check` — 777 s (earlier runs: `d2495cd` 266/266 in 577 s,
-    `5860e1f` 267/267 in 590 s, `afd4639` 269/269 in 596 s, `62fca59` 271/271, `4544f09` 272/272 in 653 s,
-    `09dfcc8` 273/273 in 711 s, `2d5d7b7` 274/274 in 589 s, `f16dfe6` 275/275 in 695 s, `f852171` 276/276 in
-    682 s).
+  - Final validation at `8308090` (after the ten Codex P1 fixes below): `bash scripts/validate.sh` green — YAML,
+    JSON, sync/mirror parity, JS syntax, `node --test` 278/278 (`tests/test_oauto_launcher.js` 106 tests: 75 before
+    this round + 12 in round 1 + 7 in round 2 + 12 across the ten Codex P1 rounds), 59 github-script bodies,
+    actionlint, `git diff --check` — 736 s (earlier runs: `d2495cd` 266/266 in 577 s, `5860e1f` 267/267 in
+    590 s, `afd4639` 269/269 in 596 s, `62fca59` 271/271, `4544f09` 272/272 in 653 s, `09dfcc8` 273/273 in
+    711 s, `2d5d7b7` 274/274 in 589 s, `f16dfe6` 275/275 in 695 s, `f852171` 276/276 in 682 s, `d9b71a1`
+    277/277 in 777 s).
 - Round 2 — resolution of the independent review's findings (`d2495cd`, each reproduced on `43b1708` first):
   P2 → new `check-repo-git` (`parse_dot_git_file`, `own_git_info`, `_git_dir_owned`, `config_value`): `.git` must
   be a real directory, or a `.git` file — parsed exactly as git does — naming a linked-worktree admin dir whose
@@ -148,7 +148,7 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
   backups `*-20261109-034619`; `oauto-policy.py` at `4544f09`, backup `*-20261109-041053`, and at `09dfcc8`,
   backup `*-20261109-043850`; `oauto-run` at `2d5d7b7`, backup `*-20261109-050947`; both at `3059954`/`f16dfe6`,
   backups `*-20261109-054251`, `*-054316`; both at `f852171`, backups `*-20261109-061235`; `oauto-run` at
-  `d9b71a1`, backup `*-20261109-063413`); `ai-launch`, the Termux
+  `d9b71a1`, backup `*-20261109-063413`, and at `8308090`, backup `*-20261109-070717`); `ai-launch`, the Termux
   `oauto-launch` wrapper and both `.bashrc` blocks were already identical and untouched; `install.sh --verify`
   clean; the device-parity test is green; `/root/work/bin/oauto-run <fixture> deepseek --check` through the
   installed copy with the real binary verified sources (verbatim), models and agents (see below). `cauto`,
@@ -337,7 +337,19 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
   byte kept) after a fail-closed check that it holds no NUL byte; an empty target still fails closed. Test: the
   Codex scenario end to end. README row and ADR item 4 note the byte-exact read; `install.sh` refreshed
   `oauto-run` (backup `*-20261109-063413`), `--verify` clean. The thread was replied to with the fix commit and
-  resolved; a Codex review of the final head was requested.
+  resolved; a Codex review of the next head was requested.
+- Codex review of the tenth pushed head `68d2fd2` (`@codex review` 06:47:53Z; receipt 07:02:39Z with `**Reviewed
+  commit:** 68d2fd2f38`; CI `validate-automation-core` success 06:50:28Z; gate `🟡` at the push, then `🔴 Active
+  Codex P1/P2 finding` 07:03:24Z): one P1, valid, reproduced by Codex and re-reproduced here — a committed
+  `a.cfg -> /outside/alias/b.cfg` with `/outside/alias` a symlink to the repository (git shown to have loaded
+  `b.cfg` through it; both files deleted): `tree_walk` saw an absolute target outside the repository and emitted
+  an outside-file record, so `b.cfg` was neither excluded nor inspected (old launcher: token present, only
+  `a.cfg` excluded; fixed: absent, both excluded). Fixed in `8308090`: wherever the walk leaves the repository
+  (an absolute target elsewhere, `..` above the root) the outside path is resolved with `realpath -m` and, when
+  it lands inside the repository, the walk continues there from the root; only a path that stays outside is an
+  outside file. Tests: the Codex scenario and a relative target climbing out into the alias. README row and ADR
+  item 4 updated; `install.sh` refreshed `oauto-run` (backup `*-20261109-070717`), `--verify` clean. The thread
+  was replied to with the fix commit and resolved; a Codex review of the final head was requested.
 - Review and gate state of the final head: recorded in `agent-memory/automation-core/cc-latest.md` (owner-facing
   state) once the exact-head CI, Codex review and Codex Gate verdict exist on the PR; never claimed here ahead of
   the evidence.

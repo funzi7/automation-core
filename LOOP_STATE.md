@@ -313,8 +313,12 @@ is the permanent human opt-out and is never removed by automation.
     components, as `W` records from `includes-in-config` and `--walk-out`
     from the scan, and are walked uncollapsed); its review of `2389a03`
     added a P1 — a committed link target ending in a newline lost it to
-    command substitution — fixed in `d9b71a1` (targets read byte-exact).
-    `main` (PR #59) was merged into the branch (`01f6840`). The Codex review, CI and Codex Gate state of the
+    command substitution — fixed in `d9b71a1` (targets read byte-exact); its
+    review of `68d2fd2` added a P1 — a link target leaving the repository
+    through an outside alias that points back into it was treated as an
+    outside file — fixed in `8308090` (outside paths that resolve back into
+    the repository re-enter the walk). `main` (PR #59) was merged into the
+    branch (`01f6840`). The Codex review, CI and Codex Gate state of the
     pushed head are recorded in `agent-memory/automation-core/cc-latest.md`.
     DONE by the owner on 2026-11-08: the Termux hop (`oauto <repo>` from a real
     Termux shell) and a review of a real project repository (the GLM audit).
