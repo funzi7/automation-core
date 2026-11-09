@@ -510,7 +510,10 @@ A1. oauto — read-only OpenCode reviewer launcher (2026-11-07):
   — fixed in `62fca59`, which also resolves committed directory symlinks on
   include paths; its review of `4dc70dd` added a P1 (an include path through
   a later-retargeted directory symlink lost its written name) — fixed in
-  `4544f09` (written name registered next to the resolved one). Shown
+  `4544f09` (written name registered next to the resolved one); its review
+  of `9e8a88d` added the same gap inside `resolve-link` for absolute targets
+  — fixed in `09dfcc8` (targets judged both as written and as live-resolved).
+  Shown
   NOT reproducible on the real binary: the claimed backslash glob escape
   (ripgrep `--glob` filter rooted at the tool path; `external_directory` gates
   the path) — no rule added. Recorded as backlog, not changed here: mutable
