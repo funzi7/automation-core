@@ -628,43 +628,6 @@ def _q(path: str) -> str:
     return git_quote(os.fsencode(path))
 
 
-def resolve_link_target(repo: str, link_path: str, target: bytes, rest: str = "") -> list[tuple[bytes, bytes]]:
-    """A committed symlink's target (its blob content, exactly as git stores it) resolved
-    the way git follows the link at runtime: relative to the link's own directory. Pure
-    path arithmetic on history entries that need not exist. ``rest``: the path components
-    below the link when the link is a directory on an include path (``conf -> realconf``
-    with ``conf/a.cfg`` included), appended after resolution. Every candidate is judged by
-    where it lands — the path exactly as written (normalised lexically, the name history
-    knows) and, when it differs, the path as the live filesystem resolves it (a directory
-    symlink retargeted since the commit) — so a relative target that escapes the
-    repository and re-enters it counts as inside. Returns include records, de-duplicated:
-    (b"I", repository-relative path) for a candidate inside the worktree, (b"O", absolute
-    path) otherwise. An empty target, or a candidate that is the repository root or lies
-    in .git, fails closed."""
-    text = target.decode("utf-8", "surrogateescape")
-    if not text or "\0" in text:
-        _die("a committed symlink include target is empty or malformed (fail closed)")
-    root = os.path.realpath(repo)
-
-    def inside(inner: str) -> tuple[bytes, bytes]:
-        if inner in ("", os.curdir) or inner == ".git" or inner.startswith(".git" + os.sep):
-            _die(f"a committed symlink include target resolves to {inner!r}, which cannot be an included config (fail closed)")
-        return (b"I", os.fsencode(inner))
-
-    base = text if os.path.isabs(text) else os.path.join(root, os.path.dirname(link_path), text)
-    if rest:
-        base = os.path.join(base, rest)
-    records: list[tuple[bytes, bytes]] = []
-    for candidate in dict.fromkeys((os.path.normpath(base), os.path.realpath(base))):
-        if candidate == root or candidate.startswith(root + os.sep):
-            record = inside(os.path.relpath(candidate, root))
-        else:
-            record = (b"O", os.fsencode(candidate))
-        if record not in records:
-            records.append(record)
-    return records
-
-
 def config_value(text: str, section: str, key: str) -> str | None:
     """The last ``<section>.<key>`` value in Git config content (git resolves a repeated
     key to its last occurrence), parsed like config_include_paths (BOM, comments, line
