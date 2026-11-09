@@ -623,6 +623,26 @@ def _q(path: str) -> str:
     return git_quote(os.fsencode(path))
 
 
+def resolve_link_target(repo: str, link_path: str, target: bytes) -> tuple[bytes, bytes]:
+    """A committed symlink's target (its blob content, exactly as git stores it) resolved
+    the way git follows the link at runtime: relative to the link's own directory. Pure
+    path arithmetic — the entries are history and need not exist. Returns an include
+    record: (b"I", repository-relative path) when the target stays inside the worktree,
+    (b"O", absolute path) for an absolute target or one escaping the repository. An empty
+    target, or one resolving to the repository root or into .git, fails closed."""
+    text = target.decode("utf-8", "surrogateescape")
+    if not text or "\0" in text:
+        _die("a committed symlink include target is empty or malformed (fail closed)")
+    if os.path.isabs(text):
+        return (b"O", os.fsencode(os.path.normpath(text)))
+    joined = os.path.normpath(os.path.join(os.path.dirname(link_path), text))
+    if joined == os.pardir or joined.startswith(os.pardir + os.sep):
+        return (b"O", os.fsencode(os.path.normpath(os.path.join(os.path.realpath(repo), joined))))
+    if joined in ("", os.curdir) or joined == ".git" or joined.startswith(".git" + os.sep):
+        _die(f"a committed symlink include target resolves to {joined!r}, which cannot be an included config (fail closed)")
+    return (b"I", os.fsencode(joined))
+
+
 def config_value(text: str, section: str, key: str) -> str | None:
     """The last ``<section>.<key>`` value in Git config content (git resolves a repeated
     key to its last occurrence), parsed like config_include_paths (BOM, comments, line
@@ -1558,6 +1578,10 @@ def main(argv: list[str]) -> None:
     p_inc.add_argument("--repo", required=True, help="repository root")
     p_inc.add_argument("--config-path", required=True, metavar="REL",
                        help="repository-relative path the config content on stdin belongs to")
+    p_link = sub.add_parser("resolve-link")
+    p_link.add_argument("--repo", required=True, help="repository root")
+    p_link.add_argument("--link-path", required=True, metavar="REL",
+                        help="repository-relative path of the committed symlink whose target (blob) is on stdin")
     p_sources = sub.add_parser("verify-sources")
     p_sources.add_argument("--config-dir", required=True)
     p_sources.add_argument("--deny-read", action="append", default=[], metavar="PATH",
@@ -1601,6 +1625,9 @@ def main(argv: list[str]) -> None:
     elif args.cmd == "includes-in-config":
         records = includes_in_config(args.repo, args.config_path, sys.stdin.buffer.read())
         sys.stdout.buffer.write(b"".join(kind + b"\0" + target + b"\0" for kind, target in records))
+    elif args.cmd == "resolve-link":
+        kind, target = resolve_link_target(args.repo, args.link_path, sys.stdin.buffer.read())
+        sys.stdout.buffer.write(kind + b"\0" + target + b"\0")
     elif args.cmd == "quote-path":
         for path in _nul_fields(sys.stdin.buffer.read(), "quote-path", terminated=False):
             print(git_quote(path))

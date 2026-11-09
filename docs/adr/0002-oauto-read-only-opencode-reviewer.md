@@ -142,7 +142,11 @@ policy, not by the system prompt alone:
    secret-like file; a missing include's last committed content (at HEAD
    and at the branch delta's merge base) is read through the hardened git
    helper and its own includes are followed the same way — through files
-   outside the repository too — and every in-repository target found this
+   outside the repository too; a committed symlink met in that history is
+   resolved within the same revision (`git ls-tree` mode `120000`, the blob
+   is the link target, resolved relative to the link's directory) and its
+   target excluded and followed, never parsed as config text (Codex P1 on
+   `0ca1844`, 2026-11-09) — and every in-repository target found this
    way is handed back to the scan, which runs again until nothing new
    appears (include targets are tracked under their referenced name and
    their canonical target, and traversal is keyed by the referenced path,

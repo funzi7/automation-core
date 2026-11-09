@@ -230,7 +230,7 @@ parse_config_includes() { # $1: the path the config content on stdin belongs to
     die "the includes of a Git config file could not be read for the preflight"
 }
 history_pass() {
-  local known=() visited=() queue=() depth=() i=0 entry d path rev kind target next
+  local known=() visited=() queue=() depth=() i=0 entry d path rev mode kind target next
   while IFS= read -r -d '' path; do known+=("$path"); done < "$included_z"
   while IFS= read -r -d '' path; do queue+=("I:$path"); depth+=(1); done < "$missing_z"
   while IFS= read -r -d '' path; do
@@ -246,8 +246,19 @@ history_pass() {
     if [[ "$entry" == I:* ]]; then
       if [[ -f "$REPO/$path" ]]; then parse_config_includes "$path" < "$REPO/$path"; fi
       for rev in "${history_revs[@]}"; do
-        # No blob at that revision (never committed there): nothing to follow.
+        # No entry at that revision (never committed there): nothing to follow.
+        mode="$(g ls-tree -z "$rev" -- "$path" | head -c 6)"
+        [[ -n "$mode" ]] || continue
         g cat-file blob "$rev:$path" > "$blob_tmp" || continue
+        if [[ "$mode" == 120000 ]]; then
+          # A committed symlink: its blob is the link target, not config text. git would
+          # have followed the link, so resolve it within the same revision (relative to
+          # the link's directory) and exclude and follow the target instead; parsing the
+          # target text as config would miss the target's deleted content.
+          python3 -I "$POLICY" resolve-link --repo="$REPO" --link-path="$path" < "$blob_tmp" >> "$hops_z" ||
+            die "a committed symlink among the included Git configs could not be resolved for the preflight (fail closed)"
+          continue
+        fi
         parse_config_includes "$path" < "$blob_tmp"
       done
     elif [[ -f "$path" ]]; then

@@ -2661,6 +2661,95 @@ test('P1 (Codex on 33c0dda): a real .git directory carrying a commondir file is 
   assert.match(r.stderr, /does not belong to this worktree/);
 });
 
+test('P1 (Codex on 0ca1844): a committed symlink among deleted included configs is resolved within the revision, so its target is excluded and followed', () => {
+  const sb = sandbox();
+  const token = 'S-LINK-HISTORY-SYNTH-9d9d';
+  // .git/config includes conf/a.cfg; at HEAD a.cfg is a symlink to b.cfg, which holds the
+  // credential; both are deleted in the worktree. The old history pass parsed the link's
+  // blob ("b.cfg") as config text, so b.cfg was never excluded and its removed line travelled.
+  const repo = chainRepo(sb, 'link-history', { 'conf/b.cfg': includedConfigText(token) }, '../conf/a.cfg');
+  fs.symlinkSync('b.cfg', path.join(repo, 'conf', 'a.cfg'));
+  git(repo, ['add', '-A']);
+  git(repo, ['commit', '-q', '-m', 'link a.cfg to b.cfg']);
+  assert.equal(git(repo, ['ls-tree', 'HEAD', '--', 'conf/a.cfg']).slice(0, 6), '120000', 'the include target is a committed symlink');
+  fs.rmSync(path.join(repo, 'conf'), { recursive: true });
+  const { r, preflight, prompt } = launchRecordingPrompt(sb, repo); // no override: nothing secret-like is present
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(!preflight.includes(token) && !prompt.includes(token),
+    `the deleted target of a committed symlink include must not reach the preflight or the prompt:\n${preflight}`);
+  assert.deepEqual(excludedLines(preflight), ['conf/a.cfg (included Git config)', 'conf/b.cfg (included Git config)']);
+});
+
+test('P1 (Codex on 0ca1844): symlink chains, loops, escaping targets and a type change in included-config history; resolve-link fails closed', () => {
+  const sb = sandbox();
+  const outcome = {};
+  const record = (label, repo, tokens, env = {}) => {
+    const { r, preflight, prompt } = launchRecordingPrompt(sb, repo, env);
+    outcome[label] = { status: r.status, leaked: tokens.some((t) => preflight.includes(t) || prompt.includes(t)), excluded: excludedLines(preflight), stderr: r.stderr };
+  };
+  // Two committed symlinks before the file: a.cfg -> b.cfg -> ../deep/c.cfg (credential); all deleted.
+  const chain = chainRepo(sb, 'link-chain', { 'deep/c.cfg': includedConfigText('S-LINK-CHAIN-1a1a') }, '../conf/a.cfg');
+  fs.mkdirSync(path.join(chain, 'conf'));
+  fs.symlinkSync('../deep/c.cfg', path.join(chain, 'conf', 'b.cfg'));
+  fs.symlinkSync('b.cfg', path.join(chain, 'conf', 'a.cfg'));
+  git(chain, ['add', '-A']);
+  git(chain, ['commit', '-q', '-m', 'links']);
+  fs.rmSync(path.join(chain, 'conf'), { recursive: true });
+  fs.rmSync(path.join(chain, 'deep'), { recursive: true });
+  record('chain', chain, ['S-LINK-CHAIN-1a1a']);
+  // A loop of committed symlinks, both deleted: terminates, both excluded. (The include is
+  // added after the commit: git itself cannot read a looping include while staging.)
+  const loop = mkRepo(sb, 'link-loop', { 'src/a.py': 'x = 1\n' });
+  fs.mkdirSync(path.join(loop, 'conf'));
+  fs.symlinkSync('b.cfg', path.join(loop, 'conf', 'a.cfg'));
+  fs.symlinkSync('a.cfg', path.join(loop, 'conf', 'b.cfg'));
+  git(loop, ['add', '-A']);
+  git(loop, ['commit', '-q', '-m', 'loop']);
+  fs.appendFileSync(path.join(loop, '.git', 'config'), '[include]\n\tpath = ../conf/a.cfg\n');
+  fs.rmSync(path.join(loop, 'conf'), { recursive: true });
+  record('loop', loop, []);
+  // A committed symlink whose target escapes the repository: followed as an outside file (never parsed as text).
+  const outsideCfg = path.join(fs.realpathSync(sb.root), 'escape-target.cfg');
+  fs.writeFileSync(outsideCfg, includedConfigText('S-LINK-ESCAPE-2b2b'));
+  const esc = chainRepo(sb, 'link-escape', {}, '../conf/a.cfg');
+  fs.mkdirSync(path.join(esc, 'conf'));
+  fs.symlinkSync(path.relative(path.join(fs.realpathSync(esc), 'conf'), outsideCfg), path.join(esc, 'conf', 'a.cfg'));
+  git(esc, ['add', '-A']);
+  git(esc, ['commit', '-q', '-m', 'escaping link']);
+  fs.rmSync(path.join(esc, 'conf'), { recursive: true });
+  record('escape', esc, ['S-LINK-ESCAPE-2b2b']);
+  // Type change: a.cfg was a symlink to b.cfg at HEAD and is now an ordinary (included, present) file; b.cfg deleted.
+  const typed = chainRepo(sb, 'link-typechange', { 'conf/b.cfg': includedConfigText('S-LINK-TYPE-3c3c') }, '../conf/a.cfg');
+  fs.symlinkSync('b.cfg', path.join(typed, 'conf', 'a.cfg'));
+  git(typed, ['add', '-A']);
+  git(typed, ['commit', '-q', '-m', 'link']);
+  fs.unlinkSync(path.join(typed, 'conf', 'a.cfg'));
+  fs.writeFileSync(path.join(typed, 'conf', 'a.cfg'), '[k]\n\tv = 1\n');
+  fs.rmSync(path.join(typed, 'conf', 'b.cfg'));
+  record('typechange', typed, ['S-LINK-TYPE-3c3c'], { OAUTO_ALLOW_SENSITIVE_FILES: '1' }); // a.cfg is present and included
+  assert.deepEqual(Object.fromEntries(Object.entries(outcome).map(([k, v]) => [k, { status: v.status, leaked: v.leaked, excluded: v.excluded }])), {
+    chain: { status: 0, leaked: false, excluded: ['conf/a.cfg (included Git config)', 'conf/b.cfg (included Git config)', 'deep/c.cfg (included Git config)'] },
+    loop: { status: 0, leaked: false, excluded: ['conf/a.cfg (included Git config)', 'conf/b.cfg (included Git config)'] },
+    escape: { status: 0, leaked: false, excluded: ['conf/a.cfg (included Git config)'] },
+    typechange: { status: 0, leaked: false, excluded: ['conf/a.cfg (included Git config)', 'conf/b.cfg (included Git config)'] },
+  }, JSON.stringify(outcome, null, 1));
+  // resolve-link itself: empty and .git targets fail closed; absolute and relative targets resolve as git would.
+  for (const [input, want] of [['', /empty or malformed/], ['../.git/config', /cannot be an included config/], ['..', /cannot be an included config|empty or malformed/]]) {
+    const bad = policy(['resolve-link', '--repo', chain, '--link-path', 'conf/a.cfg'], input);
+    assert.notEqual(bad.status, 0, `resolve-link must refuse ${JSON.stringify(input)}`);
+    if (input !== '..') assert.match(bad.stderr, want);
+  }
+  const abs = policy(['resolve-link', '--repo', chain, '--link-path', 'conf/a.cfg'], '/etc/gitconfig');
+  assert.equal(abs.status, 0, abs.stderr);
+  assert.equal(abs.stdout, 'O\0/etc/gitconfig\0');
+  const rel = policy(['resolve-link', '--repo', chain, '--link-path', 'conf/a.cfg'], '../deep/./c.cfg');
+  assert.equal(rel.status, 0, rel.stderr);
+  assert.equal(rel.stdout, 'I\0deep/c.cfg\0');
+  const up = policy(['resolve-link', '--repo', chain, '--link-path', 'conf/a.cfg'], '../../x.cfg');
+  assert.equal(up.status, 0, up.stderr);
+  assert.equal(up.stdout, `O\0${path.join(fs.realpathSync(chain), '..', 'x.cfg')}\0`);
+});
+
 test('P3-4: case-variant secret-like files are denied by their exact name under the override, in both agents and the ceiling', () => {
   const sb = sandbox();
   const repo = mkRepo(sb, 'case-variants', { 'src/a.py': 'x = 1\n', 'Auth.json': '{"t":"SYNTH"}\n',
