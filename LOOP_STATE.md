@@ -317,8 +317,34 @@ is the permanent human opt-out and is never removed by automation.
     review of `68d2fd2` added a P1 — a link target leaving the repository
     through an outside alias that points back into it was treated as an
     outside file — fixed in `8308090` (outside paths that resolve back into
-    the repository re-enter the walk). `main` (PR #59) was merged into the
-    branch (`01f6840`). The Codex review, CI and Codex Gate state of the
+    the repository re-enter the walk); a second Codex pass on `3833718` added
+    a P1 — `realpath` output captured by command substitution lost trailing
+    newline bytes of an in-repository name reached through an outside alias
+    — fixed in `1e6fbd0` (`realpath -z -m` read NUL-terminated). `main`
+    (PR #59) was merged into the branch (`01f6840`). Zen terms for both
+    approved models re-checked 2026-11-09 (zero-retention, no training).
+    OWNER-APPROVED (OPTION 1, 2026-11-09): the default `oauto <repo>` stays
+    exactly as it was and a separate PR review mode was added in `425e6ee` —
+    `oauto <repo> pr` / `oauto <repo> deepseek pr` / `... --check` identify
+    the current branch's open pull request through one read-only `gh api`
+    call outside the model, validate it (one PR, same-repo head at the local
+    HEAD, base in this repository, present locally as `origin/<base>`) and
+    run the unchanged pipeline with the verified base commit (`origin/<base>`
+    shown as its label); every doubt fails closed, nothing is ever fetched or
+    checked out. Verified on a clone at PR #58's head (17 files, identical to
+    GitHub). An independent Opus review of the task diff found a pre-existing
+    P1 (`git ls-tree` read a leading `:` in an included config's name as
+    pathspec magic, losing the chain below it — fixed with `:(literal)` in
+    `e01de32`), a PR-mode P2 (`gh api` rewrote `:owner|:repo|:branch`
+    placeholders inside the head filter and ran git in the reviewed repository
+    to fill them — the filter's colon is now `%3A` and gh runs from `/`,
+    `1b62929`) and four P3s (redaction gaps, a planted `origin/<base>` race,
+    `|` in visited keys, `oauto ./pr` for a repository named `pr`), all fixed
+    with regression tests. Physically pending for PR
+    mode: the real-repository `--check` of this checkout against PR #58
+    (needs the pushed head — it correctly refused the unpushed one; run
+    after the push, result in `cc-latest.md`), and a PR-mode TUI session.
+    The Codex review, CI and Codex Gate state of the
     pushed head are recorded in `agent-memory/automation-core/cc-latest.md`.
     DONE by the owner on 2026-11-08: the Termux hop (`oauto <repo>` from a real
     Termux shell) and a review of a real project repository (the GLM audit).

@@ -527,7 +527,19 @@ A1. oauto — read-only OpenCode reviewer launcher (2026-11-07):
   `d9b71a1` (targets read byte-exact); its review of `68d2fd2` added a P1
   (a link target leaving through an outside alias pointing back into the
   repository treated as outside) — fixed in `8308090` (such paths re-enter
-  the walk). Shown
+  the walk); a second Codex pass on `3833718` added a P1 (command
+  substitution around `realpath` dropped trailing newline bytes of an
+  in-repository name reached through an outside alias) — fixed in `1e6fbd0`
+  (`realpath -z -m` read NUL-terminated). Owner-approved OPTION 1
+  (2026-11-09): default mode unchanged, PR review mode added in `425e6ee`
+  (`oauto <repo> pr`: one read-only `gh api` call outside the model
+  identifies the branch's open pull request, validated fail-closed; the
+  unchanged pipeline runs against the verified base commit; never fetches).
+  An independent review of that diff found a pre-existing P1 (`git ls-tree`
+  read a leading `:` in an included config's name as pathspec magic; fixed
+  with `:(literal)`, `e01de32`) and a PR-mode P2 (`gh api` placeholder
+  rewriting of the head filter, gh running git in the repository; `%3A` and
+  `cd /`, `1b62929`) plus four P3s, all fixed with tests. Shown
   NOT reproducible on the real binary: the claimed backslash glob escape
   (ripgrep `--glob` filter rooted at the tool path; `external_directory` gates
   the path) — no rule added. Recorded as backlog, not changed here: mutable

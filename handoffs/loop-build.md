@@ -350,6 +350,118 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
   outside file. Tests: the Codex scenario and a relative target climbing out into the alias. README row and ADR
   item 4 updated; `install.sh` refreshed `oauto-run` (backup `*-20261109-070717`), `--verify` clean. The thread
   was replied to with the fix commit and resolved; a Codex review of the final head was requested.
+- Codex review of the eleventh pushed head `3833718` (`@codex review` 07:20:18Z): the first pass reported no
+  findings (review-state marker `completed`, `has_any_findings=false`, 07:33Z; gate `🟢 Reviewed — clear`
+  07:33:46Z) and the branch was handed off on that state; a second Codex pass on the same head then posted one
+  P1 at 08:34:39Z (receipt `**Reviewed commit:** 3833718c…`, gate back to `🔴`): `resolve_outside`'s predecessor
+  captured `realpath -m` output with command substitution in both places where the walk leaves the repository,
+  which strips trailing newline bytes — a committed `a.cfg -> /outside/alias/b.cfg<LF>` (alias → the
+  repository; git shown to have loaded `b.cfg<LF>` through it; both deleted) resolved to `b.cfg`, a file that
+  never existed, so the real file's removed credential reached `preflight.md` (old launcher: token present,
+  only `a.cfg` excluded; fixed: absent, `"b.cfg\n"` excluded). Fixed in `1e6fbd0` (2026-11-09 10:48Z):
+  `resolve_outside` runs `realpath -z -m` into a temp file and reads it with `IFS= read -r -d ''` (every byte
+  kept; failure or an empty result fails closed); the audit of the rest of the traversal found every other
+  pathname already NUL-delimited (records, blobs, include lists) and the remaining command substitutions
+  capturing only the 6-byte tree mode and non-path values (`REPO` itself comes from `pwd -P`). Tests: trailing
+  LF through the absolute-alias and the `..` branches, double LF, tab+space, backslash+quote (refused by the
+  glob-metacharacter rule — fail closed, nothing rendered), non-ASCII, and a nested alias → link →
+  `"c.cfg\n"` chain, each case first shown to be loaded by git itself. README row and ADR item 4 updated;
+  `install.sh` refreshed `oauto-run` (backup `*-20261109-104842`), `--verify` clean. Zen terms re-checked
+  2026-11-09 from <https://opencode.ai/docs/zen/>: "GLM-5.3-Flash Free … Its provider follows a zero-retention
+  policy and does not use your data for model training", the same sentence for DeepSeek V4.1 Flash Free, both
+  listed Free and absent from the Privacy section's exceptions (Big Pickle, Iceman Free).
+- Owner-approved UX change (OPTION 1, 2026-11-09): KEEP the default behaviour and ADD a separate PR review mode,
+  `oauto <repo> pr` (`425e6ee`, implemented by an Opus subagent from the planner's specification, reviewed by the
+  planner and by an independent Opus reviewer). The default `oauto <repo>` is unchanged: a test runs the launcher
+  committed before this change (`1e6fbd0`) and the new one on the same fixtures and compares preflight, prompt,
+  stderr and rendered config byte for byte (timestamp line excepted). PR mode: `pr` is accepted in any order with
+  `glm`/`deepseek` and `--check` (`oauto <repo> pr`, `oauto <repo> deepseek pr`, `oauto <repo> pr --check`), and
+  `ai-launch`'s leading-token handling became a loop over `glm|deepseek|pr`, so `oauto pr` / `oauto deepseek pr`
+  open the repository menu and forward the words (the `codex`/`claude` paths stay byte-identical to the pristine
+  launcher; the parity test pins exactly this edit; a repository literally named `glm`, `deepseek` or `pr` can
+  no longer be selected by a bare `oauto <name>`). Before the scan and after `check-repo-git`, the lock and the
+  hardened git helpers, `pr_identify` takes the GitHub repository from `remote.origin.url` (three github.com
+  forms; the URL travels to `oauto-policy pr-query` on stdin, never in argv — it may embed a credential), makes
+  ONE authenticated read-only REST call — `gh api repos/<owner>/<repo>/pulls?state=open&head=<owner>:<branch>` in
+  a scrubbed `env -i` with `timeout 60` (`OAUTO_GH_BIN` for the test double) — and lets `oauto-policy pr-select`
+  validate the response: exactly one open pull request, its head the current branch of this repository (a fork
+  head is refused), its head sha equal to the local HEAD ("push or pull first — the launcher never fetches"),
+  its base a well-formed branch of this repository, number/html_url/shas well formed; only number, html_url,
+  base ref, base sha and head sha come back, the response file is deleted. The base must exist locally as
+  `refs/remotes/origin/<base>` (unambiguous: a local branch named `origin/<base>` refuses) with a merge base.
+  Then the EXISTING pipeline runs with `base = origin/<base>` — same scan, history tree walk, classification,
+  exclusion proof, content checks, byte caps, rendered config, permissions, policies, models, lock — so the PR
+  delta carries exactly the same protections as the upstream delta. The preflight gains `- Pull request: #N
+  <url>`, `- PR base branch: <base> (GitHub base <sha12>; local origin/<base> <sha12>)` (a differing GitHub base
+  is stated, never fetched), `- Merge base: <sha>`, `- Reviewed local HEAD: <sha> (= PR head)`; the delta
+  section is titled `## Pull request #N delta vs origin/<base> (merge-base...HEAD)` with the `--stat` block
+  first; uncommitted changes keep their own section; after writing, the run is refused if HEAD or
+  `origin/<base>` moved meanwhile; the banner shows `Mode  : pull request #N → origin/<base> (merge base
+  <sha12>)`; the initial prompt names the pull request and asks for a review of that delta (uncommitted changes
+  separately) — never "ask what to review". Nothing is ever fetched, checked out, pulled or moved, and no failure
+  falls back to the default review. No tool, permission, model, agent or write path was added; the rendered
+  config is identical in both modes (asserted). Tests (fake double `tests/fixtures/fake-gh`; `runOauto` never
+  reaches the real gh): the PR #58 shape (upstream == HEAD, `origin/main` ahead) reviewed against `origin/main`
+  with the merge base and reviewed HEAD recorded; the base taken from the metadata (another base branch; a
+  differing GitHub base stated); modified/added/deleted/renamed files; uncommitted changes separate; secret-like
+  files excluded from both sections; 21 fail-closed cases on one fixture plus an unborn branch (no PR, two PRs
+  "ambiguous: PRs #58, #59", head mismatch, fork or deleted head repo, foreign base, head ref ≠ branch, empty or
+  unsafe base ref, missing number/html_url/base.sha, non-JSON, non-array, base absent locally, no merge base,
+  ambiguous `origin/main`, non-GitHub origin with an embedded token not echoed, no origin, detached HEAD, gh
+  missing) each asserting exit 1, the reason, failure before the scan, nothing rendered and no fallback; gh exit
+  1/4/124 with the stderr summarised and token-shaped text redacted; no git metadata change (every file under
+  `.git` plus `for-each-ref` compared); both aliases in both orders; `--check` with `pr`; the lock taken before
+  the gh call; `pr-query`/`pr-select` units; the `oauto-run` source-shape pin extended. Real integration check
+  (real `gh` as the owner, real OpenCode 2.2.6): on a scratch clone at the PR head `3833718` (upstream == HEAD,
+  `origin/main` `15e44e6`) `oauto-run <clone> pr --check` resolved PR #58 → `origin/main`, merge base
+  `15e44e691485`, `17 files changed, 8400 insertions(+), 22 deletions(-)` — identical to `gh pr view 58
+  --json files` (17/17, +8400/−22), nothing excluded, the diff body truncated by the existing 24,000-byte cap —
+  with `policies ok: 62 probes`, `models ok`, `agents ok`; on this checkout, which then carried one unpushed
+  commit, it failed closed as designed ("the PR head is 3833718…, the local HEAD is 1e6fbd0…: push or pull
+  first — the launcher never fetches") and the default `--check` still reviewed against
+  `origin/claude/oauto-opencode-reviewer (behind 0, ahead 1)` with no PR lines. Docs: `launchers/oauto/README.md`
+  (usage, "PR review mode", terms re-check), ADR 0002 decision item, root README bullet. Not physically tested:
+  a PR-mode TUI session; the real gh error paths (exercised through the double only); the Termux hop.
+- Independent Opus security review of the complete task diff (`3833718..425e6ee`, 2026-11-09 11:30–12:10Z): one
+  P1, one P2, four P3s, every one reproduced on the committed code before a change and fixed in two commits.
+  P1 (pre-existing, found by the reviewer, fixed by the planner in `e01de32`): `git ls-tree <rev> -- <path>` reads
+  a leading `:` in the path as pathspec magic, so a committed included config named `:inc.cfg` was never found
+  by `tree_walk` and the chain below it was lost — with both files deleted, `nested.cfg`'s removed credential
+  reached `preflight.md` (old launcher: token present, only `:inc.cfg` excluded; git itself shown to load
+  `nested.cfg` through the colon-named file); the walk now passes `":(literal)<path>"`. In the same commit the
+  history traversal's visited keys, which joined entry and context with `|`, carry the entry's length so a path
+  containing `|` cannot collide two different (entry, context) pairs (P3, planner). Tests: the colon-named chain,
+  and two `|`-named/contexted chains followed independently. P2 (PR mode, fixed by the implementer in `1b62929`,
+  reproduced with the real gh 2.46): `gh api` rewrites `:owner`, `:repo`, `:branch` and `{word}` inside an
+  endpoint and fills them by running `git symbolic-ref`, `git remote -v` and `git config --get-regexp` in its
+  working directory — the reviewed repository, with its own config — so for a branch `branch-x` GitHub received
+  `head=funzi7branch-x-x` (for `owner`: `head=funzi7funzi7`), ignored the mangled filter, returned every open PR
+  and the refusal read "ambiguous: PRs #58, #57" instead of "no open pull request" (still fail-closed: no wrong
+  PR was ever selected). Now `pr-query` encodes the filter's colon as `%3A` and refuses an endpoint still holding
+  `:`, `{` or `}`; the launcher resolves gh to an absolute path and calls it from `/` (gh shown to run git zero
+  times in the repository; GitHub shown to honour `%3A`: the real call returned exactly PR #58). P3 (`1b62929`):
+  `gh_error_summary` left URL user-info (`https://x-access-token:…@`, `user:pass@`), `token: x`, `"token":"x"`,
+  `token=x` and upper-case `AUTHORIZATION: BEARER x` unredacted — all `[redacted]` now, still one printable ASCII
+  line. P3 (`1b62929`, local race): every PR-mode diff named `origin/<base>` again while the ambiguity check ran
+  once, so a branch of that name planted mid-run (reproduced with a git wrapper) redirected the delta to C1..C2
+  instead of C0..C2; `base` is now the commit `pr_identify` verified and a new `base_label` carries the displayed
+  name (`- Base for branch delta:`, the banner, the default-mode section title), equal to `base` in default mode —
+  the default-mode byte-equivalence test still passes. P3 (`1b62929`, documented): a repository literally named
+  `pr`, `glm` or `deepseek` is selected as `oauto ./pr`. Tests added: placeholder-shaped branch names
+  (`branch-x`, `owner`, `repo-1`) reach the double verbatim with gh's working directory `/` (the launcher started
+  from inside the repository, as `ai-launch` starts it); the planted-`origin/main` race; six redaction samples
+  with a one-ASCII-line check; the `pr-query` unit (`%3A`, nothing left that gh would rewrite) and the
+  `oauto-run` source-shape pins updated; `fake-gh` logs its working directory and refuses an endpoint gh would
+  rewrite. README (usage note, PR section, redaction wording) and ADR item 9 updated. `install.sh` refreshed
+  `oauto-run` and `oauto-policy.py` (backups `*-20261109-123455`), `--verify` clean.
+- Validation at the final code of this round (`1b62929`, docs committed on top): targeted run of the PR-mode,
+  `pr-query`/`pr-select`, source-shape, `ai-launch` parity, default byte-equivalence, review-P1 and Codex-P1-#11
+  tests 16/16; then `bash scripts/validate.sh` — 291/291 node tests (up from 288 at `425e6ee`: the colon-named
+  include chain, the placeholder-shaped branch names, the planted-`origin/main` race), 59 github-script blocks
+  checked, actionlint, exit 0, 961 s; `git diff --check` clean; the installed `oauto-run`, `oauto-policy.py` and
+  `ai-launch` byte-identical to the repository (`install.sh --verify`). The real-`gh` PR-mode `--check` of this
+  checkout against PR #58 needs the pushed head (PR head == local HEAD) and is run after the push; its result,
+  the exact-head CI, the Codex review and the Gate verdict are recorded only in `cc-latest.md` (below).
 - Review and gate state of the final head: recorded in `agent-memory/automation-core/cc-latest.md` (owner-facing
   state) once the exact-head CI, Codex review and Codex Gate verdict exist on the PR; never claimed here ahead of
   the evidence.
