@@ -242,22 +242,58 @@ is the permanent human opt-out and is never removed by automation.
    crashes the job instead of exiting green or alerting — a loud, deduplicated
    `Bad credentials` preflight (with the Telegram escalation) is a future
    hardening item and is deliberately NOT part of PR #59.
-10. **oauto (read-only OpenCode reviewer launcher) — installed, PR #58 pending.** The
-    launcher, its policy module, tests and docs live under `launchers/` on branch
+10. **oauto (read-only OpenCode reviewer launcher) — installed, PR #58 pending
+    (conflicts with `main` resolved 2026-11-09).** The launcher, its policy
+    module, tests and docs live under `launchers/` on branch
     `claude/oauto-opencode-reviewer` (ADR 0002). Validated on the device against
-    OpenCode 2.2.6 with disposable fixture repositories (see the 2026-11-08
-    `handoffs/loop-build.md` entries for the full record). Codex's first review
-    (commit `d17f3a1`) found three P1s in the git preflight — repository-configured
-    textconv/external-diff helpers executed, special-character filenames escaped
-    the secret exclusion, rename detection hid a renamed secret's source — all
-    fixed on the PR branch with regression tests and recorded in the 2026-11-08
-    "Codex P1 round" entry; the Codex re-review of the fixed head and the Codex
-    Gate result are recorded in `agent-memory/automation-core/cc-latest.md`.
-    Physically pending: one `oauto <repo>` run from a real Termux shell (the hop
-    cannot be exercised from inside the Debian PRoot session), the PR merge, and
-    an owner decision on listing `oauto` in `DEVELOPMENT_RULES_FULL` §7. Any
-    OpenCode upgrade re-opens validation: the launcher refuses every version
-    other than 2.2.6.
+    OpenCode 2.2.6 with disposable fixture repositories (see the 2026-11-08 and
+    2026-11-09 `handoffs/loop-build.md` entries for the full record). Codex's
+    first review (commit `d17f3a1`) found three P1s in the git preflight —
+    repository-configured textconv/external-diff helpers executed,
+    special-character filenames escaped the secret exclusion, rename detection
+    hid a renamed secret's source — all fixed on the PR branch with regression
+    tests ("Codex P1 round" entry). 2026-11-09 round: the owner's GLM
+    whole-repository audit (run through `oauto` itself on 2026-11-08) was
+    verified finding by finding; three real gaps were fixed with reproduce-first
+    regression tests — a hard link whose other name lies outside the repository
+    was undetectable (now refused unconditionally when `st_nlink` exceeds the
+    names the scan sees), a linked worktree's git dir and commondir skipped the
+    symlinked-config refusal and the hard-link alias registration (now walked
+    under the `.git` rules), Composer `auth.json` and other common credential
+    files were missing from the pattern list (added on all four controls) — the
+    policy ceiling OpenCode loads is now verified at every launch (`debug
+    config` document `policies` + `permissions` loaded verbatim, 62 + 44 probes
+    on the real binary), and the claimed backslash glob escape was shown NOT
+    reproducible on the real binary (ripgrep `--glob` filter rooted at the tool
+    path, which `external_directory` gates) — no rule added. An independent
+    Opus review of that round found one pre-existing P2 — a crafted `.git`
+    file (`gitdir: <other repo>/.git`) pointed the preflight at another local
+    repository, whose content then reached the prompt — fixed with
+    `check-repo-git` (refuses a `.git` pointer this worktree does not own
+    before any git command runs), plus six P3s fixed (git-exact pointer
+    parsing, verbatim rule arrays, exact-name denial of case-variant secret
+    files under the override, object-store hard-link accounting, secret-named
+    git-dir aliases, walk errors failing closed). `main` (PR #59) was merged
+    into the branch (`01f6840`). The Codex review, CI and Codex Gate state of the
+    pushed head are recorded in `agent-memory/automation-core/cc-latest.md`.
+    DONE by the owner on 2026-11-08: the Termux hop (`oauto <repo>` from a real
+    Termux shell) and a review of a real project repository (the GLM audit).
+    Physically pending: the PR merge, a full DeepSeek TUI session, and an owner
+    decision on listing `oauto` in `DEVELOPMENT_RULES_FULL` §7. Any OpenCode
+    upgrade re-opens validation: the launcher refuses every version other than
+    2.2.6.
+11. **Future backlog recorded from the GLM audit (verified, deliberately NOT in
+    PR #58):** pin the third-party actions `peter-evans/create-pull-request@v6`,
+    `anthropics/claude-code-action@v1` and `openai/codex-action@v1` (and the
+    `actions/*` major tags) to commit SHAs with provenance comments — two of them
+    run with `AUTOMATION_PAT` / `ANTHROPIC_API_KEY` in scope; make
+    `scripts/validate.sh` glob `*.yml *.yaml` like `validate_github_scripts.py`
+    (no tracked `.yaml` exists today, so nothing is skipped yet); let
+    `ai-launch` take the oauto alias set from `oauto-policy approved` instead of
+    duplicating `glm|deepseek`; optionally add a `*\*` glob deny as defence in
+    depth (not exploitable on OpenCode 2.2.6, see the 2026-11-09 handoff entry);
+    a probe test that `git config --list --show-origin -z` still yields a
+    non-empty include set on a repository with includes (format-drift guard).
 
 Older items below are history. If they conflict with this section, treat them as HISTORICAL or SUPERSEDED and follow this section.
 
@@ -399,7 +435,14 @@ tool, provider, model, plugin, MCP server and external directory denied by
 before every launch with OpenCode's own diagnostics, one session per repository.
 Its git preflight runs no repository-configured helper (no textconv, external
 diff, clean/smudge filter, fsmonitor, gpg or hook; `--work-tree` pinned) and
-excludes secret-like paths by exact bytes, renames included.
+excludes secret-like paths by exact bytes, renames included. The worktree scan
+refuses outward symlinks, aliases of denied paths, hard links with a name
+outside the repository (or more names than the scan sees), symlinked Git config
+files — in `.git` and in the git dir and commondir of a linked worktree — and
+secret-like files (Composer `auth.json`, `.pgpass`, `.my.cnf`, `.s3cfg`, `.ppk`,
+kubeconfig, Terraform CLI and RubyGems credentials included since 2026-11-09)
+unless explicitly overridden; the policy ceiling and permissions OpenCode
+reports having loaded are probed before every launch.
 Install/refresh with `bash launchers/oauto/install.sh`; contract in
 `docs/adr/0002-oauto-read-only-opencode-reviewer.md`.
 

@@ -123,6 +123,23 @@ Runtime-unverified after fix #27:
 - Claude proxy applying a Codex Cloud ready diff to the original PR head.
 - Codex API backup delivery while OpenAI quota is unavailable.
 
+Verified 2026-11-09 (oauto GLM-audit round, device, disposable fixtures only):
+
+- OpenCode 2.2.6's `glob`/`grep` tools run ripgrep with the pattern as a
+  `--glob` filter rooted at the tool's `path`; `path` goes through
+  `FileAccess.resolve`, which raises `external_directory` for anything outside
+  the project directory and treats a backslash as a literal filename character
+  (`windowsPath` is the identity on POSIX). Backslash glob patterns pass oauto's
+  deny list but cannot list or read anything outside the repository (replayed
+  against the real `rg`; evidence in the 2026-11-09 handoff entry).
+- `opencode debug config --standalone` reports the loaded document's parsed
+  content under `info`, including its `permissions` and `policies` arrays in
+  the rendered shape; `verify-sources` now fails closed on them
+  (`policies ok: 62 probes; permissions ok: 44 probes` on the device).
+- The three GLM gaps (outside hard links, linked-worktree git dirs, missing
+  credential names) reproduced on the previous launcher and are refused by the
+  current one, on the real binary as well as in the node suite.
+
 Verified 2026-11-08 (Codex Gate fail-closed pass, read-only against GitHub):
 
 - Every `pull_request_target` Codex Gate run in paywall-bot and automation-core
@@ -465,10 +482,35 @@ A1. oauto — read-only OpenCode reviewer launcher (2026-11-07):
   tests that reproduced each leak first; ADR 0002 amended (decision item 8). The
   Codex re-review and Gate state for the fixed head live in
   `agent-memory/automation-core/cc-latest.md`;
-- physically pending: one `oauto <repo>` run from a real Termux shell, the PR
-  merge, and the owner's decision on listing `oauto` in
-  `DEVELOPMENT_RULES_FULL` §7. The launcher refuses any OpenCode version other
-  than 2.2.6 until re-validated.
+- 2026-11-09: the owner's GLM whole-repository audit (run through `oauto` on
+  automation-core itself, 2026-11-08) was verified claim by claim. Fixed with
+  reproduce-first regression tests: a hard link whose other name lies outside
+  the repository was undetectable (refused unconditionally when `st_nlink`
+  exceeds the names the scan sees in the worktree and `.git`); a linked
+  worktree's git dir and commondir skipped the symlinked-config refusal and the
+  hard-link alias registration (walked under the `.git` rules); Composer
+  `auth.json`, `.pgpass`, `.my.cnf`, `.s3cfg`, `*.ppk`, kubeconfig, Terraform
+  CLI, RubyGems and service-account spellings added to the one pattern list;
+  `verify-sources` now requires the `policies` and `permissions` of the
+  document OpenCode reports having loaded to equal the rendered arrays rule for
+  rule and probes them (real 2.2.6: 62 + 44 probes). An independent Opus review
+  then found a pre-existing P2 — a crafted `.git` file pointed the preflight at
+  another local repository and leaked its content into the prompt — fixed with
+  `check-repo-git` before any git command, plus six P3s (git-exact pointer
+  parsing, verbatim arrays, exact-name denial of case-variant secret files
+  under the override, object-store hard-link accounting, secret-named git-dir
+  aliases, walk errors failing closed). Shown
+  NOT reproducible on the real binary: the claimed backslash glob escape
+  (ripgrep `--glob` filter rooted at the tool path; `external_directory` gates
+  the path) — no rule added. Recorded as backlog, not changed here: mutable
+  third-party action tags, the `validate.sh` YAML glob, the duplicated alias
+  regex (LOOP_STATE item 11). `main` (PR #59) merged into the branch
+  (`01f6840`). Full record: the 2026-11-09 `handoffs/loop-build.md` entry;
+- DONE by the owner (2026-11-08): the Termux hop and a review of a real project
+  repository (the GLM audit above);
+- physically pending: the PR merge, a full DeepSeek TUI session, and the
+  owner's decision on listing `oauto` in `DEVELOPMENT_RULES_FULL` §7. The
+  launcher refuses any OpenCode version other than 2.2.6 until re-validated.
 
 A. Recovery documentation and expression-safety work completed in this pass:
 
