@@ -57,7 +57,21 @@ policy, not by the system prompt alone:
    `update` is disabled, `snapshots`, `lsp`, `formatter` and `websearch` are
    off, `mcp.servers` and `skills` are empty.
 4. **Launcher preflight, fail closed**: a per-repository lock is taken before
-   anything is written; validated binary version only; no system config under
+   anything is written; before any git command runs, `check-repo-git` refuses a
+   repository whose `.git` is not a real directory or a `.git` file this worktree
+   owns (added 2026-11-09 after the whole-repo audit found a crafted `.git`
+   file, `gitdir: <other repo>/.git`, would make every preflight git command run
+   against another local repository and leak its content): the `.git` file is
+   parsed exactly as git does (content starts `gitdir: `, only trailing CR/LF
+   stripped so a trailing space stays part of the path) and the named git dir
+   must be either this linked worktree's admin dir — its `gitdir` back-pointer
+   resolves to this `.git` file and it is `<realpath(commondir)>/worktrees/<name>`
+   — or this submodule's git dir — a `modules` path component and a last
+   `core.worktree` (resolved relative to the git dir) that is this worktree; a
+   symlinked, malformed, missing or otherwise foreign `.git` is refused (a moved
+   worktree is told to run `git worktree repair`), and the scan applies the same
+   parser so it never walks a decoy git dir. Then: validated binary version only;
+   no system config under
    `/etc/opencode`; no `opencode.json(c)` or `.opencode/` in the repository and
    no `opencode.json(c)` in any parent directory; one scan of the whole worktree
    (nothing pruned, case-insensitive, driven by the same pattern list as the
@@ -72,15 +86,24 @@ policy, not by the system prompt alone:
    (`notes.txt -> config/prod.secrets.yaml`, `c -> .docker/config.json`),
    symlinks to a directory that holds secret-like files (`cfgdir -> secrets/`),
    hard links to a secret-like file in the repository or to a file of its git
-   dir(s) other than its hooks, any worktree file that has more hard-link
-   names (`st_nlink`) than the scan finds in the worktree and `.git` (another
-   name outside the repository cannot be checked and may be a secret; a link
-   into `.git/objects`, which is not walked, is refused the same way; a
-   filesystem that reports one link for a hard-linked file defeats this),
+   dir(s) other than its hooks (refused even under a secret-like alias name,
+   which no `read` rule the file itself is denied by would catch), any worktree
+   file that has more hard-link
+   names (`st_nlink`) than the scan accounts for in the worktree and `.git`
+   (another name outside the repository cannot be checked and may be a secret,
+   so a file hard-linked from a package store or a `cp -al` copy outside the
+   repository is refused; the object store is not walked in full, but when a
+   worktree file would otherwise be unaccounted its object-store partners are
+   counted, so a self-clone or git-annex thin mode — which hard-link worktree
+   files to objects — is accepted, those being names inside the repository, not
+   aliases; a filesystem that reports one link for a hard-linked file defeats
+   this),
    symlinks inside `.git` that leave the
    repository (git-annex object links are refused by the `.git` rule), a
    `.git` that is itself a symlink, and Git config files that are symlinks
-   (git would write credentials through them into a file readable by name).
+   (git would write credentials through them into a file readable by name). A
+   directory that cannot be listed is reported as `SKIPPED` and fails the scan
+   closed (exit 3), so a hidden subtree never reads as a clean worktree.
    For a `.git` file (linked worktree, submodule checkout) the git dir and
    commondir it names are walked under the same per-file rules — symlinked
    Git config files refused, their files alias targets for hard links (not
@@ -139,13 +162,17 @@ policy, not by the system prompt alone:
    to its expected effect (`shell`, `edit`, external, `.env`, `.ssh/`,
    `.git/config` → deny; `read src/...`, `glob **/*.kt`, `grep`, `question` →
    allow; hidden agents → deny for everything). The document as `debug
-   config` reports it loaded is verified too (amended 2026-11-09): its
-   `policies` ceiling must deny every denied tool, every secret-like read
-   probe and the launch's own read denials (exact path and `*/` form), allow
-   the documented exceptions and the `opencode` provider, deny the other
-   providers, `integration.connect`, MCP, skills, plugins and web search, and
-   leave the reviewer's own tools to the permissions; its top-level
-   `permissions` must resolve the same probes as the agents.
+   config` reports it loaded is verified too (amended 2026-11-09): the
+   `policies` ceiling and the top-level `permissions` it loaded must equal the
+   arrays oauto rendered **verbatim** — exact, order-sensitive list equality,
+   so a removed, reordered or appended rule fails closed even when no probe
+   samples it (a lone key pattern, a foreign provider or integration) — after
+   which the probes replay as a semantic cross-check: the ceiling denies every
+   denied tool, every secret-like read probe and the launch's own read denials
+   (exact path and `*/` form), allows the documented exceptions and the
+   `opencode` provider, denies the other providers, `integration.connect`,
+   MCP, skills, plugins and web search, and leaves the reviewer's own tools to
+   the permissions, while the permissions resolve the same probes as the agents.
 6. **Process hygiene**: `--standalone` (no background service), scrubbed
    environment (`env -i` passing only HOME, PATH, TERM, LANG, TMPDIR, SHELL,
    USER, the private `XDG_CONFIG_HOME`, and COLORTERM/LC_ALL/XDG_*_HOME when set,
@@ -223,7 +250,16 @@ DeepSeek pass follows a GLM pass without any other model becoming selectable.
   semantics (2.x already renamed `permission`/`bash`/`task`), so a new version
   must be re-validated and the pin bumped deliberately.
 - `grep` is content-returning and path-unrestricted by OpenCode design; the
-  preflight refusal is the mitigation. Ripgrep itself is downloaded by OpenCode
+  preflight refusal is the mitigation.
+- The escaping-glob `glob` denies are defence in depth (verified on the real
+  2.2.6 binary, 2026-11-09): the `glob`/`grep` pattern is handed to ripgrep as
+  a `--glob` filter rooted at the tool's `path`, and `path` is resolved through
+  `FileAccess.resolve`, which raises `external_directory` for anything outside
+  the project directory and treats a backslash as a literal filename character
+  on POSIX. A backslash-written pattern therefore passes the deny list and still
+  cannot list or read anything outside the repository; no backslash rule was
+  added (fix only what is reproducible). An OpenCode upgrade re-opens this
+  together with the `VALIDATED_VERSION` pin. Ripgrep itself is downloaded by OpenCode
   into `~/.cache/opencode/bin/rg` on first use (one-time, now cached).
 - The `skill` tool stays in the model's tool list, but every skill is denied by
   permission and policy, so none is visible or loadable (`Unable to load skill`).

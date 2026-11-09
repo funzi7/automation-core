@@ -8,6 +8,9 @@ Subcommands
   scan            Walk a repository once: report secret-like files, symlinks and hard
                   links that leave it or alias denied paths, symlinked Git config files,
                   and credential-looking content in known config files.
+  check-repo-git  Exit 0 when a repository's .git is a real directory or a .git file this
+                  worktree owns; exit 2 (with a reason) for a symlink, a malformed or
+                  foreign .git file, so the launcher runs no git against another repo.
   classify        Read paths on stdin; print the ones the reviewer may never read.
                   With -z: NUL-delimited, bytes-exact, rename pairs (--renames) and a
                   C-quoted listing (--display); the form the launcher uses.
@@ -620,6 +623,143 @@ def _q(path: str) -> str:
     return git_quote(os.fsencode(path))
 
 
+def config_value(text: str, section: str, key: str) -> str | None:
+    """The last ``<section>.<key>`` value in Git config content (git resolves a repeated
+    key to its last occurrence), parsed like config_include_paths (BOM, comments, line
+    continuations, subsection headers). None when the key is absent."""
+    if text.startswith("﻿"):
+        text = text[1:]
+    found = None
+    current = ""
+    pending = ""
+    for physical in text.split("\n"):
+        line = _strip_config_comment(pending + physical.rstrip("\r"))
+        if (len(line) - len(line.rstrip("\\"))) % 2 == 1:
+            pending = line[:-1]
+            continue
+        pending = ""
+        header = _CONFIG_SECTION_HEADER.match(line)
+        if header:
+            current = header.group(1).split(".", 1)[0].lower()
+            line = header.group(2)
+        if current != section.lower():
+            continue
+        k, sep, value = line.partition("=")
+        if sep and k.strip().lower() == key.lower():
+            found = _config_value(value)
+    return found
+
+
+# ---------------------------------------------------------------------------
+# ``.git`` as a file: parsed exactly as git does, and checked to belong to the
+# worktree being reviewed. A crafted ``.git`` file (``gitdir: <other repo>/.git``)
+# would otherwise make every preflight git command run against another local
+# repository and leak its content into the preflight.
+# ---------------------------------------------------------------------------
+
+def parse_dot_git_file(data: bytes) -> str | None:
+    """The gitdir path a ``.git`` FILE names, parsed exactly as git does
+    (read_gitfile_gently): the content must start with ``gitdir: ``; trailing CR/LF are
+    stripped and nothing else (a trailing space stays part of the path); the remainder is
+    the path. None when it is not a well-formed ``gitdir:`` pointer or the path is empty."""
+    text = data.decode("utf-8", "surrogateescape").rstrip("\r\n")
+    prefix = "gitdir: "
+    if not text.startswith(prefix):
+        return None
+    return text[len(prefix):] or None
+
+
+def _git_pointer(path: str) -> str | None:
+    """The content of a git pointer file (``gitdir``, ``commondir``): the whole file with
+    only trailing CR/LF stripped, as git reads them. None if unreadable or empty."""
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return None
+    return data.decode("utf-8", "surrogateescape").rstrip("\r\n") or None
+
+
+def _git_dir_owned(repo: str, dot_git: str, gitdir: str, commondir: str | None) -> bool:
+    """Whether a git dir a ``.git`` FILE names belongs to this worktree: (a) a linked
+    worktree whose back-pointer resolves to this ``.git`` file and whose
+    ``<commondir>/worktrees/<name>`` layout matches, or (b) a submodule checkout whose git
+    dir has a ``modules`` path component and whose config's last ``core.worktree`` (git
+    resolves it relative to the git dir) is this worktree. ``repo`` and ``gitdir`` are
+    realpaths."""
+    back = _git_pointer(os.path.join(gitdir, "gitdir"))
+    if back is not None and commondir is not None:
+        back_abs = back if os.path.isabs(back) else os.path.join(gitdir, back)
+        name = os.path.basename(gitdir)
+        if (os.path.realpath(back_abs) == os.path.realpath(dot_git)
+                and os.path.realpath(os.path.join(commondir, "worktrees", name)) == gitdir):
+            return True
+    if "modules" in gitdir.split(os.sep):
+        text = None
+        try:
+            with open(os.path.join(gitdir, "config"), encoding="utf-8", errors="surrogateescape") as fh:
+                text = fh.read()
+        except OSError:
+            text = None
+        worktree = config_value(text, "core", "worktree") if text is not None else None
+        if worktree is not None:
+            wt_abs = worktree if os.path.isabs(worktree) else os.path.join(gitdir, worktree)
+            if os.path.realpath(wt_abs) == repo:
+                return True
+    return False
+
+
+def own_git_info(repo: str) -> tuple[str, list[str], str | None, str | None]:
+    """Classify ``<repo>/.git`` (``repo`` is taken as given; pass a realpath) and, when it
+    is a directory or a git-dir pointer this worktree owns, the git dir(s) to scan.
+    Returns ``(kind, gitdirs, gitdir, detail)``:
+      kind     "dir" (a real directory) | "owned" (a ``.git`` file this worktree owns)
+               | "symlink" | "no-git" | "malformed" | "missing" | "unowned".
+      gitdirs  the git dir(s) to walk: ``[<repo>/.git]`` for a directory, ``[gitdir,
+               commondir]`` for an owned pointer, ``[]`` otherwise.
+      gitdir   the named git dir (for the ``unowned`` scan record), or None.
+      detail   a one-line reason for every non-``dir``/``owned`` kind, else None."""
+    git_dir = os.path.join(repo, ".git")
+    if os.path.islink(git_dir):
+        return ("symlink", [], os.path.realpath(git_dir), ".git is a symlink")
+    if os.path.isdir(git_dir):
+        return ("dir", [git_dir], None, None)
+    if not os.path.exists(git_dir):
+        return ("no-git", [], None, "not a Git repository (no .git)")
+    try:
+        with open(git_dir, "rb") as fh:
+            data = fh.read()
+    except OSError as exc:
+        return ("malformed", [], None, f"cannot read the .git file: {exc.strerror}")
+    named = parse_dot_git_file(data)
+    if named is None:
+        return ("malformed", [], None, "malformed .git file (not a 'gitdir: <path>' pointer)")
+    gitdir = os.path.realpath(named if os.path.isabs(named) else os.path.join(repo, named))
+    if not os.path.isdir(gitdir):
+        return ("missing", [], gitdir, f".git file names a git dir that does not exist ({gitdir})")
+    gitdirs = [gitdir]
+    commondir = None
+    common = _git_pointer(os.path.join(gitdir, "commondir"))
+    if common is not None:
+        commondir = os.path.realpath(common if os.path.isabs(common) else os.path.join(gitdir, common))
+        gitdirs.append(commondir)
+    if _git_dir_owned(repo, git_dir, gitdir, commondir):
+        return ("owned", gitdirs, gitdir, None)
+    return ("unowned", gitdirs, gitdir,
+            f".git file names a git dir that does not belong to this worktree ({gitdir}); "
+            "if the worktree was moved, run `git worktree repair` from the main repository")
+
+
+def check_repo_git(repo: str) -> None:
+    """Exit 0 when ``<repo>/.git`` is a real directory or a ``.git`` file this worktree
+    owns; otherwise print the reason and exit 2, so the launcher refuses before any git
+    command runs against a git dir that is not this worktree's."""
+    kind, _gitdirs, _gitdir, detail = own_git_info(os.path.realpath(repo))
+    if kind in ("dir", "owned"):
+        return
+    _die(detail or "unsafe .git")
+
+
 def _is_git_dir_config(inner: str) -> bool:
     """A Git config file by its path inside a git dir: config / config.worktree at the
     top, in worktrees/<name>/, and anywhere under modules/ (submodule git dirs, nested
@@ -735,23 +875,28 @@ def check_excluded(excluded_file: str, remaining_file: str) -> None:
 
 def scan(repo: str, budget: float, included_out: str | None = None,
          config_origins: str | None = None, missing_out: str | None = None,
-         extra_config: str | None = None) -> int:
+         extra_config: str | None = None, unruled_out: str | None = None) -> int:
     """Print one ASCII record per finding (every pathname C-quoted like git) and a final
     SUMMARY line whose counts are what the launcher decides on:
 
       SENSITIVE <path>[ (included Git config)]
       SYMLINK <link> -> <target>[ (<reason>)]
       CONTENT <path>: <reason>
+      SKIPPED <path>: <reason>
       SUMMARY files=N sensitive=N symlinks=N content=N elapsed=Xs complete=0|1
 
-    ``included_out`` receives the in-repository files that a Git config includes, and
-    the include targets there that git cannot load (deleted or renamed away):
-    NUL-terminated, repository-relative, sorted. ``missing_out`` receives the latter
-    alone (include targets missing from the worktree), whose last committed content the
-    launcher reads for further includes. ``extra_config``: repository-relative paths
-    the launcher found as include targets beyond the scan's reach (in committed content,
-    through files outside the repository); each is handled exactly like an include
-    target the scan found itself."""
+    A SKIPPED record (a directory that could not be listed) sets complete=0, so the scan
+    fails closed exactly as a budget overrun does. ``included_out`` receives the
+    in-repository files that a Git config includes, and the include targets there that
+    git cannot load (deleted or renamed away): NUL-terminated, repository-relative,
+    sorted. ``missing_out`` receives the latter alone (include targets missing from the
+    worktree), whose last committed content the launcher reads for further includes.
+    ``extra_config``: repository-relative paths the launcher found as include targets
+    beyond the scan's reach (in committed content, through files outside the repository);
+    each is handled exactly like an include target the scan found itself. ``unruled_out``
+    receives every SENSITIVE worktree path whose exact spelling the static read rules do
+    not deny (a case variant such as ``Auth.json``): the launcher denies each by its
+    exact name for that launch, so the override cannot expose it to ``read``."""
     repo = os.path.realpath(repo)
     git_dir = os.path.join(repo, ".git")
     started = time.monotonic()
@@ -759,15 +904,26 @@ def scan(repo: str, budget: float, included_out: str | None = None,
     sensitive: set[str] = set()
     symlinks: set[tuple[str, str, str]] = set()     # (link, target, reason quoting its own paths)
     content: set[tuple[str, str]] = set()
+    skipped: list[tuple[str, str]] = []             # (path, strerror) of directories os.walk could not list
     dir_links: list[tuple[str, str, str]] = []      # in-repo directory aliases (link, target, rel target)
     alias_inodes: dict[tuple[int, int], str] = {}   # (st_dev, st_ino) of secret-like files and git dir files
+    git_dir_inodes: set[tuple[int, int]] = set()    # (st_dev, st_ino) of git dir files (alias refused unconditionally)
     names_in_repo: dict[tuple[int, int], int] = {}  # (st_dev, st_ino) -> names seen in the worktree and .git (st_nlink > 1 only)
+    pruned_objects: list[str] = []                  # object stores skipped in the .git walk (counted lazily, if needed)
     linked: list[tuple[str, tuple[int, int], int, bool]] = []  # worktree files with st_nlink > 1 (+ secret-like?)
     included: dict[str, str] = {}                   # in-repo, non-.git included Git configs: canonical -> rel
     unloadable_includes: dict[str, str] = {}        # in-repo include targets git cannot load (deleted ...)
     include_names: dict[str, str] = {}              # in-repo symlinks git opens as includes (target present)
     seen_configs: set[str] = set()                  # traversal, keyed by referenced name (resolution context)
     complete = True
+
+    def on_walk_error(exc: OSError) -> None:
+        # A directory that cannot be listed hides whatever is under it, so the scan must
+        # not report a clean worktree: record it and fail closed (exit 3), like a budget overrun.
+        nonlocal complete
+        where = exc.filename if exc.filename is not None else repo
+        skipped.append((rel(where) if inside_repo(where) else where, exc.strerror or "cannot list directory"))
+        complete = False
 
     def rel(path: str) -> str:
         return os.path.relpath(path, repo).replace(os.sep, "/")
@@ -807,28 +963,10 @@ def scan(repo: str, budget: float, included_out: str | None = None,
         elif os.path.isdir(target):
             dir_links.append((rel(path), target, rel_target))  # judged after the walk
 
-    def own_git_dirs() -> list[str]:
-        """This repository's git dir(s): .git itself, or for a .git file (linked
-        worktree, submodule checkout) the gitdir it names and that gitdir's commondir."""
-        if os.path.isdir(git_dir):
-            return [git_dir]
-        try:
-            with open(git_dir, encoding="utf-8", errors="replace") as fh:
-                first = fh.readline().strip()
-        except OSError:
-            return []
-        if not first.startswith("gitdir:"):
-            return []
-        gitdir = os.path.realpath(os.path.join(repo, first[len("gitdir:"):].strip()))
-        dirs = [gitdir]
-        try:
-            with open(os.path.join(gitdir, "commondir"), encoding="utf-8", errors="replace") as fh:
-                dirs.append(os.path.realpath(os.path.join(gitdir, fh.readline().strip())))
-        except OSError:
-            pass
-        return dirs
-
-    git_dirs = own_git_dirs()
+    # Parse `.git` (file or directory) exactly as git does and confirm it belongs to this
+    # worktree; a crafted `.git` file naming another repository's git dir is reported and
+    # not walked (the launcher refuses it earlier through check-repo-git).
+    git_kind, git_dirs, named_gitdir, git_detail = own_git_info(repo)
 
     def config_role(canon: str, printed: str | None = None) -> str | None:
         """Register a Git config file by where it lives. Returns the name its findings
@@ -939,13 +1077,17 @@ def scan(repo: str, budget: float, included_out: str | None = None,
         config files and its inodes matter (its files are not names inside the
         repository). Paths outside the repository are reported absolute. False when the
         time budget ran out."""
-        for dirpath, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
+        for dirpath, dirnames, filenames in os.walk(root, topdown=True, followlinks=False, onerror=on_walk_error):
             if time.monotonic() - started > budget:
                 return False
             if in_repo:
                 for d in dirnames:
                     if os.path.islink(os.path.join(dirpath, d)):
                         link_target(os.path.join(dirpath, d))
+            # The object store is not walked (it is large and holds no config or link);
+            # a worktree hard link into it is still accounted, lazily, from pruned_objects.
+            if in_repo:
+                pruned_objects.extend(os.path.join(dirpath, d) for d in dirnames if d == "objects")
             dirnames[:] = [d for d in dirnames if d != "objects"]
             for name in filenames:
                 full = os.path.join(dirpath, name)
@@ -966,24 +1108,31 @@ def scan(repo: str, budget: float, included_out: str | None = None,
                 # the worktree (ln scripts/pre-commit .git/hooks/pre-commit) is not an alias.
                 if not inner.startswith("hooks/"):
                     alias_inodes.setdefault(inode, shown)
+                    git_dir_inodes.add(inode)
                 if _is_git_dir_config(inner):
                     check_git_config(full, 0, shown, shown)
         return True
 
     # .git: links that leave the repository, the inodes of its files (a hard link to
     # one is an alias) and every Git config file (credentials, include directives).
-    if os.path.islink(git_dir):
+    if git_kind == "symlink":
         # Git would write its config (and credentials) wherever this points; refuse.
         symlinks.add((".git", os.path.realpath(git_dir), ".git itself is a symlink"))
-    if os.path.isdir(git_dir):
-        complete = walk_git_dir(git_dir, True)
-    else:
+    elif git_kind == "unowned":
+        # A .git file naming a git dir that is not this worktree's: the launcher refuses it
+        # earlier through check-repo-git; this record is defence in depth, and the foreign
+        # git dir is not walked (nothing in it is this worktree's to report).
+        symlinks.add((".git", named_gitdir or git_detail or "",
+                      ".git file names a git dir that does not belong to this worktree"))
+    elif git_kind == "dir":
+        complete = walk_git_dir(git_dir, True) and complete
+    elif git_kind == "owned":
         # A .git file (linked worktree, submodule checkout): this repository's config,
         # hooks and metadata live in the git dir(s) it names, under the same rules; a
         # git dir inside another one (worktrees/<name> in its commondir) is walked with it.
         for d in dict.fromkeys(git_dirs):
             if complete and not any(o != d and d.startswith(o + os.sep) for o in git_dirs):
-                complete = walk_git_dir(d, False)
+                complete = walk_git_dir(d, False) and complete
     if config_origins:
         check_config_origins(config_origins)
     if extra_config:
@@ -999,7 +1148,7 @@ def scan(repo: str, budget: float, included_out: str | None = None,
         if st is not None and stat.S_ISREG(st.st_mode):
             alias_inodes.setdefault((st.st_dev, st.st_ino), r)
 
-    for dirpath, dirnames, filenames in os.walk(repo, topdown=True, followlinks=False):
+    for dirpath, dirnames, filenames in os.walk(repo, topdown=True, followlinks=False, onerror=on_walk_error):
         if not complete or time.monotonic() - started > budget:
             complete = False
             break
@@ -1057,15 +1206,35 @@ def scan(repo: str, budget: float, included_out: str | None = None,
         flagged = sorted(p for p in alias_guarded if p.startswith(prefix))
         if flagged:
             symlinks.add((link, target, f"aliases a directory holding secret-like files: {_q(flagged[0])}"))
+    # A worktree file with more names than the scan has seen might share its content with
+    # a name outside the repository. The object store was not walked, so before refusing
+    # one, account its partners there: a self-clone or git-annex thin mode hard-links
+    # worktree files to objects, and those are names inside the repository, not aliases.
+    if complete and any(nlink > names_in_repo.get(inode, 0) for _r, inode, nlink, _s in linked):
+        for store in pruned_objects:
+            if time.monotonic() - started > budget:
+                complete = False
+                break
+            for obdir, obnames, obfiles in os.walk(store, topdown=True, followlinks=False, onerror=on_walk_error):
+                if time.monotonic() - started > budget:
+                    complete = False
+                    break
+                for name in obfiles:
+                    ost = lstat(os.path.join(obdir, name))
+                    if ost is not None and stat.S_ISREG(ost.st_mode) and ost.st_nlink > 1:
+                        names_in_repo[(ost.st_dev, ost.st_ino)] = names_in_repo.get((ost.st_dev, ost.st_ino), 0) + 1
+            if not complete:
+                break
     # A hard link is the same file under another name, which no symlink rule sees. An
-    # alias of a secret-like or git dir file is refused as such (a secret-like name is
-    # denied by itself); any file with more names than the scan saw in the worktree and
-    # .git (the object store is not walked) shares its content with a name outside the
-    # repository, which may be a secret: refused, since that name cannot be checked.
+    # alias of a secret-like or git dir file is refused as such; a secret-named alias of a
+    # git dir file is refused unconditionally too (it would pass the read rules), while two
+    # secret-named names of one ordinary file are each denied by name, so need no record.
+    # Any file still with more names than the scan accounted for shares its content with a
+    # name outside the repository: refused, since that name cannot be checked.
     for r, inode, nlink, secret_name in linked:
         other = alias_inodes.get(inode)
         seen = names_in_repo.get(inode, 0)
-        if not secret_name and other is not None and other != r:
+        if other is not None and other != r and (not secret_name or inode in git_dir_inodes):
             symlinks.add((r, os.path.join(repo, other), f"hard link to {_q(other)}"))
         elif nlink > seen:
             symlinks.add((r, os.path.join(repo, r), f"hard link: {nlink} names, {seen} inside the repository;"
@@ -1077,9 +1246,17 @@ def scan(repo: str, budget: float, included_out: str | None = None,
         print(f"SYMLINK {_q(link)} -> {_q(target)}" + (f" ({reason})" if reason else ""))
     for path, reason in sorted(content):
         print(f"CONTENT {_q(path)}: {reason}")
+    for path, reason in sorted(set(skipped)):
+        print(f"SKIPPED {_q(path)}: {reason}")
     elapsed = time.monotonic() - started
     print(f"SUMMARY files={files} sensitive={len(secret_like)} symlinks={len(symlinks)} content={len(content)}"
           f" elapsed={elapsed:.1f}s complete={'1' if complete else '0'}")
+    if unruled_out:
+        # SENSITIVE worktree paths the case-sensitive read rules do not deny by their exact
+        # spelling (a case variant such as Auth.json): denied by exact name for this launch.
+        with open(unruled_out, "wb") as fh:
+            unruled = sorted((p for p in sensitive if decide(read_only_ruleset(), "read", p) != "deny"), key=os.fsencode)
+            fh.write(b"".join(os.fsencode(r) + b"\0" for r in unruled))
     if included_out:
         with open(included_out, "wb") as fh:
             handed_over = included_rels | set(unloadable_includes.values()) | set(include_names.values())
@@ -1246,10 +1423,27 @@ def _loaded_rules(info: dict, key: str, config_file: str) -> list[dict]:
     return rules
 
 
+def _assert_verbatim(loaded: list[dict], expected: list[dict], key: str, config_file: str) -> None:
+    """``loaded`` (a rule array OpenCode parsed) must equal ``expected`` (what oauto
+    rendered) rule for rule, so a sampling of probes cannot miss a rule that was removed,
+    reordered or appended. Reports the first differing index, or the first missing/extra
+    rule when the lengths differ."""
+    for i in range(min(len(loaded), len(expected))):
+        if loaded[i] != expected[i]:
+            _die(f"loaded {key}[{i}] is {json.dumps(loaded[i], sort_keys=True)}, "
+                 f"expected {json.dumps(expected[i], sort_keys=True)}")
+    if len(loaded) < len(expected):
+        _die(f"loaded {key} is missing rule {len(loaded)}: {json.dumps(expected[len(loaded)], sort_keys=True)}")
+    if len(loaded) > len(expected):
+        _die(f"loaded {key} has an unexpected extra rule {len(expected)}: {json.dumps(loaded[len(expected)], sort_keys=True)}")
+
+
 def verify_sources(payload, config_dir: str, config_file: str, deny_read: list[str] = ()) -> None:
     """The only sources are the oauto directory and document, and the document as
-    OpenCode parsed it (its ``info``) resolves every probe: the ``policies`` ceiling
-    (policy_probes) and the global ``permissions`` (PROBES, as for the agents)."""
+    OpenCode parsed it (its ``info``) loaded the rendered ``policies`` and ``permissions``
+    arrays verbatim (exact list equality, so no rule can be dropped, reordered or added),
+    which the probes then replay as a semantic cross-check."""
+    deny_read = list(dict.fromkeys(p for p in deny_read if p))  # as render() dedups
     if not isinstance(payload, list):
         _die("debug config output is not a JSON array")
     documents = []
@@ -1268,21 +1462,25 @@ def verify_sources(payload, config_dir: str, config_file: str, deny_read: list[s
         _die(f"oauto config document {config_file} is not loaded")
     pol_probes = policy_probes(deny_read)
     perm_probes = PROBES + [probe for p in deny_read for probe in (("read", p, "deny"), ("read", f"./{p}", "deny"))]
+    want_policies = policies(deny_read)
+    want_permissions = read_only_ruleset(deny_read)
     for entry in documents:
         info = entry.get("info")
         if not isinstance(info, dict):
             _die(f"debug config shows no parsed content (info) for {config_file}")
-        rules = _loaded_rules(info, "policies", config_file)
+        loaded_policies = _loaded_rules(info, "policies", config_file)
+        _assert_verbatim(loaded_policies, want_policies, "policies", config_file)
+        loaded_permissions = _loaded_rules(info, "permissions", config_file)
+        _assert_verbatim(loaded_permissions, want_permissions, "permissions", config_file)
         for action, resource, expected in pol_probes:
-            got = decide(rules, action, resource)
+            got = decide(loaded_policies, action, resource)
             if (got == "deny") if expected == "not deny" else (got != expected):
                 _die(f"loaded policies: {action} {resource!r} resolves to {got}, expected {expected}")
-        rules = _loaded_rules(info, "permissions", config_file)
         for action, resource, expected in perm_probes:
-            got = decide(rules, action, resource)
+            got = decide(loaded_permissions, action, resource)
             if got != expected:
                 _die(f"loaded permissions: {action} {resource!r} resolves to {got}, expected {expected}")
-    print(f"config sources ok: only {config_file}")
+    print(f"config sources ok: only {config_file} (policies and permissions loaded verbatim)")
     print(f"policies ok: {len(pol_probes)} probes; permissions ok: {len(perm_probes)} probes")
 
 
@@ -1312,6 +1510,11 @@ def main(argv: list[str]) -> None:
                         help="write the include targets missing from the worktree, NUL-terminated")
     p_scan.add_argument("--included-out", metavar="FILE",
                         help="write the in-repository files .git/config includes, NUL-terminated")
+    p_scan.add_argument("--unruled-out", metavar="FILE",
+                        help="write the SENSITIVE worktree paths the static read rules do not deny by exact name, NUL-terminated")
+
+    p_crg = sub.add_parser("check-repo-git")
+    p_crg.add_argument("repo", help="repository root whose .git must be a real dir or a .git file this worktree owns")
 
     p_classify = sub.add_parser("classify")
     p_classify.add_argument("-z", dest="nul", action="store_true",
@@ -1357,7 +1560,9 @@ def main(argv: list[str]) -> None:
         sys.stdout.write("\n")
     elif args.cmd == "scan":
         sys.exit(scan(args.repo, args.budget, args.included_out, args.config_origins, args.missing_out,
-                      args.extra_config))
+                      args.extra_config, args.unruled_out))
+    elif args.cmd == "check-repo-git":
+        check_repo_git(args.repo)
     elif args.cmd == "classify":
         if args.nul:
             renames = _read_bytes(args.renames) if args.renames else None

@@ -59,6 +59,12 @@ done
 
 [[ -d "$REPO/.git" || -f "$REPO/.git" ]] || die "not a Git repository root: $REPO"
 REPO="$(cd "$REPO" && pwd -P)"
+# A crafted `.git` FILE (gitdir: <other repo>/.git) would make every preflight git
+# command run against another local repository and leak its content. Refuse such a
+# repository before ANY git command runs: .git must be a real directory or a .git file
+# this worktree owns (a linked worktree or submodule checkout).
+python3 -I "$POLICY" check-repo-git "$REPO" ||
+  die "refusing to launch: $REPO/.git is not this worktree's own git directory (see the reason above); no git command was run against it"
 REPO_NAME="$(basename "$REPO")"
 REPO_KEY="$REPO_NAME-$(printf '%s' "$REPO" | sha256sum | cut -c1-8)"
 MODEL_ID="$(python3 -I "$POLICY" approved | awk -v a="$MODEL_ALIAS" '$1 == a {print $2}')"
@@ -176,10 +182,11 @@ included_z="$(mktemp "$STATE_DIR/.included.XXXXXX")"
 origins_z="$(mktemp "$STATE_DIR/.origins.XXXXXX")"
 missing_z="$(mktemp "$STATE_DIR/.missing.XXXXXX")"
 extra_z="$(mktemp "$STATE_DIR/.extra.XXXXXX")"
+unruled_z="$(mktemp "$STATE_DIR/.unruled.XXXXXX")"
 new_z="$(mktemp "$STATE_DIR/.new.XXXXXX")"
 blob_tmp="$(mktemp "$STATE_DIR/.blob.XXXXXX")"
 hops_z="$(mktemp "$STATE_DIR/.hops.XXXXXX")"
-tmp_files+=("$included_z" "$origins_z" "$missing_z" "$extra_z" "$new_z" "$blob_tmp" "$hops_z")
+tmp_files+=("$included_z" "$origins_z" "$missing_z" "$extra_z" "$unruled_z" "$new_z" "$blob_tmp" "$hops_z")
 # Git names every configuration file it actually loads (includes followed however they
 # are written); the scan treats each one inside the worktree as Git configuration.
 g config --list --show-origin -z > "$origins_z" || die "git configuration cannot be listed (fail closed)"
@@ -270,10 +277,10 @@ while :; do
   scan_pass=$((scan_pass + 1))
   (( scan_pass <= 8 )) || die "Git config includes found through history did not settle within 8 scan passes (fail closed)"
   scan_status=0
-  scan_out="$(python3 -I "$POLICY" scan "$REPO" --budget "$SCAN_BUDGET" --included-out "$included_z" --config-origins "$origins_z" --missing-out "$missing_z" --extra-config "$extra_z")" || scan_status=$?
+  scan_out="$(python3 -I "$POLICY" scan "$REPO" --budget "$SCAN_BUDGET" --included-out "$included_z" --config-origins "$origins_z" --missing-out "$missing_z" --extra-config "$extra_z" --unruled-out "$unruled_z")" || scan_status=$?
   if (( scan_status != 0 )); then
     printf '%s\n' "$scan_out" | tail -3 >&2
-    die "worktree scan did not complete within ${SCAN_BUDGET}s (status $scan_status); set OAUTO_SCAN_BUDGET higher for large trees"
+    die "worktree scan did not complete (status $scan_status): a directory could not be listed or the scan budget of ${SCAN_BUDGET}s ran out; see the records above (set OAUTO_SCAN_BUDGET higher for large trees)"
   fi
   # Decisions rest on the SUMMARY counts only. The records above it (one ASCII line
   # each, names C-quoted) are displayed, never parsed for a decision.
@@ -308,6 +315,14 @@ while IFS= read -r -d '' path; do
   [[ "$path" != *[\*\?\[\{\}\\]* ]] || die "an included Git config path holds a glob metacharacter (* ? [ { } \\) and cannot be denied by its exact name; rename it"
   deny_read_args+=("--deny-read=$path")
 done < "$included_z"
+# Secret-like files the case-sensitive read rules do not deny by their exact spelling (a
+# case variant such as Auth.json): denied by exact name for this launch, so the override
+# cannot expose them to the read tool. Refused outright (override or not) when a name
+# holds a glob metacharacter, which cannot be denied exactly.
+while IFS= read -r -d '' path; do
+  [[ "$path" != *[\*\?\[\{\}\\]* ]] || die "a secret-like file name holds a glob metacharacter (* ? [ { } \\) and cannot be denied by its exact name; rename it"
+  deny_read_args+=("--deny-read=$path")
+done < "$unruled_z"
 
 # ---------------------------------------------------------------------------
 # 3. Read-only git preflight. It runs before OpenCode's restrictions apply, so no

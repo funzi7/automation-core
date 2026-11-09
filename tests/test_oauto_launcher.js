@@ -1247,7 +1247,10 @@ test('Git config files that are symlinks, and a symlinked .git, are refused (cre
   fs.symlinkSync(moved, path.join(real, '.git'));
   r = runOauto(sb, real, ['--check']);
   assert.equal(r.status, 1, r.stderr);
-  assert.match(r.stderr, /\.git -> .*\(\.git itself is a symlink\)/);
+  // check-repo-git now refuses a symlinked .git before any git runs (it was formerly the
+  // scan's `.git itself is a symlink` record; the launch is still refused either way).
+  assert.match(r.stderr, /\.git is a symlink/);
+  assert.match(r.stderr, /no git command was run against it/);
 });
 
 test('the gradle.properties content check reads the whole file and refuses one too large to read', () => {
@@ -2122,10 +2125,16 @@ test('oauto-run source: no automatic approval, standalone helpers, bounded helpe
   assert.match(code, /python3 -I "\$POLICY" render --model "\$MODEL_ALIAS" "\$\{deny_read_args\[@\]\}" "\$@"/);
   assert.match(code, /\| python3 -I "\$POLICY" verify-agents "\$\{deny_read_args\[@\]\}" >&2/);
   assert.match(code, /\| python3 -I "\$POLICY" verify-sources --config-dir "\$CONFIG_DIR" "\$\{deny_read_args\[@\]\}" >&2/);
+  // check-repo-git refuses a crafted .git file before ANY git command runs against the repo.
+  assert.match(code, /python3 -I "\$POLICY" check-repo-git "\$REPO" \|\|\s*\n?\s*die /);
+  const crgLine = lines.findIndex((l) => l.includes('check-repo-git "$REPO"'));
+  const firstGit = lines.findIndex((l) => /git -C "\$REPO"/.test(l));
+  assert.ok(crgLine >= 0 && firstGit >= 0 && crgLine < firstGit, `check-repo-git (${crgLine}) must precede the first git invocation (${firstGit})`);
   // Git itself lists every config file it loaded, before the scan, through g().
   const gLine = lines.findIndex((l) => /^g\(\) +\{/.test(l));
   const scanLine = lines.findIndex((l) => l.includes('python3 -I "$POLICY" scan "$REPO"'));
   assert.ok(gLine >= 0 && scanLine > gLine, 'the git helpers are defined before the scan');
+  assert.match(code, /scan "\$REPO" --budget "\$SCAN_BUDGET" .* --unruled-out "\$unruled_z"/);
   assert.match(code, /g config --list --show-origin -z > "\$origins_z" \|\| die "git configuration cannot be listed \(fail closed\)"/);
   assert.match(code, /scan "\$REPO" --budget "\$SCAN_BUDGET" --included-out "\$included_z" --config-origins "\$origins_z" --missing-out "\$missing_z"/);
   // Missing include targets are followed through their committed content (HEAD and the
@@ -2137,7 +2146,7 @@ test('oauto-run source: no automatic approval, standalone helpers, bounded helpe
   // One decision point: the scan runs in a bounded loop, fed what history reveals, and the
   // verdict, the deny rules and classify use the final pass.
   assert.match(code, /\(\( scan_pass <= 8 \)\) \|\| die "/);
-  assert.match(code, /--missing-out "\$missing_z" --extra-config "\$extra_z"\)" \|\| scan_status=\$\?/);
+  assert.match(code, /--missing-out "\$missing_z" --extra-config "\$extra_z" --unruled-out "\$unruled_z"\)" \|\| scan_status=\$\?/);
   assert.match(code, /\n\s*history_pass\n\s*\[\[ -s "\$new_z" \]\] \|\| break\n\s*cat "\$new_z" >> "\$extra_z"\ndone\n/);
   const loopEnd = lines.findIndex((l) => l.startsWith('note "worktree scan passes: $scan_pass"'));
   assert.ok(loopEnd > 0 && lines.findIndex((l) => l.startsWith('if (( n_symlinks > 0 )); then')) > loopEnd, 'the verdict follows the last pass');
@@ -2360,11 +2369,11 @@ const SOURCES_DIR = '/x/state/xdg-config/opencode';
 const sourcesPayload = (info) => [{ type: 'document', path: `${SOURCES_DIR}/opencode.json`, info }, { type: 'directory', path: SOURCES_DIR }];
 const verifySources = (payload, extra = []) => policy(['verify-sources', '--config-dir', SOURCES_DIR, ...extra], JSON.stringify(payload));
 
-test('E: verify-sources replays the probes against the policies and permissions OpenCode loaded, failing closed on any gap', () => {
+test('E: verify-sources requires the rendered policies and permissions verbatim, then replays the probes', () => {
   const cfg = render('glm');
   const ok = verifySources(sourcesPayload(cfg));
   assert.equal(ok.status, 0, ok.stderr);
-  const m = ok.stdout.match(/^config sources ok: only \/x\/state\/xdg-config\/opencode\/opencode\.json\npolicies ok: (\d+) probes; permissions ok: (\d+) probes\n$/);
+  const m = ok.stdout.match(/^config sources ok: only \/x\/state\/xdg-config\/opencode\/opencode\.json \(policies and permissions loaded verbatim\)\npolicies ok: (\d+) probes; permissions ok: (\d+) probes\n$/);
   assert.ok(m, ok.stdout);
   const [nPol, nPerm] = [Number(m[1]), Number(m[2])];
   const mutated = (fn) => {
@@ -2374,52 +2383,52 @@ test('E: verify-sources replays the probes against the policies and permissions 
   };
   const without = (rules, action, resource) => rules.filter((x) => !(x.action === action && x.resource === resource));
   const flipped = (rules, action, resource) => rules.map((x) => (x.action === action && x.resource === resource ? { ...x, effect: 'allow' } : x));
+  // Exact list equality: a removed, reordered, re-allowed or appended rule — even ones no
+  // probe samples (a lone key pattern, a foreign provider/integration/mcp) — fails closed.
   for (const [label, payload, reason] of [
     ['policies missing', mutated((c) => { delete c.policies; }), /the loaded document \S+ has no policies/],
     ['policies empty', mutated((c) => { c.policies = []; }), /has no policies/],
     ['no parsed document', [{ type: 'document', path: `${SOURCES_DIR}/opencode.json` }, { type: 'directory', path: SOURCES_DIR }], /no parsed content \(info\)/],
-    ['tool.use read:*.env removed', mutated((c) => { c.policies = without(c.policies, 'tool.use', 'read:*.env'); }),
-      /loaded policies: tool\.use 'read:\.env' resolves to ask, expected deny/],
-    ['tool.use shell:* removed', mutated((c) => { c.policies = without(c.policies, 'tool.use', 'shell:*'); }),
-      /loaded policies: tool\.use 'shell:anything' resolves to ask, expected deny/],
-    ['tool.use read:auth.json removed', mutated((c) => { c.policies = without(c.policies, 'tool.use', 'read:auth.json'); }),
-      /loaded policies: tool\.use 'read:auth\.json' resolves to ask, expected deny/],
-    ['mcp.use removed', mutated((c) => { c.policies = without(c.policies, 'mcp.use', '*'); }), /loaded policies: mcp\.use 'x' resolves to ask, expected deny/],
+    ['a probed deny rule removed', mutated((c) => { c.policies = without(c.policies, 'tool.use', 'read:*.env'); }),
+      /loaded policies(\[\d+\] is | is missing rule \d+: ).*read:\*\.env/],
+    ['an unprobed key pattern removed', mutated((c) => { c.policies = without(c.policies, 'tool.use', 'read:*id_rsa*'); }),
+      /loaded policies\[\d+\] is .*expected .*id_rsa/],
+    ['a credential pattern removed', mutated((c) => { c.policies = without(c.policies, 'tool.use', 'read:auth.json'); }),
+      /loaded policies\[\d+\] is .*expected .*auth\.json/],
     ['provider.use * flipped to allow', mutated((c) => { c.policies = flipped(c.policies, 'provider.use', '*'); }),
-      /loaded policies: provider\.use 'anthropic' resolves to allow, expected deny/],
-    ['tool.use edit:* flipped to allow', mutated((c) => { c.policies = flipped(c.policies, 'tool.use', 'edit:*'); }),
-      /loaded policies: tool\.use 'edit:anything' resolves to allow, expected deny/],
-    ['integration.connect flipped to allow', mutated((c) => { c.policies = flipped(c.policies, 'integration.connect', '*'); }),
-      /loaded policies: integration\.connect '\*' resolves to allow, expected deny/],
+      /loaded policies\[\d+\] is \{"action": "provider\.use", "effect": "allow", "resource": "\*"\}/],
+    ['a foreign provider appended (no probe samples it)', mutated((c) => { c.policies.push({ action: 'provider.use', resource: 'openrouter', effect: 'allow' }); }),
+      /loaded policies has an unexpected extra rule \d+: .*openrouter/],
     ['the .env.example exception removed', mutated((c) => { c.policies = without(c.policies, 'tool.use', 'read:*.env.example'); }),
-      /loaded policies: tool\.use 'read:\.env\.example' resolves to deny, expected allow/],
-    ['the ceiling denies every read', mutated((c) => { c.policies.push({ action: 'tool.use', resource: 'read:*', effect: 'deny' }); }),
-      /loaded policies: tool\.use 'read:\.env\.example' resolves to deny, expected allow/],
-    ['malformed policy rule', mutated((c) => { c.policies.push({ action: 'tool.use' }); }), /has a malformed policies rule/],
+      /loaded policies\[\d+\] is /],
+    ['reordered policies (first rule moved to the end)', mutated((c) => { c.policies.push(c.policies.shift()); }), /loaded policies\[0\] is /],
+    ['malformed policy rule (resource array)', mutated((c) => { c.policies.push({ action: 'tool.use', resource: ['read:x'], effect: 'allow' }); }), /has a malformed policies rule/],
     ['permissions widened', mutated((c) => { c.permissions.push({ action: 'read', resource: '*', effect: 'allow' }); }),
-      /loaded permissions: read '\.env' resolves to allow, expected deny/],
+      /loaded permissions has an unexpected extra rule \d+: .*"read"/],
+    ['a permission deny removed', mutated((c) => { c.permissions = without(c.permissions, 'read', '*.env'); }), /loaded permissions\[\d+\] is /],
     ['permissions missing', mutated((c) => { delete c.permissions; }), /has no permissions/],
   ]) {
     const r = verifySources(payload);
     assert.notEqual(r.status, 0, `${label} must fail verification`);
-    assert.match(r.stderr, reason, label);
+    assert.match(r.stderr, reason, `${label}: ${r.stderr}`);
     assert.equal(r.stdout, '', `${label}: no ok line`);
   }
-  // The launch's own read denials: both spellings, in the policies and the permissions.
+  // The launch's own read denials must be loaded verbatim too (both spellings, in the
+  // policies and the permissions).
   const rendered = render('glm', ['--deny-read', 'review-config.txt']);
   const notRendered = verifySources(sourcesPayload(cfg), ['--deny-read=review-config.txt']);
   assert.notEqual(notRendered.status, 0);
-  assert.match(notRendered.stderr, /loaded policies: tool\.use 'read:review-config\.txt' resolves to ask, expected deny/);
+  assert.match(notRendered.stderr, /loaded policies is missing rule \d+: .*read:review-config\.txt/);
   const half = JSON.parse(JSON.stringify(rendered));
   half.policies = without(half.policies, 'tool.use', 'read:*/review-config.txt');
   const halfDenied = verifySources(sourcesPayload(half), ['--deny-read=review-config.txt']);
   assert.notEqual(halfDenied.status, 0);
-  assert.match(halfDenied.stderr, /loaded policies: tool\.use 'read:\.\/review-config\.txt' resolves to ask, expected deny/);
+  assert.match(halfDenied.stderr, /loaded policies(\[\d+\] is | is missing rule \d+: ).*review-config\.txt/);
   const permHalf = JSON.parse(JSON.stringify(rendered));
   permHalf.permissions = without(permHalf.permissions, 'read', 'review-config.txt');
   const permDenied = verifySources(sourcesPayload(permHalf), ['--deny-read=review-config.txt']);
   assert.notEqual(permDenied.status, 0);
-  assert.match(permDenied.stderr, /loaded permissions: read 'review-config\.txt' resolves to allow, expected deny/);
+  assert.match(permDenied.stderr, /loaded permissions(\[\d+\] is | is missing rule \d+: ).*review-config\.txt/);
   const denied = verifySources(sourcesPayload(rendered), ['--deny-read=review-config.txt']);
   assert.equal(denied.status, 0, denied.stderr);
   assert.ok(denied.stdout.includes(`policies ok: ${nPol + 2} probes; permissions ok: ${nPerm + 2} probes`), denied.stdout);
@@ -2490,6 +2499,233 @@ test('E: oauto-run verifies the loaded policies and permissions including the la
   const line = direct.stdout.split('\n')[1];
   assert.match(line, /^policies ok: \d+ probes; permissions ok: \d+ probes$/);
   assert.ok(r.stderr.includes(`\n${line}\n`), `the launcher must hand its read denials to verify-sources:\n${r.stderr}`);
+});
+
+// ---------------------------------------------------------------------------
+// Round 13: a crafted .git FILE (P2-1/P3-2), verbatim-only verify (P3-3), case-variant
+// read denials (P3-4), object-store hard-link accounting (P3-5) and secret-named git-dir
+// aliases (P3-6).
+// ---------------------------------------------------------------------------
+const checkRepoGit = (repo) => policy(['check-repo-git', repo]);
+// A plain directory (not a git repo) whose .git is a FILE naming `gitdir`.
+function dotGitFile(sb, name, gitdir, { raw = null } = {}) {
+  const dir = path.join(sb.repos, name);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'README.md'), '# project to review\n');
+  fs.writeFileSync(path.join(dir, '.git'), raw !== null ? raw : `gitdir: ${gitdir}\n`);
+  return dir;
+}
+
+test('P2-1: a .git file naming another repository is refused before any git runs, nothing is rendered, the victim is untouched', () => {
+  const sb = sandbox();
+  const victim = mkRepo(sb, 'victim', { 'notes.md': 'VICTIM-NOTES-SYNTH-7f71\n', '.env': 'TOKEN=VICTIM-ENV-SYNTH\n' });
+  git(victim, ['commit', '-q', '--allow-empty', '-m', 'VICTIM-LOG-SYNTH-7f71']);
+  const realVictim = fs.realpathSync(victim);
+  const idx = path.join(realVictim, '.git', 'index');
+  const before = fs.existsSync(idx) ? fs.statSync(idx) : null;
+  for (const [label, gitdir] of [['absolute', `${realVictim}/.git`], ['relative', '../victim/.git']]) {
+    const attacker = dotGitFile(sb, `attacker-${label}`, gitdir);
+    const r = runOauto(sb, attacker, ['--check']);
+    assert.equal(r.status, 1, `${label} crafted .git must be refused (exit 0 leaked the victim):\n${r.stderr}`);
+    assert.match(r.stderr, /does not belong to this worktree/);
+    assert.match(r.stderr, /no git command was run against it/);
+    assert.ok(nothingRendered(sb, attacker), `${label}: nothing may be rendered`);
+    const pf = path.join(stateDir(sb, attacker), 'preflight.md');
+    assert.ok(!fs.existsSync(pf), `${label}: no preflight may be written`);
+    for (const token of ['VICTIM-NOTES-SYNTH-7f71', 'VICTIM-LOG-SYNTH-7f71']) {
+      assert.ok(!r.stderr.includes(token), `${label}: the victim's ${token} must not surface`);
+    }
+  }
+  const after = fs.existsSync(idx) ? fs.statSync(idx) : null;
+  assert.equal(before === null, after === null, 'victim .git/index existence unchanged');
+  if (before && after) {
+    assert.equal(after.mtimeMs, before.mtimeMs, 'victim .git/index mtime unchanged (no git ran against it)');
+    assert.equal(after.size, before.size, 'victim .git/index size unchanged');
+  }
+});
+
+test('P2-1: check-repo-git accepts a real .git dir, a linked worktree and a submodule; refuses symlinks, foreign, missing and moved', () => {
+  const sb = sandbox();
+  const plain = mkRepo(sb, 'plain', { 'a.py': 'x = 1\n' });
+  assert.equal(checkRepoGit(plain).status, 0, 'a real .git directory is accepted');
+
+  const { wt } = linkedWorktree(sb, 'lw');
+  assert.equal(checkRepoGit(wt).status, 0, 'a legitimate linked worktree is accepted');
+
+  // A real submodule checkout: <super>/sub has a .git file naming <super>/.git/modules/sub.
+  const subsrc = mkRepo(sb, 'subsrc', { 's.txt': 's\n' });
+  const sup = mkRepo(sb, 'super', { 'a.py': 'x = 1\n' });
+  git(sup, ['-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', subsrc, 'sub']);
+  git(sup, ['commit', '-q', '-m', 'add submodule']);
+  const sub = path.join(sup, 'sub');
+  assert.ok(fs.statSync(path.join(sub, '.git')).isFile(), 'the submodule .git is a file');
+  assert.equal(checkRepoGit(sub).status, 0, `a legitimate submodule checkout is accepted:\n${checkRepoGit(sub).stderr}`);
+
+  // A symlinked .git is refused with its own reason, before any git could run.
+  const realrepo = mkRepo(sb, 'realrepo', { 'a.py': 'x = 1\n' });
+  const symd = path.join(sb.repos, 'symd');
+  fs.mkdirSync(symd, { recursive: true });
+  fs.symlinkSync(path.join(realrepo, '.git'), path.join(symd, '.git'));
+  let r = checkRepoGit(symd);
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /\.git is a symlink/);
+
+  const foreign = dotGitFile(sb, 'foreign', `${fs.realpathSync(realrepo)}/.git`);
+  assert.equal(checkRepoGit(foreign).status, 2, 'a .git file naming an unrelated repo is refused');
+  assert.match(checkRepoGit(foreign).stderr, /does not belong to this worktree.*git worktree repair/s);
+
+  const missing = dotGitFile(sb, 'missingtgt', `${sb.repos}/does-not-exist/.git`);
+  r = checkRepoGit(missing);
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /does not exist/);
+
+  const malformed = dotGitFile(sb, 'malformed', '', { raw: 'this is not a gitdir pointer\n' });
+  r = checkRepoGit(malformed);
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /malformed \.git file/);
+
+  // A moved linked worktree (its admin dir's back-pointer no longer matches): refused with the repair hint.
+  const { wt: wt2 } = linkedWorktree(sb, 'moved');
+  const movedTo = path.join(sb.repos, 'moved-elsewhere');
+  fs.renameSync(wt2, movedTo);
+  r = checkRepoGit(movedTo);
+  assert.equal(r.status, 2, 'a moved linked worktree is refused until `git worktree repair`');
+  assert.match(r.stderr, /git worktree repair/);
+});
+
+test('P3-2: the .git file parser keeps git\'s trailing-space semantics; a bare redirect to a foreign git dir is refused', () => {
+  const sb = sandbox();
+  // git strips only trailing CR/LF, so `gitdir: <dir> \n` names "<dir> " (with the space),
+  // not a sibling decoy the old .strip() would have walked. Either way the dir is a bare
+  // redirect (not a worktree or submodule), so it is unowned and refused.
+  const src = mkRepo(sb, 'b2src', { 'a.py': 'x = 1\n' });
+  const real = `${fs.realpathSync(sb.repos)}/b2-gitdir `;    // trailing space is part of the name
+  fs.renameSync(path.join(src, '.git'), real);
+  fs.mkdirSync(`${fs.realpathSync(sb.repos)}/b2-gitdir`, { recursive: true });  // the decoy the old parser walked
+  const wt = path.join(sb.repos, 'b2wt');
+  fs.mkdirSync(wt, { recursive: true });
+  fs.writeFileSync(path.join(wt, 'a.py'), 'x = 1\n');
+  fs.writeFileSync(path.join(wt, '.git'), `gitdir: ${fs.realpathSync(sb.repos)}/b2-gitdir \n`);
+  const scan = scanOf(wt);
+  assert.equal(scan.status, 0, scan.stderr);
+  assert.ok(symlinkRecords(scan.stdout).some((l) => l.includes('b2-gitdir ') && l.includes('does not belong to this worktree')),
+    `the scan must name the trailing-space git dir, not the decoy:\n${scan.stdout}`);
+  const r = runOauto(sb, wt, ['--check'], { OAUTO_ALLOW_SENSITIVE_FILES: '1' });
+  assert.equal(r.status, 1, 'a bare redirect to a foreign git dir is refused even with the override');
+  assert.match(r.stderr, /does not belong to this worktree/);
+});
+
+test('P3-4: case-variant secret-like files are denied by their exact name under the override, in both agents and the ceiling', () => {
+  const sb = sandbox();
+  const repo = mkRepo(sb, 'case-variants', { 'src/a.py': 'x = 1\n', 'Auth.json': '{"t":"SYNTH"}\n',
+    '.PGPASS': 'h:5432:d:u:p\n', 'keys/Server.PPK': 'synthetic test material\n', 'sa/ServiceAccountKey.json': '{}\n',
+    'vendor/auth.json': '{}\n' });  // lowercase: the static */auth.json rule denies it exactly
+  // Without the override a secret-like file (whatever its case) already refuses the launch.
+  assert.equal(runOauto(sb, repo, ['--check']).status, 1);
+  const base = Number(policy(['verify-agents'], JSON.stringify(resolvedAgents(render('glm')))).stdout.match(/(\d+) probes each/)[1]);
+  const r = runOauto(sb, repo, ['--check'], { OAUTO_ALLOW_SENSITIVE_FILES: '1' });
+  assert.equal(r.status, 0, r.stderr);
+  const cfg = JSON.parse(fs.readFileSync(path.join(stateDir(sb, repo), 'xdg-config', 'opencode', 'opencode.json'), 'utf8'));
+  const names = ['Auth.json', '.PGPASS', 'keys/Server.PPK', 'sa/ServiceAccountKey.json'];
+  for (const p of names) {
+    for (const rules of [cfg.permissions, cfg.agents['review-glm'].permissions, cfg.agents['review-deepseek'].permissions]) {
+      assert.equal(decide(rules, 'read', p), 'deny', `read ${p} must be denied by exact name`);
+    }
+    assert.equal(decide(cfg.policies, 'tool.use', `read:${p}`), 'deny', `ceiling must deny read:${p}`);
+    assert.equal(decide(cfg.policies, 'tool.use', `read:x/${p}`), 'deny', `ceiling must deny the */ spelling of ${p}`);
+  }
+  // The launcher handed these to verify-agents, so its probe count grew (one per name; a
+  // nested name also gets its */ form only in the ceiling, agents probe the exact path).
+  assert.match(r.stderr, new RegExp(`${base + names.length} probes each`));
+  // The lowercase vendor/auth.json is secret-like too, but the static rules already deny
+  // its exact spelling, so it is NOT added to the deny-read set: the probe count above
+  // grew by the four case variants only, and no per-launch rule names it.
+  assert.equal(decide(cfg.permissions, 'read', 'vendor/auth.json'), 'deny');
+  assert.ok(!cfg.permissions.some((x) => x.resource === 'vendor/auth.json' || x.resource === '*/vendor/auth.json'),
+    'a name the static rules deny exactly gets no per-launch rule');
+});
+
+test('P3-4: a case-variant secret-like name holding a glob metacharacter refuses the launch even with the override', () => {
+  const sb = sandbox();
+  const repo = mkRepo(sb, 'case-glob', { 'src/a.py': 'x = 1\n' });
+  // `*.pem` matches `keys/Server[1].PEM` case-insensitively, but the case-sensitive read
+  // rule does not deny that exact spelling, and `[` cannot be denied by an exact name.
+  fs.mkdirSync(path.join(repo, 'keys'));
+  fs.writeFileSync(path.join(repo, 'keys', 'Server[1].PEM'), 'synthetic test material\n');
+  // Without the override the secret-like refusal already fires.
+  assert.equal(runOauto(sb, repo, ['--check']).status, 1);
+  // With the override the exact-name denial is attempted, and the metacharacter is fatal.
+  const r = runOauto(sb, repo, ['--check'], { OAUTO_ALLOW_SENSITIVE_FILES: '1' });
+  assert.equal(r.status, 1, `a glob-metacharacter secret-like name must refuse under the override:\n${r.stderr}`);
+  assert.match(r.stderr, /secret-like file name holds a glob metacharacter.*rename it/s);
+});
+
+test('P3-5: hard links to the object store are accounted names, not aliases (self-clone and annex), but outside partners still refuse', () => {
+  const sb = sandbox();
+  // A clone of the repo inside its own worktree hard-links objects; those are names inside
+  // the repository (the inner copy under */.git/*), so no hard-link record — only the usual
+  // SENSITIVE */.git/* entries, which need the override.
+  const self = mkRepo(sb, 'selfclone', { 'a.py': 'x = 1\n' });
+  execFileSync('git', ['clone', '-q', self, path.join(self, 'inner-copy')]);
+  let scan = scanOf(self);
+  assert.equal(scan.status, 0, scan.stderr);
+  assert.deepEqual(symlinkRecords(scan.stdout), [], `a self-clone must produce no hard-link record:\n${scan.stdout}`);
+  assert.equal(runOauto(sb, self, ['--check']).status, 1, 'the inner .git/* files are still SENSITIVE (override needed)');
+  assert.equal(runOauto(sb, self, ['--check'], { OAUTO_ALLOW_SENSITIVE_FILES: '1' }).status, 0);
+
+  // git-annex thin mode: a worktree file hard-linked to .git/annex/objects/... is accounted.
+  const annex = mkRepo(sb, 'annex', { 'a.py': 'x = 1\n' });
+  fs.mkdirSync(path.join(annex, '.git', 'annex', 'objects', 'aa', 'bb', 'K'), { recursive: true });
+  fs.writeFileSync(path.join(annex, '.git', 'annex', 'objects', 'aa', 'bb', 'K', 'K'), 'annex object\n');
+  fs.linkSync(path.join(annex, '.git', 'annex', 'objects', 'aa', 'bb', 'K', 'K'), path.join(annex, 'data.bin'));
+  scan = scanOf(annex);
+  assert.equal(scan.status, 0, scan.stderr);
+  assert.deepEqual(symlinkRecords(scan.stdout), [], `an annex-object hard link must be accounted:\n${scan.stdout}`);
+  assert.equal(runOauto(sb, annex, ['--check']).status, 0, 'nothing is secret-like, so the launch passes');
+
+  // A third name hidden in the object store plus one outside: still refused, count reflects the object name.
+  const outside = path.join(sb.root, 'outside-secret');
+  fs.writeFileSync(outside, 'OUTSIDE-SYNTH\n');
+  const a7 = mkRepo(sb, 'objname', { 'a.py': 'x = 1\n' });
+  fs.linkSync(outside, path.join(a7, 'notes.md'));
+  fs.mkdirSync(path.join(a7, '.git', 'objects', 'zz'), { recursive: true });
+  fs.linkSync(path.join(a7, 'notes.md'), path.join(a7, '.git', 'objects', 'zz', 'hidden'));
+  scan = scanOf(a7);
+  assert.ok(symlinkRecords(scan.stdout).some((l) => l.startsWith('SYMLINK notes.md -> ') && l.includes('3 names, 2 inside the repository')),
+    `an outside partner must still refuse, now counting the object name:\n${scan.stdout}`);
+
+  // A clone of a repository that lives OUTSIDE the worktree: objects are hard-linked to the
+  // outside source, so the names are outside — still refused.
+  const src = mkRepo(sb, 'vendor-src', { 'f.txt': 'f\n' });
+  const vendor = mkRepo(sb, 'vendor', { 'a.py': 'x = 1\n' });
+  execFileSync('git', ['clone', '-q', src, path.join(vendor, 'lib')]);
+  scan = scanOf(vendor);
+  assert.ok(symlinkRecords(scan.stdout).some((l) => l.includes('inside the repository')),
+    `a vendored clone from outside keeps outside partners and is refused:\n${scan.stdout}`);
+});
+
+test('P3-6: a secret-named hard link to a .git dir file is refused unconditionally; two secret names of one ordinary file are not', () => {
+  const sb = sandbox();
+  // ln .git/config notes.pem: the alias name (*.pem) would pass no read rule that the file
+  // itself is denied by, so it must be refused as an alias, not merely listed SENSITIVE.
+  const repo = mkRepo(sb, 'secret-alias-gitcfg', { 'src/a.py': 'x = 1\n' });
+  fs.linkSync(path.join(repo, '.git', 'config'), path.join(repo, 'notes.pem'));
+  const scan = scanOf(repo);
+  assert.equal(scan.status, 0, scan.stderr);
+  assert.ok(symlinkRecords(scan.stdout).some((l) => /^SYMLINK notes\.pem -> .*\(hard link to \.git\/config\)$/.test(l)),
+    `a secret-named alias of .git/config must be refused as an alias:\n${scan.stdout}`);
+  // Even with the override the launch is refused (the alias is unconditional, not SENSITIVE-overridable).
+  assert.equal(runOauto(sb, repo, ['--check'], { OAUTO_ALLOW_SENSITIVE_FILES: '1' }).status, 1);
+
+  // Two secret-like names of one ordinary worktree file (.env <-> prod.env): both are denied
+  // by name, so no hard-link record is needed (neither is a git dir file).
+  const repo2 = mkRepo(sb, 'two-secret-names', { 'src/a.py': 'x = 1\n' });
+  fs.writeFileSync(path.join(repo2, '.env'), 'TOKEN=SYNTH\n');
+  fs.linkSync(path.join(repo2, '.env'), path.join(repo2, 'prod.env'));
+  const scan2 = scanOf(repo2);
+  assert.equal(scan2.status, 0, scan2.stderr);
+  assert.deepEqual(symlinkRecords(scan2.stdout), [], `two secret names of one ordinary file need no hard-link record:\n${scan2.stdout}`);
+  assert.ok(scan2.stdout.includes('SENSITIVE .env') && scan2.stdout.includes('SENSITIVE prod.env'), scan2.stdout);
 });
 
 // ---------------------------------------------------------------------------
