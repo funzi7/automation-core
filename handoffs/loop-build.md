@@ -4,6 +4,471 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
 
 ---
 
+## [2026-11-09 UTC] oauto — GLM audit verification round: unaccounted hard links, linked-worktree git dirs, credential names, loaded-policy verification; `main` (PR #59) merged in
+- PR: <https://github.com/funzi7/automation-core/pull/58> (same PR; this round's commits pushed to its branch)
+- Branch: `claude/oauto-opencode-reviewer`; `origin/main` `15e44e6` (PR #59, Codex Gate fail-closed) merged in as `01f6840`
+- Status: see "Review and gate state" at the end of this entry; the PR is not merged by this round
+- Preflight facts (2026-11-08 23:30Z): branch head `18011a9` — Codex clean on request (receipt 19:42Z), 14 review
+  threads all resolved, gate `🟢`, CI green — but `CONFLICTING` against `main` `15e44e6`; worktree clean; the
+  installed launchers (`/root/work/bin/ai-launch`, `oauto-run`, `oauto-policy.py`, Termux `oauto-launch`, both
+  `.bashrc` blocks) byte-identical to the tracked copies (`install.sh --verify` clean); no concurrent writer (no
+  `in-progress.md` entry, no git lock, the only other automation-core transcript idle since 23:18Z, the
+  `oauto-automation-core-*.lock` file left by the owner's Termux run held by no process); zero hard-linked worktree
+  files in the 13 repositories under `/root/work` (`find -links +1`, `.git` excluded), so the new hard-link rule
+  refuses none of them today.
+- Merge of `main`: conflicts only in `LOOP_STATE.md` (TODO list), `handoffs/CONTEXT.md` (§7) and this file (top
+  entries); resolved by keeping both sides — main's TODO items 8 (Codex Gate, now merged) and 9 (`AUTOMATION_PAT`)
+  keep their numbers and the oauto item became 10 (the two 2026-11-08 oauto entries below say "LOOP_STATE item 8":
+  read as item 10); README and every workflow, tool and test file merged automatically; `bash scripts/validate.sh`
+  on the merge commit: 247/247 node tests, 469 s.
+- GLM whole-repository audit (the owner's `oauto automation-core` session of 2026-11-08 ~20:18–20:30Z, GLM-5.3-Flash;
+  the report was retrieved from the local OpenCode session store and treated as unverified claims). Verification:
+  | # | Claim | Against the code | Reproduced on a fixture | Outcome |
+  |---|---|---|---|---|
+  | P2-1 (A) | a hard link whose partner lies outside the repository is undetectable | true: `linked` was compared only with in-repository inodes; the README said so | yes — `ln <outside>/id_ed25519 notes.md` scanned `symlinks=0` on the old code | fixed, unconditional refusal |
+  | P2-2 (B) | no backslash deny rule for `glob` | partly: the deny list has no `\` rule and `\.\./**`-style patterns do pass it | NO on the real 2.2.6 binary (below) | no code change (fix only if reproducible); defence-in-depth backlog |
+  | P2-3 (C) | the `.git`-file (linked worktree) branch has weaker Git-config protection | true: `isfile()` followed a symlinked config, no git-dir walk, no inode registration | yes — a `config.worktree` symlinked into the worktree scanned `symlinks=0` | fixed |
+  | P2-4 | third-party actions pinned by mutable major tags | true: `actions/checkout@v5`, `github-script@v8`, `upload/download-artifact@v4`, `openai/codex-action@v1`, `anthropics/claude-code-action@v1`, `peter-evans/create-pull-request@v6`; none SHA-pinned | n/a | recorded as backlog (unrelated to this PR) |
+  | P3-5 | `scripts/validate.sh` globs `*.yml` only while `validate_github_scripts.py` scans `*.yml *.yaml` | true; no tracked `.yaml` exists, so nothing is skipped today | n/a | recorded as backlog |
+  | P3-6 (D) | `auth.json` and similar credential names missing from the pattern list | true | yes — 16 such files scanned `sensitive=0`, every rendered read rule `allow` | fixed on all four controls |
+  | P3-7 | the model-alias list is duplicated (`ai-launch` regex vs `APPROVED_MODELS`) | true | n/a | recorded as backlog |
+  | P3-8 (E) | the `tool.use` ceiling is rendered but never verified through OpenCode's output | true: `verify-agents` probed resolved permissions only; the suite checked `policies` statically | yes — `verify-sources` passed with `policies` deleted or flipped | fixed: the loaded document is verified |
+  Its "not verifiable" notes (flock re-exec semantics, `--show-origin -z` format drift) stand as observations; the
+  flock parent-holds-lock behaviour is exercised by the lock test and was observed live in the first round.
+- Finding B on the real binary (read-only Opus investigator, disposable fixture with synthetic inside/outside markers,
+  no OpenCode process left): OpenCode 2.2.6's glob tool asserts `{action:"glob", resources:[pattern]}` after
+  `FileAccess.resolve({path: path ?? "."})` + `authorizeExternal`, then runs ripgrep 15.1.0 as
+  `rg --no-config --files [--hidden] --glob=<pattern> [--glob=!**/.*] --glob=!**/.git/** .` with `cwd` = the resolved
+  path; grep does the same with `--json`, `--glob=<include>` and `-- <pattern> <path>`. `FileAccess.resolve` uses
+  `path.resolve(directory, windowsPath(path))` where `windowsPath` is the identity on POSIX, so a backslash in `path`
+  is an ordinary filename character and any result outside the project directory raises `external_directory` (denied).
+  Replaying OpenCode's exact ripgrep argv against the real `rg` for `\.\./**`, `src/\.\./\.\./**`, `*\..\*`,
+  `*\\..\\*`, `\/**`, `\\/**`, `{\.\.,src}/**` and the controls `../**`, `/**`, `**/*` returned only files inside the
+  fixture — zero outside markers — although oauto's own matcher lets the backslash patterns through the deny list; for
+  grep the outside marker appeared only when `path` was a real `..` traversal, which `FileAccess` denies before
+  ripgrep runs. Verdict: the deny-list gap buys an attacker nothing; the enforced boundary is `external_directory`.
+  The server's `POST /api/session/{id}/permission` evaluator was stricter than the agent's resolved ruleset and was not
+  used as evidence; no live-model probe was needed. A `*\*` glob deny would be defence in depth only and was not
+  added; any OpenCode upgrade re-opens this with the `VALIDATED_VERSION` pin.
+- What changed (`launchers/oauto/oauto-policy.py`, `oauto-run`, tests, `launchers/oauto/README.md`, ADR 0002):
+  - A: the scan counts, per inode, the names it sees in the worktree and in `.git` (objects skipped) for files with
+    `st_nlink > 1`; a worktree file with more links than names seen is refused unconditionally, like an outward
+    symlink — `SYMLINK <name> -> <path> (hard link: N names, M inside the repository; the other names are outside it
+    or unscanned)` — whether or not its own name is secret-like; an alias of a secret-like or git-dir file keeps the
+    `hard link to <x>` reason; in-repository pairs and a hook hard-linked from the worktree stay accepted; a link into
+    `.git/objects` is refused the same way (not walked). Consequence: files hard-linked from a package store or a
+    `cp -al` copy outside the repository are refused (none exist under `/root/work` today).
+  - C: `_is_git_config` delegates to the git-dir-relative `_is_git_dir_config`; one `walk_git_dir` walks `.git`
+    (as before) and, for a `.git` file, the git dir and commondir it names (a git dir inside its commondir once),
+    refusing symlinked Git config files, registering regular files as hard-link alias targets (hooks excepted; they
+    are not names inside the repository) and credential-checking configs; ordinary symlinks in an out-of-worktree git
+    dir are not reported, since nothing there is reachable from the worktree.
+  - D: `SENSITIVE_READ_PATTERNS` gains Composer `auth.json`, PostgreSQL `.pgpass`, MySQL `.my.cnf`, s3cmd `.s3cfg`,
+    PuTTY `*.ppk`, kubeconfig (`.kube/config`, `*.kubeconfig`), Terraform CLI (`.terraformrc`, `terraform.rc`),
+    RubyGems `.gem/credentials` and the `service_account` / `serviceaccount` / `serviceAccount` JSON spellings (the
+    read rules match as spelled; the scan and the preflight case-insensitively); no new whole-directory pattern, so
+    `SENSITIVE_DIR_COMPONENTS` is unchanged; PROBES 40 → 44 (`auth.json`, `vendor/auth.json`, `.kube/config`,
+    `deploy/sa/serviceAccountKey.json`).
+  - E: `verify-sources` (fed by the existing `debug config` call) also requires the loaded document's `info` and
+    replays `policy_probes()` against its `policies` (every denied tool, every secret-like read probe, the launch's
+    own `--deny-read` paths in both spellings, the documented exceptions, provider/integration/MCP/skill/plugin/web
+    search ceilings, "not deny" for the reviewer's own tools) and PROBES against its `permissions`, failing closed
+    on a missing, empty or malformed array; `oauto-run` passes `--deny-read` to it. Real 2.2.6 output carries both
+    arrays: `policies ok: 62 probes; permissions ok: 44 probes`.
+  - `43b1708`: the per-inode count records only files with `st_nlink > 1` (same verdicts, one entry per hard-linked
+    file instead of one per file in the tree).
+- Regression tests (`tests/test_oauto_launcher.js`, 75 → 87 tests; each new scenario reproduced the gap on the previous
+  code first — 16 of the 17 new/extended tests fail on the old launcher, the 17th only tightens an existing check):
+  `A` outside-partner link refused with the override and nothing rendered; nested, `node_modules`, three-name
+  (`3 names, 2 inside`), odd-name (C-quoted) links refused while an in-repository pair and a hook link pass and a
+  `.git/config` alias keeps its reason; a secret-named outside link (`.env`) refused under the override; `C` symlinked
+  `config.worktree` (into the worktree and dangling) and a symlinked commondir `config` refused when reviewing the
+  linked worktree, a worktree file hard-linked to `config.worktree` (alias) or to a hook (outside name) refused, a
+  clean linked worktree accepted, ordinary git-dir symlinks not reported, `_is_git_config` contract table; `D` 21
+  credential spellings denied on all four controls and 5 near misses reviewable, an `auth.json` repository refused
+  without the override and read-denied with it, a deleted `auth.json` excluded from the preflight; `E` 15 mutations
+  of the loaded document fail `verify-sources` (missing/empty/malformed `policies`, removed or flipped rules, a
+  ceiling that denies every read, widened or missing `permissions`, missing `--deny-read` rules), a PROBES table
+  replayed against both layers for both aliases, and the launcher's own `policies ok` line with a deny-read path.
+- Validation performed (device, git 2.47.3, OpenCode 2.2.6, disposable fixtures only):
+  - Old-code reproductions: scratchpad logs `repro-a/c/d/e.old.log` vs `.new.log` (quoted in the table above).
+  - Real binary, this round's `oauto-run --check` from the worktree: clean repository → `preflight exclusion ok`,
+    `config sources ok`, `policies ok: 62 probes; permissions ok: 44 probes`, `models ok`, `agents ok ... 44 probes
+    each`; `ln <outside>/.ssh/id_ed25519 notes.md` with `OAUTO_ALLOW_SENSITIVE_FILES=1` → refused, record printed,
+    state directory empty; Composer `auth.json` → refused, with the override → verified launch config; a linked
+    worktree whose `config.worktree` is a symlink into it → refused under the override; a clean linked worktree →
+    verified; no OpenCode process or service left.
+  - Round 2 (after the independent review, commit `d2495cd`), real binary from the worktree copy: a clean
+    repository, a submodule checkout (`git submodule add` of a local repository, `.git` = `gitdir:
+    ../.git/modules/sub`) and a linked worktree pass `--check` with `config sources ok ... (policies and permissions
+    loaded verbatim)`, `policies ok: 62 probes; permissions ok: 44 probes`; a crafted `.git` file (`gitdir:
+    <victim>/.git`) is refused before any git command runs (`oauto-policy: .git file names a git dir that does not
+    belong to this worktree`; the victim's `.git/index` unchanged); `Auth.json` under the override is read-denied by
+    exact name (rendered `read Auth.json` / `*/Auth.json` and `tool.use read:Auth.json` / `read:*/Auth.json` deny;
+    64/46 probes, 45 agent probes). Nothing rendered for refused launches; no OpenCode process or service left.
+  - Final validation at `8308090` (after the ten Codex P1 fixes below): `bash scripts/validate.sh` green — YAML,
+    JSON, sync/mirror parity, JS syntax, `node --test` 278/278 (`tests/test_oauto_launcher.js` 106 tests: 75 before
+    this round + 12 in round 1 + 7 in round 2 + 12 across the ten Codex P1 rounds), 59 github-script bodies,
+    actionlint, `git diff --check` — 736 s (earlier runs: `d2495cd` 266/266 in 577 s, `5860e1f` 267/267 in
+    590 s, `afd4639` 269/269 in 596 s, `62fca59` 271/271, `4544f09` 272/272 in 653 s, `09dfcc8` 273/273 in
+    711 s, `2d5d7b7` 274/274 in 589 s, `f16dfe6` 275/275 in 695 s, `f852171` 276/276 in 682 s, `d9b71a1`
+    277/277 in 777 s).
+- Round 2 — resolution of the independent review's findings (`d2495cd`, each reproduced on `43b1708` first):
+  P2 → new `check-repo-git` (`parse_dot_git_file`, `own_git_info`, `_git_dir_owned`, `config_value`): `.git` must
+  be a real directory, or a `.git` file — parsed exactly as git does — naming a linked-worktree admin dir whose
+  `gitdir` back-pointer resolves to this `.git` file under `<commondir>/worktrees/<name>`, or a submodule gitdir
+  whose last `core.worktree` resolves to this worktree; anything else (symlinked `.git`, malformed pointer,
+  missing or foreign git dir, a moved worktree — hint: `git worktree repair`) is refused by `oauto-run` right after
+  repository resolution, before any git invocation (source-shape test: the call precedes the first `git -C`); the
+  scan shares the parser and reports an unowned pointer as a SYMLINK-class record. Tests: foreign absolute and
+  relative pointers refused with nothing rendered and the victim's index untouched; real dir, linked worktree and
+  submodule accepted; symlink, foreign, missing and moved refused. P3 parser: whole content, trailing CR/LF only
+  (the trailing-blank fixture is now refused for ownership — its target is a moved plain git dir — rather than for
+  the symlinked `config.worktree`; the launch is refused either way). P3 sampling: `verify-sources` requires the
+  loaded `policies` and `permissions` to equal the rendered arrays rule for rule (first differing index reported;
+  deny-read paths de-duplicated as `render` does) before the probes; removing, re-allowing, reordering or appending
+  any rule now fails (the reviewer's probe script, which passed before, fails on every case). P3 case variants: the
+  scan writes `--unruled-out` (SENSITIVE paths the static rules do not deny as spelled) and the launcher adds
+  `--deny-read` for each — `Auth.json`, `.PGPASS`, `keys/x.PPK`, `ServiceAccountKey.json` deny in both agents and
+  the ceiling under the override, the verify-agents probe count grows by exactly four, lowercase names get no
+  duplicate rule, and a metacharacter name (`keys/Server[1].PEM`) refuses even with the override. P3 object store:
+  pruned `objects` directories are remembered and walked lazily (budget-aware, `lstat` only) when a worktree file
+  is still unaccounted — a self-clone (`git clone . inner-copy`) and git-annex thin mode are accounted names, not
+  aliases; one name in the store plus one outside still refuses ("3 names, 2 inside"); a local clone of an OUTSIDE
+  repository still refuses. P3 alias: a secret-named hard link to a git-dir file (`ln .git/config notes.pem`) is
+  refused unconditionally (`git_dir_inodes`), while two secret names of one ordinary file (`.env` ↔ `prod.env`)
+  produce no record. P3 (PLAUSIBLE) walk errors: `onerror` handlers on all four walks print `SKIPPED <path>:
+  <reason>` before `SUMMARY` and make the scan exit 3 (launcher message updated); no test — as root, a `chmod 000`
+  directory is still listable here and a path deeper than PATH_MAX did not raise inside `os.walk`, so the
+  `SKIPPED` path is implemented but unexercised. The tightened symlinked-`.git` assertion moved from the scan to
+  `check-repo-git` (refused earlier, same outcome).
+- Device: `bash launchers/oauto/install.sh` at `d2495cd` replaced `/root/work/bin/oauto-run` and
+  `oauto-policy.py` (previous copies kept as `*.backup-before-oauto-20261109-020906`; `oauto-policy.py` again at
+  `5860e1f`, backup `*-20261109-024432`; both again at `afd4639`, backups `*-20261109-031603`, and at `62fca59`,
+  backups `*-20261109-034619`; `oauto-policy.py` at `4544f09`, backup `*-20261109-041053`, and at `09dfcc8`,
+  backup `*-20261109-043850`; `oauto-run` at `2d5d7b7`, backup `*-20261109-050947`; both at `3059954`/`f16dfe6`,
+  backups `*-20261109-054251`, `*-054316`; both at `f852171`, backups `*-20261109-061235`; `oauto-run` at
+  `d9b71a1`, backup `*-20261109-063413`, and at `8308090`, backup `*-20261109-070717`); `ai-launch`, the Termux
+  `oauto-launch` wrapper and both `.bashrc` blocks were already identical and untouched; `install.sh --verify`
+  clean; the device-parity test is green; `/root/work/bin/oauto-run <fixture> deepseek --check` through the
+  installed copy with the real binary verified sources (verbatim), models and agents (see below). `cauto`,
+  `clauto` and `ai` are unaffected: the installed `ai-launch` equals the tracked copy, which the parity test
+  rebuilds from the pristine launcher plus exactly the `opencode`-mode edits (the `codex|claude` resolution and
+  menu lines are byte-identical to the pristine file).
+- DONE since the previous entries: the Termux hop (`oauto <repo>` from a real Termux shell) was run by the owner on
+  2026-11-08 and works; a review on a real project repository happened (the GLM audit of automation-core itself,
+  which produced the findings above). Still not physically tested: a full DeepSeek TUI session; the Termux hop with
+  this round's launcher (the hop files — `oauto-launch`, `ai-launch`, both `.bashrc` blocks — are unchanged, only
+  `oauto-run`/`oauto-policy.py` changed and were exercised through `--check` on the device); a real-binary session
+  on a repository holding hard links or a linked worktree (fixtures only).
+- Limitations / risks after this round: a filesystem that reports `st_nlink` = 1 for hard links defeats the hard-link
+  rule (none known on this device; `/data` is ext4/f2fs); `.git/objects` is not walked, so a worktree file
+  hard-linked into it is refused rather than classified; the loaded-policy verification proves that OpenCode parsed
+  the rendered ceiling and permissions as written and that they resolve the probes under the launcher's matcher
+  model — not a runtime decision trace (the live tool-level probes of the earlier rounds remain the evidence for the
+  matcher semantics); the backslash glob deny-list gap is real but non-exploitable on 2.2.6 (above) and is not
+  closed.
+- Independent review (Opus reviewer subagent, not the implementer; read-only; adversarial fixtures under the
+  scratchpad; `git diff 01f6840 43b1708`): no new P1. One P2, CONFIRMED and pre-existing (not introduced by this
+  round): a crafted `.git` FILE (`gitdir: <path>/other-repo/.git`, absolute or relative) made every preflight git
+  command run against another local repository's git dir, so `git diff HEAD` with `--work-tree=$REPO` listed the
+  victim's files as deletions and their content reached `preflight.md` (`--check` exited 0 without the override;
+  reach: a planted `.git` file, which `git clone` cannot produce). P3s, all CONFIRMED unless noted: the scanner
+  parsed `gitdir:`/`commondir` differently from git (first line, `.strip()`; git takes the whole file and strips only
+  trailing CR/LF — a trailing blank in the `.git` file sent the scan to a decoy directory while git used the real
+  one); `verify-sources` only sampled the loaded arrays (18 of the 21 new patterns could be removed from the loaded
+  `policies`/`permissions` and it still passed); case variants of the credential names (`Auth.json`, `.PGPASS`,
+  `x.PPK`) are flagged by the case-insensitive scan but stayed readable under the override because the read rules
+  match as spelled; the `objects` prune made legitimate layouts unaccounted hard links (`git clone . inner-copy`
+  inside the repository, git-annex thin mode) — a fail-closed regression against `01f6840`; a secret-NAMED alias of
+  a git-dir file (`ln .git/config notes.pem`) was only SENSITIVE (overridable) while the docs promised an
+  unconditional refusal; and (PLAUSIBLE, not reproducible as root) `os.walk` with `onerror=None` skips an
+  unlistable directory while reporting `complete=1`. Held under attack: outside and secret-named outside hard
+  links refused with and without the override, a third name hidden in `.git/objects` plus one outside refused,
+  linked-worktree config/hook aliases refused, `verify-sources` failing closed on effect casing, array resources,
+  missing `info` and an `ask` over `read:*`, scan findings reaching only stderr. Resolution of each finding: see the
+  "Round 2" bullet below.
+- Codex review of the first pushed head `33c0dda` (`@codex review` 02:20:29Z; receipt 02:27:31Z with `**Reviewed
+  commit:** 33c0dda703`; review-state marker `completed` with `has_unresolved_findings=true`; CI
+  `validate-automation-core` success 02:22:39Z; gate `🟡 Waiting for Codex review` at the push, then `🔴 Active
+  Codex P1/P2 finding` 02:28:25Z): one P1, valid and reproduced by Codex — a real `.git` DIRECTORY carrying a
+  `commondir` file that names another repository was accepted by `own_git_info`'s early return, and git honours
+  that file in any git dir, so the preflight read the victim's refs and objects (its committed file appeared as a
+  deletion in `preflight.md`). Fixed in `5860e1f`: a real `.git` holding a `commondir` file (empty or not) is
+  refused by `check-repo-git` before any git command, the scan reports `SYMLINK .git -> <target> (.git holds a
+  commondir file naming another git dir)`, and a submodule git dir is accepted only without a `commondir` file;
+  regression test `P1 (Codex on 33c0dda)` reproduces the leak shape (victim index untouched, nothing rendered,
+  no preflight) plus the empty-file and planted-submodule variants; README row and ADR item 4 updated;
+  `install.sh` refreshed `oauto-policy.py` (backup `*-20261109-024432`), `--verify` clean. The bridge
+  auto-triggered `@claude fix` on the finding; the Claude fixer hit `billing_error` (0 tokens) and handed off to
+  the watchdog, which cannot run in this repository (rejected `AUTOMATION_PAT`); nothing else touched the branch.
+  The thread was replied to with the fix commit and resolved; a Codex review of the next head was requested.
+- Codex review of the second pushed head `0ca1844` (`@codex review` 02:55:39Z; receipt 03:06:32Z with `**Reviewed
+  commit:** 0ca1844502`; review-state marker `completed`, `has_unresolved_findings=true`; CI
+  `validate-automation-core` success 02:57:49Z; gate `🟡` at the push — the `pull_request_target` run
+  `42553558193` published the head marker again — then `🔴 Active Codex P1/P2 finding` 03:07:16Z): one P1,
+  valid, reproduced by Codex and re-reproduced here — when `.git/config` included a tracked SYMLINK
+  (`conf/a.cfg -> b.cfg`) and both files were deleted, the history pass read `HEAD:conf/a.cfg` with `git cat-file
+  blob`, which yields the link target text for a symlink entry, and parsed that as config, so `b.cfg` was never
+  excluded and the credential removed from it reached `preflight.md` (old launcher: token present, only `a.cfg`
+  excluded; fixed: token absent, both names excluded). Fixed in `afd4639`: the history pass reads the entry mode
+  (`git ls-tree`) at each revision; a `120000` entry's blob goes to the new policy subcommand `resolve-link`, which
+  resolves the target as git would (relative to the link's directory, pure path arithmetic): an in-repository
+  target is excluded, denied and followed at the same revisions, an absolute or escaping target is followed as an
+  outside file, and an empty target or one resolving to the repository root or into `.git` fails closed. Tests:
+  the Codex scenario, a two-link chain, a symlink loop (include added after the commit, since git itself cannot
+  stage through a looping include), an escaping target, a type change (symlink at HEAD, ordinary file now) and
+  `resolve-link`'s refusals and resolutions; README row and ADR item 4 updated; `install.sh` refreshed `oauto-run`
+  and `oauto-policy.py` (backups `*-20261109-031603`), `--verify` clean. The thread was replied to with the fix
+  commit and resolved; a Codex review of the next head was requested.
+- Codex review of the third pushed head `2c743cf` (`@codex review` 03:27:08Z; receipt 03:33:32Z with `**Reviewed
+  commit:** 2c743cfb8b`; review-state marker `completed`, `has_unresolved_findings=true`; CI
+  `validate-automation-core` success 03:29:29Z; gate `🟡` at the push (head marker published again, run
+  `42556471850`), then `🔴 Active Codex P1/P2 finding` 03:34:03Z): one P1, valid, reproduced by Codex and
+  re-reproduced here — `resolve-link` labelled every ABSOLUTE symlink target `O` (outside), so a committed include
+  symlink `conf/a.cfg -> /abs/<repo>/conf/b.cfg` with both files deleted left `b.cfg` neither excluded nor
+  followed and its removed credential reached the preflight (old launcher: token present; fixed: absent, both
+  names excluded). Fixed in `62fca59`: an absolute target is judged by where it lands (existing components
+  realpath-resolved): inside the repository → an `I` record with the repository-relative path, the repository
+  root or `.git` → fail closed, elsewhere → `O`. The same commit closes the last documented gap of this class
+  — a committed DIRECTORY symlink on an include path (`conf -> realconf`, `conf/a.cfg` included, link and
+  directory deleted): git cannot read `HEAD:conf/a.cfg` through a tree symlink, so the history pass now walks
+  the path's ancestors at that revision, resolves the first `120000` entry (`resolve-link --rest=<path below
+  it>`) and follows the re-rooted path (reproduced on the previous launcher: credential in the preflight;
+  fixed: `realconf/a.cfg` excluded); the ADR/README limitation now holds only for a never-committed link. Tests:
+  the Codex absolute-target scenario plus `resolve-link`'s inside / root / `.git` / sibling-prefix cases; the
+  directory-symlink scenario plus `--rest` resolutions (root-level and nested links, escaping target).
+  `install.sh` refreshed `oauto-run` and `oauto-policy.py` (backups `*-20261109-034619`), `--verify` clean. The
+  thread was replied to with the fix commit and resolved; a Codex review of the next head was requested.
+- Codex review of the fourth pushed head `4dc70dd` (`@codex review` 03:58:05Z; receipt 04:02:05Z with `**Reviewed
+  commit:** 4dc70ddc26`; CI `validate-automation-core` success 04:00:50Z; gate `🟡` at the push, then `🔴 Active
+  Codex P1/P2 finding` 04:02:46Z): one P1, valid, reproduced by Codex and re-reproduced here — an include path's
+  directory part was resolved against the CURRENT filesystem (`_referenced`), so with a committed `conf ->
+  realconf` later retargeted to a missing `newconf` and `realconf/a.cfg` deleted, `.git/config`'s `../conf/a.cfg`
+  reached history only as `newconf/a.cfg` (never in history), the committed link was never examined and the
+  removed credential reached `preflight.md` (old launcher: token present; fixed: absent, `realconf/a.cfg`
+  excluded). Fixed in `4544f09`: `includes_in_config` and the scan's `register_include` also register the path
+  exactly as written (normalised lexically, no symlink followed) when it differs from the referenced and
+  canonical names — a present file as an include name (excluded, denied by exact name), a missing one as an
+  unloadable include target — so history traversal starts from `conf/a.cfg`, finds the committed `120000` entry
+  and re-roots below it. Tests: the Codex scenario (both names handed over by `includes-in-config`), and the
+  retarget-to-an-existing-directory variant, which the directory-alias rule refuses unconditionally while the scan
+  hands over both names. README row and ADR item 4 updated; `install.sh` refreshed `oauto-policy.py` (backup
+  `*-20261109-041053`), `--verify` clean. The thread was replied to with the fix commit and resolved; a Codex
+  review of the next head was requested.
+- Codex review of the fifth pushed head `9e8a88d` (`@codex review` 04:22:30Z; receipt 04:33:09Z with `**Reviewed
+  commit:** 9e8a88dcde`; CI `validate-automation-core` success 04:24:49Z; gate `🟡` at the push, then `🔴 Active
+  Codex P1/P2 finding` 04:33:40Z): one P1, valid, reproduced by Codex and re-reproduced here — `resolve-link`
+  realpath-resolved an ABSOLUTE target, so with a committed `a.cfg -> /repo/conf/b.cfg`, `conf -> oldconf` and
+  `oldconf/b.cfg` (credential), then `a.cfg` and `oldconf/b.cfg` deleted and `conf` retargeted to a missing
+  `newconf`, only `newconf/b.cfg` (never in history) was queued, the committed `conf -> oldconf` hop was never
+  examined and the removed credential reached `preflight.md` (old launcher: token present; fixed: absent,
+  `oldconf/b.cfg` excluded). Fixed in `09dfcc8`: `resolve-link` builds the candidate path (absolute, or relative
+  to the link's directory, plus `--rest`) and judges BOTH the lexically normalised path (the name history knows)
+  and the live-resolved path by where they land, one record per distinct result (inside → `I`, root/`.git` →
+  fail closed, elsewhere → `O`); a relative target that escapes the repository and re-enters it therefore
+  counts as inside. Tests: the Codex scenario (both paths handed over, `oldconf/b.cfg` excluded) and the
+  escape-and-re-enter case. README row and ADR item 4 updated; `install.sh` refreshed `oauto-policy.py` (backup
+  `*-20261109-043850`), `--verify` clean. The thread was replied to with the fix commit and resolved; a Codex
+  review of the next head was requested.
+- Codex review of the sixth pushed head `bdc6cef` (`@codex review` 04:51:24Z; receipt 04:56:23Z with `**Reviewed
+  commit:** bdc6cef35b`; CI `validate-automation-core` success 04:53:51Z; gate `🟡` at the push, then `🔴 Active
+  Codex P1/P2 finding` 04:56:54Z): one P1, valid, reproduced by Codex and re-reproduced here — git resolves a
+  relative `include.path` against the path it OPENED, so with `.git/config` including `../a.cfg`, a committed
+  `a.cfg -> configs/b.cfg` whose content says `path = c.cfg`, and the credential in root `c.cfg` (all three
+  deleted), git means root `c.cfg` while the history traversal parsed the target's blob relative to `configs/`
+  and looked for `configs/c.cfg`, so root `c.cfg`'s removed credential reached `preflight.md` (old launcher: token
+  present, only `a.cfg` and `configs/b.cfg` excluded; fixed: absent, `c.cfg` excluded too). Fixed in `2d5d7b7`:
+  `history_pass` carries a resolution context with every queued entry — an include directive's own path, or, for
+  the target of a committed file or directory symlink, the path by which the link was referenced — parses blobs
+  and outside files with it, processes a content path reached under two contexts under both (visited keys include
+  the context), and no longer re-seeds, as their own context, the paths it found itself in earlier passes when the
+  scan hands them back. Tests: the Codex scenario, the same through a committed directory symlink
+  (`conf/a.cfg` → `conf/x.cfg` → `realconf/x.cfg`), and one content path reached under two contexts (root and
+  nested `c.cfg` both excluded); the source-shape pin follows the new outside-file read. README row and ADR item 4
+  updated; `install.sh` refreshed `oauto-run` (backup `*-20261109-050947`), `--verify` clean. The thread was
+  replied to with the fix commit and resolved; a Codex review of the next head was requested.
+- Codex review of the seventh pushed head `0bc9c29` (`@codex review` 05:20:19Z; receipt 05:28:32Z with `**Reviewed
+  commit:** 0bc9c29d74`; CI `validate-automation-core` success 05:23:14Z; gate `🟡` at the push, then `🔴 Active
+  Codex P1/P2 finding` 05:29:05Z): one P1, valid, reproduced by Codex and re-reproduced here — a committed
+  `a.cfg -> conf/../b.cfg` with `conf -> dirs/nested` and the credential in `dirs/b.cfg` (all deleted): POSIX
+  follows `conf` first and applies `..` to `dirs/nested`, so the target is `dirs/b.cfg`, but the resolver
+  collapsed `conf/..` lexically to root `b.cfg` (and `realpath` consulted only the live tree), so the committed
+  `conf` was never inspected and the removed credential reached `preflight.md` (old launcher: token present;
+  fixed: absent, `dirs/b.cfg` excluded). Fixed in `3059954` (+ `f16dfe6` removing the dead helper): the history
+  pass now resolves every include path with `tree_walk`, a path lookup over `git ls-tree` at the revision — each
+  component looked up, a committed symlink (file or directory) replaced by its target before the next component,
+  `..` popping the directory reached so far or, above the root, re-entering the repository when the rest names it
+  (else an outside file), more than 40 hops / an empty target / a result at the repository root or inside `.git`
+  failing closed — and the file reached is excluded and followed under the entry's context. This replaces the
+  earlier `resolve-link` and `history_dir_link` mechanisms; two consequences are recorded: intermediate symlink
+  entries are no longer listed among the excluded paths (a link's diff is its target text, not config), and a
+  symlink loop among deleted included configs now refuses the launch (fail closed) instead of terminating
+  silently. Tests: the Codex scenario, the escape-and-re-enter case end to end, a committed link to the repository
+  root failing closed, adjusted chain/loop expectations, `resolve-link` unit assertions removed; README row and
+  ADR item 4 describe the walk; `install.sh` refreshed `oauto-run` and `oauto-policy.py` (backups
+  `*-20261109-054251`, `*-054316`), `--verify` clean. The thread was replied to with the fix commit and resolved;
+  a Codex review of the next head was requested.
+- Codex review of the eighth pushed head `d64744c` (`@codex review` 05:55:35Z; receipt 06:01:03Z with `**Reviewed
+  commit:** d64744cf46`; CI `validate-automation-core` success 05:57:35Z; gate `🟡` at the push, then `🔴 Active
+  Codex P1/P2 finding` 06:01:33Z): one P1, valid, reproduced by Codex and re-reproduced here — the same collapse
+  one level up: a committed `a.cfg` saying `path = conf/../b.cfg` with `conf -> dirs/nested` and the credential
+  in `dirs/b.cfg` (git shown to have loaded `dirs/b.cfg`; `a.cfg`, `conf` and `dirs/b.cfg` deleted): every
+  candidate the policy derived for the DIRECTIVE — live-resolved, canonical, lexical — collapsed `conf/..` to
+  root `b.cfg` before the tree walk could see the committed `conf` (old launcher: token present, only `a.cfg`
+  excluded; fixed: absent, `dirs/b.cfg` excluded). Fixed in `f852171`: `uncollapsed_include_path` keeps a
+  directive's `.`/`..` components repository-relative (for `.git/config` the leading `../` is the root);
+  `includes-in-config` emits it as a `W` record beside the collapsed names, the scan hands the ones it meets in
+  live Git configs over through `--walk-out`, and the launcher queues both kinds for `tree_walk` under their own
+  context without treating the raw spelling as a name to exclude — the walk's result is what gets excluded and
+  followed. Tests: the Codex scenario and the directive written directly in `.git/config`
+  (`path = ../conf/../b.cfg`); `includes-in-config`'s `W` records; the source-shape pin follows the new scan
+  argument. README row and ADR item 4 updated; `install.sh` refreshed both files (backups `*-20261109-061235`),
+  `--verify` clean. The thread was replied to with the fix commit and resolved; a Codex review of the next
+  head was requested.
+- Codex review of the ninth pushed head `2389a03` (`@codex review` 06:24:43Z; receipt 06:29:38Z with `**Reviewed
+  commit:** 2389a03686`; CI `validate-automation-core` success 06:27:09Z; gate `🟡` at the push, then `🔴 Active
+  Codex P1/P2 finding` 06:30:21Z): one P1, valid, reproduced by Codex and re-reproduced here — `tree_walk` read
+  a committed link's target with command substitution, which strips trailing newlines, so `a.cfg -> "b.cfg\n"`
+  (a filename ending in a literal newline; git shown to have loaded the file through the link) walked to
+  `b.cfg`, a file that never existed, and the credential removed from the real `"b.cfg\n"` reached
+  `preflight.md` (old launcher: token present, only `a.cfg` excluded; fixed: absent, both excluded, the name
+  shown C-quoted). Fixed in `d9b71a1`: the target is read with `IFS= read -r -d ''` from the blob file (every
+  byte kept) after a fail-closed check that it holds no NUL byte; an empty target still fails closed. Test: the
+  Codex scenario end to end. README row and ADR item 4 note the byte-exact read; `install.sh` refreshed
+  `oauto-run` (backup `*-20261109-063413`), `--verify` clean. The thread was replied to with the fix commit and
+  resolved; a Codex review of the next head was requested.
+- Codex review of the tenth pushed head `68d2fd2` (`@codex review` 06:47:53Z; receipt 07:02:39Z with `**Reviewed
+  commit:** 68d2fd2f38`; CI `validate-automation-core` success 06:50:28Z; gate `🟡` at the push, then `🔴 Active
+  Codex P1/P2 finding` 07:03:24Z): one P1, valid, reproduced by Codex and re-reproduced here — a committed
+  `a.cfg -> /outside/alias/b.cfg` with `/outside/alias` a symlink to the repository (git shown to have loaded
+  `b.cfg` through it; both files deleted): `tree_walk` saw an absolute target outside the repository and emitted
+  an outside-file record, so `b.cfg` was neither excluded nor inspected (old launcher: token present, only
+  `a.cfg` excluded; fixed: absent, both excluded). Fixed in `8308090`: wherever the walk leaves the repository
+  (an absolute target elsewhere, `..` above the root) the outside path is resolved with `realpath -m` and, when
+  it lands inside the repository, the walk continues there from the root; only a path that stays outside is an
+  outside file. Tests: the Codex scenario and a relative target climbing out into the alias. README row and ADR
+  item 4 updated; `install.sh` refreshed `oauto-run` (backup `*-20261109-070717`), `--verify` clean. The thread
+  was replied to with the fix commit and resolved; a Codex review of the final head was requested.
+- Codex review of the eleventh pushed head `3833718` (`@codex review` 07:20:18Z): the first pass reported no
+  findings (review-state marker `completed`, `has_any_findings=false`, 07:33Z; gate `🟢 Reviewed — clear`
+  07:33:46Z) and the branch was handed off on that state; a second Codex pass on the same head then posted one
+  P1 at 08:34:39Z (receipt `**Reviewed commit:** 3833718c…`, gate back to `🔴`): `resolve_outside`'s predecessor
+  captured `realpath -m` output with command substitution in both places where the walk leaves the repository,
+  which strips trailing newline bytes — a committed `a.cfg -> /outside/alias/b.cfg<LF>` (alias → the
+  repository; git shown to have loaded `b.cfg<LF>` through it; both deleted) resolved to `b.cfg`, a file that
+  never existed, so the real file's removed credential reached `preflight.md` (old launcher: token present,
+  only `a.cfg` excluded; fixed: absent, `"b.cfg\n"` excluded). Fixed in `1e6fbd0` (2026-11-09 10:48Z):
+  `resolve_outside` runs `realpath -z -m` into a temp file and reads it with `IFS= read -r -d ''` (every byte
+  kept; failure or an empty result fails closed); the audit of the rest of the traversal found every other
+  pathname already NUL-delimited (records, blobs, include lists) and the remaining command substitutions
+  capturing only the 6-byte tree mode and non-path values (`REPO` itself comes from `pwd -P`). Tests: trailing
+  LF through the absolute-alias and the `..` branches, double LF, tab+space, backslash+quote (refused by the
+  glob-metacharacter rule — fail closed, nothing rendered), non-ASCII, and a nested alias → link →
+  `"c.cfg\n"` chain, each case first shown to be loaded by git itself. README row and ADR item 4 updated;
+  `install.sh` refreshed `oauto-run` (backup `*-20261109-104842`), `--verify` clean. Zen terms re-checked
+  2026-11-09 from <https://opencode.ai/docs/zen/>: "GLM-5.3-Flash Free … Its provider follows a zero-retention
+  policy and does not use your data for model training", the same sentence for DeepSeek V4.1 Flash Free, both
+  listed Free and absent from the Privacy section's exceptions (Big Pickle, Iceman Free).
+- Owner-approved UX change (OPTION 1, 2026-11-09): KEEP the default behaviour and ADD a separate PR review mode,
+  `oauto <repo> pr` (`425e6ee`, implemented by an Opus subagent from the planner's specification, reviewed by the
+  planner and by an independent Opus reviewer). The default `oauto <repo>` is unchanged: a test runs the launcher
+  committed before this change (`1e6fbd0`) and the new one on the same fixtures and compares preflight, prompt,
+  stderr and rendered config byte for byte (timestamp line excepted). PR mode: `pr` is accepted in any order with
+  `glm`/`deepseek` and `--check` (`oauto <repo> pr`, `oauto <repo> deepseek pr`, `oauto <repo> pr --check`), and
+  `ai-launch`'s leading-token handling became a loop over `glm|deepseek|pr`, so `oauto pr` / `oauto deepseek pr`
+  open the repository menu and forward the words (the `codex`/`claude` paths stay byte-identical to the pristine
+  launcher; the parity test pins exactly this edit; a repository literally named `glm`, `deepseek` or `pr` can
+  no longer be selected by a bare `oauto <name>`). Before the scan and after `check-repo-git`, the lock and the
+  hardened git helpers, `pr_identify` takes the GitHub repository from `remote.origin.url` (three github.com
+  forms; the URL travels to `oauto-policy pr-query` on stdin, never in argv — it may embed a credential), makes
+  ONE authenticated read-only REST call — `gh api repos/<owner>/<repo>/pulls?state=open&head=<owner>:<branch>` in
+  a scrubbed `env -i` with `timeout 60` (`OAUTO_GH_BIN` for the test double) — and lets `oauto-policy pr-select`
+  validate the response: exactly one open pull request, its head the current branch of this repository (a fork
+  head is refused), its head sha equal to the local HEAD ("push or pull first — the launcher never fetches"),
+  its base a well-formed branch of this repository, number/html_url/shas well formed; only number, html_url,
+  base ref, base sha and head sha come back, the response file is deleted. The base must exist locally as
+  `refs/remotes/origin/<base>` (unambiguous: a local branch named `origin/<base>` refuses) with a merge base.
+  Then the EXISTING pipeline runs with `base = origin/<base>` — same scan, history tree walk, classification,
+  exclusion proof, content checks, byte caps, rendered config, permissions, policies, models, lock — so the PR
+  delta carries exactly the same protections as the upstream delta. The preflight gains `- Pull request: #N
+  <url>`, `- PR base branch: <base> (GitHub base <sha12>; local origin/<base> <sha12>)` (a differing GitHub base
+  is stated, never fetched), `- Merge base: <sha>`, `- Reviewed local HEAD: <sha> (= PR head)`; the delta
+  section is titled `## Pull request #N delta vs origin/<base> (merge-base...HEAD)` with the `--stat` block
+  first; uncommitted changes keep their own section; after writing, the run is refused if HEAD or
+  `origin/<base>` moved meanwhile; the banner shows `Mode  : pull request #N → origin/<base> (merge base
+  <sha12>)`; the initial prompt names the pull request and asks for a review of that delta (uncommitted changes
+  separately) — never "ask what to review". Nothing is ever fetched, checked out, pulled or moved, and no failure
+  falls back to the default review. No tool, permission, model, agent or write path was added; the rendered
+  config is identical in both modes (asserted). Tests (fake double `tests/fixtures/fake-gh`; `runOauto` never
+  reaches the real gh): the PR #58 shape (upstream == HEAD, `origin/main` ahead) reviewed against `origin/main`
+  with the merge base and reviewed HEAD recorded; the base taken from the metadata (another base branch; a
+  differing GitHub base stated); modified/added/deleted/renamed files; uncommitted changes separate; secret-like
+  files excluded from both sections; 21 fail-closed cases on one fixture plus an unborn branch (no PR, two PRs
+  "ambiguous: PRs #58, #59", head mismatch, fork or deleted head repo, foreign base, head ref ≠ branch, empty or
+  unsafe base ref, missing number/html_url/base.sha, non-JSON, non-array, base absent locally, no merge base,
+  ambiguous `origin/main`, non-GitHub origin with an embedded token not echoed, no origin, detached HEAD, gh
+  missing) each asserting exit 1, the reason, failure before the scan, nothing rendered and no fallback; gh exit
+  1/4/124 with the stderr summarised and token-shaped text redacted; no git metadata change (every file under
+  `.git` plus `for-each-ref` compared); both aliases in both orders; `--check` with `pr`; the lock taken before
+  the gh call; `pr-query`/`pr-select` units; the `oauto-run` source-shape pin extended. Real integration check
+  (real `gh` as the owner, real OpenCode 2.2.6): on a scratch clone at the PR head `3833718` (upstream == HEAD,
+  `origin/main` `15e44e6`) `oauto-run <clone> pr --check` resolved PR #58 → `origin/main`, merge base
+  `15e44e691485`, `17 files changed, 8400 insertions(+), 22 deletions(-)` — identical to `gh pr view 58
+  --json files` (17/17, +8400/−22), nothing excluded, the diff body truncated by the existing 24,000-byte cap —
+  with `policies ok: 62 probes`, `models ok`, `agents ok`; on this checkout, which then carried one unpushed
+  commit, it failed closed as designed ("the PR head is 3833718…, the local HEAD is 1e6fbd0…: push or pull
+  first — the launcher never fetches") and the default `--check` still reviewed against
+  `origin/claude/oauto-opencode-reviewer (behind 0, ahead 1)` with no PR lines. Docs: `launchers/oauto/README.md`
+  (usage, "PR review mode", terms re-check), ADR 0002 decision item, root README bullet. Not physically tested:
+  a PR-mode TUI session; the real gh error paths (exercised through the double only); the Termux hop.
+- Independent Opus security review of the complete task diff (`3833718..425e6ee`, 2026-11-09 11:30–12:10Z): one
+  P1, one P2, four P3s, every one reproduced on the committed code before a change and fixed in two commits.
+  P1 (pre-existing, found by the reviewer, fixed by the planner in `e01de32`): `git ls-tree <rev> -- <path>` reads
+  a leading `:` in the path as pathspec magic, so a committed included config named `:inc.cfg` was never found
+  by `tree_walk` and the chain below it was lost — with both files deleted, `nested.cfg`'s removed credential
+  reached `preflight.md` (old launcher: token present, only `:inc.cfg` excluded; git itself shown to load
+  `nested.cfg` through the colon-named file); the walk now passes `":(literal)<path>"`. In the same commit the
+  history traversal's visited keys, which joined entry and context with `|`, carry the entry's length so a path
+  containing `|` cannot collide two different (entry, context) pairs (P3, planner). Tests: the colon-named chain,
+  and two `|`-named/contexted chains followed independently. P2 (PR mode, fixed by the implementer in `1b62929`,
+  reproduced with the real gh 2.46): `gh api` rewrites `:owner`, `:repo`, `:branch` and `{word}` inside an
+  endpoint and fills them by running `git symbolic-ref`, `git remote -v` and `git config --get-regexp` in its
+  working directory — the reviewed repository, with its own config — so for a branch `branch-x` GitHub received
+  `head=funzi7branch-x-x` (for `owner`: `head=funzi7funzi7`), ignored the mangled filter, returned every open PR
+  and the refusal read "ambiguous: PRs #58, #57" instead of "no open pull request" (still fail-closed: no wrong
+  PR was ever selected). Now `pr-query` encodes the filter's colon as `%3A` and refuses an endpoint still holding
+  `:`, `{` or `}`; the launcher resolves gh to an absolute path and calls it from `/` (gh shown to run git zero
+  times in the repository; GitHub shown to honour `%3A`: the real call returned exactly PR #58). P3 (`1b62929`):
+  `gh_error_summary` left URL user-info (`https://x-access-token:…@`, `user:pass@`), `token: x`, `"token":"x"`,
+  `token=x` and upper-case `AUTHORIZATION: BEARER x` unredacted — all `[redacted]` now, still one printable ASCII
+  line. P3 (`1b62929`, local race): every PR-mode diff named `origin/<base>` again while the ambiguity check ran
+  once, so a branch of that name planted mid-run (reproduced with a git wrapper) redirected the delta to C1..C2
+  instead of C0..C2; `base` is now the commit `pr_identify` verified and a new `base_label` carries the displayed
+  name (`- Base for branch delta:`, the banner, the default-mode section title), equal to `base` in default mode —
+  the default-mode byte-equivalence test still passes. P3 (`1b62929`, documented): a repository literally named
+  `pr`, `glm` or `deepseek` is selected as `oauto ./pr`. Tests added: placeholder-shaped branch names
+  (`branch-x`, `owner`, `repo-1`) reach the double verbatim with gh's working directory `/` (the launcher started
+  from inside the repository, as `ai-launch` starts it); the planted-`origin/main` race; six redaction samples
+  with a one-ASCII-line check; the `pr-query` unit (`%3A`, nothing left that gh would rewrite) and the
+  `oauto-run` source-shape pins updated; `fake-gh` logs its working directory and refuses an endpoint gh would
+  rewrite. README (usage note, PR section, redaction wording) and ADR item 9 updated. `install.sh` refreshed
+  `oauto-run` and `oauto-policy.py` (backups `*-20261109-123455`), `--verify` clean.
+- Validation at the final code of this round (`1b62929`, docs committed on top): targeted run of the PR-mode,
+  `pr-query`/`pr-select`, source-shape, `ai-launch` parity, default byte-equivalence, review-P1 and Codex-P1-#11
+  tests 16/16; then `bash scripts/validate.sh` — 291/291 node tests (up from 288 at `425e6ee`: the colon-named
+  include chain, the placeholder-shaped branch names, the planted-`origin/main` race), 59 github-script blocks
+  checked, actionlint, exit 0, 961 s; `git diff --check` clean; the installed `oauto-run`, `oauto-policy.py` and
+  `ai-launch` byte-identical to the repository (`install.sh --verify`). The real-`gh` PR-mode `--check` of this
+  checkout against PR #58 needs the pushed head (PR head == local HEAD) and is run after the push; its result,
+  the exact-head CI, the Codex review and the Gate verdict are recorded only in `cc-latest.md` (below).
+- Review and gate state of the final head: recorded in `agent-memory/automation-core/cc-latest.md` (owner-facing
+  state) once the exact-head CI, Codex review and Codex Gate verdict exist on the PR; never claimed here ahead of
+  the evidence.
+- Owner follow-ups: merge PR #58 when satisfied (not merged by this round); rotate the automation-core
+  `AUTOMATION_PAT` (LOOP_STATE item 9); the backlog in LOOP_STATE item 11 (action SHA pinning, `validate.sh` YAML
+  glob, alias regex, defence-in-depth glob deny); decide whether `DEVELOPMENT_RULES_FULL` §7 lists `oauto`.
+
 ## [2026-11-08 UTC] Codex Gate reliability and fail-closed enforcement (paywall-bot Telegraph PRs)
 - PR: <https://github.com/funzi7/automation-core/pull/59>
 - Branch: `claude/codex-gate-fail-closed` (based on `main` `15652f6`)
@@ -84,6 +549,415 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
   (`completedCodexSummaryTargetsHead` / `codex-pull-request-review-summary` pins) in that repository.
 - Next: after merge, record the first observed marker and `🟠` verdict (if any) in LOOP_STATE item 8;
   confirm paywall-bot #107 goes green with Codex's re-review of the new sync head.
+  - 2026-11-09 02:20Z (recorded by the oauto round above): PR #59 merged as `15e44e6` on 2026-11-08; the first
+    `pull_request_target` gate run from the merged `main` (PR #58 push `33c0dda`, run `42550382183`) logged
+    `indexed trusted head epoch run` and left the `github-actions[bot]` `codex-head-epoch:v3` marker comment on the
+    PR — the marker publish works with `pull-requests: write`. No `🟠` verdict observed (none induced). paywall-bot
+    #107's refresh by the daily sync (03:00 UTC) is still ahead.
+
+## [2026-11-08 UTC] oauto — Codex P1 round: helper-free git preflight, exact pathnames, no rename hiding
+- PR: <https://github.com/funzi7/automation-core/pull/58> (same PR as the entry below; fixes pushed to its branch)
+- Branch: `claude/oauto-opencode-reviewer`
+- Status: Codex P1 findings fixed with regression tests; see "Review and gate state" at the end of this
+  entry for the re-review outcome.
+- What Codex found (review of commit `d17f3a1`, 2026-11-08T00:23Z, three P1 inline threads on
+  `launchers/oauto/oauto-run`):
+  - P1-A `--no-ext-diff`/`--no-textconv` missing: a repository's `.gitattributes` + `diff.<driver>.textconv`
+    (or an external diff driver) executed during the preflight's `git diff` calls, before OpenCode's
+    restrictions apply; Codex reproduced a helper creating a file outside the repository while `--check`
+    succeeded.
+  - P1-B C-quoted pathnames: `git diff --name-only` munged a deleted tracked `prod<TAB>.env` into
+    `"prod\t.env"`, so classification never saw the real path and the deleted secret reached `preflight.md`.
+  - P1-C rename detection: `git mv .env safe.txt` plus a sanitised destination made `--name-only` report
+    only the destination, the sensitive source was absent from the exclusion pathspecs, and the removed
+    secret appeared in the diff.
+- What changed (`launchers/oauto/oauto-run`, `launchers/oauto/oauto-policy.py`, tests, docs):
+  - Every preflight git call now runs `timeout 120 env -i` (HOME, PATH, LANG, TMPDIR, `GIT_OPTIONAL_LOCKS=0`,
+    `GIT_TERMINAL_PROMPT=0`, LC_ALL/TZ when set — no `GIT_DIR`/`GIT_WORK_TREE`/`GIT_EXTERNAL_DIFF`/
+    `GIT_CONFIG_*` from the caller), `git -C "$REPO" --work-tree="$REPO"` (a `core.worktree` in
+    `.git/config` cannot redirect the diff to another directory), with `core.fsmonitor=false`,
+    `core.hooksPath=/dev/null`, `log.showSignature=false`, `submodule.recurse=false`, `color.ui/diff/
+    status/decorate=never`, `diff.external=` and, for every `filter.<name>` driver found by
+    `git config --get-regexp` (the empty driver name included), `clean=`/`smudge=`/`process=`/
+    `required=false`; a driver name containing `=` cannot be addressed by `git -c` and refuses the launch.
+    Every diff goes through one helper carrying `--no-ext-diff --no-textconv --no-renames --no-relative
+    --no-color --submodule=short --ignore-submodules=dirty`; `git log` carries `--no-show-signature --no-color`.
+  - Changed paths are collected NUL-delimited (`--name-only -z`, `ls-files -z`) into 0600 temp files inside
+    the state directory, never through command substitution; `oauto-policy.py classify -z --renames
+    --display` classifies the exact bytes (decoded only for matching, surrogateescape), excludes both
+    sides of every rename/copy pair when either side is secret-like, writes a C-quoted display list
+    (git's `core.quotePath` rules, ASCII only) and fails closed on any empty, truncated or unknown record;
+    the launcher builds `:(exclude,literal)` pathspecs with `read -r -d ''` and then PROVES the exclusion
+    (`check-excluded`: the name diffs re-run with the pathspecs may list no excluded and no secret-like
+    path) before `preflight.md` is written. Temp files are removed (EXIT trap covers failures).
+  - Diffs never use rename detection; the single `-M --name-status -z` pass exists only to find pairs
+    for the both-sides exclusion. The excluded list shows e.g. `safe.txt (renamed from ".env")`.
+  - `tests/fixtures/fake-opencode` gained a `PROMPT_FILE` control so tests can assert on the whole
+    `--prompt` argument. ADR 0002 gained decision item 8 and two consequences; `launchers/oauto/README.md`
+    "What is blocked" gained the helper row; LOOP_STATE item 8 / "Device launchers" and CONTEXT A1 updated.
+- Regression tests (`tests/test_oauto_launcher.js`, now 29 tests; the launcher is driven end to end against
+  the test double, so the exact bash code paths run): `P1-A` (textconv, external diff, driver command,
+  clean/process filter incl. the empty driver name and a submodule-local filter, fsmonitor hook,
+  `post-index-change` hook via `core.hooksPath`, `gpg.program` reached through a crafted `gpgsig` commit,
+  caller-environment `GIT_EXTERNAL_DIFF`/`GIT_CONFIG_COUNT`; a `filter.x=y` driver must be refused);
+  `P1-B` TAB name without the sensitive override; `P1-B` newline, non-ASCII, space, quote, backslash,
+  leading-dash names, deleted and modified, asserting on `preflight.md`, the recorded `--prompt` and
+  `last-helper.err`; `P1-C` staged, pure and reverse renames; `P1-C` branch delta plus a non-sensitive
+  rename shown as delete+add; `F` ordinary and special-named non-sensitive changes still appear;
+  `core.worktree` redirection and a linked worktree (`.git` file); forced ANSI colour; the NUL interface
+  (`classify -z`, `check-excluded`, pairs, quoting, fail-closed cases); source-shape guard for the helpers.
+  - Reproduction first: run against the previous launcher, 7 new/changed tests failed (helpers executed;
+    TAB, newline, non-ASCII, quote and backslash names leaked; sanitised and reverse renames leaked;
+    branch-delta rename leaked; `classify -z` unknown). Not reproducible on the old code and kept as
+    guards: case F (by design), pure 100 % renames (the old code printed no hunk for them), and some
+    P1-A helpers (external diff, driver command, clean/smudge, post-index-change) because git died on the
+    required process filter first — masked, not safe. Removing each new defence one at a time in scratch
+    copies made the suite fail every time except for `-c log.showSignature=false` alone, which
+    `--no-show-signature` already covers. `color.decorate` and `submodule.recurse` are no-ops for these
+    commands in git 2.47 and stay as guards.
+- Validation performed (device, git 2.47.3, OpenCode 2.2.6, disposable fixture repositories only):
+  - `node --test tests/test_oauto_launcher.js`: 28/29 before the re-install (the device-parity test fails
+    until `install.sh` runs; see below), `bash -n`, `git diff --check` clean.
+  - Real binary, `oauto-run --check` on fixtures (scratchpad battery, 20 checks): hostile config
+    (`diff.probe.textconv/command`, `diff.external`, `filter.probe.clean/process/required`,
+    `core.fsmonitor`, `log.showSignature` + `gpg.program`) → exit 0, no helper marker, textual diffs
+    present, `config sources ok` / `models ok: exactly [glm, deepseek]` / `agents ok`; six deleted
+    special-name secrets (TAB, newline, `naïve`, `"`, `\`, `-dash`) → exit 0 without the override, no
+    synthetic value in `preflight.md`, `"prod\t.env"` listed quoted, ordinary change shown; renamed
+    secrets on a `feature` branch and staged in the worktree → no original value in the branch-delta or
+    worktree sections, no `rename from` anywhere, `safe.txt (renamed from ".env")` listed, non-sensitive
+    rename shown as add.
+  - Real binary, tool level under the rendered config (`opencode run --standalone`, six remote requests
+    with synthetic fixture content): edit/write → denied and no file created; shell → denied;
+    `/etc/hostname` → `external_directory` denied; `.env` → `Permission denied`; the probe secret never
+    appeared in any transcript; `--model opencode/big-pickle` → unavailable; `--agent build` → not found.
+    No fixture, lock or process left behind.
+- Independent review (Opus reviewer subagent, not the implementing agent, full PR diff vs `main`,
+  attack fixtures under mktemp only): P1-A and P1-B confirmed closed (no helper fired for textconv,
+  driver command, external diff, env `GIT_EXTERNAL_DIFF`, clean/smudge/process filters incl. the empty
+  name, an `include.path` driver, an env-injected `GIT_CONFIG_*` driver and a submodule's driver,
+  fsmonitor, gpg, hooks; `--work-tree` defeats `core.worktree`; `--stat` honours the pathspecs; NUL
+  interface fail-closed on every malformed input tried). One P1 in this round's own design
+  (CONFIRMED): the destination-side exclusion of a renamed secret rested on a single `-M` pass whose
+  rename detection a repository can throttle (`diff.renameLimit=1` + two ≈80 %-similar renames →
+  D/A instead of R → the destinations' add-hunks, still holding the secrets, reached `preflight.md`);
+  plus the matching test gap (only ≥50 %-similar or pure renames were tested) and the over-claim
+  "both sides" in ADR/README. Fixed: the pair pass runs `-M -C -l0` (exhaustive, limits pinned,
+  copies included) and the launch is refused if that pass fails or times out; a regression test with
+  `diff.renameLimit=1` reproduces the leak on the previous code; ADR item 8, its consequences and the
+  README row now state the real contract — the source side is always excluded, the other side of a
+  pair git detects is excluded, and a safe-named file that merely still contains secret text (edited
+  beyond git's similarity threshold) is reviewable content and is shown. No P2; nothing else found in
+  ai-launch, install.sh, lock, config rendering, verifiers or the scrubbed exec.
+  Provenance: `review_provider = claude_code_fallback` style independent review in addition to the
+  Codex review that opened this round; the Codex re-review of the fixed head is recorded below.
+  Follow-up from the same review's caveats: the name-collection and proof passes were `|| true` and a
+  transient git failure could have left a secret-like path unexcluded while the content diff still
+  succeeded — now fatal (`name_pass_failed`), with a source-shape test.
+- Device (Phase 5): `bash launchers/oauto/install.sh` refreshed `/root/work/bin/oauto-run` and
+  `oauto-policy.py` after each validated state during the round (previous copies kept as
+  `*.backup-before-oauto-20261108-120902`, `-132239`, `-134043`, `-140044`, `-144953`, `-152257`,
+  `-154043`, `-160518`, `-163804`, `-171353`, `-174147`, `-183754` and `-192727`; `ai-launch`, the
+  Termux `oauto-launch` wrapper and both `.bashrc` blocks were already identical and untouched; the
+  original `ai-launch.backup-before-oauto-20261107` still equals the pristine fixture); `install.sh
+  --verify` clean; installed copies byte-identical to the tracked ones (device-parity test passes);
+  `/root/work/bin/ai-launch opencode oauto-selftest-j [deepseek] --check` through the installed
+  launcher resolved the fixture, proved the exclusion (`preflight exclusion ok`), verified
+  sources/models/agents (GLM and DeepSeek default agents) and printed the banner; fixture, state dir
+  and lock removed; no OpenCode process or service left.
+- Final validation at the pushed head: `bash scripts/validate.sh` green (YAML, JSON, sync/mirror parity,
+  JS syntax, `node --test` 202/202 including `tests/test_oauto_launcher.js` 75/75, 59 github-script
+  bodies, actionlint, `git diff --check`); real-binary battery (scratchpad script, every scenario of
+  this entry) passed on the final launcher, and the six live model probes were repeated on it: shell,
+  `/etc/hostname`, `.env`, `opencode/big-pickle` and `--agent build` denied as before, probe secret
+  absent from every transcript, no file created; the edit probe's first run matched none of the
+  expected phrases because the model declined without calling any tool, so it was re-run with a
+  tool-listing prompt — the model reported its tools as exactly `glob, grep, question, read, skill`
+  and answered `NO-WRITE-TOOL`; nothing was created.
+- Not physically tested: the Termux hop itself (unchanged this round; `proot-distro login` cannot run
+  from inside the Debian session, so `oauto <repo>` still needs one run from a real Termux shell); a
+  review on a real project repository; a full DeepSeek TUI session; a repository using git-lfs
+  filters, submodules or linked worktrees against the real binary (covered by the node tests against
+  the test double and by real git in the fixtures, not by a real OpenCode session); a pair-pass
+  timeout on a huge change set (the refusal path is exercised only by forcing a failure in a scratch
+  copy).
+- Limitations / risks after this round: classification is by path, so a safe-named file that still
+  holds secret text (edited beyond git's 50 % similarity, or copied from an unmodified secret file under
+  the `OAUTO_ALLOW_SENSITIVE_FILES=1` override) is shown like any added file; the content-based
+  exception covers only the `CONTENT_CHECKS` basenames (SUPERSEDED within this entry: the
+  `gradle.properties.bak` rename and hard links to `.git/config` listed here as open at the time
+  were closed by the later rounds recorded below — suffixed copies and rename pairs are checked,
+  hard links to secret-like files or `.git` files are refused); `git diff` against the
+  worktree still refreshes stat data in `.git/index` (no content, ref or hook; `GIT_OPTIONAL_LOCKS=0`
+  covers `status` only); changes made to the repository during the second of collection are not
+  covered; `-l0` makes the pair pass exhaustive, so a change set with thousands of unpaired deletions
+  and additions can hit the 120 s timeout and the launch is refused rather than degraded; LFS-style
+  filtered files diff raw; submodule worktree dirtiness is not reported; `color.decorate` and
+  `submodule.recurse` are no-ops for these commands in git 2.47 and stay as guards.
+- Codex re-review of the first fixed head (`de81444`, requested with `@codex review`, exact-head CI
+  green, the three original P1 threads replied to with the fix commits and resolved): two NEW P1s,
+  both valid and reproduced by Codex — (D) a worktree symlink aliasing Git metadata or a secret-like
+  path under a harmless name (`review-config.txt -> .git/config`) passed the scan (target inside the
+  repo; `.git` pruned; only the alias name classified) and, because OpenCode checks the requested
+  path, made `.git/config` readable; (E) the `gradle.properties` content check looked only at the
+  current worktree, so a change that removed a committed credential line (or deleted the file) sent
+  the removed line in the diff. Fixed in this round: the scan refuses, unconditionally like outward
+  links, any symlink whose canonical target is or lies under `.git`/`.ssh`/`.gnupg`/`.aws`/`.docker`
+  (constant kept in sync with the directory patterns by a test) or whose target is secret-like by
+  name, and the `.git/config` content check also flags `extraHeader`/`Authorization` values;
+  changed `gradle.properties` paths (any directory) have their worktree and branch-delta diffs
+  checked (`check-diff-content`, both sides of every hunk) and a hit excludes the file from the
+  preflight, listed as `credential-looking content in its diff`. Regression tests reproduce both
+  leaks on the previous code; the real-binary battery gained both scenarios.
+- Second independent review (same Opus reviewer, read-only, `git diff de81444`): P1-D and P1-E
+  closed as reported (chained links, `..` targets, nested hops, case variants, link loops and the
+  override all held; `:(literal)` with special bytes, `--` for leading-dash paths, pipefail death on a
+  failing git, and the `check-excluded` proof all held); no P1; 5 P2 and 4 P3, all fixed in the next
+  commit: a symlink to a *directory* holding secret-like files (`cfgdir -> secrets/`) renamed the
+  directory past the name rules (D1 → refused when any flagged path lies under the target); the
+  `.git/config` check missed a token as URL user-info, `extraheader` on a section line,
+  `config.worktree`, linked-worktree and submodule configs (D5 → all checked); the `gradle.properties`
+  pattern missed `:`/whitespace separators and key-material names (E1 → broadened, no bare `auth`);
+  the content check did not follow renames/copies to `.bak`/`.orig` (E2 → prefix rule with template
+  exemption, both sides of a pair checked); git's hunk headers carried the credential line (E3 →
+  header text checked); hard links to `.git/config` or a secret-like file (D2 → refused); symlinks
+  inside `.git` leaving the repo (D4 → refused); `.docker` over-refused harmless links (D3 →
+  component set is `.git/.ssh/.gnupg/.aws`, file links by name). ADR item 4/8 and the README rows
+  now describe exactly these rules.
+- Third pass of the same reviewer on those nine fixes: all hold (root alias, two-level directory
+  alias, pnpm hard-linked store, `ssh://git@` vs `ssh://user:pw@`, `gradle.properties.example.bak`,
+  partner without a checker, `:`-separated header text); one P2 left — dotted Gradle keys (`api.key`,
+  `signing.key`, `access.key`, `private.key`) escaped the pattern → `[_.-]?` separators, test with
+  dotted/colon/space forms; P3s: a hook installed as a hard link from the worktree was refused →
+  `.git/hooks/` excluded from the hard-link inode set (test); git-annex object links and
+  `https://org@dev.azure.com`-style login-name remotes are refused by design (the latter
+  overridable) and documented; docs now say "in the repository" for hard links, name the `ssh://`
+  exemption, call the word list a heuristic, and say "unless `OAUTO_ALLOW_SENSITIVE_FILES=1`" where
+  it applies.
+- Codex re-review of the second fixed head (`a174b19`, exact-head CI green, the two P1-D/P1-E
+  threads replied to and resolved): one P1 and one P2, both valid and reproduced by Codex — a
+  `.git/config` that is itself a symlink to a worktree file (`.git/config -> ../review-config.txt`)
+  skipped the credential check while the target stayed readable by name; and the `gradle.properties`
+  content check read only the first 262,144 characters, so a credential after 320 KB of comments in
+  an untracked file passed. Fixed: a symlinked `.git` or any symlinked Git config file is refused
+  unconditionally (`SYMLINK ... (Git config file is a symlink)`), and content-checked files are read
+  in full with a 16 MiB ceiling above which the launch is refused (`too large to content-check`).
+  Regression tests reproduce both on the previous code; the real-binary battery gained both.
+- Codex re-review of the third fixed head (`a23cfec`, exact-head CI green, the previous two threads
+  replied to and resolved): two more P1s, both valid and reproduced by Codex — a secret-like file whose
+  name begins with a newline printed as `SENSITIVE ` + newline + name, the launcher's line extraction
+  yielded an empty line that command substitution dropped, and the launch proceeded without the
+  override; and a `.git/config` `include.path` (or `includeIf`) pointing at an ordinary-named worktree
+  file made that file Git configuration without any credential check, diff exclusion or read deny.
+  Fixed: the scan now prints every pathname C-quoted and ends with a `SUMMARY` line carrying
+  `sensitive=`/`symlinks=`/`content=` counts, and the launcher decides on those counts (a missing
+  summary fails closed); include directives are parsed conservatively (every `path` under `[include]`
+  or `[includeIf ...]`, recursively, loops guarded) and every included file inside the repository is
+  credential-checked, reported as `SENSITIVE ... (included Git config)` (refuse unless overridden),
+  excluded from the preflight diffs and read-denied by name in the rendered permissions and policies
+  (`render --deny-read`). Regression tests reproduce both on the previous code; the real-binary
+  battery gained both.
+- Fourth pass of the independent reviewer on that round: the quoted-records/count contract held
+  against forged names (a filename that is itself a `SUMMARY` line, names with ` -> `, `(`, quotes,
+  embedded newlines), malformed or empty summaries, budget exhaustion and the "nothing rendered
+  before the scan" property; the include handling held for `~/` into the repo, outside symlinks
+  landing inside, submodule configs, `includeIf "gitdir:..."`, quoted values with comments, real
+  continuations, deny-read paths with metacharacters, and `check-excluded`. One P2 (CONFIRMED): the
+  hand-written include resolver missed files git itself loads — an include that hops through a file
+  outside the repository back into it, a `;` comment ending in a backslash (git ends the comment at
+  the newline), a UTF-8 BOM before `[include]`, and a linked worktree (`.git` is a file, so no config
+  was scanned). Fixed by asking git: the launcher runs `git config --list --show-origin -z` through
+  the hardened helper before the scan and every `file:` origin inside the repository is handled as
+  an included Git config; the parser stays as a conservative complement for includes git did not
+  apply (BOM stripped, comment-continuation fixed, outside hops followed); an included path with
+  glob metacharacters refuses the launch rather than relying on matcher semantics; the per-launch
+  deny-read rules are also probed through `verify-agents --deny-read`. Regression tests reproduce the
+  four misses on the previous code; the battery gained the outside-hop and linked-worktree cases.
+- Fifth pass of the reviewer on that fix: no P1/P2; the four cases and their neighbours (commondir
+  and `config.worktree` includes in a linked worktree, fake `file:` text inside a multi-line value,
+  `.git/../x` origins, a vanished origin file, malformed origin lists and a config syntax error
+  both failing closed, an include target that is a symlink, a deny-read path with a space, each
+  mechanism alone) all held; the docs matched. Its P3s were taken: the per-launch deny rules now
+  also carry the `*/<path>` form so `./x` or absolute spellings are denied too, and `{`, `}` and
+  `\` join `*`, `?`, `[` as characters that refuse an included path instead of relying on matcher
+  semantics. Behaviour change worth knowing: a repository whose `.git/config` includes a tracked
+  file (`include.path = ../.gitconfig`) is now refused unless `OAUTO_ALLOW_SENSITIVE_FILES=1`.
+- Codex re-review of the fourth fixed head (`ac10beb`, exact-head CI green, the previous two threads
+  replied to and resolved): one P1, valid and reproduced by Codex — a tracked file referenced by
+  `include.path` and then DELETED was skipped by the parser's existence check (and git's origin
+  listing omits a missing include), so it never reached the exclusion list and its deletion hunk,
+  credential included, was in the preflight. Fixed: an in-repository include path is registered for
+  exclusion (and per-launch read deny) as soon as it is referenced, before the existence check;
+  only an existing file counts as secret-like, so reviewing the deletion of a leaked config does not
+  refuse the launch and does not transmit the removed contents. Regression tests cover the worktree
+  deletion, a deletion committed on the branch and a rename of the target (the exhaustive pair pass
+  excludes both names; the new name is an ordinary file until `include.path` is updated, so the
+  owner should update the include after renaming such a file); the battery gained the deletion case.
+- Sixth (final) pass of the independent reviewer on that fix: worktree deletion, branch-committed
+  deletion, `git mv`, a deleted directory, `..` and `~` spellings of a missing target all held; the
+  `*/<path>` deny and the shared metacharacter set were confirmed in code; one P2 (CONFIRMED) — a
+  chained include with BOTH files deleted leaked one hop deeper (the missing first file cannot be
+  read, so its include of the second was never found, and git's origin list omits both). Fixed: the
+  launcher fetches a missing include's last committed content (`HEAD:<path>`, and the merge base's
+  copy for the branch delta) through the hardened git helper and feeds it to the parser
+  (`includes-in-config`; `git cat-file blob` plumbing, present includes seeded too so an include line
+  dropped from an existing config while its target is deleted is still traced), repeating over newly
+  found targets (depth 8, deeper fails closed), so a deleted chain is excluded hop by hop. Its P3 — an
+  include through a directory symlink with link and target both deleted — stays a documented
+  limitation (resolving through HEAD's tree is not attempted); likewise an include line removed from
+  `.git/config` itself together with its target cannot be traced (`.git/config` has no history). The
+  stale first-round limitation lines (`.bak` rename, hard links) were marked superseded in this entry.
+- Codex re-review of the fifth fixed head (`3733fb3`, exact-head CI green, the previous thread
+  replied to and resolved): two P1s in the new history traversal, both valid and reproduced by
+  Codex — a still-present file reached only through a deleted include's committed content was
+  excluded and read-denied but never counted by the scan's refusal or alias checks (so a bearer
+  value in it stayed grep-reachable without the override); and a deleted chain passing through a
+  file outside the repository was not followed, so the returning in-repository target was missed.
+  Fixed: the scan is the single decision point and runs to a fixed point — the history traversal
+  (now following outside bridges by reading them) hands every in-repository target back to the scan
+  (`--extra-config`), which runs again until nothing new appears; refusal, credential checks,
+  alias protection, exclusion and deny-read all apply to the final set. Regression tests reproduce
+  both on the previous code; the battery gained both cases.
+- Seventh pass of the independent reviewer on that loop: no P1/P2 — termination (self-include, in/out
+  alternation, ten hops → fails closed), FIFO and 24 MB outside bridges, a bridge into another
+  repository, aliases of history-found present targets, the final-pass decision source, branch-only
+  content and an absent base all held. Its P3 was taken: an outside bridge that is a symlink now
+  resolves its relative includes against the link's own directory, as git does (`O` records carry
+  the path as joined, canonical only for the inside/outside test and de-duplication; unit test
+  added). ADR item 4 now states the deleted-directory-symlink limitation and the up-to-eight-pass
+  worst case.
+- Codex re-review of the sixth fixed head (`d789b5d`, exact-head CI green, the previous two threads
+  replied to and resolved): two P1s, both valid and reproduced by Codex, both about canonicalising
+  include paths — a tracked included config replaced by a dangling in-repository symlink
+  (`review.cfg -> missing.cfg`) lost its referenced name, so only the target was registered and the
+  type-change hunk with the committed credential was shown; and de-duplicating traversal by
+  canonical path skipped a second symlinked outside bridge whose relative includes resolved into
+  the repository. Fixed: every in-repository include target is registered under its referenced
+  name AND its canonical target, history is inspected under the referenced name, and traversal
+  (scan, `includes-in-config`, launcher history queue) is keyed by the referenced path — the
+  resolution context — with canonical paths used only for the inside/outside test and the
+  existing-file checks; depth and loop guards unchanged. Regression tests reproduce both on the
+  previous code; the battery gained both.
+- Eighth pass of the independent reviewer on that round: Codex's two cases closed (include-name links
+  pointing at `.git/config`, `.env` or a secret-like directory still refused; chains of include-name
+  links denied name by name; link loops terminate live and through history; `..`/`./`-heavy
+  spellings register once; three bridges; a metacharacter include name refuses). One P2 introduced
+  by the new exemption (CONFIRMED): a directory alias over a folder holding an exempt include-name
+  link (`d -> linkdir`, `linkdir/link.cfg -> ../conf/real.cfg`) re-exposed it as `d/link.cfg` under
+  the override → fixed by adding every handed-over include name to the set the directory-alias check
+  uses (regression test); ADR item 4 and the README now state the exemption and that a directory
+  alias over such a link is refused.
+- Review and gate state: the fixes were pushed to the PR branch after this entry's commit; the
+  exact-head CI result, the Codex re-review of the pushed head (`@codex review`), the resolution of
+  every Codex P1/P2 thread and the Codex Gate verdict are recorded on the PR and in agent-memory
+  `automation-core/cc-latest.md` (owner-facing state), never claimed here ahead of the evidence.
+- Needs from the owner: unchanged — run `oauto <repo>` once from Termux; merge the PR once Codex Gate is
+  green; decide whether `DEVELOPMENT_RULES_FULL` §7 should list `oauto` next to `cauto`/`clauto`.
+
+## [2026-11-08 UTC] oauto — read-only, privacy-restricted OpenCode reviewer launcher
+- PR: <https://github.com/funzi7/automation-core/pull/58>
+- Branch: `claude/oauto-opencode-reviewer` (from `main` = `15652f663ccf31fac3c03651a5a7b56758257de4`)
+- Status: opened — launcher installed and validated on the device; the Termux hop itself needs one manual run by the owner
+- What changed:
+  - `launchers/ai-launch` is now the tracked copy of `/root/work/bin/ai-launch` (first commit:
+    byte-identical import of the live file; later: the `opencode` mode). The mode hands off to
+    `oauto-run` right after repository resolution and before the cauto/clauto banner, and a
+    leading `glm`/`deepseek` argument is kept for oauto-run instead of being taken as a repo name.
+    The `codex`/`claude` exec blocks and the `ai` menu are byte-identical (a test rebuilds the file
+    from `tests/fixtures/ai-launch.pristine` plus exactly the intended edits).
+  - `launchers/oauto/oauto-run` + `oauto-policy.py`: per-repo lock taken first (re-exec under
+    `flock --close`, held by the flock parent for the OpenCode process lifetime); fail-closed
+    preflight (OpenCode **2.2.6** only, no `/etc/opencode`, no `opencode.json(c)`/`.opencode/` in
+    the repo, no `opencode.json(c)` in any parent); one unpruned, case-insensitive worktree scan
+    driven by the same pattern list as the `read` denies (secret-like files → refuse unless
+    `OAUTO_ALLOW_SENSITIVE_FILES=1`; symlinks leaving the repo → refuse, `/usr`,`/bin`,`/lib`
+    targets tolerated; credential-looking lines in `gradle.properties` or `.git/config` → refuse);
+    read-only git preflight (`GIT_OPTIONAL_LOCKS=0`, time-bounded, byte-capped, secret-like
+    changed/deleted/untracked paths excluded from every diff and listed by name only); a private
+    config directory per launch via `XDG_CONFIG_HOME` (`~/.config/opencode` is never read or
+    written); deny-all `permissions` + read/glob/grep/question allows, hard `policies` ceiling,
+    provider pinned to `opencode`, every offered model except the approved one(s) disabled
+    (statically and dynamically from `opencode models`); verification through `opencode debug
+    config`/`debug agents`/`models` (all `--standalone`, 40 probes per agent) plus a check that
+    nothing else appeared in the private config dir; scrubbed `env -i`; never `--auto`; the TUI
+    `--prompt` carries the preflight. Approved models: `opencode/glm-5.3-flash-free` (default)
+    and `opencode/deepseek-v4.1-flash-free` (`oauto <repo> deepseek`), both $0 and published as
+    zero-retention/no-training on opencode.ai/docs/zen (read 2026-11-07).
+  - Termux: `/data/data/com.termux/files/usr/bin/oauto-launch` + `oauto()` in Termux `.bashrc`;
+    Debian: `oauto()` in `~/.bashrc`; `launchers/oauto/install.sh` (idempotent, `--verify`,
+    refuses unpaired bashrc markers, backs up replaced files). The original live `ai-launch` is
+    kept as `/root/work/bin/ai-launch.backup-before-oauto-20261107`.
+  - Docs: `docs/adr/0002-oauto-read-only-opencode-reviewer.md`, `launchers/oauto/README.md`,
+    README `launchers/` section, this entry, LOOP_STATE item 8 + "Device launchers", CONTEXT §7 A1.
+- Validation performed (device, OpenCode 2.2.6, disposable fixture repositories only):
+  - Deterministic: `tests/test_oauto_launcher.js` 20/20 pass — rendered contract (every deny,
+    allow, policy, disabled model, agent shape), `classify`/`scan` behaviour (case-insensitive,
+    `node_modules` not pruned, symlink classes, content checks, budget exhaustion), verifiers
+    against good and 13 mutated payloads, and the launcher driven end to end against
+    `tests/fixtures/fake-opencode`: clean `--check`, dynamic model disabling, secret refusal and
+    override, outward vs system symlinks, deleted-secret exclusion from the diff, project/parent
+    config refusal, version pin, bad arguments, lock contention, detached and unborn HEAD,
+    oversized diff truncation, scrubbed launch argv/env, ai-launch routing (including the bare
+    `oauto deepseek` menu path) and parity, `install.sh` idempotency/backup/unpaired markers.
+    `bash scripts/validate.sh` green; `git diff --check` clean.
+  - Real binary, `--check` paths: `oauto-run <clean>` with GLM and DeepSeek, `ai-launch opencode
+    <repo> --check`, the Debian `oauto` function — each: config sources = only the private file,
+    models = exactly the two approved ids, 5 agents resolved with 40 probes each as expected.
+  - Real binary, refusals: `.opencode/` present, outward symlink (even with the secrets override),
+    secret-like files; override → pass with WARNING and 0 secret markers in the preflight.
+  - Real binary, tool level (exact rendered rules, harness prompt): read `.env`,
+    `config/server.pem`, `.git/config`, `.ssh/config` → `Permission denied: read`; read
+    `/etc/hostname` → `Permission denied: external_directory`; `.env.example` and `src/calc.py`
+    readable; write/edit/shell/webfetch/subagent not in the tool list; with `--auto` the same
+    denials hold; glob `{/root,x}/.ssh/*` → `Permission denied: glob` while `**/*.py` works;
+    `--model opencode/big-pickle` → `Model unavailable`; `--agent build` → `Agent not found`.
+    Earlier rounds on the same rules additionally showed: `glob /root/*` denied, websearch absent,
+    `skill` load of the real local skill `docs` → `Unable to load skill` with no skills visible, a
+    project `.opencode/plugins/marker.ts` executing without policies and not executing under the
+    `plugin.use` deny policy, and `plugins: ["-*"]` removing the free-tier provider (so it is not
+    used). No fixture file was ever changed by the model; no process was left behind.
+  - Real launch through the installed `/root/work/bin/oauto-run` under a PTY: lock held by the
+    flock parent, process tree `flock → bash oauto-run → opencode --standalone --prompt → opencode.exe
+    serve --stdio --port 0` (no shared service), the preflight prompt auto-submitted, the model read
+    `src/calc.py`, globbed for tests and returned a review with a P1 on the planted regression;
+    after SIGTERM nothing remained and the lock was free. `~/.config/opencode` was not touched.
+- Independent review: an Opus reviewer subagent (not the implementing agent) reviewed the first
+  complete version and reported 2 P1 / 10 P2 / 10 P3. All were addressed: secret contents could
+  reach the model through the preflight diff of deleted or modified tracked secrets → excluded by
+  pathspec; the scan was narrower than the read-deny list, case-sensitive and pruned
+  `node_modules` → one shared pattern list, case-insensitive, unpruned, plus `.ssh/`, `.gnupg/`,
+  `.git/`, `.npmrc`, `.pypirc`, `.aws/`, `.docker/config.json`, `local.properties`,
+  `client_secret*.json`, `*.p8` and content checks; config rendered before the lock and into the
+  shared global file → lock first and a private `XDG_CONFIG_HOME` directory; `oauto deepseek` ran
+  GLM silently → alias routing; cap arithmetic and chars-vs-bytes → byte caps under a 100,000-byte
+  limit; virtualenv symlinks refused → system prefixes tolerated; skills wording, symlink wording,
+  "every refusal fires", ADR env/probe/parent inaccuracies → corrected; `install.sh` could delete
+  the rest of `.bashrc` on an unpaired marker and took any argument → refuses both, backs up
+  files, checks modes; detached/unborn HEAD rendering, XDG pass-through, basename-keyed lock →
+  fixed; behavioural tests added. Review provenance: `review_provider = claude_code_fallback`
+  style independent review (no Codex review exists yet; PR just opened).
+- Not physically tested: the Termux entrypoint itself — `proot-distro login` refuses to run from
+  inside the Debian PRoot session ("attempted to run proot-distro in a proot session"), so
+  `oauto <repo>` must be run once from a real Termux shell by the owner; a review on a real project
+  repository (only disposable fixtures were used); a full DeepSeek TUI session (only `opencode run`
+  with the DeepSeek agent and `--check`); offline behaviour (fails closed at the `models` step by
+  design, not exercised); the free tier's daily request limit (documented by OpenCode without a
+  number); `/etc/opencode` refusal and the preflight-size refusal (code paths only, not
+  exercised); whether a running TUI re-reads its private config mid-session.
+- Limitations / risks: every model request transmits the selected code context and the preflight
+  diff to OpenCode's remote inference service — zero retention is the provider's published term
+  only; the preflight is visible in `/proc/<pid>/cmdline` to same-user processes while the session
+  runs; `grep` is content-returning and path-unrestricted by OpenCode design (an explicit
+  `path: ".env"` returned the line), so the worktree scan is the real control; project `AGENTS.md`
+  is sent to the model as instructions; OpenCode downloads ripgrep to `~/.cache/opencode/bin/rg`
+  on first grep; helper commands without `--standalone` start the shared background service (one
+  was started and stopped during this investigation; it left `~/.config/opencode/service.json`
+  with a local service password, untouched); the launcher refuses any OpenCode version other than
+  2.2.6 until re-validated; no code-editing OpenCode mode exists.
+- Needs from the owner: run `oauto <repo>` once from Termux; merge the PR; decide whether
+  `DEVELOPMENT_RULES_FULL` §7 should list `oauto` next to `cauto`/`clauto`.
+- Next: after any OpenCode upgrade, re-run `oauto <repo> --check`, the fixture battery and the
+  tool-level probes, then bump `VALIDATED_VERSION` deliberately.
 
 ## [2026-09-15 UTC] Canonical Claude fallback review evidence
 - PR: <https://github.com/funzi7/automation-core/pull/56>

@@ -1,0 +1,537 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+WORK_ROOT=/root/work
+MEMORY_ROOT=/root/work/agent-memory
+GITHUB_OWNER=funzi7
+
+REPO_CACHE_DIR=/root/.cache/ai-launch
+REPO_CACHE="$REPO_CACHE_DIR/repos"
+REPO_CACHE_LOCK="$REPO_CACHE_DIR/repos.lock"
+
+MODE="${1:-menu}"
+if (($#)); then
+  shift
+fi
+
+SELECTED_REPO=""
+SELECTED_REL=""
+SELECTED_MODE=""
+
+die() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
+
+is_git_repo_root() {
+  local p="$1"
+  [[ -d "$p/.git" || -f "$p/.git" ]]
+}
+
+repo_rel() {
+  local p="$1"
+  printf '%s\n' "${p#"$WORK_ROOT"/}"
+}
+
+scan_repos() {
+  local marker root
+
+  while IFS= read -r marker; do
+    root="${marker%/.git}"
+
+    if [[ "$root" == "$MEMORY_ROOT" || "$root" == "$MEMORY_ROOT/"* ]]; then
+      continue
+    fi
+
+    [[ "$root" == "$WORK_ROOT/"* ]] || continue
+    printf '%s
+' "$root"
+  done < <(
+    find "$WORK_ROOT" -mindepth 2 \
+      \( -type d -name .git -print -prune \) -o \
+      \( -type f -name .git -print \) 2>/dev/null
+  ) | LC_ALL=C sort -u
+}
+
+refresh_repo_cache() {
+  local lock_fd tmp
+
+  mkdir -p "$REPO_CACHE_DIR"
+
+  exec {lock_fd}>"$REPO_CACHE_LOCK"
+  flock "$lock_fd"
+
+  tmp="$(mktemp "$REPO_CACHE_DIR/repos.tmp.XXXXXX")"
+
+  if ! scan_repos >"$tmp"; then
+    rm -f "$tmp"
+    flock -u "$lock_fd"
+    exec {lock_fd}>&-
+    return 1
+  fi
+
+  mv -f "$tmp" "$REPO_CACHE"
+
+  flock -u "$lock_fd"
+  exec {lock_fd}>&-
+}
+
+collect_repos() {
+  local root
+
+  if [[ ! -f "$REPO_CACHE" ]]; then
+    refresh_repo_cache
+  fi
+
+  while IFS= read -r root; do
+    [[ -n "$root" ]] || continue
+
+    # Cheap validation only; do not recursively rescan /root/work.
+    if is_git_repo_root "$root"; then
+      printf '%s
+' "$root"
+    fi
+  done <"$REPO_CACHE"
+}
+
+choose_mode() {
+  while true; do
+    echo
+    echo "Choose coding agent:"
+    echo "  1) Codex"
+    echo "  2) Claude Code"
+    echo "  0) Exit to Termux"
+    echo
+    read -r -p "Agent [1-2]: " choice
+
+    case "$choice" in
+      1) SELECTED_MODE=codex; return 0 ;;
+      2) SELECTED_MODE=claude; return 0 ;;
+      0) exit 0 ;;
+      *) echo "Invalid choice." ;;
+    esac
+  done
+}
+
+validate_simple_repo_name() {
+  local name="$1"
+  [[ -n "$name" ]] || return 1
+  [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+  [[ "$name" != "." && "$name" != ".." ]] || return 1
+  return 0
+}
+
+prompt_repo_name() {
+  local label="${1:-Repository name}"
+  local name
+
+  while true; do
+    read -r -p "$label: " name
+    if validate_simple_repo_name "$name"; then
+      printf '%s\n' "$name"
+      return 0
+    fi
+    echo "Use only letters, numbers, dot, underscore or hyphen; no spaces/slashes." >&2
+  done
+}
+
+ensure_gh_ready() {
+  if ! command -v gh >/dev/null 2>&1; then
+    echo
+    echo "GitHub CLI (gh) is not installed inside Debian."
+    echo "GitHub create/clone is unavailable until gh is installed."
+    return 1
+  fi
+
+  if ! gh auth status >/dev/null 2>&1; then
+    echo
+    echo "GitHub CLI is installed but not authenticated."
+    echo "Run: gh auth login"
+    return 1
+  fi
+
+  return 0
+}
+
+create_local_repo() {
+  local name target
+  name="$(prompt_repo_name "New local repository name")"
+  target="$WORK_ROOT/$name"
+
+  if [[ -e "$target" ]]; then
+    echo "Path already exists: $target"
+    return 1
+  fi
+
+  mkdir -p "$target"
+
+  if git init -b main "$target" >/dev/null 2>&1; then
+    :
+  else
+    git init "$target" >/dev/null
+    git -C "$target" symbolic-ref HEAD refs/heads/main
+  fi
+
+  SELECTED_REPO="$target"
+  SELECTED_REL="$(repo_rel "$target")"
+
+  echo
+  echo "Created local Git repository:"
+  echo "  $SELECTED_REPO"
+  return 0
+}
+
+create_github_repo() {
+  ensure_gh_ready || return 1
+
+  local name visibility visibility_flag target
+  name="$(prompt_repo_name "New GitHub repository name")"
+  target="$WORK_ROOT/$name"
+
+  if [[ -e "$target" ]]; then
+    echo "Local path already exists: $target"
+    echo "Choose a different name or use the existing repository."
+    return 1
+  fi
+
+  if gh repo view "$GITHUB_OWNER/$name" >/dev/null 2>&1; then
+    echo "GitHub repository already exists: $GITHUB_OWNER/$name"
+    echo "Use 'Clone existing GitHub repository' instead."
+    return 1
+  fi
+
+  while true; do
+    echo
+    echo "Visibility:"
+    echo "  1) Private"
+    echo "  2) Public"
+    echo "  0) Back"
+    read -r -p "Visibility [1-2]: " visibility
+    case "$visibility" in
+      1) visibility_flag=--private; break ;;
+      2) visibility_flag=--public; break ;;
+      0) return 1 ;;
+      *) echo "Invalid choice." ;;
+    esac
+  done
+
+  mkdir -p "$target"
+
+  if git init -b main "$target" >/dev/null 2>&1; then
+    :
+  else
+    git init "$target" >/dev/null
+    git -C "$target" symbolic-ref HEAD refs/heads/main
+  fi
+
+  echo
+  echo "Creating GitHub repository: $GITHUB_OWNER/$name"
+
+  if ! gh repo create "$GITHUB_OWNER/$name" \
+      "$visibility_flag" \
+      --source "$target" \
+      --remote origin; then
+    echo
+    echo "GitHub creation failed."
+    echo "The local Git repository was left intact at:"
+    echo "  $target"
+    echo "No local work was deleted."
+    return 1
+  fi
+
+  SELECTED_REPO="$target"
+  SELECTED_REL="$(repo_rel "$target")"
+
+  echo
+  echo "Created:"
+  echo "  Local : $SELECTED_REPO"
+  echo "  GitHub: $GITHUB_OWNER/$name"
+  return 0
+}
+
+default_clone_name() {
+  local spec="$1"
+  local name="${spec%/}"
+  name="${name##*/}"
+  name="${name%.git}"
+  printf '%s\n' "$name"
+}
+
+clone_github_repo() {
+  ensure_gh_ready || return 1
+
+  local spec default_name name target custom
+
+  echo
+  read -r -p "GitHub repository (OWNER/REPO or URL): " spec
+  [[ -n "$spec" ]] || {
+    echo "Repository was empty."
+    return 1
+  }
+
+  default_name="$(default_clone_name "$spec")"
+  if ! validate_simple_repo_name "$default_name"; then
+    default_name=""
+  fi
+
+  if [[ -n "$default_name" ]]; then
+    read -r -p "Local folder name [$default_name]: " custom
+    name="${custom:-$default_name}"
+  else
+    name="$(prompt_repo_name "Local folder name")"
+  fi
+
+  if ! validate_simple_repo_name "$name"; then
+    echo "Invalid local folder name."
+    return 1
+  fi
+
+  target="$WORK_ROOT/$name"
+
+  if [[ -e "$target" ]]; then
+    echo "Local path already exists: $target"
+    return 1
+  fi
+
+  echo
+  echo "Cloning into: $target"
+
+  if ! gh repo clone "$spec" "$target"; then
+    echo
+    echo "Clone failed."
+    return 1
+  fi
+
+  if ! is_git_repo_root "$target"; then
+    echo "Clone completed but no Git root was found at $target"
+    return 1
+  fi
+
+  SELECTED_REPO="$target"
+  SELECTED_REL="$(repo_rel "$target")"
+
+  echo
+  echo "Cloned:"
+  echo "  $SELECTED_REPO"
+  return 0
+}
+
+new_add_repo_menu() {
+  while true; do
+    echo
+    echo "New / Add repository:"
+    echo "  1) Create new GitHub repository"
+    echo "  2) Clone existing GitHub repository"
+    echo "  3) Create local repository only"
+    echo "  0) Back"
+    echo
+    read -r -p "Choice [1-3]: " choice
+
+    case "$choice" in
+      1)
+        if create_github_repo; then
+          refresh_repo_cache
+          return 0
+        fi
+        ;;
+      2)
+        if clone_github_repo; then
+          refresh_repo_cache
+          return 0
+        fi
+        ;;
+      3)
+        if create_local_repo; then
+          refresh_repo_cache
+          return 0
+        fi
+        ;;
+      0)
+        return 1
+        ;;
+      *)
+        echo "Invalid choice."
+        ;;
+    esac
+  done
+}
+
+choose_repo() {
+  local -a repos=()
+  local choice i selected
+
+  while true; do
+    mapfile -t repos < <(collect_repos)
+
+    echo
+    echo "Choose repository:"
+    echo
+
+    if ((${#repos[@]} == 0)); then
+      echo "  (no Git repositories found under $WORK_ROOT)"
+    else
+      for i in "${!repos[@]}"; do
+        printf '  %d) %s\n' "$((i + 1))" "$(repo_rel "${repos[$i]}")"
+      done
+    fi
+
+    echo
+    echo "  N) New / Add repository"
+    echo "  R) Refresh list"
+    echo "  0) Exit to Termux"
+    echo
+
+    if ((${#repos[@]})); then
+      read -r -p "Repo [1-${#repos[@]}, N, R, 0]: " choice
+    else
+      read -r -p "Repo [N, R, 0]: " choice
+    fi
+
+    case "$choice" in
+      0)
+        exit 0
+        ;;
+      [Nn])
+        if new_add_repo_menu; then
+          return 0
+        fi
+        ;;
+      [Rr])
+        echo "Refreshing repository list..."
+        refresh_repo_cache
+        continue
+        ;;
+      *)
+        if [[ "$choice" =~ ^[0-9]+$ ]] &&
+           ((choice >= 1 && choice <= ${#repos[@]})); then
+          selected="${repos[$((choice - 1))]}"
+          SELECTED_REPO="$selected"
+          SELECTED_REL="$(repo_rel "$selected")"
+          return 0
+        fi
+        echo "Invalid choice."
+        ;;
+    esac
+  done
+}
+
+resolve_direct_repo() {
+  local arg="$1"
+  local candidate="$WORK_ROOT/$arg"
+  local -a matches=()
+  local p
+
+  if [[ "$candidate" == "$WORK_ROOT/"* ]] && is_git_repo_root "$candidate"; then
+    SELECTED_REPO="$candidate"
+    SELECTED_REL="$(repo_rel "$candidate")"
+    return 0
+  fi
+
+  while IFS= read -r p; do
+    if [[ "$(basename "$p")" == "$arg" ]]; then
+      matches+=("$p")
+    fi
+  done < <(collect_repos)
+
+  if ((${#matches[@]} == 1)); then
+    SELECTED_REPO="${matches[0]}"
+    SELECTED_REL="$(repo_rel "$SELECTED_REPO")"
+    return 0
+  fi
+
+  if ((${#matches[@]} > 1)); then
+    echo "More than one repository has basename '$arg'; choose from the menu." >&2
+  else
+    echo "Repository '$arg' was not found; choose from the menu." >&2
+  fi
+
+  return 1
+}
+
+case "$MODE" in
+  codex|claude|opencode)
+    SELECTED_MODE="$MODE"
+    ;;
+  menu)
+    choose_mode
+    ;;
+  *)
+    die "Usage: ai-launch [codex|claude|opencode|menu] [repo]"
+    ;;
+esac
+
+# oauto: leading model aliases and the PR mode (`oauto deepseek`, `oauto pr`,
+# `oauto deepseek pr`) are not repository names; keep them for oauto-run, ahead of the
+# remaining arguments, and fall through to the normal repository menu.
+oauto_args=()
+while [[ "$SELECTED_MODE" == opencode ]] && (($#)) && [[ "$1" =~ ^(glm|deepseek|pr)$ ]]; do
+  oauto_args+=("$1")
+  shift
+done
+
+if (($#)) && [[ "$1" != -* ]]; then
+  direct="$1"
+  shift
+  resolve_direct_repo "$direct" || choose_repo
+else
+  choose_repo
+fi
+
+[[ -n "$SELECTED_REPO" ]] || die "No repository selected."
+is_git_repo_root "$SELECTED_REPO" || die "Selected path is not a Git repository root: $SELECTED_REPO"
+
+cd "$SELECTED_REPO"
+
+# oauto: read-only OpenCode reviewer. Repository resolution above is shared with
+# cauto/clauto; everything OpenCode-specific (preflight, policy, lock, banner)
+# lives in oauto-run, so the codex/claude paths below are untouched.
+if [[ "$SELECTED_MODE" == opencode ]]; then
+  exec /root/work/bin/oauto-run "$SELECTED_REPO" "${oauto_args[@]}" "$@"
+fi
+
+echo
+echo "============================================================"
+echo "Agent : $SELECTED_MODE"
+echo "Repo  : $SELECTED_REL"
+echo "Path  : $SELECTED_REPO"
+echo "Queue : shared Codex + Claude heavy-build lock"
+echo "============================================================"
+echo
+
+case "$SELECTED_MODE" in
+  codex)
+    exec codex --yolo \
+      --add-dir "$MEMORY_ROOT" \
+      -m gpt-5.6-sol \
+      -c 'model_reasoning_effort="ultra"' \
+      -c 'agents.enabled=true' \
+      -c 'agents.max_concurrent_threads_per_session=4' \
+      -c 'agents.default_subagent_model="gpt-5.6-sol"' \
+      -c 'agents.default_subagent_reasoning_effort="ultra"' \
+      "$@"
+    ;;
+
+  claude)
+    export CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS=4
+    export CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY=4
+
+    exec /root/.local/bin/claude \
+      --model fable \
+      --effort max \
+      --permission-mode dontAsk \
+      --allowedTools \
+        Bash \
+        Read \
+        Edit \
+        Write \
+        Glob \
+        Grep \
+        Agent \
+        WebFetch \
+        WebSearch \
+        Skill \
+        NotebookEdit \
+      --add-dir "$MEMORY_ROOT" \
+      "$@"
+    ;;
+esac

@@ -164,21 +164,22 @@ is the permanent human opt-out and is never removed by automation.
    unverified until checked from each repository's latest sync PR and current
    workflow contents.
 4. **Codex Cloud limitation:** View task, task diff, Created commit hint, or ready diff is not delivery unless the PR branch gets a newer commit after the Cloud marker. No browser/UI automation or fake Update branch API workaround exists.
-5. **Canonical Claude fallback review evidence — merge and rollout pending.**
+5. **Canonical Claude fallback review evidence — merged; rollout pending.**
    The central contract is implemented and deterministically covered in
-   automation-core (see `docs/adr/0001-canonical-review-evidence.md`). What
-   remains physically pending: (a) **PR #56 is not merged** — its Gate is red
-   because Codex cannot review the head while its quota is exhausted and
-   fallback is not enabled here, and Merge Bot will not touch a `claude/` branch
-   touching protected paths, so it needs the owner or Codex quota to return;
-   (b) each consumer repository must then receive the new workflow through the
-   normal sync, which clones automation-core main and so must wait for the
-   merge; and (c) `CLAUDE_FALLBACK_REVIEW_ENABLED` must be set to `true` per
-   repository — Actions variables are not synced, so until it is set every repo
-   keeps the Codex-only contract unchanged. No production fallback attestation
-   has been minted or honoured yet, and because `pull_request_target` loads the
-   Gate from the base branch, the new gate/merge-bot/watchdog paths have not run
-   in production at all.
+   automation-core (see `docs/adr/0001-canonical-review-evidence.md`).
+   (a) DONE 2026-09-15T14:03:30Z: PR #56 was merged into `main` as
+   `15652f663ccf31fac3c03651a5a7b56758257de4`. Still physically pending as
+   checked on 2026-11-07: (b) no consumer default branch carries
+   `claude-fallback-review.yml` yet — paywall-bot, OptionsProfitTracker,
+   thai-rent-finder and agent-memory all return 404 for it, while sync PRs
+   paywall-bot #107 (2026-10-02), OptionsProfitTracker #20 (2026-09-22) and
+   thai-rent-finder #92 (2026-08-12) are open and unmerged; (c) no repository
+   has set `CLAUDE_FALLBACK_REVIEW_ENABLED` (variables seen: paywall-bot
+   `CLAUDE_SHOW_FULL_OUTPUT`, `CODEX_CLOUD_ENABLED`; thai-rent-finder
+   `CLAUDE_SHOW_FULL_OUTPUT`; OptionsProfitTracker and agent-memory none), so
+   every repo keeps the Codex-only contract unchanged. No production fallback
+   attestation has been minted or honoured yet, and the new gate/merge-bot/
+   watchdog paths have not been exercised in production.
 6. **OptionsProfitTracker PR #19 — not yet passable.** Its trusted quota notices
    (2026-09-07 and 2026-09-09) all predate its current head
    `074de86e52f2a168b89dc21ff32a851570f1b144`, pushed 2026-09-14T19:45:26Z, and
@@ -188,8 +189,16 @@ is the permanent human opt-out and is never removed by automation.
    review and attestation, or a normal Codex review once quota returns. Do not
    claim it passes before that evidence exists.
 7. **Longer-term:** update minutes-guard target coverage after downstream audit; keep direct-to-main and branch-protection decisions explicit.
-8. **Codex Gate fail-closed enforcement (2026-11-08) — PR #59 open, owner merge
-   pending.** Branch `claude/codex-gate-fail-closed`,
+8. **Codex Gate fail-closed enforcement (2026-11-08) — PR #59 merged to `main`
+   (`15e44e6`, 2026-11-08); first post-merge marker publish OBSERVED
+   2026-11-09 02:20Z.** On PR #58's first push after the merge, the
+   `pull_request_target` gate run `42550382183` logged `PR #58: indexed trusted
+   head epoch run 42550382183/1` and left the `github-actions[bot]`
+   `<!-- codex-head-epoch:v3 run=42550382183 attempt=1 pr=58 head=33c0dda… -->`
+   comment on the PR at 02:20:32Z — no `Resource not accessible by
+   integration` any more; the `🟡` pre-review verdict followed as designed. The
+   `🟠` technical-error verdict was not induced and stays covered by the
+   end-to-end tests only. Branch `claude/codex-gate-fail-closed`,
    <https://github.com/funzi7/automation-core/pull/59>. Physically verified:
    the root cause (403 on the PR-comment marker in both repositories; zero
    markers ever written) and the legitimacy of the three paywall-bot merges;
@@ -241,6 +250,120 @@ is the permanent human opt-out and is never removed by automation.
    crashes the job instead of exiting green or alerting — a loud, deduplicated
    `Bad credentials` preflight (with the Telegram escalation) is a future
    hardening item and is deliberately NOT part of PR #59.
+10. **oauto (read-only OpenCode reviewer launcher) — installed, PR #58 pending
+    (conflicts with `main` resolved 2026-11-09).** The launcher, its policy
+    module, tests and docs live under `launchers/` on branch
+    `claude/oauto-opencode-reviewer` (ADR 0002). Validated on the device against
+    OpenCode 2.2.6 with disposable fixture repositories (see the 2026-11-08 and
+    2026-11-09 `handoffs/loop-build.md` entries for the full record). Codex's
+    first review (commit `d17f3a1`) found three P1s in the git preflight —
+    repository-configured textconv/external-diff helpers executed,
+    special-character filenames escaped the secret exclusion, rename detection
+    hid a renamed secret's source — all fixed on the PR branch with regression
+    tests ("Codex P1 round" entry). 2026-11-09 round: the owner's GLM
+    whole-repository audit (run through `oauto` itself on 2026-11-08) was
+    verified finding by finding; three real gaps were fixed with reproduce-first
+    regression tests — a hard link whose other name lies outside the repository
+    was undetectable (now refused unconditionally when `st_nlink` exceeds the
+    names the scan sees), a linked worktree's git dir and commondir skipped the
+    symlinked-config refusal and the hard-link alias registration (now walked
+    under the `.git` rules), Composer `auth.json` and other common credential
+    files were missing from the pattern list (added on all four controls) — the
+    policy ceiling OpenCode loads is now verified at every launch (`debug
+    config` document `policies` + `permissions` loaded verbatim, 62 + 44 probes
+    on the real binary), and the claimed backslash glob escape was shown NOT
+    reproducible on the real binary (ripgrep `--glob` filter rooted at the tool
+    path, which `external_directory` gates) — no rule added. An independent
+    Opus review of that round found one pre-existing P2 — a crafted `.git`
+    file (`gitdir: <other repo>/.git`) pointed the preflight at another local
+    repository, whose content then reached the prompt — fixed with
+    `check-repo-git` (refuses a `.git` pointer this worktree does not own
+    before any git command runs), plus six P3s fixed (git-exact pointer
+    parsing, verbatim rule arrays, exact-name denial of case-variant secret
+    files under the override, object-store hard-link accounting, secret-named
+    git-dir aliases, walk errors failing closed). Codex's review of the pushed
+    head `33c0dda` added one P1 of the same class — a real `.git` directory
+    carrying a `commondir` file naming another repository — fixed in `5860e1f`
+    (refused before any git command; a submodule git dir is accepted only
+    without one); its review of the next head `0ca1844` added a P1 in the
+    include-history traversal — a committed symlink among deleted included
+    configs was read as text instead of followed, so its target's removed
+    credential travelled — fixed in `afd4639` (`resolve-link`: the target is
+    excluded and followed within the same revision); its review of `2c743cf`
+    added a P1 in that resolver — an absolute target inside the repository was
+    treated as outside — fixed in `62fca59`, which also resolves a committed
+    directory symlink on an include path (the last documented gap of this
+    class; only a never-committed, deleted directory link stays unresolvable);
+    its review of `4dc70dd` added a P1 — an include path through a directory
+    symlink retargeted later lost its written name, so history never saw the
+    committed link — fixed in `4544f09` (the written name is registered next
+    to the resolved one); its review of `9e8a88d` added the same gap inside
+    `resolve-link` for absolute targets — fixed in `09dfcc8` (every symlink
+    target is judged both as written and as live-resolved); its review of
+    `bdc6cef` added a P1 in the same traversal — nested relative includes of
+    a symlinked config were resolved against the link's target directory
+    instead of the path git opened — fixed in `2d5d7b7` (every history entry
+    carries its resolution context); its review of `0bc9c29` added a P1 — a
+    symlink target with a symlinked directory followed by `..` was collapsed
+    lexically — fixed in `3059954` (+ `f16dfe6`): historical include paths are
+    now walked through the tree at the revision like a path lookup
+    (`tree_walk`), which replaces the earlier per-link resolver; its review of
+    `d64744c` added a P1 — an include DIRECTIVE written `conf/../b.cfg` was
+    collapsed before the walk — fixed in `f852171` (directives keep their
+    components, as `W` records from `includes-in-config` and `--walk-out`
+    from the scan, and are walked uncollapsed); its review of `2389a03`
+    added a P1 — a committed link target ending in a newline lost it to
+    command substitution — fixed in `d9b71a1` (targets read byte-exact); its
+    review of `68d2fd2` added a P1 — a link target leaving the repository
+    through an outside alias that points back into it was treated as an
+    outside file — fixed in `8308090` (outside paths that resolve back into
+    the repository re-enter the walk); a second Codex pass on `3833718` added
+    a P1 — `realpath` output captured by command substitution lost trailing
+    newline bytes of an in-repository name reached through an outside alias
+    — fixed in `1e6fbd0` (`realpath -z -m` read NUL-terminated). `main`
+    (PR #59) was merged into the branch (`01f6840`). Zen terms for both
+    approved models re-checked 2026-11-09 (zero-retention, no training).
+    OWNER-APPROVED (OPTION 1, 2026-11-09): the default `oauto <repo>` stays
+    exactly as it was and a separate PR review mode was added in `425e6ee` —
+    `oauto <repo> pr` / `oauto <repo> deepseek pr` / `... --check` identify
+    the current branch's open pull request through one read-only `gh api`
+    call outside the model, validate it (one PR, same-repo head at the local
+    HEAD, base in this repository, present locally as `origin/<base>`) and
+    run the unchanged pipeline with the verified base commit (`origin/<base>`
+    shown as its label); every doubt fails closed, nothing is ever fetched or
+    checked out. Verified on a clone at PR #58's head (17 files, identical to
+    GitHub). An independent Opus review of the task diff found a pre-existing
+    P1 (`git ls-tree` read a leading `:` in an included config's name as
+    pathspec magic, losing the chain below it — fixed with `:(literal)` in
+    `e01de32`), a PR-mode P2 (`gh api` rewrote `:owner|:repo|:branch`
+    placeholders inside the head filter and ran git in the reviewed repository
+    to fill them — the filter's colon is now `%3A` and gh runs from `/`,
+    `1b62929`) and four P3s (redaction gaps, a planted `origin/<base>` race,
+    `|` in visited keys, `oauto ./pr` for a repository named `pr`), all fixed
+    with regression tests. Physically pending for PR
+    mode: the real-repository `--check` of this checkout against PR #58
+    (needs the pushed head — it correctly refused the unpushed one; run
+    after the push, result in `cc-latest.md`), and a PR-mode TUI session.
+    The Codex review, CI and Codex Gate state of the
+    pushed head are recorded in `agent-memory/automation-core/cc-latest.md`.
+    DONE by the owner on 2026-11-08: the Termux hop (`oauto <repo>` from a real
+    Termux shell) and a review of a real project repository (the GLM audit).
+    Physically pending: the PR merge, a full DeepSeek TUI session, and an owner
+    decision on listing `oauto` in `DEVELOPMENT_RULES_FULL` §7. Any OpenCode
+    upgrade re-opens validation: the launcher refuses every version other than
+    2.2.6.
+11. **Future backlog recorded from the GLM audit (verified, deliberately NOT in
+    PR #58):** pin the third-party actions `peter-evans/create-pull-request@v6`,
+    `anthropics/claude-code-action@v1` and `openai/codex-action@v1` (and the
+    `actions/*` major tags) to commit SHAs with provenance comments — two of them
+    run with `AUTOMATION_PAT` / `ANTHROPIC_API_KEY` in scope; make
+    `scripts/validate.sh` glob `*.yml *.yaml` like `validate_github_scripts.py`
+    (no tracked `.yaml` exists today, so nothing is skipped yet); let
+    `ai-launch` take the oauto alias set from `oauto-policy approved` instead of
+    duplicating `glm|deepseek`; optionally add a `*\*` glob deny as defence in
+    depth (not exploitable on OpenCode 2.2.6, see the 2026-11-09 handoff entry);
+    a probe test that `git config --list --show-origin -z` still yields a
+    non-empty include set on a repository with includes (format-drift guard).
 
 Older items below are history. If they conflict with this section, treat them as HISTORICAL or SUPERSEDED and follow this section.
 
@@ -370,6 +493,28 @@ Synced workflows listed in `sync-config.json`: `codex-auto-fix.yml`, `codex-gate
 - `bootstrap.yml`: opens onboarding PRs for newly eligible repos; never auto-merges them.
 - `telegram-morning-report.yml`: read-only daily digest; no write API calls.
 - `minutes-guard.yml`: hub-only Actions-minutes guard. Its target coverage may be stale and needs audit before expansion.
+
+## Device launchers (not synced)
+
+`launchers/ai-launch` is the tracked copy of `/root/work/bin/ai-launch` (`cauto`,
+`clauto`, `ai`, plus the `opencode` mode). `launchers/oauto/` is the `oauto <repo>`
+read-only OpenCode reviewer: OpenCode 2.2.6 pinned to `opencode/glm-5.3-flash-free`
+(default) or `opencode/deepseek-v4.1-flash-free`, read/glob/grep only, every other
+tool, provider, model, plugin, MCP server and external directory denied by
+`permissions` + `policies` in a private per-launch config directory, verified
+before every launch with OpenCode's own diagnostics, one session per repository.
+Its git preflight runs no repository-configured helper (no textconv, external
+diff, clean/smudge filter, fsmonitor, gpg or hook; `--work-tree` pinned) and
+excludes secret-like paths by exact bytes, renames included. The worktree scan
+refuses outward symlinks, aliases of denied paths, hard links with a name
+outside the repository (or more names than the scan sees), symlinked Git config
+files — in `.git` and in the git dir and commondir of a linked worktree — and
+secret-like files (Composer `auth.json`, `.pgpass`, `.my.cnf`, `.s3cfg`, `.ppk`,
+kubeconfig, Terraform CLI and RubyGems credentials included since 2026-11-09)
+unless explicitly overridden; the policy ceiling and permissions OpenCode
+reports having loaded are probed before every launch.
+Install/refresh with `bash launchers/oauto/install.sh`; contract in
+`docs/adr/0002-oauto-read-only-opencode-reviewer.md`.
 
 ## Repos Status
 

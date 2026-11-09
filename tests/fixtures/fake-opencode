@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# Test double for the OpenCode 2.2.6 CLI surface that oauto-run uses. It reads the
+# config oauto-run rendered into $XDG_CONFIG_HOME/opencode/opencode.json and answers
+# like the real binary does on the device (shapes verified 2026-11-07):
+#   --version                      -> "opencode v2.2.6" (VERSION= in the control file overrides)
+#   models --standalone            -> approved ids + EXTRA_MODELS minus disabled
+#   debug config --standalone      -> [{document}, {directory}]
+#   debug agents --standalone      -> resolved agents with model {id, providerID}
+#   --standalone --prompt <text>   -> records argv/env/prompt to LAUNCH_LOG, and the
+#                                     whole --prompt argument to PROMPT_FILE when set
+# oauto-run scrubs the environment before calling the binary, so the test controls
+# live in $HOME/.fake-opencode-control (KEY=VALUE lines); HOME always passes through.
+set -euo pipefail
+CFG="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/opencode.json"
+CONTROL="$HOME/.fake-opencode-control"
+control() { # KEY -> value or empty
+  [[ -f "$CONTROL" ]] || return 0
+  sed -n "s/^$1=//p" "$CONTROL" | head -1
+}
+VERSION="$(control VERSION)"
+EXTRA_MODELS="$(control EXTRA_MODELS)"
+LAUNCH_LOG="$(control LAUNCH_LOG)"
+PROMPT_FILE="$(control PROMPT_FILE)"
+
+case "${1:-}" in
+  --version)
+    echo "opencode v${VERSION:-2.2.6}"
+    ;;
+  models)
+    python3 -I - "$CFG" "$EXTRA_MODELS" <<'EOF'
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+catalogue = ["opencode/glm-5.3-flash-free", "opencode/deepseek-v4.1-flash-free"]
+catalogue += [m for m in sys.argv[2].replace(",", " ").split() if m]
+disabled = {f"opencode/{k}" for k, v in cfg.get("providers", {}).get("opencode", {}).get("models", {}).items() if v.get("disabled")}
+for m in sorted(set(catalogue)):
+    if m not in disabled:
+        print(m)
+EOF
+    ;;
+  debug)
+    case "${2:-}" in
+      config)
+        python3 -I - "$CFG" <<'EOF'
+import json, os, sys
+cfg = json.load(open(sys.argv[1]))
+print(json.dumps([{"type": "document", "path": sys.argv[1], "info": cfg},
+                  {"type": "directory", "path": os.path.dirname(sys.argv[1])}], indent=2))
+EOF
+        ;;
+      agents)
+        python3 -I - "$CFG" <<'EOF'
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+out = []
+for name, agent in cfg.get("agents", {}).items():
+    if agent.get("disabled"):
+        continue
+    model = agent.get("model") or cfg["model"]
+    provider, mid = model.split("/", 1)
+    out.append({
+        "id": name,
+        "hidden": name in ("title", "summary", "compaction"),
+        "mode": agent.get("mode", "primary"),
+        "model": {"id": mid, "providerID": provider},
+        "permissions": cfg.get("permissions", []) + agent.get("permissions", []),
+    })
+print(json.dumps(out, indent=2))
+EOF
+        ;;
+      *) echo "fake-opencode: unsupported debug subcommand ${2:-}" >&2; exit 2 ;;
+    esac
+    ;;
+  --standalone)
+    log="${LAUNCH_LOG:-/dev/null}"
+    {
+      echo "ARGS_BEGIN"
+      for a in "$@"; do printf '%s\n' "${a:0:120}"; done
+      echo "ARGS_END"
+      echo "ENV_BEGIN"
+      env | cut -d= -f1 | sort
+      echo "ENV_END"
+      echo "CWD $PWD"
+      echo "PROMPT_BYTES ${#3}"
+      echo "PROMPT_HEAD ${3:0:400}"
+    } > "$log"
+    if [[ -n "$PROMPT_FILE" ]]; then printf '%s' "$3" > "$PROMPT_FILE"; fi
+    ;;
+  *)
+    echo "fake-opencode: unsupported invocation: $*" >&2
+    exit 2
+    ;;
+esac

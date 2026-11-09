@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Test double for the one GitHub CLI call oauto-run makes in PR review mode:
+#   gh api -H 'Accept: application/vnd.github+json' 'repos/<owner>/<repo>/pulls?state=open&head=<owner>:<branch>&per_page=10'
+# oauto-run runs gh in a scrubbed environment (env -i keeps HOME), so the test controls
+# live in $HOME/.fake-gh-control (KEY=VALUE lines), like fake-opencode's:
+#   PULLS_JSON=<file>   printed on stdout as the API response (exit 0)
+#   EXIT=<code>         a non-zero code fails the call like gh does: STDERR's text (default:
+#                       an authentication error) on stderr, nothing useful on stdout
+#   STDERR=<text>       the error text for EXIT
+#   ARGV_LOG=<file>     every call appends its argv (one per line), its working directory
+#                       and its environment variable NAMES (never values) to this file
+# Like gh 2.46, an endpoint holding `:owner`, `:repo`, `:branch` or `{word}` is not sent as
+# written (gh fills those from git in its working directory); the double refuses it.
+set -euo pipefail
+CONTROL="$HOME/.fake-gh-control"
+control() { # KEY -> value or empty
+  [[ -f "$CONTROL" ]] || return 0
+  sed -n "s/^$1=//p" "$CONTROL" | head -1
+}
+PULLS_JSON="$(control PULLS_JSON)"
+EXIT_CODE="$(control EXIT)"
+STDERR_TEXT="$(control STDERR)"
+ARGV_LOG="$(control ARGV_LOG)"
+
+if [[ -n "$ARGV_LOG" ]]; then
+  {
+    echo "ARGS_BEGIN"
+    printf '%s\n' "$@"
+    echo "ARGS_END"
+    echo "CWD $PWD"
+    echo "ENV_BEGIN"
+    env | cut -d= -f1 | sort
+    echo "ENV_END"
+  } >> "$ARGV_LOG"
+fi
+if [[ -n "$EXIT_CODE" && "$EXIT_CODE" != 0 ]]; then
+  # gh api prints the error body on stdout and the summary on stderr.
+  echo '{"message":"Bad credentials","documentation_url":"https://docs.github.com/rest","status":"401"}'
+  printf '%s\n' "${STDERR_TEXT:-gh: Bad credentials (HTTP 401)}" >&2
+  exit "$EXIT_CODE"
+fi
+case "${1:-}" in
+  api)
+    endpoint="${!#}"
+    placeholder_re='(:(owner|repo|branch)([^A-Za-z0-9_]|$)|\{[a-z]+\})'
+    if [[ "$endpoint" =~ $placeholder_re ]]; then
+      echo "fake-gh: the endpoint holds the gh placeholder '${BASH_REMATCH[1]}', which gh would rewrite: $endpoint" >&2
+      exit 3
+    fi
+    [[ -n "$PULLS_JSON" ]] || { echo "fake-gh: no PULLS_JSON in $CONTROL" >&2; exit 2; }
+    cat -- "$PULLS_JSON"
+    ;;
+  *)
+    echo "fake-gh: unsupported invocation: $*" >&2
+    exit 2
+    ;;
+esac

@@ -1,0 +1,826 @@
+#!/usr/bin/env bash
+# oauto-run — launch OpenCode as a privacy-restricted, read-only code reviewer.
+#
+# Invoked by `/root/work/bin/ai-launch opencode <repo>` (Termux: `oauto <repo>`), which
+# resolves the repository exactly as cauto/clauto do. This script owns everything
+# OpenCode-specific:
+#
+#   0. a per-repository lock, taken before anything is written or rendered;
+#   1. fail-closed preflight (binary version, system config, project config);
+#   2. one scan of the worktree for secret-like files, outward symlinks and
+#      credential-looking config content;
+#   3. read-only git metadata collection outside the model's tool execution, in which
+#      no repository-configured helper program runs, with every secret-like path
+#      (matched by its exact bytes, renames included) excluded from the diffs;
+#   4. rendering of a private OpenCode config directory (XDG_CONFIG_HOME under the
+#      oauto state dir) from oauto-policy.py, with every model the binary offers
+#      except the approved one(s) disabled;
+#   5. verification of the resolved config, agents and models through OpenCode's own
+#      diagnostic commands;
+#   6. exec of OpenCode in a scrubbed environment with --standalone (no background
+#      service), never with --auto.
+#
+# `pr` selects the PR review mode (owner decision 2026-11-09; the default mode is
+# unchanged): the open pull request whose head is the current branch is identified
+# before the scan through one read-only GitHub API call (gh, scrubbed environment),
+# and the branch delta of step 3 is taken against that pull request's base,
+# origin/<base>, which must already exist locally. Nothing is ever fetched, checked out
+# or moved; any doubt about the pull request fails closed.
+#
+# Usage: oauto-run <repo-path> [glm|deepseek] [pr] [--check] [--render-only]
+set -euo pipefail
+
+OAUTO_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+POLICY="$OAUTO_DIR/oauto-policy.py"
+OPENCODE_BIN="${OAUTO_OPENCODE_BIN:-/usr/local/bin/opencode}"
+VALIDATED_VERSION="2.2.6"
+STATE_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/oauto"
+LOCK_DIR="${CODEX_RESOURCE_LOCK_DIR:-/root/work/.locks}"
+SCAN_BUDGET="${OAUTO_SCAN_BUDGET:-180}"
+# The preflight travels as one --prompt argument (Linux caps a single argument at
+# 128 KiB). The section caps below sum to 67,000 bytes plus headers, under the limit.
+PREFLIGHT_MAX_BYTES=100000
+DIFF_MAX_BYTES=24000
+STAT_MAX_BYTES=4000
+STATUS_MAX_BYTES=8000
+LOG_MAX_BYTES=3000
+
+die() { printf 'oauto: FAILED (fail closed): %s\n' "$*" >&2; exit 1; }
+note() { printf 'oauto: %s\n' "$*" >&2; }
+
+REPO="${1:-}"
+[[ -n "$REPO" ]] || die "usage: oauto-run <repo-path> [glm|deepseek] [pr] [--check] [--render-only]"
+shift
+MODEL_ALIAS=glm
+MODE=launch
+PR_MODE=0
+LOCKED=0
+for arg in "$@"; do
+  case "$arg" in
+    glm|deepseek) MODEL_ALIAS="$arg" ;;
+    pr) PR_MODE=1 ;;
+    --check) MODE=check ;;
+    --render-only) MODE=render ;;
+    --locked) LOCKED=1 ;;
+    *) die "unknown argument '$arg' (accepted: glm, deepseek, pr, --check, --render-only)" ;;
+  esac
+done
+
+[[ -d "$REPO/.git" || -f "$REPO/.git" ]] || die "not a Git repository root: $REPO"
+REPO="$(cd "$REPO" && pwd -P)"
+# A crafted `.git` FILE (gitdir: <other repo>/.git) would make every preflight git
+# command run against another local repository and leak its content. Refuse such a
+# repository before ANY git command runs: .git must be a real directory or a .git file
+# this worktree owns (a linked worktree or submodule checkout).
+python3 -I "$POLICY" check-repo-git "$REPO" ||
+  die "refusing to launch: $REPO/.git is not this worktree's own git directory (see the reason above); no git command was run against it"
+REPO_NAME="$(basename "$REPO")"
+REPO_KEY="$REPO_NAME-$(printf '%s' "$REPO" | sha256sum | cut -c1-8)"
+MODEL_ID="$(python3 -I "$POLICY" approved | awk -v a="$MODEL_ALIAS" '$1 == a {print $2}')"
+[[ -n "$MODEL_ID" ]] || die "model alias '$MODEL_ALIAS' is not approved"
+
+if [[ "$MODE" == render ]]; then
+  exec python3 -I "$POLICY" render --model "$MODEL_ALIAS"
+fi
+
+# ---------------------------------------------------------------------------
+# 0. Lock first. The script re-executes itself under flock; that flock parent
+#    holds the lock for the lifetime of this process and of the OpenCode process
+#    it finally execs into (--close: the descriptor is never inherited).
+# ---------------------------------------------------------------------------
+LOCK_FILE="$LOCK_DIR/oauto-$REPO_KEY.lock"
+if (( ! LOCKED )); then
+  mkdir -p "$LOCK_DIR"
+  FLOCK_BIN="$(command -v flock)" || die "flock is required"
+  if ! "$FLOCK_BIN" -n --exclusive --close "$LOCK_FILE" true 2>/dev/null; then
+    die "another oauto session is already open on $REPO_NAME (lock $LOCK_FILE); finish it before starting a second review"
+  fi
+  mode_flag=()
+  [[ "$MODE" == check ]] && mode_flag=(--check)
+  (( PR_MODE )) && mode_flag+=(pr)
+  exec "$FLOCK_BIN" -n -E 75 --exclusive --close "$LOCK_FILE" \
+    "$BASH" "$0" "$REPO" "$MODEL_ALIAS" "${mode_flag[@]}" --locked
+fi
+
+# ---------------------------------------------------------------------------
+# 1. Preflight: binary, system config, project config.
+# ---------------------------------------------------------------------------
+[[ -x "$OPENCODE_BIN" ]] || die "OpenCode binary not found at $OPENCODE_BIN"
+version="$("$OPENCODE_BIN" --version 2>/dev/null | sed -n 's/^opencode v\{0,1\}//p' | head -1)"
+[[ "$version" == "$VALIDATED_VERSION" ]] ||
+  die "OpenCode '$version' is installed but only $VALIDATED_VERSION was validated; permission semantics change between versions, re-validate before use"
+
+for sys_cfg in /etc/opencode/opencode.json /etc/opencode/opencode.jsonc; do
+  [[ -e "$sys_cfg" ]] && die "system-level OpenCode config exists ($sys_cfg); it outranks oauto's config"
+done
+
+# Project-level config outranks the launcher's config for permissions and can add
+# agents, MCP servers or plugins, so a repository carrying one is refused outright.
+for proj in "$REPO/opencode.json" "$REPO/opencode.jsonc" "$REPO/.opencode"; do
+  [[ -e "$proj" ]] && die "repository contains OpenCode project config ($proj); oauto refuses to review repositories that reconfigure OpenCode"
+done
+walk="$REPO"
+while [[ "$walk" != / ]]; do
+  walk="$(dirname "$walk")"
+  for proj in "$walk/opencode.json" "$walk/opencode.jsonc"; do
+    [[ -e "$proj" ]] && die "parent directory carries OpenCode config ($proj)"
+  done
+done
+
+# ---------------------------------------------------------------------------
+# Git, as every later step runs it: scrubbed, time-bounded and helper-free. Defined
+# before the scan, which asks git which configuration files it loads.
+# ---------------------------------------------------------------------------
+# Scrubbed, time-bounded git. env -i: no GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE /
+# GIT_EXTERNAL_DIFF / GIT_CONFIG_* redirection from the caller's environment. HOME
+# stays so the user's global config and safe.directory still apply. --work-tree:
+# a core.worktree in .git/config cannot point the diffs at a directory outside $REPO.
+git_env=(HOME="$HOME" PATH="$PATH" LANG="${LANG:-C.UTF-8}" TMPDIR="${TMPDIR:-/tmp}"
+         GIT_OPTIONAL_LOCKS=0 GIT_TERMINAL_PROMPT=0)
+if [[ -n "${LC_ALL:-}" ]]; then git_env+=("LC_ALL=$LC_ALL"); fi
+if [[ -n "${TZ:-}" ]]; then git_env+=("TZ=$TZ"); fi
+git_cfg=(-c core.pager=cat -c color.ui=never
+         -c color.diff=never -c color.status=never -c color.decorate=never  # color.<command> outranks color.ui
+         -c core.fsmonitor=false        # no fsmonitor hook on the index refresh of status/diff
+         -c core.hooksPath=/dev/null    # no repository hook, e.g. post-index-change when diff refreshes the index
+         -c log.showSignature=false     # no gpg.program / gpg.ssh.program run by git log
+         -c submodule.recurse=false     # no command recursing into submodules, which have their own config
+         -c diff.external=)             # belt and braces next to --no-ext-diff
+# Every configured clean/smudge/process filter driver (a .gitattributes `filter=`
+# acts only through these keys; git-lfs is one) is neutralised: an empty command
+# runs nothing, required=false keeps git from dying on the neutralised driver, so
+# LFS-tracked files diff raw (pointer vs content). The empty driver name (selected
+# by `filter=`) is included; a name containing '=' cannot be addressed by -c (git
+# splits at the first '='), so it is refused.
+filter_cfg=()
+while IFS= read -r -d '' entry; do
+  key="${entry%%$'\n'*}"; name="${key#filter.}"; name="${name%.*}"
+  [[ "$name" != *=* ]] || die "a configured git filter driver name contains '=', which git -c cannot neutralise; refusing to run the preflight with it"
+  filter_cfg+=(-c "filter.$name.clean=" -c "filter.$name.smudge=" -c "filter.$name.process=" -c "filter.$name.required=false")
+done < <(timeout 120 env -i "${git_env[@]}" git -C "$REPO" --work-tree="$REPO" config -z --get-regexp '^filter\..*\.(clean|smudge|process|required)$' 2>/dev/null || true)
+
+g()  { timeout 120 env -i "${git_env[@]}" git -C "$REPO" --work-tree="$REPO" "${git_cfg[@]}" "${filter_cfg[@]}" --no-pager "$@" 2>/dev/null; }
+# gd: EVERY diff the preflight runs (name collection, rename pairs, --stat, content;
+# worktree and branch delta).
+#   --no-ext-diff   no diff.external / diff.<driver>.command / GIT_EXTERNAL_DIFF program
+#   --no-textconv   no diff.<driver>.textconv program
+#   --no-renames    a renamed secret diffs as a deletion under its own (excluded) name
+#   --no-relative   names stay repository-rooted whatever diff.relative says
+#   --no-color      no ANSI escapes in the preflight whatever color.* says
+#   --submodule=short          no nested diff process inside a submodule
+#   --ignore-submodules=dirty  no child `git status` inside a submodule, which would
+#                              run with the submodule's own config and filters
+gd() { g diff --no-ext-diff --no-textconv --no-renames --no-relative --no-color --submodule=short --ignore-submodules=dirty "$@"; }
+
+# ---------------------------------------------------------------------------
+# 2. The scan, repeated while include chains reveal more: secret-like files (the
+#    grep tool returns matching lines from any file it is pointed at, so a secret
+#    in the worktree could reach the model even though reads are denied), symlinks
+#    leaving the repository (OpenCode 2.2.6 checks the requested path, not the
+#    canonical one), credential content in known config files and Git configs, and
+#    worktree files a Git config includes (they are Git configuration the reviewer
+#    could read by name).
+# ---------------------------------------------------------------------------
+# The private state directory is created now (the lock is held): the scan hands over
+# the worktree files that a Git config includes, for classify and render.
+mkdir -p "$STATE_ROOT/$REPO_KEY"
+chmod 700 "$STATE_ROOT" "$STATE_ROOT/$REPO_KEY"
+STATE_DIR="$STATE_ROOT/$REPO_KEY"
+tmp_files=()
+trap 'rm -f -- "${tmp_files[@]}"' EXIT
+included_z="$(mktemp "$STATE_DIR/.included.XXXXXX")"
+origins_z="$(mktemp "$STATE_DIR/.origins.XXXXXX")"
+missing_z="$(mktemp "$STATE_DIR/.missing.XXXXXX")"
+extra_z="$(mktemp "$STATE_DIR/.extra.XXXXXX")"
+unruled_z="$(mktemp "$STATE_DIR/.unruled.XXXXXX")"
+walk_z="$(mktemp "$STATE_DIR/.walk.XXXXXX")"
+new_z="$(mktemp "$STATE_DIR/.new.XXXXXX")"
+blob_tmp="$(mktemp "$STATE_DIR/.blob.XXXXXX")"
+hops_z="$(mktemp "$STATE_DIR/.hops.XXXXXX")"
+tmp_files+=("$included_z" "$origins_z" "$missing_z" "$extra_z" "$unruled_z" "$walk_z" "$new_z" "$blob_tmp" "$hops_z")
+# Git names every configuration file it actually loads (includes followed however they
+# are written); the scan treats each one inside the worktree as Git configuration.
+g config --list --show-origin -z > "$origins_z" || die "git configuration cannot be listed (fail closed)"
+
+# PR review mode: the pull request is identified here, outside the model's tool
+# execution and before the scan, so a doubtful pull request fails before anything is
+# scanned or rendered. The GitHub repository comes from the origin remote, the pull
+# request from one authenticated, read-only REST call through gh in a scrubbed
+# environment; oauto-policy.py validates the response and hands back five fields, and
+# nothing else from it is used or kept. The base must already be present locally as
+# origin/<base>: no fetch, checkout or ref update ever happens, and no failure falls
+# back to the default review.
+GH_BIN="${OAUTO_GH_BIN:-gh}"
+# gh_error_summary: $1 is gh's stderr -> one printable ASCII line, the first three non-empty
+# lines at 200 bytes each, with every URL user-info (`://user:secret@`), every gh token
+# shape (gh?_..., github_pat_...) and the value after `bearer`, `token` or `basic` (any case;
+# after whitespace, `:` or `=`, JSON quotes included) replaced by [redacted].
+gh_error_summary() {
+  LC_ALL=C sed -E -e 's/\r//g' -e 's/[^[:print:]]/?/g' -e '/^[[:space:]]*$/d' \
+    -e 's#://[^/@[:space:]]+@#://[redacted]@#g' \
+    -e 's/(gh[pousr]_|github_pat_)[A-Za-z0-9_]+/\1[redacted]/g' \
+    -e 's/(bearer|token|basic)("?[[:space:]]*[:=][[:space:]]*"?|[[:space:]]+)[^[:space:]",;}&]+/\1\2[redacted]/gI' -- "$1" 2>/dev/null |
+    head -n 3 | cut -c1-200 | paste -s -d '|' - | sed 's/|/ | /g' || true
+}
+pr_identify() { # sets pr_branch pr_repo pr_number pr_url pr_base_ref pr_base_sha pr_head_sha pr_local_base, or dies
+  local full_ref remote_url endpoint gh_path gh_status=0 summary pr_query_z pulls_json gh_err pr_fields
+  full_ref="$(g symbolic-ref -q HEAD)" && [[ "$full_ref" == refs/heads/?* ]] ||
+    die "PR mode reviews the pull request of the current branch, but HEAD is detached"
+  pr_branch="${full_ref#refs/heads/}"
+  [[ "$head_sha" != "(no commits)" ]] || die "PR mode: branch $pr_branch has no commits"
+  remote_url="$(g config --get remote.origin.url)" ||
+    die "PR mode needs the GitHub repository of the origin remote, but remote.origin.url is not set"
+  pr_query_z="$(mktemp "$STATE_DIR/.prquery.XXXXXX")"
+  pulls_json="$(mktemp "$STATE_DIR/.pulls.XXXXXX")"
+  gh_err="$(mktemp "$STATE_DIR/.gherr.XXXXXX")"
+  pr_fields="$(mktemp "$STATE_DIR/.prfields.XXXXXX")"
+  tmp_files+=("$pr_query_z" "$pulls_json" "$gh_err" "$pr_fields")
+  # The URL travels on stdin, never in argv or a message: it may embed a credential.
+  printf '%s' "$remote_url" | python3 -I "$POLICY" pr-query --branch="$pr_branch" > "$pr_query_z" ||
+    die "PR mode: the GitHub repository could not be taken from the origin remote (see the reason above)"
+  { IFS= read -r -d '' pr_repo && IFS= read -r -d '' endpoint; } < "$pr_query_z" ||
+    die "PR mode: malformed pr-query output (fail closed)"
+  gh_path="$(command -v "$GH_BIN" 2>/dev/null)" ||
+    die "PR mode needs the GitHub CLI to identify the pull request, but '$GH_BIN' was not found"
+  [[ "$gh_path" == /* ]] || gh_path="$PWD/$gh_path"
+  # From `/`, never from the repository: gh api fills `:owner`/`:repo`/`:branch`/`{...}`
+  # placeholders by running git in its working directory (the endpoint holds none, which
+  # pr-query enforces), and no other git than the hardened g() may ever run against it.
+  ( cd / && timeout 60 env -i HOME="$HOME" PATH="$PATH" GH_PAGER=cat GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 TERM=dumb "$gh_path" api -H 'Accept: application/vnd.github+json' "$endpoint" ) > "$pulls_json" 2> "$gh_err" || gh_status=$?
+  if (( gh_status != 0 )); then
+    summary="$(gh_error_summary "$gh_err")"
+    if (( gh_status == 124 )); then summary="timed out after 60 s${summary:+; $summary}"; fi
+    die "PR mode: the read-only GitHub API call listing the open pull requests of branch $pr_branch in $pr_repo failed (gh exit $gh_status: ${summary:-no error text}); nothing was scanned or rendered, and the default review is not used instead"
+  fi
+  python3 -I "$POLICY" pr-select --branch="$pr_branch" --head="$head_sha" --repo="$pr_repo" < "$pulls_json" > "$pr_fields" ||
+    die "PR mode: the pull request of branch $pr_branch could not be identified (see the reason above); nothing was scanned or rendered, and the default review is not used instead"
+  rm -f -- "$pulls_json" "$gh_err"   # only the validated fields are kept
+  { IFS= read -r -d '' pr_number && IFS= read -r -d '' pr_url && IFS= read -r -d '' pr_base_ref &&
+    IFS= read -r -d '' pr_base_sha && IFS= read -r -d '' pr_head_sha; } < "$pr_fields" ||
+    die "PR mode: malformed pr-select output (fail closed)"
+  [[ "$pr_head_sha" == "$head_sha" ]] || die "PR mode: the pull request head is not the local HEAD (fail closed)"
+  pr_local_base="$(g rev-parse --verify --quiet "refs/remotes/origin/$pr_base_ref^{commit}")" ||
+    die "the PR base $pr_base_ref is not present locally as origin/$pr_base_ref; fetch it first — the launcher never fetches"
+  # The delta names origin/<base>; a local branch or tag of that name would resolve first.
+  [[ "$(g rev-parse --verify --quiet "origin/$pr_base_ref^{commit}")" == "$pr_local_base" ]] ||
+    die "PR mode: origin/$pr_base_ref is ambiguous (a branch or tag of that name resolves to another commit than refs/remotes/origin/$pr_base_ref); rename it"
+  g merge-base "$pr_local_base" HEAD >/dev/null ||
+    die "origin/$pr_base_ref and HEAD have no merge base (unrelated or shallow history), so pull request #$pr_number has no delta to review here; the launcher never fetches"
+}
+
+# The commits the history pass reads: HEAD, and its merge base with the branch-delta base
+# (in PR mode the pull request's base, origin/<base>).
+branch="$(g symbolic-ref --short -q HEAD || echo '(detached)')"
+head_sha="$(g rev-parse --verify -q HEAD || echo '(no commits)')"
+upstream="$(g rev-parse --abbrev-ref --symbolic-full-name '@{u}' || true)"
+base=""
+base_label=""   # what the preflight and the banner call the base
+if (( PR_MODE )); then
+  pr_identify
+  # Every computation below names the commit pr_identify verified, never origin/<base>
+  # again: a branch or tag of that name appearing meanwhile cannot redirect a diff.
+  base="$pr_local_base"
+  base_label="origin/$pr_base_ref"
+elif [[ "$head_sha" != "(no commits)" ]]; then
+  for cand in "$upstream" origin/main origin/master main master; do
+    [[ -n "$cand" ]] || continue
+    # A candidate without a merge base (unrelated or shallow history) has no
+    # branch delta; base...HEAD would fail the strict pair pass below.
+    if g rev-parse --verify --quiet "$cand^{commit}" >/dev/null && g merge-base "$cand" HEAD >/dev/null; then
+      base="$cand"; break
+    fi
+  done
+fi
+base_label="${base_label:-$base}"   # default mode: the candidate's own name
+ahead_behind=""
+if [[ -n "$base" ]]; then
+  ahead_behind="$(g rev-list --left-right --count "$base...HEAD" | awk '{print "behind " $1 ", ahead " $2}' || true)"
+fi
+history_revs=()
+if [[ "$head_sha" != "(no commits)" ]]; then
+  history_revs+=(HEAD)
+  if [[ -n "$base" ]]; then
+    merge_base="$(g merge-base "$base" HEAD)" || die "the merge base of $base_label and HEAD cannot be computed"
+    history_revs+=("$merge_base")
+  fi
+fi
+
+# Include directives the scan cannot see: in the committed content of include targets
+# (missing ones, and present ones whose include line may be gone) and in files outside
+# the repository an include passes through. history_pass writes to $new_z every
+# in-repository target the last scan did not report; handed back to the scan, which
+# stays the single place that counts, checks, alias-protects and excludes them.
+in_list() { local needle="$1" item; shift; for item in "$@"; do [[ "$item" == "$needle" ]] && return 0; done; return 1; }
+parse_config_includes() { # $1: the path the config content on stdin belongs to
+  python3 -I "$POLICY" includes-in-config --repo="$REPO" --config-path="$1" >> "$hops_z" ||
+    die "the includes of a Git config file could not be read for the preflight"
+}
+resolve_outside() { # $1: a path outside the repository, as written; sets $abs byte-exact
+  # realpath -m resolves the components that exist and keeps the rest; its output is taken
+  # NUL-terminated (-z) and read with `read -d ''`, so a pathname ending in newline bytes
+  # survives (command substitution would strip them and name the wrong file). A failure or
+  # an empty result fails closed.
+  abs=""
+  realpath -z -m -- "$1" > "$blob_tmp" 2>/dev/null ||
+    die "an outside path on an included Git config chain could not be resolved (fail closed)"
+  IFS= read -r -d '' abs < "$blob_tmp" || true
+  [[ -n "$abs" ]] || die "an outside path on an included Git config chain resolved to nothing (fail closed)"
+}
+tree_walk() { # $1: revision; $2: repo-relative path as referenced
+  # Resolves the path against the tree at $1 the way a path walk does: each component is
+  # looked up in the tree, a committed symlink (file or directory) is replaced by its target
+  # before the next component is looked at — so `conf/../b.cfg` follows `conf` first — and
+  # `..` pops the directory reached so far. Appends one record to $hops_z: I NUL <resolved
+  # repository-relative path> NUL, or O NUL <absolute path> NUL when the walk leaves the
+  # repository; nothing when the path has no entry at that revision. Fails closed on a
+  # symlink loop (40 hops, like the kernel), an empty link target, or a result that is the
+  # repository root or lies inside .git.
+  local rev="$1" remaining="$2" resolved="" comp candidate mode target abs hops=0
+  while [[ -n "$remaining" ]]; do
+    comp="${remaining%%/*}"
+    if [[ "$remaining" == */* ]]; then remaining="${remaining#*/}"; else remaining=""; fi
+    [[ -n "$comp" && "$comp" != . ]] || continue
+    if [[ "$comp" == .. ]]; then
+      if [[ -z "$resolved" ]]; then
+        # Above the repository root. A path that re-enters the repository — by name
+        # (`../<repo>/x`) or through an outside alias that resolves back into it — continues
+        # the walk inside it; anything else is an outside file, read live.
+        if [[ "$remaining" == "${REPO##*/}"/* ]]; then remaining="${remaining#*/}"; continue; fi
+        if [[ "$remaining" == "${REPO##*/}" ]]; then remaining=""; continue; fi
+        resolve_outside "$REPO/..${remaining:+/$remaining}"
+        if [[ "$abs" == "$REPO"/* ]]; then resolved=""; remaining="${abs#"$REPO"/}"; continue; fi
+        if [[ "$abs" == "$REPO" ]]; then resolved=""; remaining=""; continue; fi
+        printf 'O\0%s\0' "$abs" >> "$hops_z"
+        return 0
+      fi
+      if [[ "$resolved" == */* ]]; then resolved="${resolved%/*}"; else resolved=""; fi
+      continue
+    fi
+    candidate="${resolved:+$resolved/}$comp"
+    # `:(literal)`: the name is a path, never pathspec magic (a leading `:` would otherwise
+    # be read as magic and the entry silently not found).
+    mode="$(g ls-tree -z "$rev" -- ":(literal)$candidate" | head -c 6)"
+    case "$mode" in
+      "") return 0 ;;                      # nothing by that name at this revision
+      120000)
+        hops=$((hops + 1))
+        (( hops <= 40 )) || die "a chain of committed symlinks on an included Git config path exceeds 40 hops (fail closed)"
+        g cat-file blob "$rev:$candidate" > "$blob_tmp" || return 0
+        # The target is read byte-exact: a trailing newline is part of the name (command
+        # substitution would strip it and walk the wrong path); a NUL cannot be a path.
+        [[ "$(tr -d -c '\000' < "$blob_tmp" | wc -c)" -eq 0 ]] ||
+          die "a committed symlink on an included Git config path has a NUL byte in its target (fail closed)"
+        target=""
+        IFS= read -r -d '' target < "$blob_tmp" || true
+        [[ -n "$target" ]] || die "a committed symlink on an included Git config path has an empty target (fail closed)"
+        if [[ "$target" == /* ]]; then
+          if [[ "$target" == "$REPO"/* ]]; then
+            resolved=""
+            remaining="${target#"$REPO"/}${remaining:+/$remaining}"
+          elif [[ "$target" == "$REPO" ]]; then
+            resolved=""
+          else
+            # An absolute target elsewhere: an outside file — unless the live filesystem
+            # resolves it back into the repository (an outside alias directory pointing
+            # at it), in which case the walk continues inside from the root.
+            resolve_outside "$target${remaining:+/$remaining}"
+            if [[ "$abs" == "$REPO"/* ]]; then resolved=""; remaining="${abs#"$REPO"/}"; continue; fi
+            if [[ "$abs" == "$REPO" ]]; then resolved=""; remaining=""; continue; fi
+            printf 'O\0%s\0' "$abs" >> "$hops_z"
+            return 0
+          fi
+        else
+          remaining="$target${remaining:+/$remaining}"   # relative to the link's directory, which is $resolved
+        fi ;;
+      040000) resolved="$candidate" ;;
+      *)
+        [[ -z "$remaining" ]] || return 0  # a blob or gitlink with components below it: no such entry
+        resolved="$candidate" ;;
+    esac
+  done
+  [[ -n "$resolved" ]] || die "a historical include path resolves to the repository root (fail closed)"
+  [[ "$resolved" != .git && "$resolved" != .git/* ]] || die "a historical include path resolves into .git (fail closed)"
+  printf 'I\0%s\0' "$resolved" >> "$hops_z"
+}
+history_pass() {
+  # Every queued entry carries the CONTEXT git resolves its relative includes against: the
+  # path git opened. For an include directive that is the target's own path; for the
+  # target of a symlink (file or directory) it stays the path by which the symlink was
+  # referenced, because git keeps the pathname it opened, not where the link led. A
+  # content path reached with two contexts is processed twice (nested relative includes
+  # resolve differently); the depth bound still terminates loops.
+  local known=() visited=() queue=() depth=() ctx=() found=() i=0 entry d c path rev kind target
+  while IFS= read -r -d '' path; do known+=("$path"); done < "$included_z"
+  # Paths this traversal itself found in earlier passes (handed to the scan through
+  # --extra-config, so the scan hands them back as include targets) are reached again
+  # through their chains, under the context git would open them with; seeding them as
+  # their own context would resolve their relative includes against the wrong directory.
+  while IFS= read -r -d '' path; do found+=("$path"); done < "$extra_z"
+  while IFS= read -r -d '' path; do
+    if ! in_list "$path" "${found[@]}"; then queue+=("I:$path"); depth+=(1); ctx+=("$path"); fi
+  done < "$missing_z"
+  while IFS= read -r -d '' path; do
+    if [[ -f "$REPO/$path" ]] && ! in_list "$path" "${found[@]}"; then queue+=("I:$path"); depth+=(1); ctx+=("$path"); fi
+  done < "$included_z"
+  # Include directives whose `.`/`..` components survive (`conf/../b.cfg`), as the scan
+  # met them in the live Git configs: walked through the tree at each revision, where a
+  # committed `conf` symlink is followed before `..` applies; the walk's result is what
+  # gets excluded, so these raw spellings are never themselves handed over as names.
+  while IFS= read -r -d '' path; do queue+=("I:$path"); depth+=(1); ctx+=("$path"); done < "$walk_z"
+  : > "$new_z"
+  enqueue_records() { # $1: records file (KIND NUL TARGET NUL); $2: inherited context, or "" for the record's own path
+    local file="$1" inherited="$2" kind target next use_ctx
+    while IFS= read -r -d '' kind; do
+      IFS= read -r -d '' target || die "a malformed include record reached the launcher"
+      case "$kind" in
+        I) if ! in_list "$target" "${known[@]}"; then known+=("$target"); printf '%s\0' "$target" >> "$new_z"; fi ;;
+        O) ;;
+        W) kind=I ;;   # an uncollapsed directive path: walked through the tree, never handed over as a name
+        *) die "a malformed include record reached the launcher" ;;
+      esac
+      next="$kind:$target"
+      use_ctx="${inherited:-$target}"
+      # Visited keys carry the entry's length so a `|` inside a path cannot make two
+      # different (entry, context) pairs collide.
+      if in_list "${#next}:$next|$use_ctx" "${visited[@]}"; then continue; fi
+      (( d < 8 )) || die "Git config includes reached through history or outside files nest deeper than 8 levels (fail closed)"
+      queue+=("$next"); depth+=("$((d + 1))"); ctx+=("$use_ctx")
+    done < "$file"
+  }
+  while (( i < ${#queue[@]} )); do
+    entry="${queue[i]}"; d="${depth[i]}"; c="${ctx[i]}"; i=$((i + 1))
+    if in_list "${#entry}:$entry|$c" "${visited[@]}"; then continue; fi
+    visited+=("${#entry}:$entry|$c")
+    path="${entry#?:}"
+    if [[ "$entry" == I:* ]]; then
+      if [[ -f "$REPO/$path" ]]; then
+        : > "$hops_z"; parse_config_includes "$c" < "$REPO/$path"; enqueue_records "$hops_z" ""
+      fi
+      for rev in "${history_revs[@]}"; do
+        # Walk the path through the tree at this revision: a committed symlink on the way
+        # (file or directory, `..` applied after the link it follows) leads elsewhere, and
+        # that path is excluded and followed under this entry's context — git goes on
+        # resolving relative to the path it opened. Parsing a link's blob as config text
+        # would miss the target's deleted content.
+        : > "$hops_z"
+        tree_walk "$rev" "$path"
+        [[ -s "$hops_z" ]] || continue                 # no entry at this revision
+        { IFS= read -r -d '' kind; IFS= read -r -d '' target; } < "$hops_z"
+        if [[ "$kind" == I && "$target" == "$path" ]]; then
+          g cat-file blob "$rev:$path" > "$blob_tmp" || continue
+          : > "$hops_z"; parse_config_includes "$c" < "$blob_tmp"; enqueue_records "$hops_z" ""
+        else
+          enqueue_records "$hops_z" "$c"
+        fi
+      done
+    elif [[ -f "$path" ]]; then
+      # Outside the repository: read as it is, no git; its includes resolve against the
+      # path git opened (its own, or the in-repository link that led here).
+      : > "$hops_z"; parse_config_includes "$c" < "$path"; enqueue_records "$hops_z" ""
+    fi
+  done
+}
+
+# Scan, follow what only history or outside files reveal, and scan again with it until
+# nothing new appears (at most 8 passes, each one complete scan within the budget). A
+# repository without includes is scanned once. The verdict is the final scan's.
+summary_re='^SUMMARY files=[0-9]+ sensitive=([0-9]+) symlinks=([0-9]+) content=([0-9]+) elapsed=[0-9.]+s complete=1$'
+scan_pass=0
+while :; do
+  scan_pass=$((scan_pass + 1))
+  (( scan_pass <= 8 )) || die "Git config includes found through history did not settle within 8 scan passes (fail closed)"
+  scan_status=0
+  scan_out="$(python3 -I "$POLICY" scan "$REPO" --budget "$SCAN_BUDGET" --included-out "$included_z" --config-origins "$origins_z" --missing-out "$missing_z" --extra-config "$extra_z" --unruled-out "$unruled_z" --walk-out "$walk_z")" || scan_status=$?
+  if (( scan_status != 0 )); then
+    printf '%s\n' "$scan_out" | tail -3 >&2
+    die "worktree scan did not complete (status $scan_status): a directory could not be listed or the scan budget of ${SCAN_BUDGET}s ran out; see the records above (set OAUTO_SCAN_BUDGET higher for large trees)"
+  fi
+  # Decisions rest on the SUMMARY counts only. The records above it (one ASCII line
+  # each, names C-quoted) are displayed, never parsed for a decision.
+  summary="${scan_out##*$'\n'}"
+  [[ "$summary" =~ $summary_re ]] ||
+    die "the worktree scan did not end with a well-formed SUMMARY line"
+  n_sensitive="${BASH_REMATCH[1]}"; n_symlinks="${BASH_REMATCH[2]}"; n_content="${BASH_REMATCH[3]}"
+  history_pass
+  [[ -s "$new_z" ]] || break
+  cat "$new_z" >> "$extra_z"
+done
+note "worktree scan passes: $scan_pass"
+scan_records() { printf '%s\n' "$scan_out" | sed -n "s/^$1 //p"; }
+if (( n_symlinks > 0 )); then
+  printf 'oauto: symlinks leaving the repository or aliasing secret-like paths (hard links included, and any hard link with a name outside the repository), and symlinked Git config files:\n%s\n' "$(scan_records SYMLINK)" >&2
+  die "refusing to launch: OpenCode resolves reads through symlinks but checks only the requested name (and a hard link is the same file under another name, wherever that name is), so these would expose paths outside $REPO, or Git metadata and secret-like files inside it, under a harmless name (symlink targets under /usr, /bin, /lib are tolerated); a symlinked Git config file would receive the credentials git writes"
+fi
+if (( n_sensitive + n_content > 0 )); then
+  if (( n_sensitive > 0 )); then printf 'oauto: secret-like files present in %s:\n%s\n' "$REPO" "$(scan_records SENSITIVE)" >&2; fi
+  if (( n_content > 0 )); then printf 'oauto: credential-looking content in:\n%s\n' "$(scan_records CONTENT)" >&2; fi
+  if [[ "${OAUTO_ALLOW_SENSITIVE_FILES:-}" != "1" ]]; then
+    die "refusing to launch: the model's grep tool can surface lines from these files. Move them out of the worktree, or set OAUTO_ALLOW_SENSITIVE_FILES=1 to accept that exposure risk explicitly (their diffs stay excluded from the preflight either way)"
+  fi
+  note "WARNING: OAUTO_ALLOW_SENSITIVE_FILES=1 set; continuing with the files above exposed to grep"
+fi
+# Worktree files a Git config includes are Git configuration: the rendered config
+# denies reading them by their exact name too.
+# A name holding a glob metacharacter cannot be denied exactly (OpenCode would read it
+# as a pattern), so it is refused outright, override or not.
+deny_read_args=()
+while IFS= read -r -d '' path; do
+  [[ "$path" != *[\*\?\[\{\}\\]* ]] || die "an included Git config path holds a glob metacharacter (* ? [ { } \\) and cannot be denied by its exact name; rename it"
+  deny_read_args+=("--deny-read=$path")
+done < "$included_z"
+# Secret-like files the case-sensitive read rules do not deny by their exact spelling (a
+# case variant such as Auth.json): denied by exact name for this launch, so the override
+# cannot expose them to the read tool. Refused outright (override or not) when a name
+# holds a glob metacharacter, which cannot be denied exactly.
+while IFS= read -r -d '' path; do
+  [[ "$path" != *[\*\?\[\{\}\\]* ]] || die "a secret-like file name holds a glob metacharacter (* ? [ { } \\) and cannot be denied by its exact name; rename it"
+  deny_read_args+=("--deny-read=$path")
+done < "$unruled_z"
+
+# ---------------------------------------------------------------------------
+# 3. Read-only git preflight. It runs before OpenCode's restrictions apply, so no
+#    helper program that the repository (.gitattributes, .git/config, a submodule's
+#    config) or the user's global config selects may run here. Secret-like paths
+#    are excluded from every diff by their exact bytes, including deleted, modified
+#    and renamed tracked secrets, so cleaning up a leak never sends the leaked
+#    content to the model.
+# ---------------------------------------------------------------------------
+PREFLIGHT_FILE="$STATE_DIR/preflight.md"
+capped() { # $1 max bytes; stdin -> stdout, byte-exact, with a truncation marker
+  local max="$1" tmp size
+  tmp="$(mktemp "$STATE_DIR/.capped.XXXXXX")"
+  cat > "$tmp"
+  size="$(wc -c < "$tmp")"
+  head -c "$max" "$tmp"
+  if (( size > max )); then
+    printf '\n[... truncated by oauto: %d of %d bytes shown ...]\n' "$max" "$size"
+  elif (( size > 0 )); then
+    [[ "$(tail -c1 "$tmp")" == "" ]] || printf '\n'
+  fi
+  rm -f "$tmp"
+}
+
+# Paths whose content may never enter the preflight: every changed, deleted, renamed
+# or untracked path that the policy classifies as secret-like. Names travel
+# NUL-delimited (-z: no C-quoting) through private temp files, never through a shell
+# variable, so the policy classifies exactly the bytes git will match.
+names="$(mktemp "$STATE_DIR/.names.XXXXXX")"
+pairs="$(mktemp "$STATE_DIR/.pairs.XXXXXX")"
+excluded_z="$(mktemp "$STATE_DIR/.excluded.XXXXXX")"
+display="$(mktemp "$STATE_DIR/.display.XXXXXX")"
+after="$(mktemp "$STATE_DIR/.after.XXXXXX")"
+content_z="$(mktemp "$STATE_DIR/.content.XXXXXX")"
+tmp_files+=("$names" "$pairs" "$excluded_z" "$display" "$after" "$content_z")
+# A partial pair list would silently drop the destination-side exclusion, so a
+# failing or timed-out pair pass is fatal (never `|| true`).
+pair_pass_failed() {
+  die "rename/copy detection for the preflight failed or exceeded 120 s; the change set is too large for oauto's secret-exclusion pass (git exit status $1)"
+}
+# Likewise a partial name list or proof list (a transient git failure or timeout)
+# would silently leave a secret-like path unexcluded while the content diff still
+# succeeds, so collection is fatal on failure too.
+name_pass_failed() {
+  die "collecting the changed paths for the preflight failed or exceeded 120 s (git exit status $1)"
+}
+if [[ "$head_sha" != "(no commits)" ]]; then
+  gd --name-only -z HEAD >> "$names" || name_pass_failed $?
+  # The only rename/copy-detecting diffs (after gd's --no-renames): -M -C pairs
+  # renames and copies of files modified in the same change set, -l0 keeps the
+  # pairing exhaustive whatever diff.renameLimit says. A pair with a secret-like
+  # side gets both sides excluded.
+  gd -M -C -l0 --name-status -z HEAD >> "$pairs" || pair_pass_failed $?
+  if [[ -n "$base" ]]; then
+    gd --name-only -z "$base...HEAD" >> "$names" || name_pass_failed $?
+    gd -M -C -l0 --name-status -z "$base...HEAD" >> "$pairs" || pair_pass_failed $?
+  fi
+fi
+g ls-files --others --exclude-standard -z >> "$names" || name_pass_failed $?
+python3 -I "$POLICY" classify -z --renames "$pairs" --display "$display" --content-candidates "$content_z" --extra-sensitive "$included_z" < "$names" > "$excluded_z" ||
+  die "could not classify the changed paths for the preflight"
+# Files with a content check (gradle.properties ...) are reviewable by name, but a
+# change that removes a credential line, or deletes the file, carries the old value
+# in its diff where the worktree scan cannot see it: such a path is excluded when its
+# own diff (uncommitted or branch delta) holds a credential-looking line.
+if [[ "$head_sha" != "(no commits)" ]]; then
+  # Records are KEY\0PATH\0: the content check to apply (a renamed or copied
+  # gradle.properties keeps its own) and the path.
+  while IFS= read -r -d '' key <&3; do
+    IFS= read -r -d '' path <&3 || die "malformed content-check candidate list"
+    for rev in HEAD ${base:+"$base...HEAD"}; do
+      status=0
+      gd "$rev" -- ":(literal)$path" | python3 -I "$POLICY" check-diff-content --checker "$key" -- "$path" || status=$?
+      if (( status == 3 )); then
+        printf '%s\0' "$path" >> "$excluded_z"
+        quoted="$(printf '%s\0' "$path" | python3 -I "$POLICY" quote-path)" || die "could not quote a path for the preflight"
+        printf '%s (credential-looking content in its diff)\n' "$quoted" >> "$display"
+        break
+      fi
+      (( status == 0 )) ||
+        die "checking the diff of a content-checked file (gradle.properties ...) for credentials failed (status $status)"
+    done
+  done 3< "$content_z"
+fi
+exclude_spec=()
+while IFS= read -r -d '' path; do exclude_spec+=(":(exclude,literal)$path"); done < "$excluded_z"
+# Prove the exclusion applied: the same name diffs, with the pathspecs, may list no
+# excluded or otherwise secret-like path.
+if [[ "$head_sha" != "(no commits)" ]]; then
+  gd --name-only -z HEAD -- "${exclude_spec[@]}" >> "$after" || name_pass_failed $?
+  if [[ -n "$base" ]]; then
+    gd --name-only -z "$base...HEAD" -- "${exclude_spec[@]}" >> "$after" || name_pass_failed $?
+  fi
+fi
+python3 -I "$POLICY" check-excluded "$excluded_z" "$after" >&2 ||
+  die "an excluded path still reaches the preflight diff"
+
+set +e +o pipefail   # a repository without commits or without a base must still produce a preflight
+{
+  echo "# oauto preflight — $REPO_NAME"
+  echo
+  echo "Collected read-only by the launcher at $(date -u +%Y-%m-%dT%H:%M:%SZ). The reviewer cannot run git; this is its only git context."
+  echo
+  echo "- Repository: $REPO"
+  echo "- Branch: $branch"
+  echo "- HEAD: $head_sha"
+  echo "- Upstream: ${upstream:-(none)}"
+  echo "- Base for branch delta: ${base_label:-(none found)} ${ahead_behind:+($ahead_behind)}"
+  if (( PR_MODE )); then
+    echo "- Pull request: #$pr_number $pr_url"
+    echo "- PR base branch: $pr_base_ref (GitHub base ${pr_base_sha:0:12}; local origin/$pr_base_ref ${pr_local_base:0:12})"
+    if [[ "$pr_base_sha" != "$pr_local_base" ]]; then
+      echo "- Note: GitHub's base $pr_base_sha is not the local origin/$pr_base_ref $pr_local_base; the merge base below is computed from the local ref (the launcher never fetches)"
+    fi
+    echo "- Merge base: $merge_base"
+    echo "- Reviewed local HEAD: $head_sha (= PR head)"
+  fi
+  if [[ -s "$display" ]]; then
+    echo
+    echo "## Excluded from this preflight (secret-like paths; names only)"
+    echo '```'
+    cat "$display"
+    echo '```'
+  fi
+  echo
+  echo "## git status --short"
+  echo '```'
+  g status --short --untracked-files=normal --ignore-submodules=dirty | capped "$STATUS_MAX_BYTES"
+  echo '```'
+  if [[ "$head_sha" != "(no commits)" ]]; then
+    echo
+    echo "## Uncommitted changes (git diff HEAD --stat / git diff HEAD)"
+    echo '```'
+    gd HEAD --stat -- "${exclude_spec[@]}" | capped "$STAT_MAX_BYTES"
+    echo '```'
+    echo '```diff'
+    gd HEAD -- "${exclude_spec[@]}" | capped "$DIFF_MAX_BYTES"
+    echo '```'
+    echo
+    echo "## Recent commits (git log --oneline -15)"
+    echo '```'
+    g log --no-show-signature --no-color --oneline -15 | capped "$LOG_MAX_BYTES"
+    echo '```'
+  fi
+  if [[ -n "$base" ]]; then
+    echo
+    if (( PR_MODE )); then
+      echo "## Pull request #$pr_number delta vs origin/$pr_base_ref (merge-base...HEAD)"
+    else
+      echo "## Branch delta vs $base_label (merge-base...HEAD)"
+    fi
+    echo '```'
+    gd --stat "$base...HEAD" -- "${exclude_spec[@]}" | capped "$STAT_MAX_BYTES"
+    echo '```'
+    echo '```diff'
+    gd "$base...HEAD" -- "${exclude_spec[@]}" | capped "$DIFF_MAX_BYTES"
+    echo '```'
+  fi
+} > "$PREFLIGHT_FILE"
+set -e -o pipefail
+chmod 600 "$PREFLIGHT_FILE"
+if (( PR_MODE )); then
+  # The preflight names one exact head and base: refused if either moved while it was collected.
+  if [[ "$(g rev-parse --verify -q HEAD)" != "$head_sha" ||
+        "$(g rev-parse --verify --quiet "refs/remotes/origin/$pr_base_ref^{commit}")" != "$pr_local_base" ]]; then
+    rm -f -- "$PREFLIGHT_FILE"
+    die "HEAD or origin/$pr_base_ref moved while the preflight was collected; run oauto again"
+  fi
+fi
+excluded_note=""
+if [[ -s "$display" ]]; then excluded_note=", secret-like paths excluded"; fi
+rm -f -- "${tmp_files[@]}"
+tmp_files=()
+trap - EXIT
+preflight_bytes="$(wc -c < "$PREFLIGHT_FILE")"
+(( preflight_bytes <= PREFLIGHT_MAX_BYTES )) ||
+  die "preflight is $preflight_bytes bytes (> $PREFLIGHT_MAX_BYTES); the uncommitted or branch diff is too large for one prompt"
+
+# ---------------------------------------------------------------------------
+# 4. Private config directory: XDG_CONFIG_HOME points into the state dir, so the
+#    user's ~/.config/opencode is neither loaded nor touched and two sessions on
+#    different repositories never share a file. Render, disable every model the
+#    binary offers except the approved set, then verify with OpenCode's own
+#    diagnostics. --standalone keeps every helper call off the background service.
+# ---------------------------------------------------------------------------
+CONF_HOME="$STATE_DIR/xdg-config"
+CONFIG_DIR="$CONF_HOME/opencode"
+CONFIG_FILE="$CONFIG_DIR/opencode.json"
+rm -rf "$CONF_HOME"
+mkdir -p "$CONFIG_DIR"
+chmod 700 "$CONF_HOME" "$CONFIG_DIR"
+
+clean_env=(HOME="$HOME" PATH="$PATH" TERM="${TERM:-xterm-256color}" LANG="${LANG:-C.UTF-8}"
+           TMPDIR="${TMPDIR:-/tmp}" SHELL=/bin/bash USER="${USER:-root}" XDG_CONFIG_HOME="$CONF_HOME")
+for passthrough in COLORTERM LC_ALL XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME; do
+  [[ -n "${!passthrough:-}" ]] && clean_env+=("$passthrough=${!passthrough}")
+done
+# oc <seconds> <opencode args...>: a time-bounded OpenCode helper call in the same
+# scrubbed environment the session itself gets (timeout is applied inside the
+# function; `timeout` cannot run a shell function directly).
+oc() {
+  local seconds="$1"; shift
+  timeout "$seconds" env -i "${clean_env[@]}" "$OPENCODE_BIN" "$@"
+}
+render_config() { # $@ = extra render args; every render denies the included Git configs
+  python3 -I "$POLICY" render --model "$MODEL_ALIAS" "${deny_read_args[@]}" "$@" > "$CONFIG_FILE.tmp"
+  mv -f "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+  chmod 600 "$CONFIG_FILE"
+}
+
+render_config
+: > "$STATE_DIR/last-helper.err"
+chmod 600 "$STATE_DIR/last-helper.err"
+offered="$(cd "$REPO" && oc 120 models --standalone 2>"$STATE_DIR/last-helper.err" || true)"
+[[ -n "$offered" ]] || die "OpenCode offered no models at all (network, provider or policy failure; see $STATE_DIR/last-helper.err)"
+disable_args=()
+while IFS= read -r mid; do
+  [[ -n "$mid" ]] || continue
+  [[ "$mid" == "$MODEL_ID" ]] && continue
+  disable_args+=(--disable-model "$mid")
+done <<< "$offered"
+render_config "${disable_args[@]}"
+
+# verify-sources also replays the probes against the policies and permissions of the
+# document OpenCode loaded, the launch's own read denials included.
+(cd "$REPO" && oc 60 debug config --standalone 2>/dev/null) | python3 -I "$POLICY" verify-sources --config-dir "$CONFIG_DIR" "${deny_read_args[@]}" >&2
+(cd "$REPO" && oc 120 models --standalone 2>/dev/null) | python3 -I "$POLICY" verify-models >&2
+(cd "$REPO" && oc 60 debug agents --standalone 2>/dev/null) | python3 -I "$POLICY" verify-agents "${deny_read_args[@]}" >&2
+# Nothing else may have appeared in the private config directory (agents/, plugins/,
+# skills/, cli.json ... would all be loaded from there).
+extra_entries="$(find "$CONFIG_DIR" -mindepth 1 ! -name opencode.json -print)"
+[[ -z "$extra_entries" ]] || die "unexpected entries in $CONFIG_DIR: $extra_entries"
+
+# ---------------------------------------------------------------------------
+# 5. Banner, exec.
+# ---------------------------------------------------------------------------
+mode_banner=""
+if (( PR_MODE )); then
+  mode_banner=$'\n'"Mode  : pull request #$pr_number → origin/$pr_base_ref (merge base ${merge_base:0:12})"
+fi
+cat >&2 <<EOF
+
+============================================================
+oauto : OpenCode $version read-only reviewer
+Repo  : $REPO_NAME ($REPO)
+Branch: $branch @ ${head_sha:0:12}  ${ahead_behind:+[$ahead_behind vs $base_label]}$mode_banner
+Model : $MODEL_ID  (OpenCode Zen, pricing: Free)
+Agent : review-$MODEL_ALIAS   (other models disabled; provider pinned to 'opencode')
+Tools : read / glob / grep only. edit, shell, web, subagents, skills, MCP,
+        plugins, sharing and external directories are denied by config+policy.
+Lock  : $LOCK_FILE
+Config: $CONFIG_FILE (private to this launch)
+Note  : every model request sends the selected code context (and the preflight
+        below) to OpenCode's remote inference service. The published terms for
+        this model state zero retention and no training; it is still a remote
+        transmission of your code.
+Preflight: $PREFLIGHT_FILE ($preflight_bytes bytes$excluded_note)
+============================================================
+
+EOF
+
+if [[ "$MODE" == check ]]; then
+  note "--check: configuration verified; not launching."
+  exit 0
+fi
+
+if (( PR_MODE )); then
+  initial_prompt="$(cat <<EOF
+You are reviewing pull request #$pr_number ($pr_url) of the repository "$REPO_NAME". Below is the read-only git preflight collected by the launcher. It holds the delta of pull request #$pr_number against $pr_base_ref: origin/$pr_base_ref...HEAD, from the merge base ${merge_base:0:12} to the reviewed local HEAD ${head_sha:0:12}, which is the pull request's head. Review that delta (read the affected files in full first). If the preflight also lists uncommitted changes, they are not part of the pull request: review them separately.
+
+$(cat "$PREFLIGHT_FILE")
+EOF
+)"
+else
+  initial_prompt="$(cat <<EOF
+You are reviewing the repository "$REPO_NAME". Below is the read-only git preflight collected by the launcher. Review the uncommitted changes and the branch delta it shows (read the affected files in full first). If it shows nothing to review, ask me what to review.
+
+$(cat "$PREFLIGHT_FILE")
+EOF
+)"
+fi
+
+# Scrubbed environment: no API keys, tokens or proxy settings reach OpenCode, so no
+# provider other than the built-in free tier can appear, and OPENCODE_* overrides
+# (for example OPENCODE_API_KEY) cannot widen the model set. The flock parent that
+# re-executed this script keeps the lock until OpenCode exits.
+cd "$REPO"
+exec env -i "${clean_env[@]}" "$OPENCODE_BIN" --standalone --prompt "$initial_prompt"
