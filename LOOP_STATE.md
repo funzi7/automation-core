@@ -307,8 +307,12 @@ is the permanent human opt-out and is never removed by automation.
     symlink target with a symlinked directory followed by `..` was collapsed
     lexically — fixed in `3059954` (+ `f16dfe6`): historical include paths are
     now walked through the tree at the revision like a path lookup
-    (`tree_walk`), which replaces the earlier per-link resolver. `main`
-    (PR #59) was merged into the branch (`01f6840`). The Codex review, CI and Codex Gate state of the
+    (`tree_walk`), which replaces the earlier per-link resolver; its review of
+    `d64744c` added a P1 — an include DIRECTIVE written `conf/../b.cfg` was
+    collapsed before the walk — fixed in `f852171` (directives keep their
+    components, as `W` records from `includes-in-config` and `--walk-out`
+    from the scan, and are walked uncollapsed). `main` (PR #59) was merged
+    into the branch (`01f6840`). The Codex review, CI and Codex Gate state of the
     pushed head are recorded in `agent-memory/automation-core/cc-latest.md`.
     DONE by the owner on 2026-11-08: the Termux hop (`oauto <repo>` from a real
     Termux shell) and a review of a real project repository (the GLM audit).

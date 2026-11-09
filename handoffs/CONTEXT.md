@@ -519,7 +519,10 @@ A1. oauto — read-only OpenCode reviewer launcher (2026-11-07):
   review of `0bc9c29` added a P1 (a symlink target with a symlinked directory
   followed by `..` collapsed lexically) — fixed in `3059954` + `f16dfe6`
   (historical include paths are walked through the tree at the revision,
-  `tree_walk`, replacing the per-link resolver). Shown
+  `tree_walk`, replacing the per-link resolver); its review of `d64744c`
+  added a P1 (an include directive written `conf/../b.cfg` collapsed before
+  the walk) — fixed in `f852171` (directives reach the walk uncollapsed, as
+  `W` records and `--walk-out`). Shown
   NOT reproducible on the real binary: the claimed backslash glob escape
   (ripgrep `--glob` filter rooted at the tool path; `external_directory` gates
   the path) — no rule added. Recorded as backlog, not changed here: mutable

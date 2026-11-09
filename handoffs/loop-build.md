@@ -106,12 +106,12 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
     belong to this worktree`; the victim's `.git/index` unchanged); `Auth.json` under the override is read-denied by
     exact name (rendered `read Auth.json` / `*/Auth.json` and `tool.use read:Auth.json` / `read:*/Auth.json` deny;
     64/46 probes, 45 agent probes). Nothing rendered for refused launches; no OpenCode process or service left.
-  - Final validation at `f16dfe6` (after the seven Codex P1 fixes below): `bash scripts/validate.sh` green — YAML,
-    JSON, sync/mirror parity, JS syntax, `node --test` 275/275 (`tests/test_oauto_launcher.js` 103 tests: 75 before
-    this round + 12 in round 1 + 7 in round 2 + 1 + 2 + 2 + 1 + 1 + 1 + 1 for the seven Codex P1 rounds), 59
-    github-script bodies, actionlint, `git diff --check` — 695 s (earlier runs: `d2495cd` 266/266 in 577 s,
+  - Final validation at `f852171` (after the eight Codex P1 fixes below): `bash scripts/validate.sh` green — YAML,
+    JSON, sync/mirror parity, JS syntax, `node --test` 276/276 (`tests/test_oauto_launcher.js` 104 tests: 75 before
+    this round + 12 in round 1 + 7 in round 2 + 1 + 2 + 2 + 1 + 1 + 1 + 1 + 1 for the eight Codex P1 rounds), 59
+    github-script bodies, actionlint, `git diff --check` — 682 s (earlier runs: `d2495cd` 266/266 in 577 s,
     `5860e1f` 267/267 in 590 s, `afd4639` 269/269 in 596 s, `62fca59` 271/271, `4544f09` 272/272 in 653 s,
-    `09dfcc8` 273/273 in 711 s, `2d5d7b7` 274/274 in 589 s).
+    `09dfcc8` 273/273 in 711 s, `2d5d7b7` 274/274 in 589 s, `f16dfe6` 275/275 in 695 s).
 - Round 2 — resolution of the independent review's findings (`d2495cd`, each reproduced on `43b1708` first):
   P2 → new `check-repo-git` (`parse_dot_git_file`, `own_git_info`, `_git_dir_owned`, `config_value`): `.git` must
   be a real directory, or a `.git` file — parsed exactly as git does — naming a linked-worktree admin dir whose
@@ -146,7 +146,7 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
   `5860e1f`, backup `*-20261109-024432`; both again at `afd4639`, backups `*-20261109-031603`, and at `62fca59`,
   backups `*-20261109-034619`; `oauto-policy.py` at `4544f09`, backup `*-20261109-041053`, and at `09dfcc8`,
   backup `*-20261109-043850`; `oauto-run` at `2d5d7b7`, backup `*-20261109-050947`; both at `3059954`/`f16dfe6`,
-  backups `*-20261109-054251`, `*-054316`); `ai-launch`, the Termux
+  backups `*-20261109-054251`, `*-054316`; both at `f852171`, backups `*-20261109-061235`); `ai-launch`, the Termux
   `oauto-launch` wrapper and both `.bashrc` blocks were already identical and untouched; `install.sh --verify`
   clean; the device-parity test is green; `/root/work/bin/oauto-run <fixture> deepseek --check` through the
   installed copy with the real binary verified sources (verbatim), models and agents (see below). `cauto`,
@@ -306,7 +306,24 @@ Handoff log for the self-healing-loop build. Newest entry is first. Historical e
   root failing closed, adjusted chain/loop expectations, `resolve-link` unit assertions removed; README row and
   ADR item 4 describe the walk; `install.sh` refreshed `oauto-run` and `oauto-policy.py` (backups
   `*-20261109-054251`, `*-054316`), `--verify` clean. The thread was replied to with the fix commit and resolved;
-  a Codex review of the final head was requested.
+  a Codex review of the next head was requested.
+- Codex review of the eighth pushed head `d64744c` (`@codex review` 05:55:35Z; receipt 06:01:03Z with `**Reviewed
+  commit:** d64744cf46`; CI `validate-automation-core` success 05:57:35Z; gate `🟡` at the push, then `🔴 Active
+  Codex P1/P2 finding` 06:01:33Z): one P1, valid, reproduced by Codex and re-reproduced here — the same collapse
+  one level up: a committed `a.cfg` saying `path = conf/../b.cfg` with `conf -> dirs/nested` and the credential
+  in `dirs/b.cfg` (git shown to have loaded `dirs/b.cfg`; `a.cfg`, `conf` and `dirs/b.cfg` deleted): every
+  candidate the policy derived for the DIRECTIVE — live-resolved, canonical, lexical — collapsed `conf/..` to
+  root `b.cfg` before the tree walk could see the committed `conf` (old launcher: token present, only `a.cfg`
+  excluded; fixed: absent, `dirs/b.cfg` excluded). Fixed in `f852171`: `uncollapsed_include_path` keeps a
+  directive's `.`/`..` components repository-relative (for `.git/config` the leading `../` is the root);
+  `includes-in-config` emits it as a `W` record beside the collapsed names, the scan hands the ones it meets in
+  live Git configs over through `--walk-out`, and the launcher queues both kinds for `tree_walk` under their own
+  context without treating the raw spelling as a name to exclude — the walk's result is what gets excluded and
+  followed. Tests: the Codex scenario and the directive written directly in `.git/config`
+  (`path = ../conf/../b.cfg`); `includes-in-config`'s `W` records; the source-shape pin follows the new scan
+  argument. README row and ADR item 4 updated; `install.sh` refreshed both files (backups `*-20261109-061235`),
+  `--verify` clean. The thread was replied to with the fix commit and resolved; a Codex review of the final
+  head was requested.
 - Review and gate state of the final head: recorded in `agent-memory/automation-core/cc-latest.md` (owner-facing
   state) once the exact-head CI, Codex review and Codex Gate verdict exist on the PR; never claimed here ahead of
   the evidence.
