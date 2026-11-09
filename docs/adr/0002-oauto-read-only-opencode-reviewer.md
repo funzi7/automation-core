@@ -69,7 +69,11 @@ policy, not by the system prompt alone:
    — or this submodule's git dir — a `modules` path component and a last
    `core.worktree` (resolved relative to the git dir) that is this worktree; a
    symlinked, malformed, missing or otherwise foreign `.git` is refused (a moved
-   worktree is told to run `git worktree repair`), and the scan applies the same
+   worktree is told to run `git worktree repair`); a real `.git` directory that
+   carries a `commondir` file is refused as well — git honours that file in any
+   git dir and would take refs, objects and config from the directory it names
+   (Codex P1 on `33c0dda`, 2026-11-09) — and a submodule git dir is accepted
+   only without one; the scan applies the same
    parser so it never walks a decoy git dir. Then: validated binary version only;
    no system config under
    `/etc/opencode`; no `opencode.json(c)` or `.opencode/` in the repository and

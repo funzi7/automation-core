@@ -694,7 +694,9 @@ def _git_dir_owned(repo: str, dot_git: str, gitdir: str, commondir: str | None) 
         if (os.path.realpath(back_abs) == os.path.realpath(dot_git)
                 and os.path.realpath(os.path.join(commondir, "worktrees", name)) == gitdir):
             return True
-    if "modules" in gitdir.split(os.sep):
+    # A submodule git dir has no commondir file; one planted there would redirect refs,
+    # objects and config to another repository, so it is never accepted.
+    if commondir is None and "modules" in gitdir.split(os.sep):
         text = None
         try:
             with open(os.path.join(gitdir, "config"), encoding="utf-8", errors="surrogateescape") as fh:
@@ -723,6 +725,18 @@ def own_git_info(repo: str) -> tuple[str, list[str], str | None, str | None]:
     if os.path.islink(git_dir):
         return ("symlink", [], os.path.realpath(git_dir), ".git is a symlink")
     if os.path.isdir(git_dir):
+        # git honours a `commondir` file inside any git dir (gitrepository-layout): refs,
+        # objects and config then come from the directory it names. A real `.git` that
+        # carries one is not a layout git creates for a worktree; a planted one would make
+        # every preflight git command read another local repository, so it is refused.
+        common_file = os.path.join(git_dir, "commondir")
+        if os.path.lexists(common_file):
+            common = _git_pointer(common_file)
+            target = (os.path.realpath(common if os.path.isabs(common) else os.path.join(git_dir, common))
+                      if common is not None else common_file)
+            return ("foreign-common", [], target,
+                    f".git holds a commondir file ({target}); this worktree's refs, objects and config would come "
+                    "from another git dir, so it is not this worktree's own git directory")
         return ("dir", [git_dir], None, None)
     if not os.path.exists(git_dir):
         return ("no-git", [], None, "not a Git repository (no .git)")
@@ -1124,6 +1138,11 @@ def scan(repo: str, budget: float, included_out: str | None = None,
         # git dir is not walked (nothing in it is this worktree's to report).
         symlinks.add((".git", named_gitdir or git_detail or "",
                       ".git file names a git dir that does not belong to this worktree"))
+    elif git_kind == "foreign-common":
+        # A real .git directory carrying a commondir file: git would take refs, objects and
+        # config from the directory it names (refused earlier by check-repo-git as well).
+        symlinks.add((".git", named_gitdir or git_detail or "",
+                      ".git holds a commondir file naming another git dir"))
     elif git_kind == "dir":
         complete = walk_git_dir(git_dir, True) and complete
     elif git_kind == "owned":

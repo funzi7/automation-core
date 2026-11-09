@@ -2615,6 +2615,52 @@ test('P3-2: the .git file parser keeps git\'s trailing-space semantics; a bare r
   assert.match(r.stderr, /does not belong to this worktree/);
 });
 
+test('P1 (Codex on 33c0dda): a real .git directory carrying a commondir file is refused before any git runs; a planted commondir in a submodule git dir too', () => {
+  const sb = sandbox();
+  const victim = mkRepo(sb, 'cd-victim', { 'private.txt': 'VICTIM-PRIVATE-SYNTH-c0c0\n' });
+  const realVictim = fs.realpathSync(victim);
+  const idx = path.join(realVictim, '.git', 'index');
+  const before = fs.statSync(idx);
+  // An otherwise ordinary repository whose REAL .git directory names the victim's git dir as its
+  // common dir: git would take refs, objects and config from there despite --work-tree.
+  const attacker = mkRepo(sb, 'cd-attacker', { 'README.md': '# review me\n' });
+  fs.writeFileSync(path.join(attacker, '.git', 'commondir'), `${realVictim}/.git\n`);
+  let r = checkRepoGit(attacker);
+  assert.equal(r.status, 2, 'a real .git with a commondir file must be refused');
+  assert.match(r.stderr, /\.git holds a commondir file \(.*cd-victim\/\.git\)/);
+  const scan = scanOf(attacker);
+  assert.equal(scan.status, 0, scan.stderr);
+  assert.deepEqual(symlinkRecords(scan.stdout),
+    [`SYMLINK .git -> ${realVictim}/.git (.git holds a commondir file naming another git dir)`]);
+  r = runOauto(sb, attacker, ['--check'], { OAUTO_ALLOW_SENSITIVE_FILES: '1' });
+  assert.equal(r.status, 1, `exit 0 would have leaked the victim:\n${r.stderr}`);
+  assert.match(r.stderr, /holds a commondir file/);
+  assert.match(r.stderr, /no git command was run against it/);
+  assert.ok(nothingRendered(sb, attacker), 'nothing may be rendered');
+  assert.ok(!fs.existsSync(path.join(stateDir(sb, attacker), 'preflight.md')), 'no preflight may be written');
+  assert.ok(!r.stderr.includes('VICTIM-PRIVATE-SYNTH-c0c0'));
+  const after = fs.statSync(idx);
+  assert.equal(after.mtimeMs, before.mtimeMs, 'victim .git/index mtime unchanged (no git ran against it)');
+  assert.equal(after.size, before.size);
+  // An empty commondir file is refused as well: git would still honour the file.
+  fs.writeFileSync(path.join(attacker, '.git', 'commondir'), '');
+  r = checkRepoGit(attacker);
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /holds a commondir file/);
+  // A submodule git dir has no commondir file; a planted one would redirect the submodule's
+  // refs, objects and config, so the checkout is no longer owned.
+  const subsrc = mkRepo(sb, 'cd-subsrc', { 's.txt': 's\n' });
+  const sup = mkRepo(sb, 'cd-super', { 'a.py': 'x = 1\n' });
+  git(sup, ['-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', subsrc, 'sub']);
+  git(sup, ['commit', '-q', '-m', 'add submodule']);
+  const sub = path.join(sup, 'sub');
+  assert.equal(checkRepoGit(sub).status, 0, 'the clean submodule checkout is accepted');
+  fs.writeFileSync(path.join(sup, '.git', 'modules', 'sub', 'commondir'), `${realVictim}/.git\n`);
+  r = checkRepoGit(sub);
+  assert.equal(r.status, 2, 'a planted commondir in the submodule git dir must be refused');
+  assert.match(r.stderr, /does not belong to this worktree/);
+});
+
 test('P3-4: case-variant secret-like files are denied by their exact name under the override, in both agents and the ceiling', () => {
   const sb = sandbox();
   const repo = mkRepo(sb, 'case-variants', { 'src/a.py': 'x = 1\n', 'Auth.json': '{"t":"SYNTH"}\n',
