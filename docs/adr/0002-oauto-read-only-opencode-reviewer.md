@@ -150,7 +150,11 @@ policy, not by the system prompt alone:
    through a directory symlink retargeted since the commit, or a relative one
    that escapes and re-enters the repository is an in-repository target like
    any other) and its target excluded and followed, never parsed as config
-   text (Codex P1s on `0ca1844`, `2c743cf` and `9e8a88d`, 2026-11-09) — and
+   text; the target's own relative includes are then resolved against the
+   path git opened — the link's referenced name, carried as the traversal
+   context, not the directory the link led to — and a content path reached
+   under two contexts is followed under both (Codex P1s on `0ca1844`,
+   `2c743cf`, `9e8a88d` and `bdc6cef`, 2026-11-09) — and
    every in-repository target found this
    way is handed back to the scan, which runs again until nothing new
    appears (include targets are tracked under their referenced name and

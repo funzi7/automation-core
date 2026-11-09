@@ -2142,7 +2142,8 @@ test('oauto-run source: no automatic approval, standalone helpers, bounded helpe
   // built only after every hop is known.
   assert.match(code, /^\s*g cat-file blob "\$rev:\$path" > "\$blob_tmp" \|\| continue$/m);
   assert.match(code, /includes-in-config --repo="\$REPO" --config-path="\$1" >> "\$hops_z" \|\|\n\s*die "/);
-  assert.match(code, /^\s*parse_config_includes "\$path" < "\$path" /m, 'a file outside the repository is read as it is, without git');
+  assert.match(code, /^\s*: > "\$hops_z"; parse_config_includes "\$c" < "\$path"; enqueue_records "\$hops_z" ""$/m,
+    'a file outside the repository is read as it is, without git, under the context git opened it with');
   // One decision point: the scan runs in a bounded loop, fed what history reveals, and the
   // verdict, the deny rules and classify use the final pass.
   assert.match(code, /\(\( scan_pass <= 8 \)\) \|\| die "/);
@@ -2886,6 +2887,49 @@ test('P1 (Codex on 9e8a88d): a committed symlink with an absolute target through
   const back = policy(['resolve-link', '--repo', repo, '--link-path', 'a.cfg'], `../${path.basename(real)}/conf/b.cfg`);
   assert.equal(back.status, 0, back.stderr);
   assert.equal(back.stdout, 'I\0conf/b.cfg\0I\0newconf/b.cfg\0');
+});
+
+test('P1 (Codex on bdc6cef): a symlinked included config keeps its resolution context in history, so nested relative includes resolve like git', () => {
+  const sb = sandbox();
+  const outcome = {};
+  const record = (label, repo, tokens, env = {}) => {
+    const { r, preflight, prompt } = launchRecordingPrompt(sb, repo, env);
+    outcome[label] = { status: r.status, leaked: tokens.some((t) => preflight.includes(t) || prompt.includes(t)), excluded: excludedLines(preflight), stderr: r.stderr };
+  };
+  // Codex's scenario: .git/config includes ../a.cfg; committed a.cfg -> configs/b.cfg; b.cfg says
+  // `path = c.cfg`, which git resolves relative to a.cfg (the path it opened) → root c.cfg, the
+  // credential; all three deleted. The old traversal resolved it relative to configs/ instead.
+  const ctx = chainRepo(sb, 'ctx-symlink', { 'configs/b.cfg': '[include]\n\tpath = c.cfg\n', 'c.cfg': includedConfigText('S-CTX-ROOT-9a9a'),
+    'configs/c.cfg': '[k]\n\tv = decoy\n' }, '../a.cfg');
+  fs.symlinkSync('configs/b.cfg', path.join(ctx, 'a.cfg'));
+  git(ctx, ['add', '-A']);
+  git(ctx, ['commit', '-q', '-m', 'a.cfg -> configs/b.cfg']);
+  for (const f of ['a.cfg', 'configs/b.cfg', 'c.cfg']) fs.rmSync(path.join(ctx, f));
+  record('symlink', ctx, ['S-CTX-ROOT-9a9a']);
+  // Through a committed directory symlink: conf -> realconf, realconf/a.cfg says `path = x.cfg`;
+  // git opened conf/a.cfg, so x.cfg is conf/x.cfg → realconf/x.cfg (the credential); all deleted.
+  const dir = chainRepo(sb, 'ctx-dirlink', { 'realconf/a.cfg': '[include]\n\tpath = x.cfg\n', 'realconf/x.cfg': includedConfigText('S-CTX-DIR-8b8b') }, '../conf/a.cfg');
+  fs.symlinkSync('realconf', path.join(dir, 'conf'));
+  git(dir, ['add', '-A']);
+  git(dir, ['commit', '-q', '-m', 'conf -> realconf']);
+  fs.unlinkSync(path.join(dir, 'conf'));
+  fs.rmSync(path.join(dir, 'realconf'), { recursive: true });
+  record('dirlink', dir, ['S-CTX-DIR-8b8b']);
+  // One content path reached with two contexts: a.cfg -> configs/b.cfg AND a direct include of
+  // configs/b.cfg; `path = c.cfg` then names root c.cfg (via a.cfg) and configs/c.cfg (directly).
+  const two = chainRepo(sb, 'ctx-two', { 'configs/b.cfg': '[include]\n\tpath = c.cfg\n', 'c.cfg': includedConfigText('S-CTX-TWO-ROOT-7c7c'),
+    'configs/c.cfg': includedConfigText('S-CTX-TWO-SUB-6d6d') }, '../a.cfg');
+  fs.appendFileSync(path.join(two, '.git', 'config'), '[include]\n\tpath = ../configs/b.cfg\n');
+  fs.symlinkSync('configs/b.cfg', path.join(two, 'a.cfg'));
+  git(two, ['add', '-A']);
+  git(two, ['commit', '-q', '-m', 'two contexts']);
+  for (const f of ['a.cfg', 'configs/b.cfg', 'c.cfg', 'configs/c.cfg']) fs.rmSync(path.join(two, f));
+  record('two', two, ['S-CTX-TWO-ROOT-7c7c', 'S-CTX-TWO-SUB-6d6d']);
+  assert.deepEqual(Object.fromEntries(Object.entries(outcome).map(([k, v]) => [k, { status: v.status, leaked: v.leaked, excluded: v.excluded }])), {
+    symlink: { status: 0, leaked: false, excluded: ['a.cfg (included Git config)', 'c.cfg (included Git config)', 'configs/b.cfg (included Git config)'] },
+    dirlink: { status: 0, leaked: false, excluded: ['realconf/a.cfg (included Git config)', 'realconf/x.cfg (included Git config)'] },
+    two: { status: 0, leaked: false, excluded: ['a.cfg (included Git config)', 'c.cfg (included Git config)', 'configs/b.cfg (included Git config)', 'configs/c.cfg (included Git config)'] },
+  }, JSON.stringify(outcome, null, 1));
 });
 
 test('P3-4: case-variant secret-like files are denied by their exact name under the override, in both agents and the ceiling', () => {

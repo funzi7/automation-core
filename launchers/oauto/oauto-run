@@ -247,44 +247,28 @@ history_dir_link() { # $1: revision; $2: repo-relative include path with no entr
   done
 }
 history_pass() {
-  local known=() visited=() queue=() depth=() i=0 entry d path rev mode kind target next
+  # Every queued entry carries the CONTEXT git resolves its relative includes against: the
+  # path git opened. For an include directive that is the target's own path; for the
+  # target of a symlink (file or directory) it stays the path by which the symlink was
+  # referenced, because git keeps the pathname it opened, not where the link led. A
+  # content path reached with two contexts is processed twice (nested relative includes
+  # resolve differently); the depth bound still terminates loops.
+  local known=() visited=() queue=() depth=() ctx=() found=() i=0 entry d c path rev mode
   while IFS= read -r -d '' path; do known+=("$path"); done < "$included_z"
-  while IFS= read -r -d '' path; do queue+=("I:$path"); depth+=(1); done < "$missing_z"
+  # Paths this traversal itself found in earlier passes (handed to the scan through
+  # --extra-config, so the scan hands them back as include targets) are reached again
+  # through their chains, under the context git would open them with; seeding them as
+  # their own context would resolve their relative includes against the wrong directory.
+  while IFS= read -r -d '' path; do found+=("$path"); done < "$extra_z"
   while IFS= read -r -d '' path; do
-    if [[ -f "$REPO/$path" ]]; then queue+=("I:$path"); depth+=(1); fi
+    if ! in_list "$path" "${found[@]}"; then queue+=("I:$path"); depth+=(1); ctx+=("$path"); fi
+  done < "$missing_z"
+  while IFS= read -r -d '' path; do
+    if [[ -f "$REPO/$path" ]] && ! in_list "$path" "${found[@]}"; then queue+=("I:$path"); depth+=(1); ctx+=("$path"); fi
   done < "$included_z"
   : > "$new_z"
-  while (( i < ${#queue[@]} )); do
-    entry="${queue[i]}"; d="${depth[i]}"; i=$((i + 1))
-    if in_list "$entry" "${visited[@]}"; then continue; fi
-    visited+=("$entry")
-    : > "$hops_z"
-    path="${entry#?:}"
-    if [[ "$entry" == I:* ]]; then
-      if [[ -f "$REPO/$path" ]]; then parse_config_includes "$path" < "$REPO/$path"; fi
-      for rev in "${history_revs[@]}"; do
-        mode="$(g ls-tree -z "$rev" -- "$path" | head -c 6)"
-        if [[ -z "$mode" ]]; then
-          # No entry under that name at this revision: either never committed there, or a
-          # directory on the way was a committed symlink — resolved as one more hop.
-          history_dir_link "$rev" "$path"
-          continue
-        fi
-        g cat-file blob "$rev:$path" > "$blob_tmp" || continue
-        if [[ "$mode" == 120000 ]]; then
-          # A committed symlink: its blob is the link target, not config text. git would
-          # have followed the link, so resolve it within the same revision (relative to
-          # the link's directory) and exclude and follow the target instead; parsing the
-          # target text as config would miss the target's deleted content.
-          python3 -I "$POLICY" resolve-link --repo="$REPO" --link-path="$path" < "$blob_tmp" >> "$hops_z" ||
-            die "a committed symlink among the included Git configs could not be resolved for the preflight (fail closed)"
-          continue
-        fi
-        parse_config_includes "$path" < "$blob_tmp"
-      done
-    elif [[ -f "$path" ]]; then
-      parse_config_includes "$path" < "$path" # outside the repository: read as it is, no git
-    fi
+  enqueue_records() { # $1: records file (KIND NUL TARGET NUL); $2: inherited context, or "" for the record's own path
+    local file="$1" inherited="$2" kind target next use_ctx
     while IFS= read -r -d '' kind; do
       IFS= read -r -d '' target || die "a malformed include record reached the launcher"
       case "$kind" in
@@ -293,10 +277,50 @@ history_pass() {
         *) die "a malformed include record reached the launcher" ;;
       esac
       next="$kind:$target"
-      if in_list "$next" "${visited[@]}"; then continue; fi
+      use_ctx="${inherited:-$target}"
+      if in_list "$next|$use_ctx" "${visited[@]}"; then continue; fi
       (( d < 8 )) || die "Git config includes reached through history or outside files nest deeper than 8 levels (fail closed)"
-      queue+=("$next"); depth+=("$((d + 1))")
-    done < "$hops_z"
+      queue+=("$next"); depth+=("$((d + 1))"); ctx+=("$use_ctx")
+    done < "$file"
+  }
+  while (( i < ${#queue[@]} )); do
+    entry="${queue[i]}"; d="${depth[i]}"; c="${ctx[i]}"; i=$((i + 1))
+    if in_list "$entry|$c" "${visited[@]}"; then continue; fi
+    visited+=("$entry|$c")
+    path="${entry#?:}"
+    if [[ "$entry" == I:* ]]; then
+      if [[ -f "$REPO/$path" ]]; then
+        : > "$hops_z"; parse_config_includes "$c" < "$REPO/$path"; enqueue_records "$hops_z" ""
+      fi
+      for rev in "${history_revs[@]}"; do
+        mode="$(g ls-tree -z "$rev" -- "$path" | head -c 6)"
+        if [[ -z "$mode" ]]; then
+          # No entry under that name at this revision: either never committed there, or a
+          # directory on the way was a committed symlink — resolved as one more hop whose
+          # target keeps this entry's context.
+          : > "$hops_z"; history_dir_link "$rev" "$path"; enqueue_records "$hops_z" "$c"
+          continue
+        fi
+        g cat-file blob "$rev:$path" > "$blob_tmp" || continue
+        if [[ "$mode" == 120000 ]]; then
+          # A committed symlink: its blob is the link target, not config text. git would
+          # have followed the link, so resolve it within the same revision (relative to
+          # the link's directory) and exclude and follow the target instead — under this
+          # entry's context, since git goes on resolving relative to the path it opened;
+          # parsing the target text as config would miss the target's deleted content.
+          : > "$hops_z"
+          python3 -I "$POLICY" resolve-link --repo="$REPO" --link-path="$path" < "$blob_tmp" >> "$hops_z" ||
+            die "a committed symlink among the included Git configs could not be resolved for the preflight (fail closed)"
+          enqueue_records "$hops_z" "$c"
+          continue
+        fi
+        : > "$hops_z"; parse_config_includes "$c" < "$blob_tmp"; enqueue_records "$hops_z" ""
+      done
+    elif [[ -f "$path" ]]; then
+      # Outside the repository: read as it is, no git; its includes resolve against the
+      # path git opened (its own, or the in-repository link that led here).
+      : > "$hops_z"; parse_config_includes "$c" < "$path"; enqueue_records "$hops_z" ""
+    fi
   done
 }
 
