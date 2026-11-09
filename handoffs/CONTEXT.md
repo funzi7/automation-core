@@ -515,7 +515,11 @@ A1. oauto — read-only OpenCode reviewer launcher (2026-11-07):
   — fixed in `09dfcc8` (targets judged both as written and as live-resolved);
   its review of `bdc6cef` added a P1 (nested relative includes of a symlinked
   config resolved against the target's directory, not the path git opened) —
-  fixed in `2d5d7b7` (history entries carry their resolution context). Shown
+  fixed in `2d5d7b7` (history entries carry their resolution context); its
+  review of `0bc9c29` added a P1 (a symlink target with a symlinked directory
+  followed by `..` collapsed lexically) — fixed in `3059954` + `f16dfe6`
+  (historical include paths are walked through the tree at the revision,
+  `tree_walk`, replacing the per-link resolver). Shown
   NOT reproducible on the real binary: the claimed backslash glob escape
   (ripgrep `--glob` filter rooted at the tool path; `external_directory` gates
   the path) — no rule added. Recorded as backlog, not changed here: mutable

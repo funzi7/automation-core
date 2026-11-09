@@ -303,8 +303,12 @@ is the permanent human opt-out and is never removed by automation.
     `bdc6cef` added a P1 in the same traversal — nested relative includes of
     a symlinked config were resolved against the link's target directory
     instead of the path git opened — fixed in `2d5d7b7` (every history entry
-    carries its resolution context). `main` (PR #59) was merged into the
-    branch (`01f6840`). The Codex review, CI and Codex Gate state of the
+    carries its resolution context); its review of `0bc9c29` added a P1 — a
+    symlink target with a symlinked directory followed by `..` was collapsed
+    lexically — fixed in `3059954` (+ `f16dfe6`): historical include paths are
+    now walked through the tree at the revision like a path lookup
+    (`tree_walk`), which replaces the earlier per-link resolver. `main`
+    (PR #59) was merged into the branch (`01f6840`). The Codex review, CI and Codex Gate state of the
     pushed head are recorded in `agent-memory/automation-core/cc-latest.md`.
     DONE by the owner on 2026-11-08: the Termux hop (`oauto <repo>` from a real
     Termux shell) and a review of a real project repository (the GLM audit).
